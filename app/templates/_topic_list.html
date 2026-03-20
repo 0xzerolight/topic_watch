@@ -1,0 +1,9 @@
+{% for item in topic_data %}
+    {% set topic = item.topic %}
+    {% set last_check = item.last_check %}
+    {% set article_count = item.article_count %}
+    {% include "_topic_row.html" %}
+{% endfor %}
+{% if not topic_data %}
+<tr><td colspan="6"><em>No topics match your search.</em></td></tr>
+{% endif %}

@@ -1,0 +1,46 @@
+# Version control
+.git/
+.gitignore
+
+# Tests
+tests/
+
+# Virtual environments
+.venv/
+venv/
+
+# Runtime data (mounted as volume)
+data/
+
+# CI/CD and automation
+.github/
+.claude-runner/
+.claude/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# Documentation
+*.md
+
+# Dev tooling configs
+.pre-commit-config.yaml
+Makefile
+ruff.toml
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db

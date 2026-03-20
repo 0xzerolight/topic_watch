@@ -1,0 +1,43 @@
+{% macro render_pagination(page, total_pages, base_url) %}
+{% if total_pages > 1 %}
+<nav role="navigation" aria-label="Pagination">
+    <ul>
+        {% if page > 2 %}
+        <li><a href="{{ base_url }}?page=1">First</a></li>
+        {% endif %}
+        {% if page > 1 %}
+        <li><a href="{{ base_url }}?page={{ page - 1 }}">Previous</a></li>
+        {% endif %}
+
+        {% set start = [1, page - 2] | max %}
+        {% set end = [total_pages, page + 2] | min %}
+
+        {% if start > 1 %}
+        <li><a href="{{ base_url }}?page=1">1</a></li>
+        {% if start > 2 %}<li>...</li>{% endif %}
+        {% endif %}
+
+        {% for p in range(start, end + 1) %}
+        {% if p == page %}
+        <li><a href="{{ base_url }}?page={{ p }}" aria-current="page"><strong>{{ p }}</strong></a></li>
+        {% else %}
+        <li><a href="{{ base_url }}?page={{ p }}">{{ p }}</a></li>
+        {% endif %}
+        {% endfor %}
+
+        {% if end < total_pages %}
+        {% if end < total_pages - 1 %}<li>...</li>{% endif %}
+        <li><a href="{{ base_url }}?page={{ total_pages }}">{{ total_pages }}</a></li>
+        {% endif %}
+
+        {% if page < total_pages %}
+        <li><a href="{{ base_url }}?page={{ page + 1 }}">Next</a></li>
+        {% endif %}
+        {% if page < total_pages - 1 %}
+        <li><a href="{{ base_url }}?page={{ total_pages }}">Last</a></li>
+        {% endif %}
+    </ul>
+    <p><small>Page {{ page }} of {{ total_pages }}</small></p>
+</nav>
+{% endif %}
+{% endmacro %}

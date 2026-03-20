@@ -1,0 +1,273 @@
+{% extends "base.html" %}
+{% block title %}Settings - Topic Watch{% endblock %}
+{% block content %}
+<h1>Settings</h1>
+
+{% if request.query_params.get("saved") %}
+<article style="border-left: 4px solid var(--pico-ins-color, #2e7d32); padding: 1rem; margin-bottom: 1rem;">
+    <strong>&#10003; Settings saved successfully.</strong>
+    <small>Changes are active immediately.</small>
+</article>
+{% endif %}
+
+{% if errors %}
+<article aria-label="Validation errors" style="border-left: 4px solid var(--pico-del-color, #c62828); padding: 1rem; margin-bottom: 1rem;">
+    <strong>Validation errors — settings were not saved.</strong>
+    <ul style="margin: 0.5rem 0 0;">
+        {% for error in errors %}
+        <li>{{ error }}</li>
+        {% endfor %}
+    </ul>
+</article>
+{% endif %}
+
+<article>
+    <p>Configuration file: <code>{{ config_path }}</code></p>
+    <p><small>Settings overridden by environment variables (<code>TOPIC_WATCH_*</code>) cannot be changed here.</small></p>
+</article>
+
+<form method="post" action="/settings">
+    <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
+
+    <h2>LLM Configuration</h2>
+
+    <label for="llm_model">
+        Model
+        <input type="text" id="llm_model" name="llm_model" required
+               value="{{ form.llm_model if form else settings.llm.model }}"
+               placeholder="e.g., openai/gpt-4o-mini">
+    </label>
+
+    <label for="llm_api_key">
+        API Key <small>(leave blank to keep current key)</small>
+        <div style="display: flex; gap: 0.5rem; align-items: center;">
+            <input type="password" id="llm_api_key" name="llm_api_key"
+                   value="{{ form.llm_api_key if form else '' }}"
+                   placeholder="{{ settings.llm.api_key[:4] }}...{{ settings.llm.api_key[-4:] if settings.llm.api_key|length > 8 else '****' }}"
+                   style="flex: 1; margin: 0;">
+            <button type="button" onclick="toggleApiKey()" style="white-space: nowrap; margin: 0;">Show</button>
+        </div>
+    </label>
+
+    <label for="llm_base_url">
+        Base URL <small>(optional)</small>
+        <input type="text" id="llm_base_url" name="llm_base_url"
+               value="{{ form.llm_base_url if form else (settings.llm.base_url or '') }}"
+               placeholder="Leave empty unless using a self-hosted LLM">
+    </label>
+
+    <h2>Notifications</h2>
+
+    <label for="notification_urls">
+        Notification URLs <small>(one per line, Apprise format)</small>
+        <textarea id="notification_urls" name="notification_urls" rows="4"
+                  placeholder="ntfy://my-topic&#10;discord://webhook-id/token">{{ form.notification_urls if form else (settings.notifications.urls | join('\n')) }}</textarea>
+    </label>
+
+    <label for="webhook_urls">
+        Webhook URLs <small>(one per line, JSON POST)</small>
+        <textarea id="webhook_urls" name="webhook_urls" rows="3"
+                  placeholder="https://example.com/webhook">{{ form.webhook_urls if form else (settings.notifications.webhook_urls | join('\n')) }}</textarea>
+    </label>
+
+    <h2>Checking</h2>
+
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+        <label for="check_interval_hours">
+            Default Check Interval (hours)
+            <input type="number" id="check_interval_hours" name="check_interval_hours" required
+                   min="1" max="168"
+                   value="{{ form.check_interval_hours if form else settings.check_interval_hours }}">
+        </label>
+
+        <label for="max_articles_per_check">
+            Max Articles per Check
+            <input type="number" id="max_articles_per_check" name="max_articles_per_check" required
+                   min="1" max="100"
+                   value="{{ form.max_articles_per_check if form else settings.max_articles_per_check }}">
+        </label>
+    </div>
+
+    <details>
+        <summary><strong>Advanced Settings</strong></summary>
+        <div style="padding-top: 1rem;">
+
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+                <label for="knowledge_state_max_tokens">
+                    Knowledge State Max Tokens
+                    <input type="number" id="knowledge_state_max_tokens" name="knowledge_state_max_tokens"
+                           min="500" max="10000"
+                           value="{{ form.knowledge_state_max_tokens if form else settings.knowledge_state_max_tokens }}">
+                </label>
+
+                <label for="article_retention_days">
+                    Article Retention Days
+                    <input type="number" id="article_retention_days" name="article_retention_days"
+                           min="1" max="3650"
+                           value="{{ form.article_retention_days if form else settings.article_retention_days }}">
+                </label>
+
+                <label for="feed_fetch_timeout">
+                    Feed Fetch Timeout (seconds)
+                    <input type="number" id="feed_fetch_timeout" name="feed_fetch_timeout"
+                           min="1" step="0.5"
+                           value="{{ form.feed_fetch_timeout if form else settings.feed_fetch_timeout }}">
+                </label>
+
+                <label for="article_fetch_timeout">
+                    Article Fetch Timeout (seconds)
+                    <input type="number" id="article_fetch_timeout" name="article_fetch_timeout"
+                           min="1" step="0.5"
+                           value="{{ form.article_fetch_timeout if form else settings.article_fetch_timeout }}">
+                </label>
+
+                <label for="llm_analysis_timeout">
+                    LLM Analysis Timeout (seconds)
+                    <input type="number" id="llm_analysis_timeout" name="llm_analysis_timeout"
+                           min="10"
+                           value="{{ form.llm_analysis_timeout if form else settings.llm_analysis_timeout }}">
+                </label>
+
+                <label for="llm_knowledge_timeout">
+                    LLM Knowledge Timeout (seconds)
+                    <input type="number" id="llm_knowledge_timeout" name="llm_knowledge_timeout"
+                           min="10"
+                           value="{{ form.llm_knowledge_timeout if form else settings.llm_knowledge_timeout }}">
+                </label>
+
+                <label for="web_page_size">
+                    Web Page Size
+                    <input type="number" id="web_page_size" name="web_page_size"
+                           min="5" max="200"
+                           value="{{ form.web_page_size if form else settings.web_page_size }}">
+                </label>
+            </div>
+
+        </div>
+    </details>
+
+    <div style="margin-top: 1.5rem;">
+        <button type="submit">Save Settings</button>
+    </div>
+</form>
+
+<hr>
+
+<h2>Test Notifications</h2>
+<div>
+    <p>Send a test notification to verify your notification configuration works.</p>
+    <button
+        hx-post="/notifications/test"
+        hx-target="#notification-test-result"
+        hx-swap="innerHTML"
+        hx-indicator="#test-spinner"
+        hx-disabled-elt="this"
+    >
+        Send Test Notification
+    </button>
+    <span id="test-spinner" class="htmx-indicator">
+        <span class="spinner"></span> Sending...
+    </span>
+    <div id="notification-test-result" style="margin-top: 1rem;"></div>
+</div>
+
+<h2>Browser Notifications</h2>
+<div id="browser-notif-section">
+    <p>Get desktop notifications in your browser when Topic Watch finds new information.</p>
+    <div style="display: flex; gap: 1rem; align-items: center; flex-wrap: wrap;">
+        <label style="margin: 0; cursor: pointer;">
+            <input type="checkbox" id="browser-notif-toggle" role="switch"
+                   onchange="toggleBrowserNotifications(this.checked)">
+            Enable browser notifications
+        </label>
+        <span id="browser-notif-status" style="font-size: 0.875rem;"></span>
+    </div>
+    <div id="browser-notif-denied" style="display: none; margin-top: 0.5rem;">
+        <small style="color: var(--pico-del-color, #c62828);">
+            Browser notifications are blocked. To enable them, click the lock/info icon in your browser's address bar and allow notifications for this site.
+        </small>
+    </div>
+</div>
+
+<script>
+function toggleApiKey() {
+    var field = document.getElementById("llm_api_key");
+    var btn = field.nextElementSibling;
+    if (field.type === "password") {
+        field.type = "text";
+        btn.textContent = "Hide";
+    } else {
+        field.type = "password";
+        btn.textContent = "Show";
+    }
+}
+
+function toggleBrowserNotifications(enabled) {
+    if (enabled) {
+        TopicWatchNotifications.requestPermission().then(function(permission) {
+            if (permission === "granted") {
+                TopicWatchNotifications.setEnabled(true);
+                updateBrowserNotifUI();
+                // Send a test browser notification
+                TopicWatchNotifications.show(
+                    "Topic Watch",
+                    "Browser notifications are now enabled!"
+                );
+            } else {
+                // Permission denied — uncheck and show help
+                document.getElementById("browser-notif-toggle").checked = false;
+                TopicWatchNotifications.setEnabled(false);
+                updateBrowserNotifUI();
+            }
+        });
+    } else {
+        TopicWatchNotifications.setEnabled(false);
+        updateBrowserNotifUI();
+    }
+}
+
+function updateBrowserNotifUI() {
+    var toggle = document.getElementById("browser-notif-toggle");
+    var status = document.getElementById("browser-notif-status");
+    var denied = document.getElementById("browser-notif-denied");
+
+    if (!TopicWatchNotifications.isSupported()) {
+        toggle.disabled = true;
+        status.textContent = "Not supported in this browser";
+        return;
+    }
+
+    var enabled = TopicWatchNotifications.isEnabled();
+    toggle.checked = enabled;
+
+    if (Notification.permission === "denied") {
+        toggle.disabled = true;
+        toggle.checked = false;
+        TopicWatchNotifications.setEnabled(false);
+        denied.style.display = "block";
+        status.textContent = "Blocked by browser";
+    } else if (enabled && Notification.permission === "granted") {
+        denied.style.display = "none";
+        status.textContent = "Active";
+        status.style.color = "var(--pico-ins-color, #2e7d32)";
+    } else {
+        denied.style.display = "none";
+        status.textContent = "";
+    }
+}
+
+document.addEventListener("DOMContentLoaded", updateBrowserNotifUI);
+
+document.body.addEventListener("htmx:afterSwap", function(event) {
+    if (event.detail.target.id === "notification-test-result") {
+        var html = event.detail.target.innerHTML;
+        if (html.indexOf("sent successfully") !== -1) {
+            TopicWatchNotifications.show(
+                "Topic Watch Test",
+                "This is a test notification from Topic Watch. Notifications are working!"
+            );
+        }
+    }
+});
+</script>
+{% endblock %}

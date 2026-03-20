@@ -1,0 +1,142 @@
+{% extends "base.html" %}
+{% block title %}Add Topic - Topic Watch{% endblock %}
+{% block content %}
+<h1>Add Topic</h1>
+
+{% if errors %}
+<article aria-label="Validation errors">
+    <header>Validation Errors</header>
+    <ul>
+        {% for error in errors %}
+        <li>{{ error }}</li>
+        {% endfor %}
+    </ul>
+</article>
+{% endif %}
+
+<form method="post" action="/topics">
+    <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
+    <label for="name">
+        Topic Name
+        <input type="text" id="name" name="name" required
+               value="{{ name or '' }}"
+               placeholder="e.g., Elden Ring DLC">
+    </label>
+
+    <label for="description">
+        Description (what you care about)
+        <input type="text" id="description" name="description" required
+               value="{{ description or '' }}"
+               placeholder="e.g., Release date, pricing, and new content">
+    </label>
+
+    <fieldset>
+        <legend>Feed Source</legend>
+        <label>
+            <input type="radio" name="feed_mode" value="auto"
+                   {{ 'checked' if (feed_mode or 'auto') == 'auto' }}
+                   onchange="document.getElementById('manual-feeds').style.display='none'">
+            Automatic (Google News)
+        </label>
+        <label>
+            <input type="radio" name="feed_mode" value="manual"
+                   {{ 'checked' if (feed_mode or 'auto') == 'manual' }}
+                   onchange="document.getElementById('manual-feeds').style.display='block'">
+            Manual (provide RSS URLs)
+        </label>
+    </fieldset>
+
+    <div id="manual-feeds" style="{{ 'display:block' if (feed_mode or 'auto') == 'manual' else 'display:none' }}">
+        <label for="feed_urls">
+            RSS Feed URLs (one per line)
+            <textarea id="feed_urls" name="feed_urls" rows="4"
+                      placeholder="https://example.com/feed.xml">{{ feed_urls or '' }}</textarea>
+        </label>
+        <button type="button"
+                hx-post="/feeds/validate"
+                hx-include="#feed_urls"
+                hx-target="#feed-validation-results"
+                hx-swap="innerHTML"
+                class="secondary outline"
+                style="margin-top: 0.5em;">
+            Validate URLs
+        </button>
+        <div id="feed-validation-results"></div>
+    </div>
+
+    <label>
+        Check Interval
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem;">
+            <input type="number" id="interval_value" name="interval_value"
+                   min="1" step="1"
+                   value="{{ interval_value or '' }}"
+                   placeholder="Default"
+                   oninput="updateIntervalMinutes()"
+                   style="margin-bottom: 0;">
+            <select id="interval_unit" name="interval_unit"
+                    onchange="updateIntervalMinutes(); updateIntervalRange();"
+                    style="margin-bottom: 0;">
+                <option value="minutes">Minutes</option>
+                <option value="hours">Hours</option>
+                <option value="days">Days</option>
+                <option value="weeks">Weeks</option>
+            </select>
+        </div>
+        <input type="hidden" id="check_interval_minutes" name="check_interval_minutes" value="{{ check_interval_minutes or '' }}">
+        <small>Leave empty to use the global default.</small>
+    </label>
+
+    <label for="tags">
+        Tags (comma-separated)
+        <input type="text" id="tags" name="tags"
+               value="{{ tags or '' }}"
+               placeholder="e.g., tech, ai, security">
+        <small>Optional. Use tags to organize and filter topics.</small>
+    </label>
+
+    <button type="submit">Create Topic</button>
+</form>
+
+<script>
+var UNIT_MULTIPLIERS = { minutes: 1, hours: 60, days: 1440, weeks: 10080 };
+var UNIT_RANGES = {
+    minutes: { min: 10, max: 60 },
+    hours: { min: 1, max: 168 },
+    days: { min: 1, max: 7 },
+    weeks: { min: 1, max: 1 }
+};
+
+function updateIntervalMinutes() {
+    var val = document.getElementById("interval_value").value;
+    var unit = document.getElementById("interval_unit").value;
+    var hidden = document.getElementById("check_interval_minutes");
+    if (val === "" || val === null) {
+        hidden.value = "";
+    } else {
+        hidden.value = parseInt(val, 10) * UNIT_MULTIPLIERS[unit];
+    }
+}
+
+function updateIntervalRange() {
+    var input = document.getElementById("interval_value");
+    var unit = document.getElementById("interval_unit").value;
+    var range = UNIT_RANGES[unit];
+    input.min = range.min;
+    input.max = range.max;
+    // Clamp current value if out of range
+    if (input.value !== "" && parseInt(input.value, 10) > range.max) {
+        input.value = range.max;
+        updateIntervalMinutes();
+    }
+    if (input.value !== "" && parseInt(input.value, 10) < range.min) {
+        input.value = range.min;
+        updateIntervalMinutes();
+    }
+}
+
+// Initialize range on page load
+document.addEventListener("DOMContentLoaded", function() {
+    updateIntervalRange();
+});
+</script>
+{% endblock %}

@@ -1,0 +1,31 @@
+# Ruff configuration for Topic Watch
+target-version = "py311"
+line-length = 120
+
+[lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # isort (import sorting)
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "N",    # pep8-naming
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "B008",   # do not perform function calls in argument defaults (needed for FastAPI Depends())
+    "N818",   # exception name should end in Error (not always appropriate)
+]
+
+[lint.per-file-ignores]
+"tests/**/*.py" = ["B011"]  # allow assert False in tests
+"app/migrations/**/*.py" = ["E501"]  # migrations can have long lines
+
+[lint.isort]
+known-first-party = ["app"]
+
+[format]
+quote-style = "double"
+indent-style = "space"

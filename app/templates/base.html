@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}Topic Watch{% endblock %}</title>
+    <!-- Vendored dependencies — update versions in app/static/vendor/
+         Pico CSS: https://github.com/picocss/pico (currently v2)
+         HTMX: https://htmx.org (currently v2.0.4) -->
+    <!-- Pico CSS v2 (vendored) -->
+    <link rel="stylesheet" href="/static/vendor/pico.min.css?v=2">
+    <link rel="stylesheet" href="/static/themes.css?v=2">
+    <script src="/static/theme.js?v=2"></script>
+    <script src="/static/notifications.js?v=2"></script>
+    <!-- HTMX v2.0.4 (vendored) -->
+    <script src="/static/vendor/htmx.min.js?v=2"></script>
+    <style>
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        .spinner {
+            display: inline-block;
+            width: 1em;
+            height: 1em;
+            border: 2px solid currentColor;
+            border-right-color: transparent;
+            border-radius: 50%;
+            animation: spin 0.6s linear infinite;
+            vertical-align: middle;
+        }
+        .htmx-indicator {
+            opacity: 0;
+            transition: opacity 200ms ease-in;
+        }
+        .htmx-request .htmx-indicator,
+        .htmx-request.htmx-indicator {
+            opacity: 1;
+        }
+        button[disabled] {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+    </style>
+</head>
+<body hx-headers='{"X-CSRF-Token": "{{ request.state.csrf_token }}"}'>
+    <header class="container">
+        <nav>
+            <ul>
+                <li><strong>Topic Watch</strong></li>
+            </ul>
+            <ul>
+                <li><a href="/">Dashboard</a></li>
+                <li><a href="/topics/new">Add Topic</a></li>
+                <li><a href="/settings">Settings</a></li>
+                <li><a href="/feeds">Feed Health</a></li>
+                <li>
+                    <select id="theme-select" aria-label="Theme"></select>
+                </li>
+            </ul>
+        </nav>
+    </header>
+    <main class="container">
+        {% block content %}{% endblock %}
+    </main>
+</body>
+</html>

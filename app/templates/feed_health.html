@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}Feed Health - Topic Watch{% endblock %}
+{% block content %}
+<h1>Feed Health</h1>
+
+{% if feeds %}
+<table>
+    <thead>
+        <tr>
+            <th>Status</th>
+            <th>Feed URL</th>
+            <th>Last Success</th>
+            <th>Last Error</th>
+            <th>Consecutive Failures</th>
+            <th>Total Fetches</th>
+            <th>Failure Rate</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for feed in feeds %}
+        <tr>
+            <td>
+                {% if feed.consecutive_failures == 0 %}
+                    <span style="color: green" title="Healthy">&#9679; Healthy</span>
+                {% elif feed.consecutive_failures <= 2 %}
+                    <span style="color: orange" title="Degraded">&#9679; Degraded</span>
+                {% else %}
+                    <span style="color: red" title="Unhealthy">&#9679; Unhealthy</span>
+                {% endif %}
+            </td>
+            <td><a href="{{ feed.feed_url }}" target="_blank"><small>{{ feed.feed_url|truncate(60) }}</small></a></td>
+            <td>{{ feed.last_success_at|timeago if feed.last_success_at else "Never" }}</td>
+            <td>
+                {% if feed.last_error_at %}
+                    <span title="{{ feed.last_error_message }}">{{ feed.last_error_at|timeago }}</span>
+                {% else %}
+                    Never
+                {% endif %}
+            </td>
+            <td>{{ feed.consecutive_failures }}</td>
+            <td>{{ feed.total_fetches }}</td>
+            <td>
+                {% if feed.total_fetches > 0 %}
+                    {{ "%.0f"|format(feed.total_failures / feed.total_fetches * 100) }}%
+                {% else %}
+                    -
+                {% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<p>No feed health data yet. Feed health is tracked automatically after feeds are fetched.</p>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,54 @@
+<tr id="topic-{{ topic.id }}"{% if not topic.is_active %} style="opacity: 0.5"{% endif %}
+    data-topic-name="{{ topic.name }}"
+    {% if last_check and last_check.has_new_info %}data-new-info="true"{% endif %}>
+    <td>
+        <input type="checkbox" name="topic_ids" value="{{ topic.id }}"
+               class="topic-select" onchange="updateBulkBar()">
+    </td>
+    <td>
+        <a href="/topics/{{ topic.id }}">{{ topic.name }}</a>
+        {% for tag in topic.tags %}<kbd style="font-size:0.75em; margin-left:0.25em;">{{ tag }}</kbd>{% endfor %}
+    </td>
+    <td>
+        {% if topic.status.value == "ready" %}
+            Ready
+        {% elif topic.status.value == "researching" %}
+            <span aria-busy="true">Researching</span>
+        {% else %}
+            Error
+        {% endif %}
+    </td>
+    <td>
+        {% if last_check %}
+            <span title="{{ last_check.checked_at.strftime('%Y-%m-%d %H:%M') }}">{{ last_check.checked_at | timeago }}</span>
+            <br><small>{{ last_check.llm_response | confidence_badge }}</small>
+        {% else %}
+            Never
+        {% endif %}
+    </td>
+    <td>{{ article_count }}</td>
+    <td>
+        <div style="display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;">
+        {% if topic.is_active and topic.status.value == "ready" %}
+        <button
+            hx-post="/topics/{{ topic.id }}/check"
+            hx-target="#topic-{{ topic.id }}"
+            hx-swap="outerHTML"
+            hx-disabled-elt="this"
+            style="padding: 0.25rem 0.75rem; font-size: 0.875rem; margin: 0;"
+        >
+            Check Now <span class="htmx-indicator spinner"></span>
+        </button>
+        {% endif %}
+        <button
+            hx-post="/topics/{{ topic.id }}/toggle-active"
+            hx-target="#topic-{{ topic.id }}"
+            hx-swap="outerHTML"
+            class="secondary"
+            style="padding: 0.25rem 0.75rem; font-size: 0.875rem; margin: 0;"
+        >
+            {% if topic.is_active %}Disable{% else %}Enable{% endif %}
+        </button>
+        </div>
+    </td>
+</tr>

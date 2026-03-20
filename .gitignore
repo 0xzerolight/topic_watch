@@ -1,0 +1,38 @@
+# Config with secrets
+data/config.yml
+data/*.db
+data/*.db-wal
+data/*.db-shm
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude / AI tooling
+.claude/
+.claude-runner/
+CLAUDE.md
+
+# Build / lint caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
