@@ -11,7 +11,9 @@ from app.config import load_settings
 class TestConfigLoading:
     """Test loading configuration from YAML files."""
 
-    def test_load_valid_config(self, sample_config_yaml: Path) -> None:
+    def test_load_valid_config(self, sample_config_yaml: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("TOPIC_WATCH_LLM__API_KEY", raising=False)
+        monkeypatch.delenv("TOPIC_WATCH_LLM__MODEL", raising=False)
         settings = load_settings(config_path=sample_config_yaml)
         assert settings.llm.model == "openai/gpt-4o-mini"
         assert settings.llm.api_key == "test-api-key-12345"
@@ -31,13 +33,17 @@ class TestConfigLoading:
         with pytest.raises(SystemExit):
             load_settings(config_path=tmp_path / "nonexistent.yml")
 
-    def test_missing_required_llm_section(self, tmp_path: Path) -> None:
+    def test_missing_required_llm_section(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("TOPIC_WATCH_LLM__API_KEY", raising=False)
+        monkeypatch.delenv("TOPIC_WATCH_LLM__MODEL", raising=False)
         config = tmp_path / "config.yml"
         config.write_text("check_interval_hours: 6\n")
         with pytest.raises(ValidationError):
             load_settings(config_path=config)
 
-    def test_missing_api_key(self, tmp_path: Path) -> None:
+    def test_missing_api_key(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("TOPIC_WATCH_LLM__API_KEY", raising=False)
+        monkeypatch.delenv("TOPIC_WATCH_LLM__MODEL", raising=False)
         config = tmp_path / "config.yml"
         config.write_text('llm:\n  model: "openai/gpt-4o-mini"\n')
         with pytest.raises(ValidationError):
