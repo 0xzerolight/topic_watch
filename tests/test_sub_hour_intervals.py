@@ -3,6 +3,7 @@
 import sqlite3
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import httpx
 import pytest
@@ -48,6 +49,10 @@ async def client(
 
     app.dependency_overrides[get_db_conn] = override_db
     app.dependency_overrides[get_settings] = override_settings
+
+    # Set db_path so background tasks (_run_init) use the test database
+    db_path_str = db_conn.execute("PRAGMA database_list").fetchone()[2]
+    app.state.db_path = Path(db_path_str)
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
