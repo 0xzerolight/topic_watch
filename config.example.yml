@@ -1,0 +1,55 @@
+# Topic Watch Configuration
+# Copy this file to data/config.yml and fill in your values.
+# All settings can be overridden via environment variables with the prefix TOPIC_WATCH_
+# Example: TOPIC_WATCH_LLM__API_KEY=sk-abc123
+
+# LLM provider settings (required)
+llm:
+  # Model string in LiteLLM format: provider/model-name
+  # Examples: openai/gpt-4o-mini, anthropic/claude-3-haiku-20240307, ollama/llama3
+  model: "openai/gpt-4o-mini"
+
+  # API key for your LLM provider
+  api_key: "your-api-key-here"
+
+  # Optional: Base URL for self-hosted providers like Ollama
+  # base_url: "http://localhost:11434"
+
+# Notification settings
+# Uses Apprise URL format. See: https://github.com/caronc/apprise/wiki
+notifications:
+  urls:
+    - "ntfy://your-topic-name"
+    # - "discord://webhook_id/webhook_token"
+    # - "tgram://bot_token/chat_id"
+    # - "slack://token_a/token_b/token_c/channel"
+
+  # Custom webhook URLs for JSON POST notifications
+  # Each URL receives a POST with JSON body:
+  # {"topic": "name", "summary": "...", "key_facts": [...], "source_urls": [...], "confidence": 0.85, "timestamp": "..."}
+  webhook_urls: []
+    # - "https://your-server.com/webhook/topic-watch"
+    # - "https://hooks.example.com/trigger"
+
+# Check interval in hours (how often to check each topic for updates)
+check_interval_hours: 6
+
+# Maximum number of articles to process per check per topic
+# Higher values use more LLM tokens but catch more updates
+max_articles_per_check: 10
+
+# Maximum token budget for the knowledge state summary
+# The LLM will compress older facts when approaching this limit
+knowledge_state_max_tokens: 2000
+
+# Number of days to retain articles before automatic cleanup
+# Older articles are deleted daily at 4 AM
+article_retention_days: 90
+
+# --- Advanced settings (optional, sensible defaults) ---
+# web_page_size: 20
+# feed_max_retries: 2
+# content_fetch_concurrency: 3
+# scheduler_misfire_grace_time: 300
+# scheduler_jitter_seconds: 30
+# llm_max_retries: 2

@@ -1,0 +1,173 @@
+{% extends "base.html" %}
+{% block title %}Dashboard - Topic Watch{% endblock %}
+{% block content %}
+<div style="display:flex; justify-content:space-between; align-items:center">
+    <h1>Topics</h1>
+    <div style="display: flex; gap: 0.5rem; align-items: center;">
+        {% if topic_data %}
+        <form method="post" action="/check-all" style="display:inline">
+            <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
+            <button type="submit" class="secondary"
+                    onclick="this.disabled=true;this.innerHTML='Checking\u2026 <span class=\'spinner\' style=\'display:inline-block\'></span>';this.form.submit();">
+                Check All
+            </button>
+        </form>
+        {% endif %}
+        <a href="/export/topics/json" role="button" class="outline secondary">Export All</a>
+    </div>
+</div>
+
+{% if topic_data or active_tag %}
+{% if status_counts %}
+<p>
+    <small>
+        {{ status_counts.ready }} ready{% if status_counts.researching %}, {{ status_counts.researching }} researching{% endif %}{% if status_counts.error %}, {{ status_counts.error }} error{% endif %}
+    </small>
+</p>
+{% endif %}
+
+{% if all_tags %}
+<div style="margin-bottom: 1em;">
+    <small>
+        Filter by tag:
+        {% for t in all_tags %}
+        <a href="/?tag={{ t }}" role="button" class="{% if active_tag == t %}{% else %}secondary {% endif %}outline" style="padding: 0.15em 0.5em; font-size: 0.85em; margin-right: 0.25em;">{{ t }}</a>
+        {% endfor %}
+        {% if active_tag %}
+        <a href="/" role="button" class="secondary outline" style="padding: 0.15em 0.5em; font-size: 0.85em;">&#x2715; Clear</a>
+        {% endif %}
+    </small>
+</div>
+{% endif %}
+
+<div style="display: flex; gap: 1em; margin-bottom: 1em;">
+    <input type="search" name="q" placeholder="Search topics..."
+           hx-get="/topics/search"
+           hx-trigger="keyup changed delay:300ms, search"
+           hx-target="#topic-list"
+           hx-include="[name='status']"
+           style="margin-bottom: 0;">
+    <select name="status"
+            hx-get="/topics/search"
+            hx-trigger="change"
+            hx-target="#topic-list"
+            hx-include="[name='q']"
+            style="margin-bottom: 0; width: auto;">
+        <option value="all">All Statuses</option>
+        <option value="ready">Ready</option>
+        <option value="researching">Researching</option>
+        <option value="error">Error</option>
+    </select>
+</div>
+
+<div id="bulk-bar" style="display:none; margin-bottom:1em; padding:0.75em; background:var(--pico-card-background-color, #f8f9fa); border-radius:0.25em;">
+    <span id="selected-count">0</span> topic(s) selected:
+    <button type="button" class="secondary"
+            onclick="return submitBulk('/topics/bulk-delete')"
+            style="margin-left:1em;">
+        Delete Selected
+    </button>
+    <button type="button" class="secondary"
+            onclick="return submitBulk('/topics/bulk-check')"
+            style="margin-left:0.5em;">
+        Check Selected
+    </button>
+</div>
+
+<table>
+    <thead>
+        <tr>
+            <th><input type="checkbox" id="select-all" onchange="toggleAll(this)"></th>
+            <th>Name</th>
+            <th>Status</th>
+            <th>Last Check</th>
+            <th>Articles</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody id="topic-list">
+        {% include "_topic_list.html" %}
+    </tbody>
+</table>
+{% else %}
+{% if active_tag %}
+<p>No topics found with tag <kbd>{{ active_tag }}</kbd>. <a href="/">Clear filter</a>.</p>
+{% else %}
+<p>No topics configured. <a href="/topics/new">Add your first topic</a>.</p>
+{% endif %}
+{% endif %}
+
+<script>
+function toggleAll(master) {
+    document.querySelectorAll('.topic-select').forEach(cb => {
+        cb.checked = master.checked;
+    });
+    updateBulkBar();
+}
+
+function updateBulkBar() {
+    const checked = document.querySelectorAll('.topic-select:checked');
+    const bar = document.getElementById('bulk-bar');
+    const count = document.getElementById('selected-count');
+    if (checked.length > 0) {
+        bar.style.display = 'block';
+        count.textContent = checked.length;
+    } else {
+        bar.style.display = 'none';
+        const selectAll = document.getElementById('select-all');
+        if (selectAll) selectAll.checked = false;
+    }
+}
+
+function submitBulk(action) {
+    const checked = document.querySelectorAll('.topic-select:checked');
+    if (checked.length === 0) return false;
+
+    if (action === '/topics/bulk-delete') {
+        if (!confirm('Delete ' + checked.length + ' topic(s) and all their data?')) return false;
+    }
+
+    const form = document.createElement('form');
+    form.method = 'POST';
+    form.action = action;
+
+    const csrf = document.createElement('input');
+    csrf.type = 'hidden';
+    csrf.name = 'csrf_token';
+    csrf.value = '{{ request.state.csrf_token }}';
+    form.appendChild(csrf);
+
+    checked.forEach(cb => {
+        const input = document.createElement('input');
+        input.type = 'hidden';
+        input.name = 'topic_ids';
+        input.value = cb.value;
+        form.appendChild(input);
+    });
+
+    document.body.appendChild(form);
+    form.submit();
+    return false;
+}
+
+// Browser notification when a check finds new info
+document.body.addEventListener("htmx:afterSwap", function(event) {
+    var detailTarget = event.detail.target;
+    if (detailTarget && detailTarget.id && detailTarget.id.startsWith("topic-")) {
+        // For outerHTML swaps, detail.target is the old (detached) element.
+        // Look up the new element by ID instead.
+        var target = document.getElementById(detailTarget.id) || detailTarget;
+        var newInfo = target.getAttribute("data-new-info");
+        var topicName = target.getAttribute("data-topic-name");
+        if (newInfo === "true" && topicName) {
+            var link = target.querySelector("a");
+            TopicWatchNotifications.show(
+                "New Info: " + topicName,
+                "Topic Watch found new information for \"" + topicName + "\".",
+                { url: link ? link.href : "/" }
+            );
+        }
+    }
+});
+</script>
+{% endblock %}

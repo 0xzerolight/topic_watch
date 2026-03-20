@@ -1,0 +1,45 @@
+name: Feature Request
+description: Suggest a new feature or improvement for Topic Watch
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement. Please describe your idea as clearly as possible.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What feature do you want and why?
+      description: Describe the feature and the problem it solves.
+      placeholder: |
+        I'd like Topic Watch to support ... because ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Use case
+      description: How would you use this feature in practice?
+      placeholder: |
+        I would use this when ... to ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Have you considered any workarounds or alternative approaches?
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Any other context, mockups, or references that might help.
+    validations:
+      required: false

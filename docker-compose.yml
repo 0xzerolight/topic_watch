@@ -1,0 +1,21 @@
+services:
+  topic-watch:
+    build: .
+    container_name: topic-watch
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    environment:
+      - TZ=UTC
+      # Override config via environment variables instead of mounting config.yml:
+      # TOPIC_WATCH_LLM__API_KEY: "your-api-key-here"
+      # TOPIC_WATCH_LLM__MODEL: "openai/gpt-4o-mini"
+      # TOPIC_WATCH_CHECK_INTERVAL_HOURS: "6"

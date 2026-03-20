@@ -1,0 +1,246 @@
+/*
+ * Topic Watch Custom Themes
+ *
+ * Each theme block overrides Pico CSS custom properties under a
+ * [data-theme="name"] selector. Pico's built-in "light" and "dark"
+ * themes require no CSS here — they are handled natively.
+ *
+ * To add a new theme:
+ *   1. Add a new [data-theme="your-theme"] { ... } block below
+ *   2. Register the theme in theme.js THEMES array
+ */
+
+
+/* ============================================================
+ * NORD
+ * Based on nordtheme.com — arctic, blue-tinted dark theme
+ * ============================================================ */
+html[data-custom-theme="nord"] {
+  color-scheme: dark;
+
+  --pico-background-color: #2e3440;
+  --pico-color: #d8dee9;
+
+  --pico-primary: #88c0d0;
+  --pico-primary-hover: #8fbcbb;
+  --pico-primary-focus: rgba(136, 192, 208, 0.25);
+  --pico-primary-inverse: #2e3440;
+
+  --pico-secondary: #81a1c1;
+  --pico-secondary-hover: #5e81ac;
+  --pico-secondary-focus: rgba(129, 161, 193, 0.25);
+  --pico-secondary-inverse: #2e3440;
+
+  --pico-muted-color: #7b88a1;
+  --pico-muted-border-color: #3b4252;
+
+  --pico-card-background-color: #3b4252;
+  --pico-card-border-color: #434c5e;
+  --pico-card-sectioning-background-color: #434c5e;
+
+  --pico-form-element-background-color: #3b4252;
+  --pico-form-element-border-color: #4c566a;
+  --pico-form-element-color: #d8dee9;
+  --pico-form-element-focus-color: #88c0d0;
+
+  --pico-table-border-color: #3b4252;
+  --pico-table-row-stripped-background-color: #333a47;
+
+  --pico-code-background-color: #3b4252;
+  --pico-code-color: #a3be8c;
+
+  --pico-contrast: #eceff4;
+  --pico-contrast-hover: #e5e9f0;
+  --pico-contrast-focus: rgba(236, 239, 244, 0.25);
+  --pico-contrast-inverse: #2e3440;
+}
+
+
+/* ============================================================
+ * DRACULA
+ * Based on draculatheme.com — dark with vivid purple/pink
+ * ============================================================ */
+html[data-custom-theme="dracula"] {
+  color-scheme: dark;
+
+  --pico-background-color: #282a36;
+  --pico-color: #f8f8f2;
+
+  --pico-primary: #bd93f9;
+  --pico-primary-hover: #caa9fa;
+  --pico-primary-focus: rgba(189, 147, 249, 0.25);
+  --pico-primary-inverse: #282a36;
+
+  --pico-secondary: #ff79c6;
+  --pico-secondary-hover: #ff92d0;
+  --pico-secondary-focus: rgba(255, 121, 198, 0.25);
+  --pico-secondary-inverse: #282a36;
+
+  --pico-muted-color: #6272a4;
+  --pico-muted-border-color: #44475a;
+
+  --pico-card-background-color: #44475a;
+  --pico-card-border-color: #6272a4;
+  --pico-card-sectioning-background-color: #383a4a;
+
+  --pico-form-element-background-color: #44475a;
+  --pico-form-element-border-color: #6272a4;
+  --pico-form-element-color: #f8f8f2;
+  --pico-form-element-focus-color: #bd93f9;
+
+  --pico-table-border-color: #44475a;
+  --pico-table-row-stripped-background-color: #323442;
+
+  --pico-code-background-color: #44475a;
+  --pico-code-color: #50fa7b;
+
+  --pico-contrast: #f8f8f2;
+  --pico-contrast-hover: #e8e8e2;
+  --pico-contrast-focus: rgba(248, 248, 242, 0.25);
+  --pico-contrast-inverse: #282a36;
+}
+
+
+/* ============================================================
+ * SOLARIZED DARK
+ * Based on ethanschoonover.com/solarized
+ * ============================================================ */
+html[data-custom-theme="solarized"] {
+  color-scheme: dark;
+
+  --pico-background-color: #002b36;
+  --pico-color: #839496;
+
+  --pico-primary: #268bd2;
+  --pico-primary-hover: #2aa198;
+  --pico-primary-focus: rgba(38, 139, 210, 0.25);
+  --pico-primary-inverse: #fdf6e3;
+
+  --pico-secondary: #859900;
+  --pico-secondary-hover: #b58900;
+  --pico-secondary-focus: rgba(133, 153, 0, 0.25);
+  --pico-secondary-inverse: #fdf6e3;
+
+  --pico-muted-color: #586e75;
+  --pico-muted-border-color: #073642;
+
+  --pico-card-background-color: #073642;
+  --pico-card-border-color: #0a4f5c;
+  --pico-card-sectioning-background-color: #0a4050;
+
+  --pico-form-element-background-color: #073642;
+  --pico-form-element-border-color: #586e75;
+  --pico-form-element-color: #839496;
+  --pico-form-element-focus-color: #268bd2;
+
+  --pico-table-border-color: #073642;
+  --pico-table-row-stripped-background-color: #05303a;
+
+  --pico-code-background-color: #073642;
+  --pico-code-color: #b58900;
+
+  --pico-contrast: #fdf6e3;
+  --pico-contrast-hover: #eee8d5;
+  --pico-contrast-focus: rgba(253, 246, 227, 0.25);
+  --pico-contrast-inverse: #002b36;
+}
+
+
+/* ============================================================
+ * HIGH CONTRAST
+ * Maximum readability with pure black/white + bright accents
+ * ============================================================ */
+html[data-custom-theme="high-contrast"] {
+  color-scheme: dark;
+
+  --pico-background-color: #000000;
+  --pico-color: #ffffff;
+
+  --pico-primary: #00ff41;
+  --pico-primary-hover: #33ff66;
+  --pico-primary-focus: rgba(0, 255, 65, 0.3);
+  --pico-primary-inverse: #000000;
+
+  --pico-secondary: #ffff00;
+  --pico-secondary-hover: #ffff55;
+  --pico-secondary-focus: rgba(255, 255, 0, 0.3);
+  --pico-secondary-inverse: #000000;
+
+  --pico-muted-color: #aaaaaa;
+  --pico-muted-border-color: #444444;
+
+  --pico-card-background-color: #111111;
+  --pico-card-border-color: #ffffff;
+  --pico-card-sectioning-background-color: #1a1a1a;
+
+  --pico-form-element-background-color: #111111;
+  --pico-form-element-border-color: #ffffff;
+  --pico-form-element-color: #ffffff;
+  --pico-form-element-focus-color: #00ff41;
+
+  --pico-table-border-color: #444444;
+  --pico-table-row-stripped-background-color: #0a0a0a;
+
+  --pico-code-background-color: #111111;
+  --pico-code-color: #00ff41;
+
+  --pico-contrast: #ffffff;
+  --pico-contrast-hover: #dddddd;
+  --pico-contrast-focus: rgba(255, 255, 255, 0.3);
+  --pico-contrast-inverse: #000000;
+}
+
+
+/* ============================================================
+ * TOKYO NIGHT
+ * Based on github.com/enkia/tokyo-night-vscode-theme
+ * ============================================================ */
+html[data-custom-theme="tokyo-night"] {
+  color-scheme: dark;
+
+  --pico-background-color: #1a1b26;
+  --pico-color: #a9b1d6;
+
+  --pico-primary: #7aa2f7;
+  --pico-primary-hover: #7dcfff;
+  --pico-primary-focus: rgba(122, 162, 247, 0.25);
+  --pico-primary-inverse: #1a1b26;
+
+  --pico-secondary: #bb9af7;
+  --pico-secondary-hover: #c0a8f0;
+  --pico-secondary-focus: rgba(187, 154, 247, 0.25);
+  --pico-secondary-inverse: #1a1b26;
+
+  --pico-muted-color: #565f89;
+  --pico-muted-border-color: #3b4261;
+
+  --pico-card-background-color: #24283b;
+  --pico-card-border-color: #3b4261;
+  --pico-card-sectioning-background-color: #1f2335;
+
+  --pico-form-element-background-color: #24283b;
+  --pico-form-element-border-color: #3b4261;
+  --pico-form-element-color: #a9b1d6;
+  --pico-form-element-focus-color: #7aa2f7;
+
+  --pico-table-border-color: #3b4261;
+  --pico-table-row-stripped-background-color: #1f2335;
+
+  --pico-code-background-color: #24283b;
+  --pico-code-color: #9ece6a;
+
+  --pico-contrast: #c0caf5;
+  --pico-contrast-hover: #a9b1d6;
+  --pico-contrast-focus: rgba(192, 202, 245, 0.25);
+  --pico-contrast-inverse: #1a1b26;
+}
+
+
+/* --- Theme selector styling --- */
+#theme-select {
+  width: auto;
+  padding: 0.25rem 2rem 0.25rem 0.5rem;
+  margin: 0;
+  border: none;
+  font-size: 0.875rem;
+}

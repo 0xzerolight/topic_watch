@@ -1,0 +1,212 @@
+{% extends "base.html" %}
+{% from "_pagination.html" import render_pagination %}
+{% block title %}{{ topic.name }} - Topic Watch{% endblock %}
+{% block content %}
+<hgroup>
+    <h1>{{ topic.name }}</h1>
+    <p>{{ topic.description }}</p>
+    {% if topic.tags %}
+    <p>{% for tag in topic.tags %}<kbd>{{ tag }}</kbd> {% endfor %}</p>
+    {% endif %}
+</hgroup>
+
+{% if not topic.is_active %}
+<p><mark>This topic is currently disabled and will not be checked automatically.</mark></p>
+{% endif %}
+
+<div id="status-area">
+    {% include "topic_status.html" %}
+</div>
+
+<h2>Feed Source</h2>
+{% if topic.feed_mode.value == "auto" %}
+<p>
+    <strong>Mode:</strong> Automatic (Google News)<br>
+    <strong>Search URL:</strong>
+    {% if auto_feed_url in feed_health_map %}
+        {% set fh = feed_health_map[auto_feed_url] %}
+        {% if fh.consecutive_failures == 0 %}
+            <span style="color: green" title="Healthy ({{ fh.total_fetches }} fetches, {{ fh.total_failures }} failures)">&#9679;</span>
+        {% elif fh.consecutive_failures <= 2 %}
+            <span style="color: orange" title="Degraded ({{ fh.consecutive_failures }} consecutive failures)">&#9679;</span>
+        {% else %}
+            <span style="color: red" title="Unhealthy ({{ fh.consecutive_failures }} consecutive failures): {{ fh.last_error_message }}">&#9679;</span>
+        {% endif %}
+    {% else %}
+        <span style="color: gray" title="No health data">&#9679;</span>
+    {% endif %}
+    <a href="{{ auto_feed_url }}" target="_blank">{{ auto_feed_url }}</a>
+</p>
+{% else %}
+<p><strong>Mode:</strong> Manual</p>
+{% if topic.feed_urls %}
+<ul>
+    {% for url in topic.feed_urls %}
+    <li>
+        {% if url in feed_health_map %}
+            {% set fh = feed_health_map[url] %}
+            {% if fh.consecutive_failures == 0 %}
+                <span style="color: green" title="Healthy ({{ fh.total_fetches }} fetches, {{ fh.total_failures }} failures)">&#9679;</span>
+            {% elif fh.consecutive_failures <= 2 %}
+                <span style="color: orange" title="Degraded ({{ fh.consecutive_failures }} consecutive failures)">&#9679;</span>
+            {% else %}
+                <span style="color: red" title="Unhealthy ({{ fh.consecutive_failures }} consecutive failures): {{ fh.last_error_message }}">&#9679;</span>
+            {% endif %}
+        {% else %}
+            <span style="color: gray" title="No health data">&#9679;</span>
+        {% endif %}
+        <a href="{{ url }}" target="_blank">{{ url }}</a>
+    </li>
+    {% endfor %}
+</ul>
+{% else %}
+<p>No feed URLs configured.</p>
+{% endif %}
+{% endif %}
+
+<p><strong>Check Interval:</strong>
+    {% if topic.check_interval_minutes %}
+        {% if topic.check_interval_minutes % 60 == 0 %}
+            Every {{ topic.check_interval_minutes // 60 }}h (custom)
+        {% elif topic.check_interval_minutes >= 60 %}
+            Every {{ topic.check_interval_minutes // 60 }}h {{ topic.check_interval_minutes % 60 }}m (custom)
+        {% else %}
+            Every {{ topic.check_interval_minutes }}m (custom)
+        {% endif %}
+    {% else %}
+        Every {{ default_interval }} hour(s) (global default)
+    {% endif %}
+</p>
+
+<h2>Recent Articles</h2>
+{% if articles %}
+<details>
+    <summary>{{ article_count }} article{{ "s" if article_count != 1 }} (showing latest {{ articles|length }})</summary>
+    <div style="overflow-x: auto;">
+    <table>
+        <thead>
+            <tr>
+                <th>Title</th>
+                <th>Source</th>
+                <th>Fetched</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for article in articles %}
+            <tr>
+                <td><a href="{{ article.url }}" target="_blank">{{ article.title }}</a></td>
+                <td><small>{{ article.source_feed|truncate(40) }}</small></td>
+                <td>{{ article.fetched_at.strftime("%Y-%m-%d %H:%M") }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    </div>
+</details>
+{% else %}
+<p>No articles fetched yet.</p>
+{% endif %}
+
+<h2>Check History</h2>
+{% if checks %}
+<div style="overflow-x: auto;">
+<table>
+    <thead>
+        <tr>
+            <th>Time</th>
+            <th>Articles Found</th>
+            <th>New Articles</th>
+            <th>New Info</th>
+            <th>Confidence</th>
+            <th>Notified</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for check in checks %}
+        <tr>
+            <td><span title="{{ check.checked_at.strftime('%Y-%m-%d %H:%M') }}">{{ check.checked_at | timeago }}</span></td>
+            <td>{{ check.articles_found }}</td>
+            <td>{{ check.articles_new }}</td>
+            <td>{{ "Yes" if check.has_new_info else "No" }}</td>
+            <td>{{ check.llm_response | confidence_badge }}</td>
+            <td>
+                {% if check.notification_sent %}
+                    Sent
+                {% elif check.notification_error %}
+                    Failed: {{ check.notification_error }}
+                {% else %}
+                    -
+                {% endif %}
+            </td>
+            <td>
+                {% if check.has_new_info %}
+                <span id="notify-result-{{ check.id }}">
+                    <button
+                        hx-post="/topics/{{ topic.id }}/checks/{{ check.id }}/notify"
+                        hx-target="#notify-result-{{ check.id }}"
+                        hx-swap="innerHTML"
+                        hx-headers='{"X-CSRF-Token": "{{ request.state.csrf_token }}"}'
+                        style="font-size: 0.75rem; padding: 0.25rem 0.5rem;"
+                        class="outline"
+                    >
+                        Notify
+                    </button>
+                </span>
+                {% else %}
+                -
+                {% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+</div>
+{{ render_pagination(page, total_pages, "/topics/" ~ topic.id) }}
+{% else %}
+<p>No checks performed yet.</p>
+{% endif %}
+
+{% if topic.status.value == "error" %}
+<article style="border-left: 4px solid var(--pico-color-orange-500, #f57c00); padding: 1rem; margin-bottom: 1rem;">
+    <strong>Research failed.</strong>
+    {% if topic.error_message %}
+    <p><small>{{ topic.error_message }}</small></p>
+    {% endif %}
+    <p>Click "Retry Research" below to retry the initial research phase.</p>
+</article>
+{% endif %}
+
+<h2>Actions</h2>
+<div style="display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; margin-bottom: 1rem;">
+    {% if topic.status.value == "error" %}
+    <form method="post" action="/topics/{{ topic.id }}/init" style="margin: 0;">
+        <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
+        <button type="submit" class="contrast" style="margin: 0;">Retry Research</button>
+    </form>
+    {% endif %}
+    {% if topic.is_active and topic.status.value == "ready" %}
+    <form method="post" action="/topics/{{ topic.id }}/check" style="margin: 0;">
+        <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
+        <button type="submit" style="margin: 0;">Check Now</button>
+    </form>
+    {% endif %}
+    <form method="post" action="/topics/{{ topic.id }}/toggle-active" style="margin: 0;">
+        <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
+        <button type="submit" class="secondary" style="margin: 0;">{% if topic.is_active %}Disable{% else %}Enable{% endif %}</button>
+    </form>
+    <a href="/topics/{{ topic.id }}/edit" role="button" class="secondary" style="margin: 0;">Edit</a>
+</div>
+<div style="display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center;">
+    <a href="/topics/{{ topic.id }}/export/json" role="button" class="outline secondary" style="font-size: 0.875rem; padding: 0.25rem 0.75rem; margin: 0;">Export JSON</a>
+    <a href="/topics/{{ topic.id }}/export/csv" role="button" class="outline secondary" style="font-size: 0.875rem; padding: 0.25rem 0.75rem; margin: 0;">Export CSV</a>
+    <form method="post" action="/topics/{{ topic.id }}/delete"
+          style="margin: 0; margin-left: auto;"
+          onsubmit="return confirm('Delete this topic and all its data?')">
+        <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
+        <button type="submit" class="outline" style="font-size: 0.875rem; padding: 0.25rem 0.75rem; margin: 0; color: var(--pico-del-color, #c62828);">Delete Topic</button>
+    </form>
+</div>
+
+<p><small>Total articles: {{ article_count }} | Created: {{ topic.created_at.strftime("%Y-%m-%d %H:%M") }}</small></p>
+{% endblock %}

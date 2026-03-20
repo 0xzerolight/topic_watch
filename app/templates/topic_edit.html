@@ -1,0 +1,157 @@
+{% extends "base.html" %}
+{% block title %}Edit {{ topic.name }} - Topic Watch{% endblock %}
+{% block content %}
+<h1>Edit Topic</h1>
+
+{% if errors %}
+<article aria-label="Validation errors">
+    <header>Validation Errors</header>
+    <ul>
+        {% for error in errors %}
+        <li>{{ error }}</li>
+        {% endfor %}
+    </ul>
+</article>
+{% endif %}
+
+<form method="post" action="/topics/{{ topic.id }}/edit">
+    <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
+    <label for="name">
+        Topic Name
+        <input type="text" id="name" name="name" required
+               value="{{ name if name is defined else topic.name }}">
+    </label>
+
+    <label for="description">
+        Description (what you care about)
+        <input type="text" id="description" name="description" required
+               value="{{ description if description is defined else topic.description }}">
+    </label>
+
+    {% set current_mode = feed_mode if feed_mode is defined else topic.feed_mode.value %}
+    <fieldset>
+        <legend>Feed Source</legend>
+        <label>
+            <input type="radio" name="feed_mode" value="auto"
+                   {{ 'checked' if current_mode == 'auto' }}
+                   onchange="document.getElementById('manual-feeds').style.display='none'">
+            Automatic (Google News)
+        </label>
+        <label>
+            <input type="radio" name="feed_mode" value="manual"
+                   {{ 'checked' if current_mode == 'manual' }}
+                   onchange="document.getElementById('manual-feeds').style.display='block'">
+            Manual (provide RSS URLs)
+        </label>
+    </fieldset>
+
+    <div id="manual-feeds" style="{{ 'display:block' if current_mode == 'manual' else 'display:none' }}">
+        <label for="feed_urls">
+            RSS Feed URLs (one per line)
+            <textarea id="feed_urls" name="feed_urls" rows="4">{{ feed_urls if feed_urls is defined else topic.feed_urls | join('\n') }}</textarea>
+        </label>
+        <button type="button"
+                hx-post="/feeds/validate"
+                hx-include="#feed_urls"
+                hx-target="#feed-validation-results"
+                hx-swap="innerHTML"
+                class="secondary outline"
+                style="margin-top: 0.5em;">
+            Validate URLs
+        </button>
+        <div id="feed-validation-results"></div>
+    </div>
+
+    {% set current_interval = check_interval_minutes if check_interval_minutes is defined else (topic.check_interval_minutes or '') %}
+    <label>
+        Check Interval
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem;">
+            <input type="number" id="interval_value" name="interval_value"
+                   min="1" step="1"
+                   value=""
+                   placeholder="Default"
+                   oninput="updateIntervalMinutes()"
+                   style="margin-bottom: 0;">
+            <select id="interval_unit" name="interval_unit"
+                    onchange="updateIntervalMinutes(); updateIntervalRange();"
+                    style="margin-bottom: 0;">
+                <option value="minutes">Minutes</option>
+                <option value="hours">Hours</option>
+                <option value="days">Days</option>
+                <option value="weeks">Weeks</option>
+            </select>
+        </div>
+        <input type="hidden" id="check_interval_minutes" name="check_interval_minutes"
+               value="{{ current_interval }}">
+        <small>Leave empty to use the global default.</small>
+    </label>
+
+    {% set current_tags = tags if tags is defined else tags_string %}
+    <label for="tags">
+        Tags (comma-separated)
+        <input type="text" id="tags" name="tags"
+               value="{{ current_tags or '' }}"
+               placeholder="e.g., tech, ai, security">
+        <small>Optional. Use tags to organize and filter topics.</small>
+    </label>
+
+    <div role="group">
+        <button type="submit">Save Changes</button>
+        <a href="/topics/{{ topic.id }}" role="button" class="secondary">Cancel</a>
+    </div>
+</form>
+
+<script>
+var UNIT_MULTIPLIERS = { minutes: 1, hours: 60, days: 1440, weeks: 10080 };
+var UNIT_RANGES = {
+    minutes: { min: 10, max: 60 },
+    hours: { min: 1, max: 168 },
+    days: { min: 1, max: 7 },
+    weeks: { min: 1, max: 1 }
+};
+
+function updateIntervalMinutes() {
+    var val = document.getElementById("interval_value").value;
+    var unit = document.getElementById("interval_unit").value;
+    var hidden = document.getElementById("check_interval_minutes");
+    if (val === "" || val === null) {
+        hidden.value = "";
+    } else {
+        hidden.value = parseInt(val, 10) * UNIT_MULTIPLIERS[unit];
+    }
+}
+
+function updateIntervalRange() {
+    var input = document.getElementById("interval_value");
+    var unit = document.getElementById("interval_unit").value;
+    var range = UNIT_RANGES[unit];
+    input.min = range.min;
+    input.max = range.max;
+    if (input.value !== "" && parseInt(input.value, 10) > range.max) {
+        input.value = range.max;
+        updateIntervalMinutes();
+    }
+    if (input.value !== "" && parseInt(input.value, 10) < range.min) {
+        input.value = range.min;
+        updateIntervalMinutes();
+    }
+}
+
+function decomposeMinutes(totalMinutes) {
+    if (!totalMinutes) return { value: "", unit: "hours" };
+    var m = parseInt(totalMinutes, 10);
+    if (m % 10080 === 0) return { value: m / 10080, unit: "weeks" };
+    if (m % 1440 === 0) return { value: m / 1440, unit: "days" };
+    if (m % 60 === 0) return { value: m / 60, unit: "hours" };
+    return { value: m, unit: "minutes" };
+}
+
+document.addEventListener("DOMContentLoaded", function() {
+    var hidden = document.getElementById("check_interval_minutes");
+    var result = decomposeMinutes(hidden.value);
+    document.getElementById("interval_value").value = result.value;
+    document.getElementById("interval_unit").value = result.unit;
+    updateIntervalRange();
+});
+</script>
+{% endblock %}
