@@ -13,6 +13,9 @@ llm:
   api_key: "your-api-key-here"
 
   # Optional: Base URL for self-hosted providers like Ollama
+  # If running Topic Watch in Docker, use host.docker.internal instead of localhost:
+  # base_url: "http://host.docker.internal:11434"
+  # If running without Docker:
   # base_url: "http://localhost:11434"
 
 # Notification settings

@@ -1,6 +1,6 @@
 [project]
 name = "topic-watch"
-version = "0.1.0"
+version = "1.0.0"
 description = "Self-hosted news watchdog with AI-powered novelty detection"
 license = "GPL-3.0-or-later"
 readme = "README.md"
@@ -56,4 +56,4 @@ disallow_untyped_defs = false
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-addopts = "--cov=app --cov-report=term-missing --cov-fail-under=60"
+addopts = "--cov=app --cov-report=term-missing --cov-fail-under=85"

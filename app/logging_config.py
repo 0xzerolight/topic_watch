@@ -68,6 +68,7 @@ def setup_logging() -> None:
     Otherwise, uses plain text format (default).
     """
     log_format = os.environ.get("TOPIC_WATCH_LOG_FORMAT", "text").lower()
+    log_level = os.environ.get("TOPIC_WATCH_LOG_LEVEL", "INFO").upper()
     check_id_filter = CheckIdFilter()
 
     if log_format == "json":
@@ -76,10 +77,10 @@ def setup_logging() -> None:
         handler.addFilter(check_id_filter)
         logging.root.handlers.clear()
         logging.root.addHandler(handler)
-        logging.root.setLevel(logging.INFO)
+        logging.root.setLevel(getattr(logging, log_level, logging.INFO))
     else:
         logging.basicConfig(
-            level=logging.INFO,
+            level=getattr(logging, log_level, logging.INFO),
             format="%(asctime)s [%(levelname)s] %(name)s [%(check_id)s]: %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )

@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.1.0] - 2026-03-20
+## [1.0.0] - 2026-03-20
 
 ### Added
 
@@ -21,7 +21,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Settings UI for in-app configuration
 - Custom color themes (Nord, Dracula, Solarized Dark, High Contrast, Tokyo Night)
 - CSRF protection on all mutation endpoints
-- Docker and docker-compose packaging with health checks
+- SSRF protection blocking private/internal network ranges on article fetches
+- XSS protection with input sanitization on all user-facing outputs
+- Export filename sanitization preventing header injection
+- Rate limiting on API endpoints with automatic cleanup
+- Docker multi-stage build with non-root user, HEALTHCHECK, and STOPSIGNAL
+- Docker Compose resource limits (512M memory) and log rotation
+- Auto-copy config on first run with clear setup instructions
+- Configurable log level via `TOPIC_WATCH_LOG_LEVEL` environment variable
+- Version display in web UI footer
+- Ruff security lint rules (bandit) in CI
+- CI testing on Python 3.11, 3.12, and 3.13
+- Dependabot for automated dependency updates
+- Reverse proxy examples (Caddy, Nginx) in README
 - Comprehensive test suite (92% coverage)
 
-[0.1.0]: https://github.com/0xzerolight/topic_watch/releases/tag/v0.1.0
+[1.0.0]: https://github.com/0xzerolight/topic_watch/releases/tag/v1.0.0

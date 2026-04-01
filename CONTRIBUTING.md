@@ -20,10 +20,11 @@ Thanks for your interest in contributing! This guide covers everything you need 
    ```bash
    cp config.example.yml data/config.yml
    ```
-5. **(Optional) Install pre-commit hooks:**
+5. **(Optional) Install git hooks:**
    ```bash
-   pre-commit install
+   make dev
    ```
+   This installs pre-commit hooks (ruff + mypy on every commit) and pre-push hooks (pytest runs before every push). You can bypass the pre-push hook with `git push --no-verify` if needed.
 
 ## Development Workflow
 
@@ -71,7 +72,7 @@ pytest --cov=app --cov-report=term-missing
 
 - New features and bug fixes should include tests.
 - Tests must not make live API calls. Mock all LLM interactions using the patterns already in `tests/`.
-- The minimum coverage threshold is 60%. CI will fail if coverage drops below this.
+- The minimum coverage threshold is 85%. CI will fail if coverage drops below this.
 
 ## Commit Messages
 
@@ -113,4 +114,4 @@ Open an issue on [GitHub Issues](https://github.com/0xzerolight/topic_watch/issu
 
 ## Suggesting Features
 
-Open an issue or start a discussion on [GitHub Discussions](https://github.com/0xzerolight/topic_watch/discussions). Describe the use case and why the feature would be useful.
+Open an issue on [GitHub Issues](https://github.com/0xzerolight/topic_watch/issues). Describe the use case and why the feature would be useful.

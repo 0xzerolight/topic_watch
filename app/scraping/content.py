@@ -11,6 +11,8 @@ from typing import cast
 import httpx
 import trafilatura
 
+from app.url_validation import is_private_url
+
 logger = logging.getLogger(__name__)
 
 _ARTICLE_FETCH_TIMEOUT = 20.0
@@ -35,6 +37,9 @@ async def _fetch_html(
     timeout: float = _ARTICLE_FETCH_TIMEOUT,
 ) -> str | None:
     """Fetch a URL and return HTML text, or None on error."""
+    if is_private_url(url):
+        logger.warning("Blocked article fetch to private/reserved URL: %s", url)
+        return None
     owns_client = client is None
     if owns_client:
         client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
