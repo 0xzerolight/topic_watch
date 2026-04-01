@@ -100,7 +100,7 @@ docs: clarify reverse proxy setup in README
 - Target the `main` branch.
 - Include tests for new features or bug fixes.
 - Ensure all CI checks pass (lint, format, type check, tests).
-- Keep PRs focused — one logical change per PR.
+- Keep PRs focused. One logical change per PR.
 - Write a clear description of what the PR does and why.
 
 ## Reporting Bugs
