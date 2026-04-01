@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Topic Watch
+Comment=Self-hosted news monitoring with AI-powered novelty detection
+Exec=xdg-open http://localhost:8000
+Icon=applications-internet
+Terminal=false
+Categories=Network;Monitor;
+StartupNotify=false

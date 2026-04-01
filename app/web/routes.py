@@ -930,6 +930,66 @@ async def export_topic_csv(
     )
 
 
+@router.get("/setup", response_class=HTMLResponse)
+async def setup_view(request: Request):
+    """Display the first-run setup wizard, or redirect to dashboard if already configured."""
+    if not getattr(request.app.state, "setup_required", False):
+        return RedirectResponse(url="/", status_code=303)
+    return templates.TemplateResponse(
+        request,
+        "setup.html",
+        {"setup_mode": True},
+    )
+
+
+@router.post("/setup", dependencies=[Depends(verify_csrf)])
+async def complete_setup(
+    request: Request,
+    llm_model: str = Form(...),
+    llm_api_key: str = Form(...),
+    llm_base_url: str = Form(""),
+):
+    """Process setup form and start the application."""
+    from pydantic import ValidationError
+
+    from app.config import LLMSettings, NotificationSettings
+    from app.scheduler import start_scheduler
+
+    try:
+        new_settings = Settings(  # type: ignore[call-arg]
+            llm=LLMSettings(
+                model=llm_model,
+                api_key=llm_api_key,
+                base_url=llm_base_url or None,
+            ),
+            notifications=NotificationSettings(),
+        )
+    except ValidationError as exc:
+        errors = [f"{' → '.join(str(loc) for loc in e['loc'])}: {e['msg']}" for e in exc.errors()]
+        return templates.TemplateResponse(
+            request,
+            "setup.html",
+            {
+                "setup_mode": True,
+                "errors": errors,
+                "form": {
+                    "llm_model": llm_model,
+                    "llm_api_key": llm_api_key,
+                    "llm_base_url": llm_base_url,
+                },
+            },
+            status_code=422,
+        )
+
+    save_settings_to_yaml(new_settings)
+    request.app.state.settings = new_settings
+    request.app.state.setup_required = False
+    start_scheduler(new_settings, db_path=request.app.state.db_path)
+    logger.info("Setup completed — application is now configured")
+
+    return RedirectResponse(url="/", status_code=303)
+
+
 @router.get("/settings", response_class=HTMLResponse)
 async def settings_view(
     request: Request,
