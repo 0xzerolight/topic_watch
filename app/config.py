@@ -7,7 +7,6 @@ for nested keys (e.g., TOPIC_WATCH_LLM__API_KEY).
 
 import logging
 import shutil
-import sys
 from pathlib import Path
 from typing import Self
 
@@ -33,8 +32,8 @@ _yaml_file_override: str | None = None
 class LLMSettings(BaseModel):
     """LLM provider configuration."""
 
-    model: str = Field(description="LiteLLM model string, e.g. 'openai/gpt-4o-mini'")
-    api_key: str = Field(description="API key for the LLM provider")
+    model: str = Field(default="", description="LiteLLM model string, e.g. 'openai/gpt-4o-mini'")
+    api_key: str = Field(default="", description="API key for the LLM provider")
     base_url: str | None = Field(
         default=None,
         description="Optional base URL for self-hosted providers like Ollama",
@@ -68,7 +67,7 @@ class Settings(BaseSettings):
         env_nested_delimiter="__",
     )
 
-    llm: LLMSettings
+    llm: LLMSettings = LLMSettings()
     notifications: NotificationSettings = NotificationSettings()
     check_interval_hours: int = Field(default=6, ge=1, le=168)
     max_articles_per_check: int = Field(default=10, ge=1, le=100)
@@ -96,10 +95,16 @@ class Settings(BaseSettings):
     )
     llm_max_retries: int = Field(default=2, ge=0, le=10, description="Maximum retries for LLM API calls")
 
+    def is_configured(self) -> bool:
+        """Return True if minimal required configuration is present."""
+        return bool(self.llm.model and self.llm.api_key and self.llm.api_key != "your-api-key-here")
+
     @model_validator(mode="after")
     def validate_llm_model_format(self) -> Self:
         """Warn about common model string mistakes."""
         model_str = self.llm.model
+        if not model_str:
+            return self
         known_providers = [
             "openai",
             "anthropic",
@@ -167,9 +172,8 @@ def load_settings(config_path: Path | None = None) -> Settings:
     Returns:
         Validated Settings instance.
 
-    Raises:
-        SystemExit: If config file is missing.
-        ValidationError: If config values are invalid.
+    Returns:
+        Validated Settings instance (may be unconfigured — check is_configured()).
     """
     global _yaml_file_override
 
@@ -180,22 +184,12 @@ def load_settings(config_path: Path | None = None) -> Settings:
         if example_path.exists():
             effective_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(example_path, effective_path)
-            print(  # noqa: T201
-                f"\n{'=' * 60}\n"
-                f"  First run detected!\n"
-                f"  Created config file: {effective_path}\n\n"
-                f"  Please edit it to set your LLM API key and preferences,\n"
-                f"  then restart the application.\n"
-                f"{'=' * 60}\n",
-                file=sys.stderr,
-            )
-            raise SystemExit(1)
-        logger.error(
-            "Config file not found: %s. Copy config.example.yml to %s and fill in your values.",
-            effective_path,
-            effective_path,
-        )
-        raise SystemExit(1)
+            logger.info("First run detected — created config file: %s", effective_path)
+        else:
+            effective_path.parent.mkdir(parents=True, exist_ok=True)
+            logger.info("No config file found — starting with defaults (setup required)")
+            # Return unconfigured settings so the setup wizard can handle it
+            return Settings()  # type: ignore[call-arg]
 
     _yaml_file_override = str(effective_path) if config_path else None
 

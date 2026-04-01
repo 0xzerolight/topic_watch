@@ -48,6 +48,7 @@
             <ul>
                 <li><strong>Topic Watch</strong></li>
             </ul>
+            {% if not setup_mode %}
             <ul>
                 <li><a href="/">Dashboard</a></li>
                 <li><a href="/topics/new">Add Topic</a></li>
@@ -57,6 +58,7 @@
                     <select id="theme-select" aria-label="Theme"></select>
                 </li>
             </ul>
+            {% endif %}
         </nav>
     </header>
     <main class="container">

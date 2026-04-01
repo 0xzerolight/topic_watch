@@ -25,35 +25,65 @@ The default state is **no notification**. You only hear from Topic Watch when so
 
 ## Quick Start
 
-### 1. Clone and configure
+### One-line install (requires Docker)
+
+**Linux / macOS:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/0xzerolight/topic_watch/main/install.sh | bash
+```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/0xzerolight/topic_watch/main/install.ps1 | iex
+```
+
+This pulls the Docker image, starts Topic Watch, sets up a desktop shortcut and auto-start, and opens the setup wizard in your browser. Configure your LLM API key in the wizard and you're ready to go.
+
+Customize the install with environment variables:
+
+```bash
+# Linux / macOS
+TOPIC_WATCH_DIR=~/my-path TOPIC_WATCH_PORT=9000 curl -fsSL .../install.sh | bash
+
+# Windows (PowerShell)
+$env:TOPIC_WATCH_DIR="C:\TopicWatch"; $env:TOPIC_WATCH_PORT="9000"; irm .../install.ps1 | iex
+```
+
+<details>
+<summary><strong>Manual setup</strong></summary>
+
+#### With Docker
 
 ```bash
 git clone https://github.com/0xzerolight/topic_watch.git
 cd topic_watch
-mkdir -p data
-cp config.example.yml data/config.yml
-```
-
-Edit `data/config.yml` with your LLM API key and notification URLs.
-
-### 2. Start
-
-```bash
 docker compose up -d
 ```
 
-### 3. Open the dashboard
+#### Without Docker
 
-Visit [http://localhost:8000](http://localhost:8000) and add your first topic.
+```bash
+git clone https://github.com/0xzerolight/topic_watch.git
+cd topic_watch
+python -m venv .venv && source .venv/bin/activate
+pip install .
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+</details>
+
+Visit [http://localhost:8000](http://localhost:8000) — the setup wizard will guide you through configuring your LLM provider, then you can start adding topics.
 
 ## Configuration
 
-All settings live in `data/config.yml`. Copy `config.example.yml` to get started.
+All settings live in `data/config.yml`. On first run, the setup wizard at [http://localhost:8000/setup](http://localhost:8000/setup) will configure the essentials for you. You can also edit the file directly.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `llm.model` | string | *required* | LiteLLM model string (e.g. `openai/gpt-4o-mini`) |
-| `llm.api_key` | string | *required* | API key for your LLM provider |
+| `llm.model` | string | — | LiteLLM model string (e.g. `openai/gpt-4o-mini`) |
+| `llm.api_key` | string | — | API key for your LLM provider |
 | `llm.base_url` | string | — | Base URL for self-hosted providers (e.g. Ollama) |
 | `notifications.urls` | list | `[]` | Apprise notification URLs (see [Notification Services](#notification-services)) |
 | `check_interval_hours` | int | `6` | Hours between automatic checks (1–168) |

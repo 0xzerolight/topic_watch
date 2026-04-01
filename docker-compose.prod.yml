@@ -1,0 +1,26 @@
+services:
+  topic-watch:
+    image: ghcr.io/0xzerolight/topic_watch:latest
+    container_name: topic-watch
+    ports:
+      - "${TOPIC_WATCH_PORT:-8000}:8000"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    environment:
+      - TZ=UTC

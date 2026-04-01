@@ -1,0 +1,15 @@
+[Unit]
+Description=Topic Watch - Self-hosted news monitoring
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%INSTALL_DIR%
+ExecStart=/usr/bin/docker compose up
+ExecStop=/usr/bin/docker compose down
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

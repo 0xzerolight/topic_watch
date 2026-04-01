@@ -19,6 +19,7 @@ from app.logging_config import setup_logging
 from app.scheduler import start_scheduler, stop_scheduler
 from app.web.csrf import CSRFMiddleware
 from app.web.routes import router
+from app.web.setup_middleware import SetupRedirectMiddleware
 
 logger = logging.getLogger(__name__)
 
@@ -30,12 +31,18 @@ async def lifespan(app: FastAPI):
     settings = load_settings()
     db_path = resolve_db_path(settings)
     init_db(db_path)
-    with get_db(db_path) as conn:
-        recover_stuck_topics(conn)
     app.state.settings = settings
     app.state.db_path = db_path
-    start_scheduler(settings, db_path=db_path)
-    logger.info("Topic Watch web UI started")
+    app.state.setup_required = not settings.is_configured()
+
+    if settings.is_configured():
+        with get_db(db_path) as conn:
+            recover_stuck_topics(conn)
+        start_scheduler(settings, db_path=db_path)
+        logger.info("Topic Watch web UI started")
+    else:
+        logger.info("Topic Watch started in setup mode — visit /setup to configure")
+
     yield
     stop_scheduler()
     logger.info("Topic Watch web UI stopped")
@@ -43,5 +50,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Topic Watch", lifespan=lifespan)
 app.add_middleware(CSRFMiddleware)
+app.add_middleware(SetupRedirectMiddleware)
 app.include_router(router)
 app.mount("/static", StaticFiles(directory=str(Path(__file__).resolve().parent / "static")), name="static")

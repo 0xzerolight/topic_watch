@@ -40,6 +40,10 @@ RUN groupadd --system appgroup && \
 
 USER appuser
 
+LABEL org.opencontainers.image.source="https://github.com/0xzerolight/topic_watch"
+LABEL org.opencontainers.image.description="Self-hosted news monitoring with AI-powered novelty detection"
+LABEL org.opencontainers.image.licenses="GPL-3.0-or-later"
+
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=10s \
