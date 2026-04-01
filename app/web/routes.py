@@ -5,9 +5,9 @@ import csv
 import io
 import json
 import logging
+import re
 import sqlite3
 import time
-from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -15,6 +15,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
+from app import __version__
 from app.analysis.llm import NoveltyResult
 from app.checker import check_all_topics, check_topic
 from app.config import DEFAULT_CONFIG_PATH, Settings, save_settings_to_yaml
@@ -46,6 +47,8 @@ logger = logging.getLogger(__name__)
 
 _TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATE_DIR))
+
+templates.env.globals["version"] = __version__
 
 
 def _timeago(dt: datetime) -> str:
@@ -167,7 +170,7 @@ templates.env.filters["confidence_badge"] = _confidence_badge
 router = APIRouter()
 
 # Simple in-memory rate limiter for feed validation
-_rate_limit_store: dict[str, list[float]] = defaultdict(list)
+_rate_limit_store: dict[str, list[float]] = {}
 _RATE_LIMIT_MAX = 10
 _RATE_LIMIT_WINDOW = 60  # seconds
 
@@ -175,11 +178,18 @@ _RATE_LIMIT_WINDOW = 60  # seconds
 def _check_rate_limit(ip: str) -> bool:
     """Check if IP is within rate limit. Returns True if allowed."""
     now = time.time()
-    timestamps = _rate_limit_store[ip]
-    _rate_limit_store[ip] = [t for t in timestamps if now - t < _RATE_LIMIT_WINDOW]
-    if len(_rate_limit_store[ip]) >= _RATE_LIMIT_MAX:
+    timestamps = _rate_limit_store.get(ip, [])
+    active = [t for t in timestamps if now - t < _RATE_LIMIT_WINDOW]
+    if len(active) >= _RATE_LIMIT_MAX:
+        _rate_limit_store[ip] = active
         return False
-    _rate_limit_store[ip].append(now)
+    active.append(now)
+    _rate_limit_store[ip] = active
+    # Evict stale IPs to prevent unbounded memory growth
+    if len(_rate_limit_store) > 10000:
+        stale = [k for k, v in _rate_limit_store.items() if not v or now - v[-1] >= _RATE_LIMIT_WINDOW]
+        for k in stale:
+            del _rate_limit_store[k]
     return True
 
 
@@ -859,7 +869,8 @@ async def export_topic_json(
     }
 
     content = json.dumps(data, indent=2, default=str)
-    filename = f"topic_{topic_id}_{topic.name.replace(' ', '_').lower()}.json"
+    safe_name = re.sub(r"[^a-z0-9_-]", "", topic.name.replace(" ", "_").lower())
+    filename = f"topic_{topic_id}_{safe_name}.json"
 
     return StreamingResponse(
         iter([content]),
@@ -909,7 +920,8 @@ async def export_topic_csv(
         )
 
     content = output.getvalue()
-    filename = f"checks_{topic_id}_{topic.name.replace(' ', '_').lower()}.csv"
+    safe_name = re.sub(r"[^a-z0-9_-]", "", topic.name.replace(" ", "_").lower())
+    filename = f"checks_{topic_id}_{safe_name}.csv"
 
     return StreamingResponse(
         iter([content]),
@@ -1116,7 +1128,9 @@ async def force_notify(
             return HTMLResponse('<span style="color: var(--pico-del-color, red);">Delivery failed</span>')
     except Exception as exc:
         logger.warning("Force notify failed for check %d", check_id, exc_info=True)
-        return HTMLResponse(f'<span style="color: var(--pico-del-color, red);">Error: {exc}</span>')
+        from markupsafe import escape
+
+        return HTMLResponse(f'<span style="color: var(--pico-del-color, red);">Error: {escape(str(exc))}</span>')
 
 
 # --- Background tasks ---

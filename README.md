@@ -179,6 +179,45 @@ python -m app.cli init "Topic Name"   # Re-initialize a topic's knowledge state
   - Nginx with HTTP basic auth
   - Caddy with `basicauth`
 
+<details>
+<summary>Example: Caddy reverse proxy with basic auth</summary>
+
+```
+topic-watch.example.com {
+    basicauth {
+        admin $2a$14$YOUR_HASHED_PASSWORD
+    }
+    reverse_proxy localhost:8000
+}
+```
+
+Generate a password hash with: `caddy hash-password`
+</details>
+
+<details>
+<summary>Example: Nginx with HTTP basic auth</summary>
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name topic-watch.example.com;
+
+    auth_basic "Topic Watch";
+    auth_basic_user_file /etc/nginx/.htpasswd;
+
+    location / {
+        proxy_pass http://localhost:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+Create credentials with: `htpasswd -c /etc/nginx/.htpasswd admin`
+</details>
+
 Your API keys are stored in `data/config.yml` (gitignored) or passed via environment variables. All data stays on your machine — the only outbound connections are to news sources and your LLM provider.
 
 See [SECURITY.md](SECURITY.md) for reporting vulnerabilities.

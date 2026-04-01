@@ -6,6 +6,8 @@ for nested keys (e.g., TOPIC_WATCH_LLM__API_KEY).
 """
 
 import logging
+import shutil
+import sys
 from pathlib import Path
 from typing import Self
 
@@ -174,6 +176,20 @@ def load_settings(config_path: Path | None = None) -> Settings:
     effective_path = config_path or DEFAULT_CONFIG_PATH
 
     if not effective_path.exists():
+        example_path = PROJECT_ROOT / "config.example.yml"
+        if example_path.exists():
+            effective_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(example_path, effective_path)
+            print(  # noqa: T201
+                f"\n{'=' * 60}\n"
+                f"  First run detected!\n"
+                f"  Created config file: {effective_path}\n\n"
+                f"  Please edit it to set your LLM API key and preferences,\n"
+                f"  then restart the application.\n"
+                f"{'=' * 60}\n",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
         logger.error(
             "Config file not found: %s. Copy config.example.yml to %s and fill in your values.",
             effective_path,

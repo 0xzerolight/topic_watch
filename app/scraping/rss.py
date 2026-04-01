@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 FeedHealthCallback = Callable[[str, bool, str | None], None]  # (feed_url, success, error_msg)
 
-_USER_AGENT = "TopicWatch/0.1.0 (RSS reader)"
+_USER_AGENT = "TopicWatch/1.0.0 (RSS reader)"
 _FEED_FETCH_TIMEOUT = 15.0
 _GOOGLE_NEWS_RSS_TEMPLATE = "https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
 

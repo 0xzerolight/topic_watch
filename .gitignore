@@ -29,10 +29,10 @@ Thumbs.db
 # Claude / AI tooling
 .claude/
 .claude-runner/
-CLAUDE.md
 
 # Build / lint caches
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
 .coverage
+htmlcov/
