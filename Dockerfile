@@ -9,7 +9,7 @@ WORKDIR /build
 RUN pip install --no-cache-dir --upgrade pip
 
 # Copy project metadata and install into a venv
-COPY pyproject.toml ./
+COPY pyproject.toml README.md ./
 COPY app/ ./app/
 
 RUN python -m venv /opt/venv
