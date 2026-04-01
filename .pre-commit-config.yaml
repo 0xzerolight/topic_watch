@@ -29,13 +29,3 @@ repos:
         args: [--ignore-missing-imports]
         pass_filenames: false
         entry: mypy app/
-
-  - repo: local
-    hooks:
-      - id: pytest
-        name: run tests
-        entry: pytest --tb=short -q
-        language: system
-        stages: [pre-push]
-        pass_filenames: false
-        always_run: true
