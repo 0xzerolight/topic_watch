@@ -21,6 +21,7 @@ ignore = [
     "N818",   # exception name should end in Error (not always appropriate)
     "S101",   # assert usage (used intentionally in app for invariant checks)
     "S608",   # SQL injection false positive (we use parameterized queries)
+    "S704",   # Markup usage is intentional and pre-escaped
 ]
 
 [lint.per-file-ignores]
