@@ -39,8 +39,8 @@ Topic Watch monitors user-defined topics by fetching articles from RSS feeds, th
 ```
 
 **Two entry points trigger checks:**
-1. **APScheduler** — a background job ticks every 1 minute, queries which topics are due based on their individual `check_interval_minutes`, and runs the pipeline for each.
-2. **Web UI** — users can trigger manual checks via the dashboard, which runs the same pipeline as a FastAPI background task.
+1. **APScheduler** - a background job ticks every 1 minute, queries which topics are due based on their individual `check_interval_minutes`, and runs the pipeline for each.
+2. **Web UI** - users can trigger manual checks via the dashboard, which runs the same pipeline as a FastAPI background task.
 
 ## Module Map
 
@@ -65,7 +65,7 @@ All application code lives under `app/`.
 
 | Module | Responsibility |
 |--------|---------------|
-| `scraping/__init__.py` | `fetch_new_articles_for_topic()` — orchestrates feed fetch, dedup against DB, cross-topic content reuse, concurrent content extraction (semaphore-limited), and article storage. |
+| `scraping/__init__.py` | `fetch_new_articles_for_topic()` - orchestrates feed fetch, dedup against DB, cross-topic content reuse, concurrent content extraction (semaphore-limited), and article storage. |
 | `scraping/rss.py` | RSS/Atom feed fetching via httpx + feedparser. Google News RSS URL builder for auto feed mode. Retry on timeouts and 5xx. Feed health callbacks. |
 | `scraping/content.py` | Article HTML fetch + trafilatura content extraction. Falls back to RSS summary on failure. Content truncated to 5000 chars at word boundary. |
 
@@ -100,11 +100,11 @@ All application code lives under `app/`.
 
 ### Frontend
 
-- `templates/` — 12 Jinja2 templates. Base layout with Pico CSS + HTMX. HTMX partials for dynamic updates.
-- `static/themes.css` — Custom color themes (Nord, Dracula, Solarized, High Contrast, Tokyo Night).
-- `static/theme.js` — Theme switcher with localStorage persistence.
-- `static/notifications.js` — Browser push notification wrapper.
-- `static/vendor/` — Vendored Pico CSS and HTMX. No build tooling.
+- `templates/` - 13 Jinja2 templates. Base layout with Pico CSS + HTMX. HTMX partials for dynamic updates.
+- `static/themes.css` - Custom color themes (Nord, Dracula, Solarized, High Contrast, Tokyo Night).
+- `static/theme.js` - Theme switcher with localStorage persistence.
+- `static/notifications.js` - Browser push notification wrapper.
+- `static/vendor/` - Vendored Pico CSS and HTMX. No build tooling.
 
 ## Key Design Decisions
 
@@ -157,7 +157,7 @@ All application code lives under `app/`.
   └──────────────┘           └──────────────┘
 ```
 
-New topics start in **RESEARCHING** — articles are fetched and an initial knowledge state is built via the LLM. On success, the topic moves to **READY** and enters the normal check cycle. On failure, it moves to **ERROR** with a user-visible message. Users can retry from the dashboard.
+New topics start in **RESEARCHING**: articles are fetched and an initial knowledge state is built via the LLM. On success, the topic moves to **READY** and enters the normal check cycle. On failure, it moves to **ERROR** with a user-visible message. Users can retry from the dashboard.
 
 ## Request Lifecycle
 
@@ -167,12 +167,12 @@ New topics start in **RESEARCHING** — articles are fetched and an initial know
 2. `retry_pending_notifications()` retries any failed deliveries from prior cycles.
 3. `get_topics_due_for_check()` finds active READY topics whose last check exceeds their interval.
 4. For each due topic, `check_topic()` runs with a unique correlation ID:
-   - **Fetch** — `fetch_new_articles_for_topic()`: fetch feeds, dedup against DB, extract content.
-   - **Analyze** — `analyze_articles()`: LLM compares articles against knowledge state.
-   - **Update** — If `has_new_info`: update knowledge state via LLM.
-   - **Notify** — Send notification via Apprise + webhooks. Queue for retry on failure.
-   - **Record** — Mark articles processed, create `CheckResult`.
-5. Each topic is independent — errors in one do not affect others.
+   - **Fetch** - `fetch_new_articles_for_topic()`: fetch feeds, dedup against DB, extract content.
+   - **Analyze** - `analyze_articles()`: LLM compares articles against knowledge state.
+   - **Update** - If `has_new_info`: update knowledge state via LLM.
+   - **Notify** - Send notification via Apprise + webhooks. Queue for retry on failure.
+   - **Record** - Mark articles processed, create `CheckResult`.
+5. Each topic is independent. Errors in one do not affect others.
 
 ### Manual Check (Web UI)
 
@@ -193,8 +193,8 @@ New topics start in **RESEARCHING** — articles are fetched and an initial know
 Settings are managed by Pydantic `BaseSettings` in `app/config.py`.
 
 **Sources (highest priority first):**
-1. Environment variables — prefix `TOPIC_WATCH_`, nested keys use `__` (e.g., `TOPIC_WATCH_LLM__API_KEY`)
-2. YAML file — `data/config.yml`
+1. Environment variables - prefix `TOPIC_WATCH_`, nested keys use `__` (e.g., `TOPIC_WATCH_LLM__API_KEY`)
+2. YAML file - `data/config.yml`
 3. Field defaults in `Settings` class
 
 On first run, `config.example.yml` is auto-copied to `data/config.yml`.

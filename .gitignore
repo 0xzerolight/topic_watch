@@ -36,3 +36,6 @@ Thumbs.db
 .ruff_cache/
 .coverage
 htmlcov/
+
+# extra
+PROMOTION.md
