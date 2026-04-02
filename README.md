@@ -30,7 +30,17 @@ Self-hosted news monitoring with LLM-powered novelty detection. Watches topics v
 
 ## Quick Start
 
-### One-line install (requires Docker)
+### Installing Docker
+
+Topic Watch runs in Docker. If you don't have it yet:
+
+- **Linux:** `curl -fsSL https://get.docker.com | sh`
+- **macOS:** Download [Docker Desktop](https://www.docker.com/products/docker-desktop/) and run the installer
+- **Windows:** Download [Docker Desktop](https://www.docker.com/products/docker-desktop/) and run the installer. WSL 2 backend is recommended.
+
+Make sure Docker is running before continuing.
+
+### One-line install
 
 **Linux / macOS:**
 
