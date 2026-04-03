@@ -7,6 +7,17 @@ from pathlib import Path
 import pytest
 
 from app.database import get_connection, init_db
+from app.main import app
+
+
+@pytest.fixture(autouse=True)
+def _safe_config_path(tmp_path: Path):
+    """Ensure app.state.config_path always points to a temp directory.
+
+    Prevents tests from accidentally writing to the real data/config.yml.
+    This runs for every test automatically.
+    """
+    app.state.config_path = tmp_path / "config.yml"
 
 
 @pytest.fixture

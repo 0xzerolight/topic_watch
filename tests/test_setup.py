@@ -92,17 +92,13 @@ class TestSetupWizard:
         assert response.status_code == 303
         assert response.headers["location"] == "/"
 
-    def test_post_setup_success(self, unconfigured_app: TestClient, tmp_path: Path) -> None:
+    def test_post_setup_success(self, unconfigured_app: TestClient) -> None:
         # Get CSRF token first
         get_response = unconfigured_app.get("/setup")
         csrf_token = get_response.cookies.get("csrf_token")
         assert csrf_token
 
-        with (
-            patch("app.config.save_settings_to_yaml") as mock_save,
-            patch("app.scheduler.start_scheduler") as mock_sched,
-        ):
-            mock_save.return_value = None
+        with patch("app.scheduler.start_scheduler") as mock_sched:
             mock_sched.return_value = None
 
             response = unconfigured_app.post(
@@ -126,10 +122,7 @@ class TestSetupWizard:
         get_response = unconfigured_app.get("/setup")
         csrf_token = get_response.cookies.get("csrf_token")
 
-        with (
-            patch("app.config.save_settings_to_yaml"),
-            patch("app.scheduler.start_scheduler"),
-        ):
+        with patch("app.scheduler.start_scheduler"):
             response = unconfigured_app.post(
                 "/setup",
                 data={
@@ -149,10 +142,7 @@ class TestSetupWizard:
         get_response = unconfigured_app.get("/setup")
         csrf_token = get_response.cookies.get("csrf_token")
 
-        with (
-            patch("app.config.save_settings_to_yaml"),
-            patch("app.scheduler.start_scheduler"),
-        ):
+        with patch("app.scheduler.start_scheduler"):
             response = unconfigured_app.post(
                 "/setup",
                 data={

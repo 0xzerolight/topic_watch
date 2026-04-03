@@ -15,7 +15,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from app.config import load_settings, resolve_db_path
+from app.config import DEFAULT_CONFIG_PATH, load_settings, resolve_db_path
 from app.crud import recover_stuck_topics
 from app.database import get_db, init_db
 from app.logging_config import setup_logging
@@ -36,6 +36,7 @@ async def lifespan(app: FastAPI):
     init_db(db_path)
     app.state.settings = settings
     app.state.db_path = db_path
+    app.state.config_path = DEFAULT_CONFIG_PATH
     app.state.setup_required = not settings.is_configured()
 
     if settings.is_configured():
