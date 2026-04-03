@@ -9,12 +9,12 @@ WORKDIR /build
 RUN pip install --no-cache-dir --upgrade pip
 
 # Copy project metadata and install into a venv
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md requirements.txt ./
 COPY app/ ./app/
 
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir --require-hashes -r requirements.txt && pip install --no-cache-dir --no-deps .
 
 # === Stage 2: Runtime ===
 FROM python:3.11-slim

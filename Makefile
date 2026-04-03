@@ -1,12 +1,17 @@
-.PHONY: dev test lint format typecheck coverage docker docker-run run clean ci help
+.PHONY: dev test lint format typecheck coverage docker docker-run run clean ci lock help
 
 help: ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
 
 dev: ## Install project in editable mode with dev dependencies
-	pip install -e ".[dev]"
+	pip install --require-hashes -r requirements-dev.txt
+	pip install --no-deps -e .
 	pre-commit install
 	pre-commit install --hook-type pre-push
+
+lock: ## Regenerate pinned requirements lockfiles from pyproject.toml
+	pip-compile --strip-extras --generate-hashes --output-file=requirements.txt pyproject.toml
+	pip-compile --strip-extras --generate-hashes --extra=dev --output-file=requirements-dev.txt pyproject.toml
 
 test: ## Run tests with pytest
 	pytest --tb=short
