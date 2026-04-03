@@ -11,7 +11,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Form, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from markupsafe import Markup, escape
@@ -484,7 +484,7 @@ async def topic_detail(
     """Topic detail page: knowledge state, check history, actions."""
     topic = get_topic(conn, topic_id)
     if topic is None:
-        return HTMLResponse("Topic not found", status_code=404)
+        raise HTTPException(status_code=404, detail="Topic not found")
 
     auto_feed_url = None
     if topic.feed_mode == FeedMode.AUTO:
@@ -543,7 +543,7 @@ async def topic_status(
     """HTMX partial: knowledge state fragment for polling during research."""
     topic = get_topic(conn, topic_id)
     if topic is None:
-        return HTMLResponse("Topic not found", status_code=404)
+        raise HTTPException(status_code=404, detail="Topic not found")
 
     knowledge = get_knowledge_state(conn, topic_id)
 
@@ -570,7 +570,7 @@ async def check_topic_handler(
 
     topic = get_topic(conn, topic_id)
     if topic is None:
-        return HTMLResponse("Topic not found", status_code=404)
+        raise HTTPException(status_code=404, detail="Topic not found")
 
     if not await _checking_state.start_check(topic_id):
         # Already checking — return current state without re-checking
@@ -621,7 +621,7 @@ async def toggle_active(
     """Toggle a topic's is_active flag."""
     topic = get_topic(conn, topic_id)
     if topic is None:
-        return HTMLResponse("Topic not found", status_code=404)
+        raise HTTPException(status_code=404, detail="Topic not found")
 
     topic.is_active = not topic.is_active
     update_topic(conn, topic)
@@ -656,7 +656,7 @@ async def reinit_topic(
     """Re-trigger initial research for error recovery."""
     topic = get_topic(conn, topic_id)
     if topic is None:
-        return HTMLResponse("Topic not found", status_code=404)
+        raise HTTPException(status_code=404, detail="Topic not found")
 
     topic.status = TopicStatus.RESEARCHING
     topic.status_changed_at = datetime.now(UTC)
@@ -692,7 +692,7 @@ async def topic_edit_form(
     """Render the edit topic form."""
     topic = get_topic(conn, topic_id)
     if topic is None:
-        return HTMLResponse("Topic not found", status_code=404)
+        raise HTTPException(status_code=404, detail="Topic not found")
     return templates.TemplateResponse(
         request,
         "topic_edit.html",
@@ -720,7 +720,7 @@ async def edit_topic_handler(
     """Update an existing topic's name, description, feed URLs, and feed mode."""
     topic = get_topic(conn, topic_id)
     if topic is None:
-        return HTMLResponse("Topic not found", status_code=404)
+        raise HTTPException(status_code=404, detail="Topic not found")
 
     mode = FeedMode.AUTO if feed_mode == "auto" else FeedMode.MANUAL
 
@@ -852,7 +852,7 @@ async def export_topic_json(
     """Export a topic with articles and check results as JSON."""
     topic = get_topic(conn, topic_id)
     if topic is None:
-        return HTMLResponse("Topic not found", status_code=404)
+        raise HTTPException(status_code=404, detail="Topic not found")
 
     articles = list_articles_for_topic(conn, topic_id)
     checks = list_check_results(conn, topic_id, limit=10000, offset=0)
@@ -884,7 +884,7 @@ async def export_topic_csv(
     """Export check results for a topic as CSV."""
     topic = get_topic(conn, topic_id)
     if topic is None:
-        return HTMLResponse("Topic not found", status_code=404)
+        raise HTTPException(status_code=404, detail="Topic not found")
 
     checks = list_check_results(conn, topic_id, limit=10000, offset=0)
 
@@ -1175,11 +1175,11 @@ async def force_notify(
     """Re-send notification for a specific check result."""
     topic = get_topic(conn, topic_id)
     if topic is None:
-        return HTMLResponse("Topic not found", status_code=404)
+        raise HTTPException(status_code=404, detail="Topic not found")
 
     check_result = get_check_result(conn, check_id)
     if check_result is None or check_result.topic_id != topic_id:
-        return HTMLResponse("Check result not found", status_code=404)
+        raise HTTPException(status_code=404, detail="Check result not found")
 
     if not check_result.has_new_info or not check_result.llm_response:
         return HTMLResponse(
