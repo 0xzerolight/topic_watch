@@ -18,7 +18,7 @@ from fastapi.templating import Jinja2Templates
 from app import __version__
 from app.analysis.llm import NoveltyResult
 from app.checker import check_all_topics, check_topic
-from app.config import DEFAULT_CONFIG_PATH, Settings, save_settings_to_yaml
+from app.config import DEFAULT_CONFIG_PATH, Settings, load_settings, save_settings_to_yaml
 from app.crud import (
     count_articles_for_topic,
     count_check_results,
@@ -955,6 +955,11 @@ async def complete_setup(
     from app.config import LLMSettings, NotificationSettings
     from app.scheduler import start_scheduler
 
+    form_values = {
+        "llm_model": llm_model,
+        "llm_api_key": llm_api_key,
+        "llm_base_url": llm_base_url,
+    }
     try:
         new_settings = Settings(  # type: ignore[call-arg]
             llm=LLMSettings(
@@ -964,38 +969,35 @@ async def complete_setup(
             ),
             notifications=NotificationSettings(),
         )
+        save_settings_to_yaml(new_settings)
+        request.app.state.settings = new_settings
+        request.app.state.setup_required = False
+        start_scheduler(new_settings, db_path=request.app.state.db_path)
     except ValidationError as exc:
         errors = [f"{' → '.join(str(loc) for loc in e['loc'])}: {e['msg']}" for e in exc.errors()]
         return templates.TemplateResponse(
             request,
             "setup.html",
-            {
-                "setup_mode": True,
-                "errors": errors,
-                "form": {
-                    "llm_model": llm_model,
-                    "llm_api_key": llm_api_key,
-                    "llm_base_url": llm_base_url,
-                },
-            },
+            {"setup_mode": True, "errors": errors, "form": form_values},
+            status_code=422,
+        )
+    except Exception as exc:
+        logger.exception("Setup failed: %s", exc)
+        return templates.TemplateResponse(
+            request,
+            "setup.html",
+            {"setup_mode": True, "errors": [f"Setup failed: {exc}"], "form": form_values},
             status_code=422,
         )
 
-    save_settings_to_yaml(new_settings)
-    request.app.state.settings = new_settings
-    request.app.state.setup_required = False
-    start_scheduler(new_settings, db_path=request.app.state.db_path)
     logger.info("Setup completed — application is now configured")
-
     return RedirectResponse(url="/", status_code=303)
 
 
 @router.get("/settings", response_class=HTMLResponse)
-async def settings_view(
-    request: Request,
-    settings: Settings = Depends(get_settings),
-):
+async def settings_view(request: Request):
     """Display of current configuration as an editable form."""
+    settings = load_settings()
     return templates.TemplateResponse(
         request,
         "settings.html",
@@ -1035,7 +1037,23 @@ async def update_settings(
     # If API key field is empty, retain existing key
     effective_api_key = llm_api_key.strip() or request.app.state.settings.llm.api_key
 
-    # Build a new Settings object to validate via Pydantic
+    # Build a new Settings object to validate via Pydantic, then save
+    form_values = {
+        "llm_model": llm_model,
+        "llm_api_key": llm_api_key,
+        "llm_base_url": llm_base_url,
+        "notification_urls": notification_urls,
+        "webhook_urls": webhook_urls,
+        "check_interval_hours": check_interval_hours,
+        "max_articles_per_check": max_articles_per_check,
+        "knowledge_state_max_tokens": knowledge_state_max_tokens,
+        "article_retention_days": article_retention_days,
+        "feed_fetch_timeout": feed_fetch_timeout,
+        "article_fetch_timeout": article_fetch_timeout,
+        "llm_analysis_timeout": llm_analysis_timeout,
+        "llm_knowledge_timeout": llm_knowledge_timeout,
+        "web_page_size": web_page_size,
+    }
     try:
         new_settings = Settings(  # type: ignore[call-arg]
             llm=LLMSettings(
@@ -1064,39 +1082,34 @@ async def update_settings(
             scheduler_jitter_seconds=request.app.state.settings.scheduler_jitter_seconds,
             llm_max_retries=request.app.state.settings.llm_max_retries,
         )
+        save_settings_to_yaml(new_settings)
+        request.app.state.settings = new_settings
     except ValidationError as exc:
         errors = [f"{' → '.join(str(loc) for loc in e['loc'])}: {e['msg']}" for e in exc.errors()]
-        current_settings = request.app.state.settings
         return templates.TemplateResponse(
             request,
             "settings.html",
             {
-                "settings": current_settings,
+                "settings": request.app.state.settings,
                 "config_path": str(DEFAULT_CONFIG_PATH),
                 "errors": errors,
-                # Pass back submitted form values
-                "form": {
-                    "llm_model": llm_model,
-                    "llm_api_key": llm_api_key,
-                    "llm_base_url": llm_base_url,
-                    "notification_urls": notification_urls,
-                    "webhook_urls": webhook_urls,
-                    "check_interval_hours": check_interval_hours,
-                    "max_articles_per_check": max_articles_per_check,
-                    "knowledge_state_max_tokens": knowledge_state_max_tokens,
-                    "article_retention_days": article_retention_days,
-                    "feed_fetch_timeout": feed_fetch_timeout,
-                    "article_fetch_timeout": article_fetch_timeout,
-                    "llm_analysis_timeout": llm_analysis_timeout,
-                    "llm_knowledge_timeout": llm_knowledge_timeout,
-                    "web_page_size": web_page_size,
-                },
+                "form": form_values,
             },
             status_code=422,
         )
-
-    save_settings_to_yaml(new_settings)
-    request.app.state.settings = new_settings
+    except Exception as exc:
+        logger.exception("Failed to save settings: %s", exc)
+        return templates.TemplateResponse(
+            request,
+            "settings.html",
+            {
+                "settings": request.app.state.settings,
+                "config_path": str(DEFAULT_CONFIG_PATH),
+                "errors": [f"Failed to save settings: {exc}"],
+                "form": form_values,
+            },
+            status_code=422,
+        )
 
     return RedirectResponse(url="/settings?saved=1", status_code=303)
 

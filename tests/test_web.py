@@ -67,13 +67,15 @@ async def client(
     app.dependency_overrides[get_db_conn] = override_db
     app.dependency_overrides[get_settings] = override_settings
 
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app),
-        base_url="http://test",
-        cookies={"csrf_token": CSRF_TEST_TOKEN},
-        headers={"X-CSRF-Token": CSRF_TEST_TOKEN},
-    ) as ac:
-        yield ac
+    # GET /settings calls load_settings() directly instead of using Depends
+    with patch("app.web.routes.load_settings", return_value=settings):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+            cookies={"csrf_token": CSRF_TEST_TOKEN},
+            headers={"X-CSRF-Token": CSRF_TEST_TOKEN},
+        ) as ac:
+            yield ac
 
     app.dependency_overrides.clear()
 
