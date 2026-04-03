@@ -45,13 +45,15 @@ async def client(
     app.dependency_overrides[get_db_conn] = override_db
     app.dependency_overrides[get_settings] = override_settings
 
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app),
-        base_url="http://test",
-        cookies={"csrf_token": CSRF_TEST_TOKEN},
-        headers={"X-CSRF-Token": CSRF_TEST_TOKEN},
-    ) as ac:
-        yield ac
+    # GET /settings calls load_settings() directly instead of using Depends
+    with patch("app.web.routes.load_settings", return_value=settings):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+            cookies={"csrf_token": CSRF_TEST_TOKEN},
+            headers={"X-CSRF-Token": CSRF_TEST_TOKEN},
+        ) as ac:
+            yield ac
 
     app.dependency_overrides.clear()
 
@@ -333,3 +335,53 @@ class TestSettingsPost:
         data = yaml.safe_load(config_file.read_text())
         assert data["llm"]["model"] == "openai/gpt-4o-mini"
         assert data["check_interval_hours"] == 8
+
+    async def test_yaml_parse_error_returns_422(self, client: httpx.AsyncClient) -> None:
+        """Non-ValidationError (e.g. YAML ScannerError) returns 422, not 500."""
+        import yaml as _yaml
+
+        error = _yaml.scanner.ScannerError("while scanning", None, "could not find expected ':'", None)
+        with patch("app.web.routes.Settings", side_effect=error):
+            response = await client.post(
+                "/settings",
+                data=self._valid_form_data(),
+                follow_redirects=False,
+            )
+        assert response.status_code == 422
+        assert "failed to save settings" in response.text.lower()
+
+    async def test_save_io_error_returns_422(self, client: httpx.AsyncClient) -> None:
+        """I/O error during save_settings_to_yaml returns 422, not 500."""
+        with patch("app.web.routes.save_settings_to_yaml", side_effect=PermissionError("[Errno 13] Permission denied")):
+            response = await client.post(
+                "/settings",
+                data=self._valid_form_data(),
+                follow_redirects=False,
+            )
+        assert response.status_code == 422
+        assert "failed to save settings" in response.text.lower()
+
+    async def test_settings_page_calls_load_settings(self, db_conn: sqlite3.Connection) -> None:
+        """GET /settings calls load_settings() to show fresh values from disk."""
+        fresh_settings = _make_settings(check_interval_hours=24)
+        app.state.settings = _make_settings(check_interval_hours=6)
+
+        def override_db():
+            yield db_conn
+
+        app.dependency_overrides[get_db_conn] = override_db
+
+        try:
+            with patch("app.web.routes.load_settings", return_value=fresh_settings) as mock_load:
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app),
+                    base_url="http://test",
+                    cookies={"csrf_token": CSRF_TEST_TOKEN},
+                ) as ac:
+                    response = await ac.get("/settings")
+                mock_load.assert_called_once()
+                assert response.status_code == 200
+                # Fresh value (24) should appear, not stale value (6)
+                assert 'value="24"' in response.text
+        finally:
+            app.dependency_overrides.clear()
