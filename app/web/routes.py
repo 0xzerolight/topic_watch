@@ -160,12 +160,10 @@ def _confidence_badge(llm_response: str | None) -> str:
         bg, color = "#ff4136", "#fff"
 
     score_text = f"{confidence:.2f}"
-    return str(
-        Markup(
-            f'<span style="background:{bg};color:{color};padding:0.15em 0.5em;'
-            f'border-radius:0.25em;font-size:0.85em;font-weight:600;" '
-            f'title="Confidence: {score_text}">{score_text}</span>'
-        )
+    return Markup(  # type: ignore[no-any-return]
+        f'<span style="background:{bg};color:{color};padding:0.15em 0.5em;'
+        f'border-radius:0.25em;font-size:0.85em;font-weight:600;" '
+        f'title="Confidence: {score_text}">{score_text}</span>'
     )
 
 
