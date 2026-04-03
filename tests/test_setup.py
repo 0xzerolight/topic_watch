@@ -22,6 +22,7 @@ def unconfigured_app(tmp_path: Path):
         # Set state after lifespan runs to avoid it being overwritten
         app.state.settings = Settings()  # type: ignore[call-arg]
         app.state.db_path = db_path
+        app.state.config_path = tmp_path / "config.yml"
         app.state.setup_required = True
         yield client
 
@@ -46,6 +47,7 @@ def configured_app(tmp_path: Path, sample_config_yaml: Path, monkeypatch: pytest
         # Set state after lifespan runs to avoid it being overwritten
         app.state.settings = settings
         app.state.db_path = db_path
+        app.state.config_path = tmp_path / "config.yml"
         app.state.setup_required = False
         yield client
 
