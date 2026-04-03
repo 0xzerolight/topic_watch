@@ -15,6 +15,7 @@ from app.migrations.m005_status_changed_at import up as m005_up
 from app.migrations.m006_topic_tags import up as m006_up
 from app.migrations.m007_feed_health import up as m007_up
 from app.migrations.m008_interval_minutes import up as m008_up
+from app.migrations.m009_article_provider import up as m009_up
 
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "baseline schema version", m001_up),
@@ -25,4 +26,5 @@ MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (6, "add tags column to topics", m006_up),
     (7, "add feed_health table", m007_up),
     (8, "add check_interval_minutes column to topics", m008_up),
+    (9, "add source_provider column to articles", m009_up),
 ]

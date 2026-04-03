@@ -314,9 +314,9 @@ def create_article(conn: sqlite3.Connection, article: Article) -> Article:
     data = article.to_insert_dict()
     cursor = conn.execute(
         """INSERT INTO articles (topic_id, title, url, content_hash,
-           raw_content, source_feed, fetched_at, processed)
+           raw_content, source_feed, source_provider, fetched_at, processed)
            VALUES (:topic_id, :title, :url, :content_hash,
-           :raw_content, :source_feed, :fetched_at, :processed)""",
+           :raw_content, :source_feed, :source_provider, :fetched_at, :processed)""",
         data,
     )
     article.id = cursor.lastrowid

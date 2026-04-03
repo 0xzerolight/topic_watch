@@ -19,9 +19,10 @@ from app.crud import (
 )
 from app.models import Article, Topic
 from app.scraping.content import extract_article_content
-from app.scraping.google_news import is_google_news_url, resolve_google_news_urls
+from app.scraping.google_news import resolve_google_news_urls
 from app.scraping.relevance import score_relevance
 from app.scraping.rss import FeedEntry, compute_article_hash, fetch_feeds_for_topic
+from app.scraping.rss import FeedResponse as FeedResponse
 
 logger = logging.getLogger(__name__)
 
@@ -75,12 +76,13 @@ async def fetch_new_articles_for_topic(
         return callback
 
     # 1. Fetch all feed entries
-    entries = await fetch_feeds_for_topic(
+    response = await fetch_feeds_for_topic(
         topic,
         timeout=feed_fetch_timeout,
         max_attempts=feed_max_retries,
         health_callback=_make_health_callback(conn),
     )
+    entries = response.entries
     if not entries:
         return FetchResult(articles=[], total_feed_entries=0)
 
@@ -130,12 +132,13 @@ async def fetch_new_articles_for_topic(
 
     # 3b. Resolve Google News redirect URLs for entries that need content fetching.
     # Done after dedup+limiting to minimize requests (typically ~10 URLs, not 100).
-    google_urls = [e.url for e, _ in fetch_batch if is_google_news_url(e.url)]
-    if google_urls:
-        resolved = await resolve_google_news_urls(google_urls, timeout=feed_fetch_timeout)
-        for entry, _ in fetch_batch:
-            if entry.url in resolved:
-                entry.url = resolved[entry.url]
+    if response.needs_url_resolution:
+        google_urls = [e.url for e, _ in fetch_batch if "news.google.com/" in e.url]
+        if google_urls:
+            resolved = await resolve_google_news_urls(google_urls, timeout=feed_fetch_timeout)
+            for entry, _ in fetch_batch:
+                if entry.url in resolved:
+                    entry.url = resolved[entry.url]
 
     # 4. Extract content concurrently with semaphore (only for entries needing fetch)
     semaphore = asyncio.Semaphore(concurrency)
@@ -163,6 +166,7 @@ async def fetch_new_articles_for_topic(
             content_hash=content_hash,
             raw_content=reused_content,
             source_feed=entry.source_feed,
+            source_provider=response.provider_name,
         )
         try:
             created = create_article(conn, article)
@@ -183,6 +187,7 @@ async def fetch_new_articles_for_topic(
             content_hash=content_hash,
             raw_content=content if isinstance(content, str) and content else None,
             source_feed=entry.source_feed,
+            source_provider=response.provider_name,
         )
         try:
             created = create_article(conn, article)

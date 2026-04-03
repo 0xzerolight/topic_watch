@@ -10,6 +10,7 @@ from app.config import LLMSettings, Settings
 from app.crud import create_topic, get_topic
 from app.models import Article, Topic, TopicStatus
 from app.scraping import FetchResult
+from app.scraping.rss import FeedResponse
 
 
 def _make_settings(**overrides) -> Settings:
@@ -171,7 +172,7 @@ class TestCmdInit:
             patch(
                 "app.scraping.fetch_feeds_for_topic",
                 new_callable=AsyncMock,
-                return_value=[],
+                return_value=FeedResponse(),
             ),
         ):
             mock_get_db.return_value.__enter__ = lambda s: db_conn

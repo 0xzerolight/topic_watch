@@ -10,18 +10,27 @@ from app.crud import create_topic, list_articles_for_topic
 from app.models import Article, FeedMode, Topic
 from app.scraping import fetch_new_articles_for_topic
 from app.scraping.content import _truncate, extract_article_content
+from app.scraping.providers import GoogleNewsProvider
 from app.scraping.rss import (
     FeedEntry,
+    FeedResponse,
     _parse_entry,
     _parse_feed_date,
     _resolve_google_news_url,
-    build_google_news_url,
     compute_article_hash,
     fetch_feed,
     fetch_feeds_for_topic,
 )
 
 # --- Sample RSS/Atom XML for mocking ---
+
+_EMPTY_RSS = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Empty Feed</title>
+  </channel>
+</rss>"""
 
 _SAMPLE_RSS = """\
 <?xml version="1.0" encoding="UTF-8"?>
@@ -264,43 +273,51 @@ class TestFetchFeed:
 
 
 class TestBuildGoogleNewsUrl:
+    """Tests for GoogleNewsProvider URL building (moved from old build_google_news_url)."""
+
     def test_basic_query(self) -> None:
+        provider = GoogleNewsProvider()
         topic = Topic(name="Elden Ring DLC", description="release date of the DLC", feed_urls=[])
-        url = build_google_news_url(topic)
+        url = provider.build_feed_url(topic)
         assert "news.google.com/rss/search" in url
         assert "Elden+Ring+DLC" in url
         assert "hl=en-US" in url
 
     def test_description_supplements_query(self) -> None:
+        provider = GoogleNewsProvider()
         topic = Topic(name="Solo Leveling", description="season 3 release date anime", feed_urls=[])
-        url = build_google_news_url(topic)
+        url = provider.build_feed_url(topic)
         assert "Solo+Leveling" in url
         assert "season" in url
         assert "release" in url
 
     def test_empty_description_uses_name_only(self) -> None:
+        provider = GoogleNewsProvider()
         topic = Topic(name="Elden Ring DLC", description="", feed_urls=[])
-        url = build_google_news_url(topic)
+        url = provider.build_feed_url(topic)
         assert "Elden+Ring+DLC" in url
 
     def test_special_characters_encoded(self) -> None:
+        provider = GoogleNewsProvider()
         topic = Topic(name="C++ news & updates", description="", feed_urls=[])
-        url = build_google_news_url(topic)
+        url = provider.build_feed_url(topic)
         assert "C%2B%2B" in url
         assert "%26" in url
 
     def test_empty_name(self) -> None:
+        provider = GoogleNewsProvider()
         topic = Topic(name="", description="", feed_urls=[])
-        url = build_google_news_url(topic)
+        url = provider.build_feed_url(topic)
         assert "news.google.com/rss/search" in url
 
     def test_long_description_truncated(self) -> None:
+        provider = GoogleNewsProvider()
         topic = Topic(
             name="Test",
             description="one two three four five six seven eight nine ten",
             feed_urls=[],
         )
-        url = build_google_news_url(topic)
+        url = provider.build_feed_url(topic)
         # Only first 6 words of description should be used
         assert "seven" not in url
         assert "six" in url
@@ -369,9 +386,10 @@ class TestFetchFeedsForTopic:
             original_init(self_client, **kwargs)
 
         with patch.object(httpx.AsyncClient, "__init__", patched_init):
-            entries = await fetch_feeds_for_topic(topic)
+            response = await fetch_feeds_for_topic(topic)
 
-        assert len(entries) == 3  # 2 from RSS + 1 from Atom
+        assert len(response.entries) == 3  # 2 from RSS + 1 from Atom
+        assert response.provider_name is None  # MANUAL mode
 
     async def test_deduplicates_by_url(self) -> None:
         # Both feeds return the same RSS content
@@ -397,15 +415,15 @@ class TestFetchFeedsForTopic:
             original_init(self_client, **kwargs)
 
         with patch.object(httpx.AsyncClient, "__init__", patched_init):
-            entries = await fetch_feeds_for_topic(topic)
+            response = await fetch_feeds_for_topic(topic)
 
         # Should dedup: both feeds have same 2 URLs
-        assert len(entries) == 2
+        assert len(response.entries) == 2
 
     async def test_empty_feed_urls_manual_mode(self) -> None:
         topic = Topic(name="T", description="d", feed_mode=FeedMode.MANUAL, feed_urls=[])
-        entries = await fetch_feeds_for_topic(topic)
-        assert entries == []
+        response = await fetch_feeds_for_topic(topic)
+        assert response.entries == []
 
     async def test_one_feed_failure_doesnt_stop_others(self) -> None:
         transport = _mock_transport(
@@ -430,14 +448,17 @@ class TestFetchFeedsForTopic:
             original_init(self_client, **kwargs)
 
         with patch.object(httpx.AsyncClient, "__init__", patched_init):
-            entries = await fetch_feeds_for_topic(topic)
+            response = await fetch_feeds_for_topic(topic)
 
-        assert len(entries) == 2  # Got entries from the good feed
+        assert len(response.entries) == 2  # Got entries from the good feed
 
-    async def test_auto_mode_uses_google_news(self) -> None:
-        """Auto mode generates Google News URL from topic name."""
-        transport = _mock_transport({"news.google.com": (200, _SAMPLE_RSS)})
+    async def test_auto_mode_uses_router(self) -> None:
+        """Auto mode uses the router to select a provider (Bing first by default)."""
+        from app.scraping.routing import ProviderRouter
+
+        transport = _mock_transport({"bing.com": (200, _SAMPLE_RSS)})
         topic = Topic(name="Test Topic", description="d", feed_mode=FeedMode.AUTO)
+        router = ProviderRouter()
 
         original_init = httpx.AsyncClient.__init__
 
@@ -446,9 +467,11 @@ class TestFetchFeedsForTopic:
             original_init(self_client, **kwargs)
 
         with patch.object(httpx.AsyncClient, "__init__", patched_init):
-            entries = await fetch_feeds_for_topic(topic)
+            response = await fetch_feeds_for_topic(topic, router=router)
 
-        assert len(entries) == 2  # Got entries from the mock RSS
+        assert len(response.entries) == 2
+        assert response.provider_name == "bing_news"
+        assert response.needs_url_resolution is False
 
     async def test_manual_mode_ignores_auto_url(self) -> None:
         """Manual mode uses feed_urls, not auto-generated URL."""
@@ -466,9 +489,91 @@ class TestFetchFeedsForTopic:
             original_init(self_client, **kwargs)
 
         with patch.object(httpx.AsyncClient, "__init__", patched_init):
-            entries = await fetch_feeds_for_topic(topic)
+            response = await fetch_feeds_for_topic(topic)
 
-        assert len(entries) == 2
+        assert len(response.entries) == 2
+        assert response.provider_name is None  # MANUAL mode has no provider
+
+    async def test_auto_fallback_on_empty(self) -> None:
+        """When first provider returns empty, falls back to second."""
+        from app.scraping.providers import BingNewsProvider, GoogleNewsProvider
+        from app.scraping.routing import ProviderRouter
+
+        transport = _mock_transport(
+            {
+                "bing.com": (200, _EMPTY_RSS),
+                "news.google.com": (200, _SAMPLE_RSS),
+            }
+        )
+        topic = Topic(name="Test", description="d", feed_mode=FeedMode.AUTO)
+        router = ProviderRouter(providers=[BingNewsProvider(), GoogleNewsProvider()])
+
+        original_init = httpx.AsyncClient.__init__
+
+        def patched_init(self_client, **kwargs):
+            kwargs["transport"] = transport
+            original_init(self_client, **kwargs)
+
+        with patch.object(httpx.AsyncClient, "__init__", patched_init):
+            response = await fetch_feeds_for_topic(topic, router=router)
+
+        assert len(response.entries) == 2
+        assert response.provider_name == "google_news"
+        assert response.needs_url_resolution is True
+
+    async def test_auto_fallback_on_http_error(self) -> None:
+        """When first provider HTTP errors, falls back to second."""
+        from app.scraping.providers import BingNewsProvider, GoogleNewsProvider
+        from app.scraping.routing import ProviderRouter
+
+        transport = _mock_transport(
+            {
+                "bing.com": (500, "Error"),
+                "news.google.com": (200, _SAMPLE_RSS),
+            }
+        )
+        topic = Topic(name="Test", description="d", feed_mode=FeedMode.AUTO)
+        router = ProviderRouter(providers=[BingNewsProvider(), GoogleNewsProvider()])
+
+        original_init = httpx.AsyncClient.__init__
+
+        def patched_init(self_client, **kwargs):
+            kwargs["transport"] = transport
+            original_init(self_client, **kwargs)
+
+        with patch.object(httpx.AsyncClient, "__init__", patched_init):
+            response = await fetch_feeds_for_topic(topic, router=router)
+
+        assert len(response.entries) == 2
+        assert response.provider_name == "google_news"
+
+    async def test_auto_both_fail(self) -> None:
+        """When both providers fail, returns empty and marks both unhealthy."""
+        from app.scraping.providers import BingNewsProvider, GoogleNewsProvider
+        from app.scraping.routing import ProviderRouter
+
+        transport = _mock_transport(
+            {
+                "bing.com": (500, "Error"),
+                "news.google.com": (500, "Error"),
+            }
+        )
+        topic = Topic(name="Test", description="d", feed_mode=FeedMode.AUTO)
+        router = ProviderRouter(providers=[BingNewsProvider(), GoogleNewsProvider()])
+
+        original_init = httpx.AsyncClient.__init__
+
+        def patched_init(self_client, **kwargs):
+            kwargs["transport"] = transport
+            original_init(self_client, **kwargs)
+
+        with patch.object(httpx.AsyncClient, "__init__", patched_init):
+            response = await fetch_feeds_for_topic(topic, router=router)
+
+        assert response.entries == []
+        # Both providers should have recorded a failure
+        assert "bing_news" in router._health
+        assert "google_news" in router._health
 
 
 # ============================================================
@@ -604,7 +709,7 @@ class TestFetchNewArticlesForTopic:
             )
         ]
         with (
-            patch("app.scraping.fetch_feeds_for_topic", return_value=entries),
+            patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=entries)),
             patch("app.scraping.extract_article_content", return_value="Extracted content"),
         ):
             stored = (await fetch_new_articles_for_topic(topic, db_conn)).articles
@@ -642,7 +747,7 @@ class TestFetchNewArticlesForTopic:
         )
         db_conn.commit()
 
-        with patch("app.scraping.fetch_feeds_for_topic", return_value=[entry]):
+        with patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=[entry])):
             stored = (await fetch_new_articles_for_topic(topic, db_conn)).articles
 
         assert len(stored) == 0
@@ -661,7 +766,7 @@ class TestFetchNewArticlesForTopic:
             for i in range(5)
         ]
         with (
-            patch("app.scraping.fetch_feeds_for_topic", return_value=entries),
+            patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=entries)),
             patch("app.scraping.extract_article_content", return_value="Content"),
         ):
             stored = (await fetch_new_articles_for_topic(topic, db_conn, max_articles=2)).articles
@@ -671,7 +776,7 @@ class TestFetchNewArticlesForTopic:
     async def test_no_feeds_returns_empty(self, db_conn: sqlite3.Connection) -> None:
         topic = self._make_topic(db_conn)
 
-        with patch("app.scraping.fetch_feeds_for_topic", return_value=[]):
+        with patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse()):
             stored = (await fetch_new_articles_for_topic(topic, db_conn)).articles
 
         assert stored == []
@@ -688,7 +793,7 @@ class TestFetchNewArticlesForTopic:
             )
         ]
         with (
-            patch("app.scraping.fetch_feeds_for_topic", return_value=entries),
+            patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=entries)),
             patch(
                 "app.scraping.extract_article_content",
                 side_effect=Exception("Network error"),

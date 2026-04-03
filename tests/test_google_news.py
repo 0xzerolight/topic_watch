@@ -15,7 +15,7 @@ from app.scraping.google_news import (
     resolve_google_news_url,
     resolve_google_news_urls,
 )
-from app.scraping.rss import FeedEntry
+from app.scraping.rss import FeedEntry, FeedResponse
 
 # --- Mock HTML for Google News article page ---
 
@@ -330,7 +330,10 @@ class TestGoogleNewsIntegration:
             return "Extracted article content"
 
         with (
-            patch("app.scraping.fetch_feeds_for_topic", return_value=entries),
+            patch(
+                "app.scraping.fetch_feeds_for_topic",
+                return_value=FeedResponse(entries=entries, provider_name="google_news", needs_url_resolution=True),
+            ),
             patch("app.scraping.extract_article_content", side_effect=mock_extract),
             patch("app.scraping.resolve_google_news_urls", return_value={_GOOGLE_RSS_URL: _REAL_ARTICLE_URL}),
         ):
@@ -356,7 +359,10 @@ class TestGoogleNewsIntegration:
         ]
 
         with (
-            patch("app.scraping.fetch_feeds_for_topic", return_value=entries),
+            patch(
+                "app.scraping.fetch_feeds_for_topic",
+                return_value=FeedResponse(entries=entries, provider_name="google_news", needs_url_resolution=True),
+            ),
             patch("app.scraping.extract_article_content", return_value="Some content"),
             patch("app.scraping.resolve_google_news_urls", return_value={}),  # Resolution fails
         ):
