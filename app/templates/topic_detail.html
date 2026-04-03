@@ -171,7 +171,7 @@
 <article style="border-left: 4px solid var(--pico-color-orange-500, #f57c00); padding: 1rem; margin-bottom: 1rem;">
     <strong>Research failed.</strong>
     {% if topic.error_message %}
-    <p><small>{{ topic.error_message }}</small></p>
+    <small>{{ topic.error_message | sanitize_error }}</small>
     {% endif %}
     <p>Click "Retry Research" below to retry the initial research phase.</p>
 </article>
