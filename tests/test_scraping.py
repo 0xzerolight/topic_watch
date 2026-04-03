@@ -14,6 +14,7 @@ from app.scraping.rss import (
     FeedEntry,
     _parse_entry,
     _parse_feed_date,
+    _resolve_google_news_url,
     build_google_news_url,
     compute_article_hash,
     fetch_feed,
@@ -303,6 +304,45 @@ class TestBuildGoogleNewsUrl:
         # Only first 6 words of description should be used
         assert "seven" not in url
         assert "six" in url
+
+
+class TestResolveGoogleNewsUrl:
+    def test_non_google_url_unchanged(self) -> None:
+        url = "https://example.com/article"
+        assert _resolve_google_news_url(url, "") == url
+
+    def test_extracts_real_url_from_description(self) -> None:
+        google_url = "https://news.google.com/rss/articles/CBMiQ2h0dHBz..."
+        description = '<a href="https://comicbook.com/anime/solo-leveling-s3" target="_blank">Title</a>'
+        result = _resolve_google_news_url(google_url, description)
+        assert result == "https://comicbook.com/anime/solo-leveling-s3"
+
+    def test_ignores_google_self_links(self) -> None:
+        google_url = "https://news.google.com/rss/articles/CBMiQ2h0dHBz..."
+        description = '<a href="https://news.google.com/stories/123">Title</a>'
+        result = _resolve_google_news_url(google_url, description)
+        assert result == google_url  # falls back to original
+
+    def test_falls_back_when_no_href(self) -> None:
+        google_url = "https://news.google.com/rss/articles/CBMiQ2h0dHBz..."
+        result = _resolve_google_news_url(google_url, "No links here")
+        assert result == google_url
+
+    def test_empty_description(self) -> None:
+        google_url = "https://news.google.com/rss/articles/CBMiQ2h0dHBz..."
+        result = _resolve_google_news_url(google_url, "")
+        assert result == google_url
+
+    def test_parse_entry_resolves_google_url(self) -> None:
+        """_parse_entry should resolve Google News URLs in the parsed entry."""
+        raw_entry = {
+            "title": "Solo Leveling S3 Release Date",
+            "link": "https://news.google.com/rss/articles/CBMiQ2h0dHBz...",
+            "summary": '<a href="https://animenews.com/solo-leveling-s3" target="_blank">Title</a>',
+        }
+        entry = _parse_entry(raw_entry, "https://news.google.com/rss/search?q=test")
+        assert entry is not None
+        assert entry.url == "https://animenews.com/solo-leveling-s3"
 
 
 class TestFetchFeedsForTopic:
