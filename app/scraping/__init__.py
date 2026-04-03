@@ -84,14 +84,6 @@ async def fetch_new_articles_for_topic(
     if not entries:
         return FetchResult(articles=[], total_feed_entries=0)
 
-    # 1b. Resolve Google News redirect URLs to actual article URLs
-    google_urls = [e.url for e in entries if is_google_news_url(e.url)]
-    if google_urls:
-        resolved = await resolve_google_news_urls(google_urls, timeout=feed_fetch_timeout)
-        for entry in entries:
-            if entry.url in resolved:
-                entry.url = resolved[entry.url]
-
     # 2. Filter to entries not already in DB; split into reuse vs. fetch-needed
     new_entries: list[tuple[FeedEntry, str]] = []
     reuse_entries: list[tuple[FeedEntry, str, str]] = []  # (entry, hash, reused_content)
@@ -135,6 +127,15 @@ async def fetch_new_articles_for_topic(
 
     reuse_batch = [(e, h, c) for e, h, c in all_candidates if c is not None]
     fetch_batch = [(e, h) for e, h, c in all_candidates if c is None]
+
+    # 3b. Resolve Google News redirect URLs for entries that need content fetching.
+    # Done after dedup+limiting to minimize requests (typically ~10 URLs, not 100).
+    google_urls = [e.url for e, _ in fetch_batch if is_google_news_url(e.url)]
+    if google_urls:
+        resolved = await resolve_google_news_urls(google_urls, timeout=feed_fetch_timeout)
+        for entry, _ in fetch_batch:
+            if entry.url in resolved:
+                entry.url = resolved[entry.url]
 
     # 4. Extract content concurrently with semaphore (only for entries needing fetch)
     semaphore = asyncio.Semaphore(concurrency)

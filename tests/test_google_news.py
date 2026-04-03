@@ -251,26 +251,13 @@ class TestResolveGoogleNewsUrls:
             "https://example.com/article",
         ]
 
-        transport = _mock_transport(
-            {
-                "/articles/": (200, _google_article_html()),
-                "batchexecute": (200, _batchexecute_response(_REAL_ARTICLE_URL)),
-            }
-        )
-
-        with patch("app.scraping.google_news.httpx.AsyncClient") as mock_cls:
-            mock_cls.return_value.__aenter__ = lambda self: _make_async(httpx.AsyncClient(transport=transport))
-            # Use direct patching of the internal client creation
-            pass
-
-        # Simpler approach: patch at the resolve level
         async def mock_resolve(url, client):
             if is_google_news_url(url):
                 return _REAL_ARTICLE_URL
             return url
 
         with patch("app.scraping.google_news.resolve_google_news_url", side_effect=mock_resolve):
-            resolved = await resolve_google_news_urls(urls)
+            resolved = await resolve_google_news_urls(urls, request_delay=0)
 
         assert _GOOGLE_RSS_URL in resolved
         assert resolved[_GOOGLE_RSS_URL] == _REAL_ARTICLE_URL
@@ -291,9 +278,25 @@ class TestResolveGoogleNewsUrls:
             return url  # No resolution — returns same URL
 
         with patch("app.scraping.google_news.resolve_google_news_url", side_effect=mock_resolve):
-            resolved = await resolve_google_news_urls([_GOOGLE_RSS_URL])
+            resolved = await resolve_google_news_urls([_GOOGLE_RSS_URL], request_delay=0)
 
         assert resolved == {}
+
+    async def test_early_termination_on_first_failure(self) -> None:
+        """Stops resolving remaining URLs if the first one fails (likely rate limited)."""
+        call_count = 0
+
+        async def mock_resolve(url, client):
+            nonlocal call_count
+            call_count += 1
+            return url  # All fail
+
+        google_url2 = "https://news.google.com/rss/articles/CBMiSecondArticle?oc=5"
+        with patch("app.scraping.google_news.resolve_google_news_url", side_effect=mock_resolve):
+            resolved = await resolve_google_news_urls([_GOOGLE_RSS_URL, google_url2], request_delay=0)
+
+        assert resolved == {}
+        assert call_count == 1  # Only tried the first URL
 
 
 # ============================================================
