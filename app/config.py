@@ -232,9 +232,9 @@ def load_settings(config_path: Path | None = None) -> Settings:
         _yaml_file_override = None
 
 
-def save_settings_to_yaml(settings: "Settings", config_path: Path | None = None) -> None:
+def save_settings_to_yaml(settings: "Settings", config_path: Path) -> None:
     """Write current settings back to the YAML config file."""
-    effective_path = config_path or DEFAULT_CONFIG_PATH
+    effective_path = config_path
 
     data: dict = {
         "llm": {
