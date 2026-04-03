@@ -73,11 +73,14 @@ _GOOGLE_NEWS_HREF_RE = re.compile(r'<a[^>]+href=["\']([^"\']+)["\']', re.IGNOREC
 
 
 def _resolve_google_news_url(link: str, description: str) -> str:
-    """Extract the real article URL from a Google News RSS entry.
+    """Extract the real article URL from a Google News RSS entry (fast path).
 
     Google News RSS entries use redirect URLs (news.google.com/rss/articles/...)
-    as their <link>. The actual article URL is embedded as an <a href="...">
-    in the entry's <description> HTML. Falls back to the original link.
+    as their <link>. Some entries embed the actual article URL as an <a href>
+    in the description HTML. This is a zero-cost regex check that avoids HTTP
+    requests. When it fails (e.g. Google embeds the same redirect URL in the
+    description), the async resolver in google_news.py handles it later in
+    the pipeline.
     """
     if "news.google.com/" not in link:
         return link
