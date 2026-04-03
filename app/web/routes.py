@@ -21,7 +21,6 @@ from app.analysis.llm import NoveltyResult
 from app.checker import check_all_topics, check_topic
 from app.config import (
     CLOUD_PROVIDERS,
-    DEFAULT_CONFIG_PATH,
     LOCAL_PROVIDER_DEFAULTS,
     Settings,
     is_cloud_provider,
@@ -981,7 +980,7 @@ async def complete_setup(
             ),
             notifications=NotificationSettings(),
         )
-        save_settings_to_yaml(new_settings)
+        save_settings_to_yaml(new_settings, request.app.state.config_path)
         request.app.state.settings = new_settings
         request.app.state.setup_required = False
         start_scheduler(new_settings, db_path=request.app.state.db_path)
@@ -1009,13 +1008,13 @@ async def complete_setup(
 @router.get("/settings", response_class=HTMLResponse)
 async def settings_view(request: Request):
     """Display of current configuration as an editable form."""
-    settings = load_settings()
+    settings = load_settings(config_path=request.app.state.config_path)
     return templates.TemplateResponse(
         request,
         "settings.html",
         {
             "settings": settings,
-            "config_path": str(DEFAULT_CONFIG_PATH),
+            "config_path": str(request.app.state.config_path),
             "cloud_providers": sorted(CLOUD_PROVIDERS),
             "local_provider_defaults": LOCAL_PROVIDER_DEFAULTS,
         },
@@ -1105,7 +1104,7 @@ async def update_settings(
             llm_max_retries=request.app.state.settings.llm_max_retries,
             llm_temperature=request.app.state.settings.llm_temperature,
         )
-        save_settings_to_yaml(new_settings)
+        save_settings_to_yaml(new_settings, request.app.state.config_path)
         request.app.state.settings = new_settings
     except ValidationError as exc:
         errors = [f"{' → '.join(str(loc) for loc in e['loc'])}: {e['msg']}" for e in exc.errors()]
@@ -1114,7 +1113,7 @@ async def update_settings(
             "settings.html",
             {
                 "settings": request.app.state.settings,
-                "config_path": str(DEFAULT_CONFIG_PATH),
+                "config_path": str(request.app.state.config_path),
                 "errors": errors,
                 "form": form_values,
                 "cloud_providers": sorted(CLOUD_PROVIDERS),
@@ -1129,7 +1128,7 @@ async def update_settings(
             "settings.html",
             {
                 "settings": request.app.state.settings,
-                "config_path": str(DEFAULT_CONFIG_PATH),
+                "config_path": str(request.app.state.config_path),
                 "errors": [f"Failed to save settings: {exc}"],
                 "form": form_values,
                 "cloud_providers": sorted(CLOUD_PROVIDERS),
