@@ -17,7 +17,7 @@ from app.analysis.prompts import (
     build_knowledge_update_messages,
     build_novelty_messages,
 )
-from app.config import Settings
+from app.config import Settings, is_cloud_provider
 from app.models import Article, Topic
 
 logger = logging.getLogger(__name__)
@@ -49,6 +49,13 @@ class KnowledgeStateUpdate(BaseModel):
 def _get_client(settings: Settings) -> instructor.AsyncInstructor:
     """Create an async instructor-patched litellm client."""
     return cast(instructor.AsyncInstructor, instructor.from_litellm(litellm.acompletion))
+
+
+def _effective_base_url(settings: Settings) -> str | None:
+    """Return base_url only for non-cloud providers (safety net for misconfigured configs)."""
+    if settings.llm.base_url and not is_cloud_provider(settings.llm.model):
+        return settings.llm.base_url
+    return None
 
 
 def count_tokens(text: str, model: str) -> int:
@@ -120,7 +127,7 @@ async def analyze_articles(
             messages=messages,  # type: ignore[arg-type]
             max_retries=settings.llm_max_retries,
             api_key=settings.llm.api_key,
-            api_base=settings.llm.base_url,
+            api_base=_effective_base_url(settings),
             timeout=settings.llm_analysis_timeout,
         )
 
@@ -151,7 +158,7 @@ async def generate_initial_knowledge(
             messages=messages,  # type: ignore[arg-type]
             max_retries=settings.llm_max_retries,
             api_key=settings.llm.api_key,
-            api_base=settings.llm.base_url,
+            api_base=_effective_base_url(settings),
             timeout=settings.llm_knowledge_timeout,
         )
 
@@ -186,7 +193,7 @@ async def generate_knowledge_update(
             messages=messages,  # type: ignore[arg-type]
             max_retries=settings.llm_max_retries,
             api_key=settings.llm.api_key,
-            api_base=settings.llm.base_url,
+            api_base=_effective_base_url(settings),
             timeout=settings.llm_knowledge_timeout,
         )
 

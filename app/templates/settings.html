@@ -49,12 +49,15 @@
         </div>
     </label>
 
-    <label for="llm_base_url">
-        Base URL <small>(optional)</small>
-        <input type="text" id="llm_base_url" name="llm_base_url"
-               value="{{ form.llm_base_url if form else (settings.llm.base_url or '') }}"
-               placeholder="Leave empty unless using a self-hosted LLM">
-    </label>
+    <div id="base-url-group">
+        <label for="llm_base_url">
+            Base URL <small>(optional)</small>
+            <input type="text" id="llm_base_url" name="llm_base_url"
+                   value="{{ form.llm_base_url if form else (settings.llm.base_url or '') }}"
+                   placeholder="e.g., http://localhost:11434 for Ollama">
+            <small id="base-url-hint">Required for self-hosted providers like Ollama. Cloud providers (OpenAI, Anthropic, etc.) don't need this.</small>
+        </label>
+    </div>
 
     <h2>Notifications</h2>
 
@@ -269,5 +272,44 @@ document.body.addEventListener("htmx:afterSwap", function(event) {
         }
     }
 });
+
+// Provider-aware base_url visibility
+(function() {
+    var CLOUD = {{ cloud_providers | tojson }};
+    var LOCAL_DEFAULTS = {{ local_provider_defaults | tojson }};
+    var modelInput = document.getElementById("llm_model");
+    var group = document.getElementById("base-url-group");
+    var urlInput = document.getElementById("llm_base_url");
+    var hint = document.getElementById("base-url-hint");
+
+    function getProvider(s) {
+        var i = s.indexOf("/");
+        return i > 0 ? s.substring(0, i).toLowerCase().trim() : "";
+    }
+
+    function update() {
+        var p = getProvider(modelInput.value);
+        if (!p) {
+            group.style.display = "";
+            hint.textContent = "Required for self-hosted providers like Ollama. Cloud providers don't need this.";
+            return;
+        }
+        if (CLOUD.indexOf(p) !== -1) {
+            group.style.display = "none";
+            urlInput.value = "";
+            return;
+        }
+        group.style.display = "";
+        if (LOCAL_DEFAULTS[p] && !urlInput.value) {
+            urlInput.value = LOCAL_DEFAULTS[p];
+        }
+        hint.textContent = LOCAL_DEFAULTS[p]
+            ? "Make sure your " + p + " server is running at this address."
+            : "Enter the base URL for your self-hosted provider.";
+    }
+
+    modelInput.addEventListener("input", update);
+    update();
+})();
 </script>
 {% endblock %}
