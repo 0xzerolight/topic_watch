@@ -14,6 +14,7 @@ from pathlib import Path
 from fastapi import APIRouter, BackgroundTasks, Depends, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
+from markupsafe import Markup, escape
 
 from app import __version__
 from app.analysis.llm import NoveltyResult
@@ -77,15 +78,13 @@ def _timeago(dt: datetime) -> str:
 templates.env.filters["timeago"] = _timeago
 
 
-def _sanitize_error(error_message: str | None) -> str:
+def _sanitize_error(error_message: str | None) -> Markup:
     """Format error messages for display, collapsing long tracebacks."""
-    from markupsafe import Markup, escape
-
     if not error_message:
-        return str(Markup("<p>An unknown error occurred.</p>"))
+        return Markup("<p>An unknown error occurred.</p>")
 
     if len(error_message) < 200:
-        return str(Markup(f"<p>{escape(error_message)}</p>"))
+        return Markup(f"<p>{escape(error_message)}</p>")
 
     # Extract last non-empty line as the summary (usually the actual error)
     lines = error_message.strip().splitlines()
@@ -101,12 +100,10 @@ def _sanitize_error(error_message: str | None) -> str:
     escaped_summary = escape(summary)
     escaped_full = escape(error_message)
 
-    return str(
-        Markup(
-            f"<p>{escaped_summary}</p>"
-            f"<details><summary><small>Show full error</small></summary>"
-            f"<pre><code>{escaped_full}</code></pre></details>"
-        )
+    return Markup(
+        f"<p>{escaped_summary}</p>"
+        f"<details><summary><small>Show full error</small></summary>"
+        f"<pre><code>{escaped_full}</code></pre></details>"
     )
 
 
