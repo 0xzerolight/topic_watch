@@ -9,8 +9,11 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import HTTPException
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 
 from app.config import load_settings, resolve_db_path
 from app.crud import recover_stuck_topics
@@ -53,3 +56,17 @@ app.add_middleware(CSRFMiddleware)
 app.add_middleware(SetupRedirectMiddleware)
 app.include_router(router)
 app.mount("/static", StaticFiles(directory=str(Path(__file__).resolve().parent / "static")), name="static")
+
+_error_templates = Jinja2Templates(directory=str(Path(__file__).resolve().parent / "templates"))
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException) -> HTMLResponse:
+    """Render HTTP errors using the app's error template instead of raw JSON."""
+    from app import __version__
+
+    return _error_templates.TemplateResponse(
+        "error.html",
+        {"request": request, "status_code": exc.status_code, "detail": exc.detail, "version": __version__},
+        status_code=exc.status_code,
+    )
