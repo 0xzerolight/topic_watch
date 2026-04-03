@@ -39,3 +39,4 @@ htmlcov/
 
 # extra
 PROMOTION.md
+.gstack/

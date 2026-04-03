@@ -270,6 +270,32 @@ class TestCountTokens:
         assert count == 100  # len(400) // 4
 
 
+class TestEffectiveBaseUrl:
+    """Tests for _effective_base_url safety net."""
+
+    def test_cloud_provider_ignores_base_url(self) -> None:
+        from app.analysis.llm import _effective_base_url
+
+        settings = _make_settings(
+            llm=LLMSettings(model="anthropic/claude-haiku-4-5", api_key="k", base_url="http://localhost:11434")
+        )
+        assert _effective_base_url(settings) is None
+
+    def test_local_provider_preserves_base_url(self) -> None:
+        from app.analysis.llm import _effective_base_url
+
+        settings = _make_settings(
+            llm=LLMSettings(model="ollama/llama3", api_key="k", base_url="http://localhost:11434")
+        )
+        assert _effective_base_url(settings) == "http://localhost:11434"
+
+    def test_no_base_url_returns_none(self) -> None:
+        from app.analysis.llm import _effective_base_url
+
+        settings = _make_settings(llm=LLMSettings(model="openai/gpt-4", api_key="k"))
+        assert _effective_base_url(settings) is None
+
+
 # ============================================================
 # TestAnalyzeArticles (async, mocked LLM)
 # ============================================================

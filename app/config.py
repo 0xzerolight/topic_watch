@@ -28,6 +28,38 @@ DEFAULT_CONFIG_PATH = DATA_DIR / "config.yml"
 # Module-level override for testability
 _yaml_file_override: str | None = None
 
+# Providers that use their own cloud endpoints — base_url should never be set for these.
+CLOUD_PROVIDERS: frozenset[str] = frozenset(
+    {
+        "openai",
+        "anthropic",
+        "gemini",
+        "azure",
+        "cohere",
+        "replicate",
+        "huggingface",
+        "together_ai",
+    }
+)
+
+# Default base URLs for self-hosted providers (used as form auto-fill hints).
+LOCAL_PROVIDER_DEFAULTS: dict[str, str] = {
+    "ollama": "http://localhost:11434",
+}
+
+
+def extract_provider(model_str: str) -> str | None:
+    """Extract the provider prefix from a LiteLLM model string (e.g. 'openai/gpt-4' → 'openai')."""
+    if "/" in model_str:
+        return model_str.split("/", 1)[0].lower().strip()
+    return None
+
+
+def is_cloud_provider(model_str: str) -> bool:
+    """Return True if the model string's provider prefix is a known cloud provider."""
+    provider = extract_provider(model_str)
+    return provider in CLOUD_PROVIDERS if provider else False
+
 
 class LLMSettings(BaseModel):
     """LLM provider configuration."""
@@ -105,21 +137,11 @@ class Settings(BaseSettings):
         model_str = self.llm.model
         if not model_str:
             return self
-        known_providers = [
-            "openai",
-            "anthropic",
-            "ollama",
-            "gemini",
-            "azure",
-            "cohere",
-            "replicate",
-            "huggingface",
-            "together_ai",
-        ]
+        known_providers = CLOUD_PROVIDERS | frozenset(LOCAL_PROVIDER_DEFAULTS)
         if "/" in model_str:
             provider = model_str.split("/")[0]
             if provider not in known_providers:
-                close = [p for p in known_providers if _is_close(provider, p)]
+                close = [p for p in sorted(known_providers) if _is_close(provider, p)]
                 if close:
                     logger.warning(
                         "Unknown LLM provider '%s'. Did you mean '%s'? Model string: '%s'",
@@ -228,7 +250,7 @@ def save_settings_to_yaml(settings: "Settings", config_path: Path | None = None)
         "llm_max_retries": settings.llm_max_retries,
     }
 
-    if settings.llm.base_url:
+    if settings.llm.base_url and not is_cloud_provider(settings.llm.model):
         data["llm"]["base_url"] = settings.llm.base_url
 
     if settings.notifications.urls:
