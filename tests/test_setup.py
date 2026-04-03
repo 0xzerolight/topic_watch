@@ -144,6 +144,29 @@ class TestSetupWizard:
         assert response.status_code == 303
         assert app.state.settings.llm.base_url == "http://localhost:11434"
 
+    def test_post_setup_cloud_provider_strips_base_url(self, unconfigured_app: TestClient) -> None:
+        """POST /setup with a cloud provider model and stale base_url strips base_url."""
+        get_response = unconfigured_app.get("/setup")
+        csrf_token = get_response.cookies.get("csrf_token")
+
+        with (
+            patch("app.config.save_settings_to_yaml"),
+            patch("app.scheduler.start_scheduler"),
+        ):
+            response = unconfigured_app.post(
+                "/setup",
+                data={
+                    "llm_model": "anthropic/claude-haiku-4-5",
+                    "llm_api_key": "sk-ant-test",
+                    "llm_base_url": "http://localhost:11434",
+                    "csrf_token": csrf_token,
+                },
+                follow_redirects=False,
+            )
+
+        assert response.status_code == 303
+        assert app.state.settings.llm.base_url is None
+
     def test_post_setup_nav_hidden(self, unconfigured_app: TestClient) -> None:
         response = unconfigured_app.get("/setup")
         assert response.status_code == 200

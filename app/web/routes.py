@@ -19,7 +19,15 @@ from markupsafe import Markup, escape
 from app import __version__
 from app.analysis.llm import NoveltyResult
 from app.checker import check_all_topics, check_topic
-from app.config import DEFAULT_CONFIG_PATH, Settings, load_settings, save_settings_to_yaml
+from app.config import (
+    CLOUD_PROVIDERS,
+    DEFAULT_CONFIG_PATH,
+    LOCAL_PROVIDER_DEFAULTS,
+    Settings,
+    is_cloud_provider,
+    load_settings,
+    save_settings_to_yaml,
+)
 from app.crud import (
     count_articles_for_topic,
     count_check_results,
@@ -932,10 +940,11 @@ async def setup_view(request: Request):
     """Display the first-run setup wizard, or redirect to dashboard if already configured."""
     if not getattr(request.app.state, "setup_required", False):
         return RedirectResponse(url="/", status_code=303)
+    _provider_ctx = {"cloud_providers": sorted(CLOUD_PROVIDERS), "local_provider_defaults": LOCAL_PROVIDER_DEFAULTS}
     return templates.TemplateResponse(
         request,
         "setup.html",
-        {"setup_mode": True},
+        {"setup_mode": True, **_provider_ctx},
     )
 
 
@@ -952,17 +961,23 @@ async def complete_setup(
     from app.config import LLMSettings, NotificationSettings
     from app.scheduler import start_scheduler
 
+    # Strip base_url for cloud providers (e.g. stale Ollama URL when switching to Anthropic)
+    effective_base_url = llm_base_url.strip() or None
+    if effective_base_url and is_cloud_provider(llm_model):
+        effective_base_url = None
+
     form_values = {
         "llm_model": llm_model,
         "llm_api_key": llm_api_key,
         "llm_base_url": llm_base_url,
     }
+    _provider_ctx = {"cloud_providers": sorted(CLOUD_PROVIDERS), "local_provider_defaults": LOCAL_PROVIDER_DEFAULTS}
     try:
         new_settings = Settings(  # type: ignore[call-arg]
             llm=LLMSettings(
                 model=llm_model,
                 api_key=llm_api_key,
-                base_url=llm_base_url or None,
+                base_url=effective_base_url,
             ),
             notifications=NotificationSettings(),
         )
@@ -975,7 +990,7 @@ async def complete_setup(
         return templates.TemplateResponse(
             request,
             "setup.html",
-            {"setup_mode": True, "errors": errors, "form": form_values},
+            {"setup_mode": True, "errors": errors, "form": form_values, **_provider_ctx},
             status_code=422,
         )
     except Exception as exc:
@@ -983,7 +998,7 @@ async def complete_setup(
         return templates.TemplateResponse(
             request,
             "setup.html",
-            {"setup_mode": True, "errors": [f"Setup failed: {exc}"], "form": form_values},
+            {"setup_mode": True, "errors": [f"Setup failed: {exc}"], "form": form_values, **_provider_ctx},
             status_code=422,
         )
 
@@ -1001,6 +1016,8 @@ async def settings_view(request: Request):
         {
             "settings": settings,
             "config_path": str(DEFAULT_CONFIG_PATH),
+            "cloud_providers": sorted(CLOUD_PROVIDERS),
+            "local_provider_defaults": LOCAL_PROVIDER_DEFAULTS,
         },
     )
 
@@ -1034,6 +1051,11 @@ async def update_settings(
     # If API key field is empty, retain existing key
     effective_api_key = llm_api_key.strip() or request.app.state.settings.llm.api_key
 
+    # Strip base_url for cloud providers (e.g. stale Ollama URL when switching to Anthropic)
+    effective_base_url = llm_base_url.strip() or None
+    if effective_base_url and is_cloud_provider(llm_model):
+        effective_base_url = None
+
     # Build a new Settings object to validate via Pydantic, then save
     form_values = {
         "llm_model": llm_model,
@@ -1056,7 +1078,7 @@ async def update_settings(
             llm=LLMSettings(
                 model=llm_model,
                 api_key=effective_api_key,
-                base_url=llm_base_url or None,
+                base_url=effective_base_url,
             ),
             notifications=NotificationSettings(
                 urls=parsed_notification_urls,
@@ -1091,6 +1113,8 @@ async def update_settings(
                 "config_path": str(DEFAULT_CONFIG_PATH),
                 "errors": errors,
                 "form": form_values,
+                "cloud_providers": sorted(CLOUD_PROVIDERS),
+                "local_provider_defaults": LOCAL_PROVIDER_DEFAULTS,
             },
             status_code=422,
         )
@@ -1104,6 +1128,8 @@ async def update_settings(
                 "config_path": str(DEFAULT_CONFIG_PATH),
                 "errors": [f"Failed to save settings: {exc}"],
                 "form": form_values,
+                "cloud_providers": sorted(CLOUD_PROVIDERS),
+                "local_provider_defaults": LOCAL_PROVIDER_DEFAULTS,
             },
             status_code=422,
         )

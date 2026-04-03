@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from app.config import Settings, load_settings
+from app.config import Settings, extract_provider, is_cloud_provider, load_settings
 
 
 class TestConfigLoading:
@@ -127,3 +127,71 @@ class TestEnvVarOverrides:
         monkeypatch.setenv("TOPIC_WATCH_CHECK_INTERVAL_HOURS", "12")
         settings = load_settings(config_path=sample_config_yaml)
         assert settings.check_interval_hours == 12
+
+
+class TestProviderDetection:
+    """Tests for extract_provider and is_cloud_provider helpers."""
+
+    def test_extract_provider_with_slash(self) -> None:
+        assert extract_provider("openai/gpt-4") == "openai"
+
+    def test_extract_provider_ollama(self) -> None:
+        assert extract_provider("ollama/llama3") == "ollama"
+
+    def test_extract_provider_no_slash(self) -> None:
+        assert extract_provider("gpt-4") is None
+
+    def test_extract_provider_empty(self) -> None:
+        assert extract_provider("") is None
+
+    def test_extract_provider_case_insensitive(self) -> None:
+        assert extract_provider("Anthropic/claude-3") == "anthropic"
+
+    def test_is_cloud_provider_openai(self) -> None:
+        assert is_cloud_provider("openai/gpt-4o-mini") is True
+
+    def test_is_cloud_provider_anthropic(self) -> None:
+        assert is_cloud_provider("anthropic/claude-haiku-4-5") is True
+
+    def test_is_cloud_provider_ollama(self) -> None:
+        assert is_cloud_provider("ollama/llama3") is False
+
+    def test_is_cloud_provider_unknown(self) -> None:
+        assert is_cloud_provider("groq/mixtral") is False
+
+    def test_is_cloud_provider_no_slash(self) -> None:
+        assert is_cloud_provider("gpt-4") is False
+
+
+class TestSaveSettingsBaseUrlGuard:
+    """Test that save_settings_to_yaml strips base_url for cloud providers."""
+
+    def test_cloud_provider_base_url_omitted(self, tmp_path: Path) -> None:
+        """base_url is NOT written to YAML when model is a cloud provider."""
+        import yaml
+
+        from app.config import LLMSettings, save_settings_to_yaml
+
+        settings = Settings(
+            llm=LLMSettings(model="anthropic/claude-haiku-4-5", api_key="sk-test", base_url="http://localhost:11434"),
+        )  # type: ignore[call-arg]
+        config_file = tmp_path / "config.yml"
+        save_settings_to_yaml(settings, config_file)
+
+        data = yaml.safe_load(config_file.read_text())
+        assert "base_url" not in data.get("llm", {})
+
+    def test_local_provider_base_url_preserved(self, tmp_path: Path) -> None:
+        """base_url IS written to YAML when model is a local provider."""
+        import yaml
+
+        from app.config import LLMSettings, save_settings_to_yaml
+
+        settings = Settings(
+            llm=LLMSettings(model="ollama/llama3", api_key="dummy", base_url="http://localhost:11434"),
+        )  # type: ignore[call-arg]
+        config_file = tmp_path / "config.yml"
+        save_settings_to_yaml(settings, config_file)
+
+        data = yaml.safe_load(config_file.read_text())
+        assert data["llm"]["base_url"] == "http://localhost:11434"

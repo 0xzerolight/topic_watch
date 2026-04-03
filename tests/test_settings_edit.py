@@ -93,13 +93,13 @@ class TestSaveSettingsToYaml:
         assert "base_url" not in data.get("llm", {})
 
     async def test_includes_base_url_when_set(self, tmp_path: Path) -> None:
-        """base_url should appear in YAML when it is set."""
+        """base_url should appear in YAML when it is set for a local provider."""
         from app.config import save_settings_to_yaml
 
         settings = _make_settings(
             llm=LLMSettings(
-                model="openai/gpt-4o-mini",
-                api_key="test-key-12345678",
+                model="ollama/llama3",
+                api_key="dummy",
                 base_url="http://localhost:11434",
             )
         )
@@ -385,3 +385,16 @@ class TestSettingsPost:
                 assert 'value="24"' in response.text
         finally:
             app.dependency_overrides.clear()
+
+    async def test_cloud_provider_base_url_stripped(self, client: httpx.AsyncClient) -> None:
+        """POST /settings with a cloud provider model strips any stale base_url."""
+        with patch("app.web.routes.save_settings_to_yaml"):
+            await client.post(
+                "/settings",
+                data=self._valid_form_data(
+                    llm_model="anthropic/claude-haiku-4-5",
+                    llm_base_url="http://localhost:11434",
+                ),
+                follow_redirects=False,
+            )
+        assert app.state.settings.llm.base_url is None
