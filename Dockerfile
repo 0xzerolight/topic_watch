@@ -32,9 +32,11 @@ COPY --from=builder /opt/venv /opt/venv
 COPY app/ ./app/
 COPY config.example.yml ./
 
-# Create non-root user with write access to data volume
-RUN groupadd --system appgroup && \
-    useradd --system --gid appgroup --create-home appuser && \
+# Create non-root user with write access to data volume.
+# UID/GID 1000 matches the default host user on most Linux distros,
+# so bind-mounted files in ./data are writable without permission issues.
+RUN groupadd --gid 1000 appgroup && \
+    useradd --uid 1000 --gid appgroup --create-home appuser && \
     mkdir -p /app/data && \
     chown -R appuser:appgroup /app/data
 
