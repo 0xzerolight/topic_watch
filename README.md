@@ -98,7 +98,7 @@ Settings live in `data/config.yml`. First run auto-copies `config.example.yml`. 
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `llm.model` | string | - | LiteLLM model string (e.g. `openai/gpt-4o-mini`) |
+| `llm.model` | string | - | LiteLLM model string (e.g. `openai/gpt-5.4-nano`) |
 | `llm.api_key` | string | - | API key for your LLM provider |
 | `llm.base_url` | string | - | Base URL for self-hosted providers (Ollama, etc.) |
 | `notifications.urls` | list | `[]` | [Apprise](https://github.com/caronc/apprise/wiki) notification URLs |
@@ -133,7 +133,7 @@ All settings can be overridden with `TOPIC_WATCH_` prefix. Double underscores fo
 
 ```bash
 TOPIC_WATCH_LLM__API_KEY=sk-abc123
-TOPIC_WATCH_LLM__MODEL=openai/gpt-4o-mini
+TOPIC_WATCH_LLM__MODEL=openai/gpt-5.4-nano
 TOPIC_WATCH_CHECK_INTERVAL_HOURS=4
 TOPIC_WATCH_NOTIFICATIONS__WEBHOOK_URLS='["https://example.com/hook"]'
 ```
@@ -165,19 +165,21 @@ Uses [LiteLLM](https://docs.litellm.ai/docs/providers). Anything LiteLLM support
 
 | Provider | Model String | Notes |
 |----------|-------------|-------|
-| OpenAI | `openai/gpt-4o-mini` | Good cost/quality balance |
-| Anthropic | `anthropic/claude-3-5-haiku-latest` | |
-| Ollama | `ollama/llama3` | Free, local. Set `llm.base_url` |
-| Google Gemini | `gemini/gemini-2.0-flash` | |
+| OpenAI | `openai/gpt-5.4-nano` | Cheapest OpenAI option |
+| Anthropic | `anthropic/claude-haiku-4-5` | Fast, good quality |
+| Ollama | `ollama/llama3.3` | Free, local. Set `llm.base_url` |
+| Google Gemini | `gemini/gemini-2.5-flash` | |
+| Groq | `groq/llama-3.3-70b-versatile` | Very fast inference |
+| DeepSeek | `deepseek/deepseek-chat` | Very cheap |
 | Azure OpenAI | `azure/your-deployment` | |
-| Cohere | `cohere/command-r` | |
-| Together AI | `together_ai/meta-llama/Llama-3-8b-chat-hf` | |
+| Cohere | `cohere_chat/command-a-03-2025` | |
+| Together AI | `together_ai/meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8` | |
 
 ### Ollama
 
 ```yaml
 llm:
-  model: "ollama/llama3"
+  model: "ollama/llama3.3"
   api_key: "unused"
   base_url: "http://host.docker.internal:11434"  # or http://localhost:11434 outside Docker
 ```
@@ -300,7 +302,7 @@ See [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
 **Config file not found** - Run `mkdir -p data && cp config.example.yml data/config.yml`.
 
-**LLM errors / checks failing** - Check your API key, make sure the model string has the provider prefix (`openai/gpt-4o-mini`, not `gpt-4o-mini`), check logs with `docker compose logs -f`.
+**LLM errors / checks failing** - Check your API key, make sure the model string has the provider prefix (`openai/gpt-5.4-nano`, not `gpt-5.4-nano`), check logs with `docker compose logs -f`.
 
 **No notifications** - Check `notifications.urls` in config. Use the Test Notification button on the Settings page. Verify the [Apprise URL format](https://github.com/caronc/apprise/wiki).
 
@@ -314,7 +316,7 @@ See [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
 ## FAQ
 
-**Cost?** ~1,700 tokens per check. GPT-4o-mini: ~$0.0003-0.001/check. 5 topics, 4x/day = ~$0.42/month. Ollama: free.
+**Cost?** ~1,700 tokens per check. GPT-5.4 Nano: ~$0.0003/check. 5 topics, 4x/day = under $0.20/month. Ollama: free.
 
 **Why not Google Alerts?** Google Alerts sends every mention. Topic Watch only notifies when something is *actually* new.
 

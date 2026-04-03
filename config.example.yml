@@ -6,8 +6,8 @@
 # LLM provider settings (required)
 llm:
   # Model string in LiteLLM format: provider/model-name
-  # Examples: openai/gpt-4o-mini, anthropic/claude-3-5-haiku-latest, ollama/llama3
-  model: "openai/gpt-4o-mini"
+  # Examples: openai/gpt-5.4-nano, anthropic/claude-haiku-4-5, ollama/llama3.3
+  model: "openai/gpt-5.4-nano"
 
   # API key for your LLM provider
   api_key: "your-api-key-here"

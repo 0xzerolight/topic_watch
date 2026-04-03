@@ -26,5 +26,5 @@ services:
       - TZ=UTC
       # Override config via environment variables instead of mounting config.yml:
       # TOPIC_WATCH_LLM__API_KEY: "your-api-key-here"
-      # TOPIC_WATCH_LLM__MODEL: "openai/gpt-4o-mini"
+      # TOPIC_WATCH_LLM__MODEL: "openai/gpt-5.4-nano"
       # TOPIC_WATCH_CHECK_INTERVAL_HOURS: "6"
