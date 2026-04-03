@@ -46,7 +46,7 @@ from app.crud import (
 )
 from app.models import FeedMode, Topic, TopicStatus
 from app.notifications import format_notification, send_notification
-from app.scraping.rss import build_google_news_url
+from app.scraping.routing import router as provider_router
 from app.url_validation import validate_feed_urls
 from app.web.csrf import verify_csrf
 from app.web.dependencies import get_db_conn, get_settings
@@ -493,7 +493,7 @@ async def topic_detail(
 
     auto_feed_url = None
     if topic.feed_mode == FeedMode.AUTO:
-        auto_feed_url = build_google_news_url(topic)
+        auto_feed_url = provider_router.get_provider().build_feed_url(topic)
 
     per_page = settings.web_page_size
     offset = (max(1, page) - 1) * per_page
@@ -506,10 +506,13 @@ async def topic_detail(
     total_pages = max(1, (total_checks + per_page - 1) // per_page)
 
     feed_health_map = {}
-    if topic.feed_mode == FeedMode.AUTO and auto_feed_url:
-        health = get_feed_health(conn, auto_feed_url)
-        if health:
-            feed_health_map[auto_feed_url] = health
+    if topic.feed_mode == FeedMode.AUTO:
+        # Show health for all provider URLs, not just the active one
+        for provider in provider_router.providers:
+            url = provider.build_feed_url(topic)
+            health = get_feed_health(conn, url)
+            if health:
+                feed_health_map[url] = health
     else:
         for url in topic.feed_urls:
             health = get_feed_health(conn, url)

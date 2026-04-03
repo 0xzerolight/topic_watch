@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, patch
 from app.crud import create_article, create_topic, find_article_by_hash
 from app.models import Article, FeedMode, Topic
 from app.scraping import fetch_new_articles_for_topic
-from app.scraping.rss import FeedEntry, compute_article_hash
+from app.scraping.rss import FeedEntry, FeedResponse, compute_article_hash
 
 # ============================================================
 # Helpers
@@ -189,7 +189,7 @@ class TestFetchNewArticlesCrossTopicDedup:
         extract_mock = AsyncMock(return_value="Freshly fetched content")
 
         with (
-            patch("app.scraping.fetch_feeds_for_topic", return_value=[entry]),
+            patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=[entry])),
             patch("app.scraping.extract_article_content", extract_mock),
         ):
             stored = (await fetch_new_articles_for_topic(topic_b, db_conn)).articles
@@ -211,7 +211,7 @@ class TestFetchNewArticlesCrossTopicDedup:
         extract_mock = AsyncMock(return_value="Freshly fetched content")
 
         with (
-            patch("app.scraping.fetch_feeds_for_topic", return_value=[entry]),
+            patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=[entry])),
             patch("app.scraping.extract_article_content", extract_mock),
         ):
             stored = (await fetch_new_articles_for_topic(topic, db_conn)).articles
@@ -245,7 +245,7 @@ class TestFetchNewArticlesCrossTopicDedup:
         extract_mock = AsyncMock(return_value="Freshly fetched content")
 
         with (
-            patch("app.scraping.fetch_feeds_for_topic", return_value=[entry]),
+            patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=[entry])),
             patch("app.scraping.extract_article_content", extract_mock),
         ):
             stored = (await fetch_new_articles_for_topic(topic_b, db_conn)).articles
@@ -269,7 +269,7 @@ class TestFetchNewArticlesCrossTopicDedup:
         extract_mock = AsyncMock(return_value="Fresh content")
 
         with (
-            patch("app.scraping.fetch_feeds_for_topic", return_value=[entry]),
+            patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=[entry])),
             patch("app.scraping.extract_article_content", extract_mock),
         ):
             stored = (await fetch_new_articles_for_topic(topic, db_conn)).articles
@@ -304,7 +304,7 @@ class TestFetchNewArticlesCrossTopicDedup:
         extract_mock = AsyncMock(return_value="Fresh content")
 
         with (
-            patch("app.scraping.fetch_feeds_for_topic", return_value=[entry]),
+            patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=[entry])),
             patch("app.scraping.extract_article_content", extract_mock),
         ):
             stored = (await fetch_new_articles_for_topic(topic_b, db_conn)).articles
@@ -346,7 +346,7 @@ class TestFetchNewArticlesCrossTopicDedup:
         extract_mock = AsyncMock(return_value="Freshly fetched new content")
 
         with (
-            patch("app.scraping.fetch_feeds_for_topic", return_value=entries),
+            patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=entries)),
             patch("app.scraping.extract_article_content", extract_mock),
         ):
             stored = (await fetch_new_articles_for_topic(topic_b, db_conn)).articles
