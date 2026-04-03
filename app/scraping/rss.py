@@ -7,6 +7,7 @@ to FeedEntry models ready for dedup and storage.
 import asyncio
 import hashlib
 import logging
+import re
 from calendar import timegm
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -68,6 +69,26 @@ def _parse_feed_date(entry: dict) -> datetime | None:
     return None
 
 
+_GOOGLE_NEWS_HREF_RE = re.compile(r'<a[^>]+href=["\']([^"\']+)["\']', re.IGNORECASE)
+
+
+def _resolve_google_news_url(link: str, description: str) -> str:
+    """Extract the real article URL from a Google News RSS entry.
+
+    Google News RSS entries use redirect URLs (news.google.com/rss/articles/...)
+    as their <link>. The actual article URL is embedded as an <a href="...">
+    in the entry's <description> HTML. Falls back to the original link.
+    """
+    if "news.google.com/" not in link:
+        return link
+    match = _GOOGLE_NEWS_HREF_RE.search(description)
+    if match:
+        real_url = match.group(1)
+        if real_url and not real_url.startswith("https://news.google.com/"):
+            return real_url
+    return link
+
+
 def _parse_entry(raw_entry: dict, source_feed: str) -> FeedEntry | None:
     """Convert a feedparser entry dict to a FeedEntry, or None if invalid."""
     title = raw_entry.get("title", "").strip()
@@ -81,6 +102,9 @@ def _parse_entry(raw_entry: dict, source_feed: str) -> FeedEntry | None:
         content_list = raw_entry.get("content", [])
         if content_list and isinstance(content_list, list):
             summary = content_list[0].get("value", "")
+
+    # Google News RSS uses redirect URLs — resolve to actual article URLs
+    url = _resolve_google_news_url(url, summary)
 
     return FeedEntry(
         title=title,
