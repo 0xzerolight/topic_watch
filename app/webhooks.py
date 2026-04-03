@@ -22,6 +22,7 @@ def _build_webhook_payload(topic_name: str, novelty_result: NoveltyResult) -> di
     """Build the JSON payload for a webhook POST."""
     return {
         "topic": topic_name,
+        "reasoning": novelty_result.reasoning,
         "summary": novelty_result.summary or "",
         "key_facts": novelty_result.key_facts,
         "source_urls": novelty_result.source_urls,

@@ -496,7 +496,7 @@ async def topic_detail(
 
     auto_feed_url = None
     if topic.feed_mode == FeedMode.AUTO:
-        auto_feed_url = build_google_news_url(topic.name)
+        auto_feed_url = build_google_news_url(topic)
 
     per_page = settings.web_page_size
     offset = (max(1, page) - 1) * per_page
@@ -1039,6 +1039,7 @@ async def update_settings(
     llm_analysis_timeout: int = Form(60),
     llm_knowledge_timeout: int = Form(120),
     web_page_size: int = Form(20),
+    min_confidence_threshold: float = Form(0.6),
 ):
     """Save updated settings to config file and reload into app state."""
     from pydantic import ValidationError
@@ -1072,6 +1073,7 @@ async def update_settings(
         "llm_analysis_timeout": llm_analysis_timeout,
         "llm_knowledge_timeout": llm_knowledge_timeout,
         "web_page_size": web_page_size,
+        "min_confidence_threshold": min_confidence_threshold,
     }
     try:
         new_settings = Settings(  # type: ignore[call-arg]
@@ -1093,6 +1095,7 @@ async def update_settings(
             llm_analysis_timeout=llm_analysis_timeout,
             llm_knowledge_timeout=llm_knowledge_timeout,
             web_page_size=web_page_size,
+            min_confidence_threshold=min_confidence_threshold,
             # Preserve values not in form from current app settings
             db_path=request.app.state.settings.db_path,
             feed_max_retries=request.app.state.settings.feed_max_retries,
@@ -1100,6 +1103,7 @@ async def update_settings(
             scheduler_misfire_grace_time=request.app.state.settings.scheduler_misfire_grace_time,
             scheduler_jitter_seconds=request.app.state.settings.scheduler_jitter_seconds,
             llm_max_retries=request.app.state.settings.llm_max_retries,
+            llm_temperature=request.app.state.settings.llm_temperature,
         )
         save_settings_to_yaml(new_settings)
         request.app.state.settings = new_settings
@@ -1255,7 +1259,7 @@ async def _run_init(topic_id: int, settings: Settings, db_path: Path | None = No
                 return
 
             async def _do_init_work(topic, conn):
-                articles = await fetch_new_articles_for_topic(
+                fetch_result = await fetch_new_articles_for_topic(
                     topic,
                     conn,
                     max_articles=settings.max_articles_per_check,
@@ -1264,6 +1268,7 @@ async def _run_init(topic_id: int, settings: Settings, db_path: Path | None = No
                     feed_max_retries=settings.feed_max_retries,
                     concurrency=settings.content_fetch_concurrency,
                 )
+                articles = fetch_result.articles
 
                 if not articles:
                     topic.status = TopicStatus.ERROR
@@ -1271,6 +1276,8 @@ async def _run_init(topic_id: int, settings: Settings, db_path: Path | None = No
                     update_topic(conn, topic)
                     return
 
+                # create_knowledge_state uses INSERT OR REPLACE, so re-init works
+                # atomically without a separate delete step
                 await initialize_knowledge(topic, articles, conn, settings)
 
                 article_ids = [a.id for a in articles if a.id is not None]

@@ -7,6 +7,7 @@ orchestrates the full pipeline from RSS fetch through DB storage.
 import asyncio
 import logging
 import sqlite3
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from app.crud import (
@@ -18,11 +19,20 @@ from app.crud import (
 )
 from app.models import Article, Topic
 from app.scraping.content import extract_article_content
+from app.scraping.relevance import score_relevance
 from app.scraping.rss import FeedEntry, compute_article_hash, fetch_feeds_for_topic
 
 logger = logging.getLogger(__name__)
 
 _CONTENT_FETCH_CONCURRENCY = 3
+
+
+@dataclass
+class FetchResult:
+    """Result of fetching articles for a topic."""
+
+    articles: list[Article]
+    total_feed_entries: int
 
 
 async def fetch_new_articles_for_topic(
@@ -33,7 +43,7 @@ async def fetch_new_articles_for_topic(
     article_fetch_timeout: float = 20.0,
     feed_max_retries: int = 2,
     concurrency: int = _CONTENT_FETCH_CONCURRENCY,
-) -> list[Article]:
+) -> FetchResult:
     """Fetch feeds, dedup against DB, extract content, and store new articles.
 
     Args:
@@ -46,7 +56,7 @@ async def fetch_new_articles_for_topic(
         concurrency: Maximum number of concurrent article content fetches.
 
     Returns:
-        List of newly stored Article objects.
+        FetchResult with stored articles and total feed entry count.
     """
     if topic.id is None:
         raise ValueError("Topic must have an ID")
@@ -71,7 +81,7 @@ async def fetch_new_articles_for_topic(
         health_callback=_make_health_callback(conn),
     )
     if not entries:
-        return []
+        return FetchResult(articles=[], total_feed_entries=0)
 
     # 2. Filter to entries not already in DB; split into reuse vs. fetch-needed
     new_entries: list[tuple[FeedEntry, str]] = []
@@ -92,7 +102,7 @@ async def fetch_new_articles_for_topic(
             new_entries.append((entry, content_hash))
 
     if not new_entries and not reuse_entries:
-        return []
+        return FetchResult(articles=[], total_feed_entries=len(entries))
 
     # 3. Sort by published date (newest first, None dates last), apply limit
     datetime_min = datetime.min.replace(tzinfo=UTC)
@@ -109,7 +119,7 @@ async def fetch_new_articles_for_topic(
         (e, h, None) for e, h in new_entries
     ]
     all_candidates.sort(
-        key=lambda t: t[0].published or datetime_min,
+        key=lambda t: (t[0].published or datetime_min, score_relevance(topic, t[0])),
         reverse=True,
     )
     all_candidates = all_candidates[:max_articles]
@@ -177,4 +187,4 @@ async def fetch_new_articles_for_topic(
         len(stored),
         len(entries),
     )
-    return stored
+    return FetchResult(articles=stored, total_feed_entries=len(entries))

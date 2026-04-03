@@ -82,5 +82,9 @@ async def extract_article_content(
         extracted = cast(str | None, trafilatura.extract(html, favor_precision=True))
         if extracted:
             return _truncate(extracted, max_content_length)
+        # Second attempt: favor recall over precision for JS-heavy or complex sites
+        extracted = cast(str | None, trafilatura.extract(html, favor_recall=True))
+        if extracted:
+            return _truncate(extracted, max_content_length)
 
     return _truncate(fallback_summary, max_content_length)

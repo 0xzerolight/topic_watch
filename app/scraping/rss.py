@@ -29,9 +29,15 @@ _FEED_FETCH_TIMEOUT = 15.0
 _GOOGLE_NEWS_RSS_TEMPLATE = "https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
 
 
-def build_google_news_url(topic_name: str) -> str:
-    """Build a Google News RSS search URL from a topic name."""
-    return _GOOGLE_NEWS_RSS_TEMPLATE.format(query=quote_plus(topic_name))
+def build_google_news_url(topic: Topic) -> str:
+    """Build a Google News RSS search URL from topic name and description."""
+    query_parts = [topic.name]
+    if topic.description:
+        desc_words = topic.description.split()[:6]
+        if desc_words:
+            query_parts.append(" ".join(desc_words))
+    query = " ".join(query_parts)
+    return _GOOGLE_NEWS_RSS_TEMPLATE.format(query=quote_plus(query))
 
 
 class FeedEntry(BaseModel):
@@ -175,7 +181,7 @@ async def fetch_feeds_for_topic(
     health_callback: FeedHealthCallback | None = None,
 ) -> list[FeedEntry]:
     """Fetch all feeds for a topic concurrently, deduplicated by URL."""
-    effective_urls = [build_google_news_url(topic.name)] if topic.feed_mode == FeedMode.AUTO else topic.feed_urls
+    effective_urls = [build_google_news_url(topic)] if topic.feed_mode == FeedMode.AUTO else topic.feed_urls
 
     if not effective_urls:
         return []

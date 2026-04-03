@@ -213,7 +213,7 @@ class TestTopicDetailFeedHealthIndicators:
         from app.scraping.rss import build_google_news_url
 
         topic = _make_topic(db_conn, name="Auto Topic", feed_mode=FeedMode.AUTO, feed_urls=[])
-        auto_url = build_google_news_url("Auto Topic")
+        auto_url = build_google_news_url(topic)
         upsert_feed_health_success(db_conn, auto_url)
         db_conn.commit()
 
