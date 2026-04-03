@@ -19,6 +19,7 @@ from app.crud import (
 )
 from app.models import Article, Topic
 from app.scraping.content import extract_article_content
+from app.scraping.google_news import is_google_news_url, resolve_google_news_urls
 from app.scraping.relevance import score_relevance
 from app.scraping.rss import FeedEntry, compute_article_hash, fetch_feeds_for_topic
 
@@ -82,6 +83,14 @@ async def fetch_new_articles_for_topic(
     )
     if not entries:
         return FetchResult(articles=[], total_feed_entries=0)
+
+    # 1b. Resolve Google News redirect URLs to actual article URLs
+    google_urls = [e.url for e in entries if is_google_news_url(e.url)]
+    if google_urls:
+        resolved = await resolve_google_news_urls(google_urls, timeout=feed_fetch_timeout)
+        for entry in entries:
+            if entry.url in resolved:
+                entry.url = resolved[entry.url]
 
     # 2. Filter to entries not already in DB; split into reuse vs. fetch-needed
     new_entries: list[tuple[FeedEntry, str]] = []

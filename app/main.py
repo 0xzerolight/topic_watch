@@ -67,7 +67,8 @@ async def http_exception_handler(request: Request, exc: HTTPException) -> HTMLRe
     from app import __version__
 
     return _error_templates.TemplateResponse(
+        request,
         "error.html",
-        {"request": request, "status_code": exc.status_code, "detail": exc.detail, "version": __version__},
+        {"status_code": exc.status_code, "detail": exc.detail, "version": __version__},
         status_code=exc.status_code,
     )
