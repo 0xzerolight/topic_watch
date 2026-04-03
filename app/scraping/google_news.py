@@ -29,6 +29,7 @@ _SIG_RE = re.compile(r'data-n-a-sg="([^"]+)"')
 _TS_RE = re.compile(r'data-n-a-ts="([^"]+)"')
 
 _RESOLVE_TIMEOUT = 10.0
+_REQUEST_DELAY = 0.5  # seconds between resolution requests to avoid rate limiting
 _BATCHEXECUTE_URL = "https://news.google.com/_/DotsSplashUi/data/batchexecute"
 _USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
 
@@ -166,14 +167,17 @@ async def resolve_google_news_url(
 async def resolve_google_news_urls(
     urls: list[str],
     timeout: float = _RESOLVE_TIMEOUT,
-    concurrency: int = 3,
+    request_delay: float = _REQUEST_DELAY,
 ) -> dict[str, str]:
     """Batch-resolve Google News redirect URLs to actual article URLs.
+
+    Resolves URLs sequentially with a delay between requests to avoid
+    triggering Google's rate limiter. Stops early if a 429 is encountered.
 
     Args:
         urls: List of URLs (may include non-Google News URLs, which are skipped).
         timeout: HTTP timeout for resolution requests.
-        concurrency: Max concurrent resolution requests.
+        request_delay: Delay in seconds between resolution requests.
 
     Returns:
         Dict mapping original Google News URLs to resolved URLs.
@@ -184,7 +188,6 @@ async def resolve_google_news_urls(
         return {}
 
     resolved: dict[str, str] = {}
-    semaphore = asyncio.Semaphore(concurrency)
 
     async with httpx.AsyncClient(
         cookies=_CONSENT_COOKIE,
@@ -192,19 +195,30 @@ async def resolve_google_news_urls(
         timeout=timeout,
         follow_redirects=True,
     ) as client:
+        for i, url in enumerate(google_urls):
+            if i > 0:
+                await asyncio.sleep(request_delay)
 
-        async def _resolve_one(url: str) -> None:
-            async with semaphore:
-                result = await resolve_google_news_url(url, client)
-                if result != url:
-                    resolved[url] = result
-
-        tasks = [_resolve_one(u) for u in google_urls]
-        await asyncio.gather(*tasks, return_exceptions=True)
+            result = await resolve_google_news_url(url, client)
+            if result == url:
+                # Check if this was a rate limit failure — if so, stop trying
+                # (resolve_google_news_url returns the original URL on any failure,
+                # including 429. We detect rate limiting by checking if the first
+                # resolution attempt fails, which strongly suggests all will fail.)
+                if i == 0:
+                    logger.warning(
+                        "First Google News URL resolution failed, skipping remaining %d URLs",
+                        len(google_urls) - 1,
+                    )
+                    break
+            else:
+                resolved[url] = result
 
     if resolved:
         logger.info("Resolved %d/%d Google News URLs to actual article URLs", len(resolved), len(google_urls))
-    else:
+    elif google_urls:
         logger.warning("Failed to resolve any of %d Google News URLs", len(google_urls))
+
+    return resolved
 
     return resolved
