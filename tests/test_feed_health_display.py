@@ -209,11 +209,11 @@ class TestTopicDetailFeedHealthIndicators:
     async def test_topic_detail_auto_mode_shows_health_indicator(
         self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
     ) -> None:
-        """Auto-mode topic detail shows health indicator next to Google News URL."""
-        from app.scraping.rss import build_google_news_url
+        """Auto-mode topic detail shows health indicator next to provider URL."""
+        from app.scraping.routing import router as provider_router
 
         topic = _make_topic(db_conn, name="Auto Topic", feed_mode=FeedMode.AUTO, feed_urls=[])
-        auto_url = build_google_news_url(topic)
+        auto_url = provider_router.get_provider().build_feed_url(topic)
         upsert_feed_health_success(db_conn, auto_url)
         db_conn.commit()
 

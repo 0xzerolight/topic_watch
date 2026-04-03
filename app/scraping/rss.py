@@ -4,15 +4,18 @@ Fetches feeds via httpx, parses with feedparser, and converts entries
 to FeedEntry models ready for dedup and storage.
 """
 
+from __future__ import annotations
+
 import asyncio
 import hashlib
 import logging
 import re
 from calendar import timegm
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from time import struct_time
-from urllib.parse import quote_plus
+from typing import TYPE_CHECKING
 
 import feedparser
 import httpx
@@ -21,24 +24,15 @@ from pydantic import BaseModel
 from app.models import FeedMode, Topic
 from app.url_validation import is_private_url
 
+if TYPE_CHECKING:
+    from app.scraping.routing import ProviderRouter
+
 logger = logging.getLogger(__name__)
 
 FeedHealthCallback = Callable[[str, bool, str | None], None]  # (feed_url, success, error_msg)
 
 _USER_AGENT = "TopicWatch/1.0.0 (RSS reader)"
 _FEED_FETCH_TIMEOUT = 15.0
-_GOOGLE_NEWS_RSS_TEMPLATE = "https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
-
-
-def build_google_news_url(topic: Topic) -> str:
-    """Build a Google News RSS search URL from topic name and description."""
-    query_parts = [topic.name]
-    if topic.description:
-        desc_words = topic.description.split()[:6]
-        if desc_words:
-            query_parts.append(" ".join(desc_words))
-    query = " ".join(query_parts)
-    return _GOOGLE_NEWS_RSS_TEMPLATE.format(query=quote_plus(query))
 
 
 class FeedEntry(BaseModel):
@@ -51,6 +45,20 @@ class FeedEntry(BaseModel):
     source_feed: str
 
 
+@dataclass
+class FeedResponse:
+    """Result of fetching feeds for a topic.
+
+    Wraps the parsed entries with metadata about which provider was
+    used, so downstream code can make provider-specific decisions
+    (e.g. Google News URL resolution) without importing provider classes.
+    """
+
+    entries: list[FeedEntry] = field(default_factory=list)
+    provider_name: str | None = None
+    needs_url_resolution: bool = False
+
+
 def compute_article_hash(url: str, title: str) -> str:
     """Compute a deterministic, case-insensitive content hash."""
     raw = f"{url}|{title}".lower()
@@ -59,8 +67,8 @@ def compute_article_hash(url: str, title: str) -> str:
 
 def _parse_feed_date(entry: dict) -> datetime | None:
     """Extract a datetime from a feedparser entry's date fields."""
-    for field in ("published_parsed", "updated_parsed"):
-        val = entry.get(field)
+    for date_field in ("published_parsed", "updated_parsed"):
+        val = entry.get(date_field)
         if isinstance(val, struct_time):
             try:
                 return datetime.fromtimestamp(timegm(val), tz=UTC)
@@ -206,12 +214,85 @@ async def fetch_feeds_for_topic(
     timeout: float = _FEED_FETCH_TIMEOUT,
     max_attempts: int = 2,
     health_callback: FeedHealthCallback | None = None,
-) -> list[FeedEntry]:
-    """Fetch all feeds for a topic concurrently, deduplicated by URL."""
-    effective_urls = [build_google_news_url(topic)] if topic.feed_mode == FeedMode.AUTO else topic.feed_urls
+    router: ProviderRouter | None = None,
+) -> FeedResponse:
+    """Fetch all feeds for a topic, deduplicated by URL.
 
-    if not effective_urls:
-        return []
+    For AUTO mode: uses the router to select a provider, with
+    within-cycle fallback (max 1 retry with the next provider).
+    For MANUAL mode: fetches all explicit feed URLs concurrently.
+    """
+    if topic.feed_mode == FeedMode.AUTO:
+        return await _fetch_auto(topic, timeout, max_attempts, health_callback, router)
+    return await _fetch_manual(topic, timeout, max_attempts, health_callback)
+
+
+async def _fetch_auto(
+    topic: Topic,
+    timeout: float,
+    max_attempts: int,
+    health_callback: FeedHealthCallback | None,
+    router: ProviderRouter | None,
+) -> FeedResponse:
+    """AUTO mode: try provider, fallback to next on empty/error."""
+    if router is None:
+        from app.scraping.routing import router as default_router
+
+        router = default_router
+
+    provider = router.get_provider()
+
+    async with httpx.AsyncClient(
+        headers={"User-Agent": _USER_AGENT},
+        timeout=timeout,
+        follow_redirects=True,
+    ) as client:
+        feed_url = provider.build_feed_url(topic)
+        entries = await fetch_feed(
+            feed_url, client, timeout=timeout, max_attempts=max_attempts, health_callback=health_callback
+        )
+
+        if entries:
+            router.mark_healthy(provider.name)
+            return FeedResponse(
+                entries=entries,
+                provider_name=provider.name,
+                needs_url_resolution=provider.needs_url_resolution(),
+            )
+
+        # First provider failed or empty — try fallback
+        router.mark_unhealthy(provider.name)
+        next_provider = router.get_next_provider(provider)
+        if next_provider is None:
+            return FeedResponse(entries=[], provider_name=provider.name, needs_url_resolution=False)
+
+        logger.info("Provider %s returned no entries, falling back to %s", provider.name, next_provider.name)
+        feed_url = next_provider.build_feed_url(topic)
+        entries = await fetch_feed(
+            feed_url, client, timeout=timeout, max_attempts=max_attempts, health_callback=health_callback
+        )
+
+        if entries:
+            router.mark_healthy(next_provider.name)
+            return FeedResponse(
+                entries=entries,
+                provider_name=next_provider.name,
+                needs_url_resolution=next_provider.needs_url_resolution(),
+            )
+
+        router.mark_unhealthy(next_provider.name)
+        return FeedResponse(entries=[], provider_name=next_provider.name, needs_url_resolution=False)
+
+
+async def _fetch_manual(
+    topic: Topic,
+    timeout: float,
+    max_attempts: int,
+    health_callback: FeedHealthCallback | None,
+) -> FeedResponse:
+    """MANUAL mode: fetch all explicit feed URLs concurrently."""
+    if not topic.feed_urls:
+        return FeedResponse()
 
     async with httpx.AsyncClient(
         headers={"User-Agent": _USER_AGENT},
@@ -220,7 +301,7 @@ async def fetch_feeds_for_topic(
     ) as client:
         tasks = [
             fetch_feed(url, client, timeout=timeout, max_attempts=max_attempts, health_callback=health_callback)
-            for url in effective_urls
+            for url in topic.feed_urls
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -235,4 +316,4 @@ async def fetch_feeds_for_topic(
                 seen_urls.add(entry.url)
                 entries.append(entry)
 
-    return entries
+    return FeedResponse(entries=entries)
