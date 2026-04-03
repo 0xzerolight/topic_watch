@@ -264,20 +264,45 @@ class TestFetchFeed:
 
 class TestBuildGoogleNewsUrl:
     def test_basic_query(self) -> None:
-        url = build_google_news_url("Elden Ring DLC")
+        topic = Topic(name="Elden Ring DLC", description="release date of the DLC", feed_urls=[])
+        url = build_google_news_url(topic)
         assert "news.google.com/rss/search" in url
         assert "Elden+Ring+DLC" in url
         assert "hl=en-US" in url
 
+    def test_description_supplements_query(self) -> None:
+        topic = Topic(name="Solo Leveling", description="season 3 release date anime", feed_urls=[])
+        url = build_google_news_url(topic)
+        assert "Solo+Leveling" in url
+        assert "season" in url
+        assert "release" in url
+
+    def test_empty_description_uses_name_only(self) -> None:
+        topic = Topic(name="Elden Ring DLC", description="", feed_urls=[])
+        url = build_google_news_url(topic)
+        assert "Elden+Ring+DLC" in url
+
     def test_special_characters_encoded(self) -> None:
-        url = build_google_news_url("C++ news & updates")
+        topic = Topic(name="C++ news & updates", description="", feed_urls=[])
+        url = build_google_news_url(topic)
         assert "C%2B%2B" in url
         assert "%26" in url
 
-    def test_empty_string(self) -> None:
-        url = build_google_news_url("")
+    def test_empty_name(self) -> None:
+        topic = Topic(name="", description="", feed_urls=[])
+        url = build_google_news_url(topic)
         assert "news.google.com/rss/search" in url
-        assert "q=&" in url
+
+    def test_long_description_truncated(self) -> None:
+        topic = Topic(
+            name="Test",
+            description="one two three four five six seven eight nine ten",
+            feed_urls=[],
+        )
+        url = build_google_news_url(topic)
+        # Only first 6 words of description should be used
+        assert "seven" not in url
+        assert "six" in url
 
 
 class TestFetchFeedsForTopic:
@@ -451,6 +476,43 @@ class TestExtractArticleContent:
             )
         assert len(content) <= 104  # 100 + "..."
 
+    async def test_favor_recall_fallback(self) -> None:
+        """When favor_precision fails, favor_recall should be tried before RSS fallback."""
+        transport = _mock_transport({"example.com": (200, "<html><body><p>Some content</p></body></html>")})
+        call_count = 0
+
+        def mock_extract(html, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if kwargs.get("favor_precision"):
+                return None  # Precision fails
+            if kwargs.get("favor_recall"):
+                return "Recall extracted content"
+            return None
+
+        async with httpx.AsyncClient(transport=transport) as client:
+            with patch("app.scraping.content.trafilatura.extract", side_effect=mock_extract):
+                content = await extract_article_content(
+                    "https://example.com/article",
+                    fallback_summary="RSS fallback",
+                    client=client,
+                )
+        assert content == "Recall extracted content"
+        assert call_count == 2
+
+    async def test_both_extractions_fail_uses_summary(self) -> None:
+        """When both precision and recall fail, RSS summary is used."""
+        transport = _mock_transport({"example.com": (200, "<html><body></body></html>")})
+
+        with patch("app.scraping.content.trafilatura.extract", return_value=None):
+            async with httpx.AsyncClient(transport=transport) as client:
+                content = await extract_article_content(
+                    "https://example.com/article",
+                    fallback_summary="RSS summary fallback",
+                    client=client,
+                )
+        assert content == "RSS summary fallback"
+
 
 # ============================================================
 # TestTruncate
@@ -505,7 +567,7 @@ class TestFetchNewArticlesForTopic:
             patch("app.scraping.fetch_feeds_for_topic", return_value=entries),
             patch("app.scraping.extract_article_content", return_value="Extracted content"),
         ):
-            stored = await fetch_new_articles_for_topic(topic, db_conn)
+            stored = (await fetch_new_articles_for_topic(topic, db_conn)).articles
 
         assert len(stored) == 1
         assert stored[0].title == "New Article"
@@ -541,7 +603,7 @@ class TestFetchNewArticlesForTopic:
         db_conn.commit()
 
         with patch("app.scraping.fetch_feeds_for_topic", return_value=[entry]):
-            stored = await fetch_new_articles_for_topic(topic, db_conn)
+            stored = (await fetch_new_articles_for_topic(topic, db_conn)).articles
 
         assert len(stored) == 0
 
@@ -562,7 +624,7 @@ class TestFetchNewArticlesForTopic:
             patch("app.scraping.fetch_feeds_for_topic", return_value=entries),
             patch("app.scraping.extract_article_content", return_value="Content"),
         ):
-            stored = await fetch_new_articles_for_topic(topic, db_conn, max_articles=2)
+            stored = (await fetch_new_articles_for_topic(topic, db_conn, max_articles=2)).articles
 
         assert len(stored) == 2
 
@@ -570,7 +632,7 @@ class TestFetchNewArticlesForTopic:
         topic = self._make_topic(db_conn)
 
         with patch("app.scraping.fetch_feeds_for_topic", return_value=[]):
-            stored = await fetch_new_articles_for_topic(topic, db_conn)
+            stored = (await fetch_new_articles_for_topic(topic, db_conn)).articles
 
         assert stored == []
 
@@ -592,7 +654,7 @@ class TestFetchNewArticlesForTopic:
                 side_effect=Exception("Network error"),
             ),
         ):
-            stored = await fetch_new_articles_for_topic(topic, db_conn)
+            stored = (await fetch_new_articles_for_topic(topic, db_conn)).articles
 
         assert len(stored) == 1
         assert stored[0].raw_content == "Fallback summary text"

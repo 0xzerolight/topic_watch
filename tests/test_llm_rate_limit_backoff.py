@@ -220,7 +220,7 @@ class TestGenerateInitialKnowledgeRateLimit:
     async def test_retries_on_rate_limit_and_succeeds(self) -> None:
         """generate_initial_knowledge retries on RateLimitError and succeeds."""
         rate_error = _make_rate_limit_error()
-        expected = KnowledgeStateUpdate(updated_summary="Summary.", token_count=0)
+        expected = KnowledgeStateUpdate(sufficient_data=True, confidence=0.9, updated_summary="Summary.", token_count=0)
         mock_client, mock_create = _mock_instructor_client(expected)
         mock_create.side_effect = [rate_error, expected]
         settings = _make_settings()
@@ -276,7 +276,7 @@ class TestGenerateKnowledgeUpdateRateLimit:
     async def test_retries_on_rate_limit_and_succeeds(self) -> None:
         """generate_knowledge_update retries on RateLimitError and succeeds."""
         rate_error = _make_rate_limit_error()
-        expected = KnowledgeStateUpdate(updated_summary="Updated.", token_count=0)
+        expected = KnowledgeStateUpdate(sufficient_data=True, confidence=0.9, updated_summary="Updated.", token_count=0)
         mock_client, mock_create = _mock_instructor_client(expected)
         mock_create.side_effect = [rate_error, expected]
         novelty = NoveltyResult(has_new_info=True, summary="New fact.", confidence=0.85)

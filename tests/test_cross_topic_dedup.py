@@ -192,7 +192,7 @@ class TestFetchNewArticlesCrossTopicDedup:
             patch("app.scraping.fetch_feeds_for_topic", return_value=[entry]),
             patch("app.scraping.extract_article_content", extract_mock),
         ):
-            stored = await fetch_new_articles_for_topic(topic_b, db_conn)
+            stored = (await fetch_new_articles_for_topic(topic_b, db_conn)).articles
 
         # Article should be created for topic_b
         assert len(stored) == 1
@@ -214,7 +214,7 @@ class TestFetchNewArticlesCrossTopicDedup:
             patch("app.scraping.fetch_feeds_for_topic", return_value=[entry]),
             patch("app.scraping.extract_article_content", extract_mock),
         ):
-            stored = await fetch_new_articles_for_topic(topic, db_conn)
+            stored = (await fetch_new_articles_for_topic(topic, db_conn)).articles
 
         assert len(stored) == 1
         assert stored[0].raw_content == "Freshly fetched content"
@@ -248,7 +248,7 @@ class TestFetchNewArticlesCrossTopicDedup:
             patch("app.scraping.fetch_feeds_for_topic", return_value=[entry]),
             patch("app.scraping.extract_article_content", extract_mock),
         ):
-            stored = await fetch_new_articles_for_topic(topic_b, db_conn)
+            stored = (await fetch_new_articles_for_topic(topic_b, db_conn)).articles
 
         assert len(stored) == 1
         assert stored[0].raw_content == "Freshly fetched content"
@@ -272,7 +272,7 @@ class TestFetchNewArticlesCrossTopicDedup:
             patch("app.scraping.fetch_feeds_for_topic", return_value=[entry]),
             patch("app.scraping.extract_article_content", extract_mock),
         ):
-            stored = await fetch_new_articles_for_topic(topic, db_conn)
+            stored = (await fetch_new_articles_for_topic(topic, db_conn)).articles
 
         # Should be skipped — already exists for this topic
         assert len(stored) == 0
@@ -307,7 +307,7 @@ class TestFetchNewArticlesCrossTopicDedup:
             patch("app.scraping.fetch_feeds_for_topic", return_value=[entry]),
             patch("app.scraping.extract_article_content", extract_mock),
         ):
-            stored = await fetch_new_articles_for_topic(topic_b, db_conn)
+            stored = (await fetch_new_articles_for_topic(topic_b, db_conn)).articles
 
         # topic_b already has it — must be skipped
         assert len(stored) == 0
@@ -349,7 +349,7 @@ class TestFetchNewArticlesCrossTopicDedup:
             patch("app.scraping.fetch_feeds_for_topic", return_value=entries),
             patch("app.scraping.extract_article_content", extract_mock),
         ):
-            stored = await fetch_new_articles_for_topic(topic_b, db_conn)
+            stored = (await fetch_new_articles_for_topic(topic_b, db_conn)).articles
 
         assert len(stored) == 2
 

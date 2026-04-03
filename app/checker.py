@@ -92,7 +92,7 @@ async def _check_topic_inner(
 
     # Step 1: Fetch new articles
     try:
-        new_articles = await fetch_new_articles_for_topic(
+        fetch_result = await fetch_new_articles_for_topic(
             topic,
             conn,
             max_articles=settings.max_articles_per_check,
@@ -105,7 +105,8 @@ async def _check_topic_inner(
         logger.warning("Scraping failed for topic '%s'", topic.name, exc_info=True)
         return _record_result(conn, result)
 
-    result.articles_found = len(new_articles)
+    new_articles = fetch_result.articles
+    result.articles_found = fetch_result.total_feed_entries
     result.articles_new = len(new_articles)
 
     if not new_articles:
@@ -122,46 +123,57 @@ async def _check_topic_inner(
     result.llm_response = novelty.model_dump_json()
 
     # Step 4: If new info, update knowledge and notify
+    low_confidence = False
     if novelty.has_new_info:
-        try:
-            await update_knowledge(topic, novelty, conn, settings)
-        except Exception:
-            logger.warning(
-                "Knowledge update failed for topic '%s'",
+        if novelty.confidence < settings.min_confidence_threshold:
+            logger.info(
+                "Topic '%s': new info detected but confidence %.2f below threshold %.2f, skipping notification",
                 topic.name,
-                exc_info=True,
+                novelty.confidence,
+                settings.min_confidence_threshold,
             )
+            low_confidence = True
+        else:
+            try:
+                await update_knowledge(topic, novelty, conn, settings)
+            except Exception:
+                logger.warning(
+                    "Knowledge update failed for topic '%s'",
+                    topic.name,
+                    exc_info=True,
+                )
 
-        title, body = format_notification(topic.name, novelty)
-        try:
-            sent = await send_notification(title, body, settings)
-            result.notification_sent = sent
-            if not sent:
-                result.notification_error = "Delivery failed"
+            title, body = format_notification(topic.name, novelty)
+            try:
+                sent = await send_notification(title, body, settings)
+                result.notification_sent = sent
+                if not sent:
+                    result.notification_error = "Delivery failed"
+                    _queue_notification(conn, topic_id, title, body)
+            except Exception as exc:
+                logger.warning(
+                    "Notification failed for topic '%s'",
+                    topic.name,
+                    exc_info=True,
+                )
+                result.notification_error = str(exc)
                 _queue_notification(conn, topic_id, title, body)
-        except Exception as exc:
-            logger.warning(
-                "Notification failed for topic '%s'",
-                topic.name,
-                exc_info=True,
-            )
-            result.notification_error = str(exc)
-            _queue_notification(conn, topic_id, title, body)
 
-        # Send webhooks (independent of Apprise success/failure)
-        try:
-            await send_webhooks(topic.name, novelty, settings)
-        except Exception:
-            logger.warning(
-                "Webhook delivery failed for topic '%s'",
-                topic.name,
-                exc_info=True,
-            )
+            # Send webhooks (independent of Apprise success/failure)
+            try:
+                await send_webhooks(topic.name, novelty, settings)
+            except Exception:
+                logger.warning(
+                    "Webhook delivery failed for topic '%s'",
+                    topic.name,
+                    exc_info=True,
+                )
 
-    # Step 5: Mark articles as processed
-    article_ids = [a.id for a in new_articles if a.id is not None]
-    if article_ids:
-        mark_articles_processed(conn, article_ids)
+    # Step 5: Mark articles as processed (skip if low confidence — re-examine next cycle)
+    if not low_confidence:
+        article_ids = [a.id for a in new_articles if a.id is not None]
+        if article_ids:
+            mark_articles_processed(conn, article_ids)
 
     logger.info(
         "Topic '%s': %d articles, new_info=%s, notified=%s",

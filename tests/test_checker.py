@@ -20,6 +20,7 @@ from app.models import (
     Topic,
     TopicStatus,
 )
+from app.scraping import FetchResult
 
 
 def _make_settings(**overrides) -> Settings:
@@ -87,7 +88,7 @@ class TestCheckTopic:
             patch(
                 "app.checker.fetch_new_articles_for_topic",
                 new_callable=AsyncMock,
-                return_value=articles,
+                return_value=FetchResult(articles=articles, total_feed_entries=len(articles)),
             ),
             patch(
                 "app.checker.analyze_articles",
@@ -129,7 +130,7 @@ class TestCheckTopic:
             patch(
                 "app.checker.fetch_new_articles_for_topic",
                 new_callable=AsyncMock,
-                return_value=articles,
+                return_value=FetchResult(articles=articles, total_feed_entries=len(articles)),
             ),
             patch(
                 "app.checker.analyze_articles",
@@ -153,7 +154,7 @@ class TestCheckTopic:
             patch(
                 "app.checker.fetch_new_articles_for_topic",
                 new_callable=AsyncMock,
-                return_value=[],
+                return_value=FetchResult(articles=[], total_feed_entries=0),
             ),
             patch(
                 "app.checker.analyze_articles",
@@ -208,7 +209,7 @@ class TestCheckTopic:
             patch(
                 "app.checker.fetch_new_articles_for_topic",
                 new_callable=AsyncMock,
-                return_value=articles,
+                return_value=FetchResult(articles=articles, total_feed_entries=len(articles)),
             ),
             patch(
                 "app.checker.analyze_articles",
@@ -250,7 +251,7 @@ class TestCheckTopic:
             patch(
                 "app.checker.fetch_new_articles_for_topic",
                 new_callable=AsyncMock,
-                return_value=articles,
+                return_value=FetchResult(articles=articles, total_feed_entries=len(articles)),
             ),
             patch(
                 "app.checker.analyze_articles",
@@ -293,7 +294,7 @@ class TestCheckTopic:
             patch(
                 "app.checker.fetch_new_articles_for_topic",
                 new_callable=AsyncMock,
-                return_value=articles,
+                return_value=FetchResult(articles=articles, total_feed_entries=len(articles)),
             ),
             patch(
                 "app.checker.analyze_articles",
@@ -330,7 +331,7 @@ class TestCheckTopic:
             patch(
                 "app.checker.fetch_new_articles_for_topic",
                 new_callable=AsyncMock,
-                return_value=articles,
+                return_value=FetchResult(articles=articles, total_feed_entries=len(articles)),
             ),
             patch(
                 "app.checker.analyze_articles",
@@ -362,7 +363,7 @@ class TestCheckTopic:
             patch(
                 "app.checker.fetch_new_articles_for_topic",
                 new_callable=AsyncMock,
-                return_value=articles,
+                return_value=FetchResult(articles=articles, total_feed_entries=len(articles)),
             ),
             patch(
                 "app.checker.analyze_articles",
@@ -386,6 +387,88 @@ class TestCheckTopic:
         assert result.notification_sent is True
         assert result.has_new_info is True
 
+    async def test_low_confidence_skips_notification_and_leaves_articles_unprocessed(
+        self, db_conn: sqlite3.Connection
+    ) -> None:
+        """New info with confidence below threshold → no notification, no knowledge update,
+        and articles are NOT marked as processed (so they get re-examined next cycle)."""
+        topic = _make_topic(db_conn)
+        create_knowledge_state(
+            db_conn,
+            KnowledgeState(topic_id=topic.id, summary_text="Known facts.", token_count=20),
+        )
+        db_conn.commit()
+        settings = _make_settings(min_confidence_threshold=0.6)
+
+        articles = [_make_article(topic_id=topic.id)]
+        novelty = NoveltyResult(
+            has_new_info=True,
+            summary="Possibly new info",
+            confidence=0.3,
+        )
+
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=articles, total_feed_entries=len(articles)),
+            ),
+            patch(
+                "app.checker.analyze_articles",
+                new_callable=AsyncMock,
+                return_value=novelty,
+            ),
+            patch("app.checker.update_knowledge", new_callable=AsyncMock) as mock_update,
+            patch("app.checker.send_notification") as mock_send,
+            patch("app.checker.mark_articles_processed") as mock_mark,
+        ):
+            result = await check_topic(topic, db_conn, settings)
+
+        # has_new_info is True (LLM detected it) but notification not sent
+        assert result.has_new_info is True
+        assert result.notification_sent is False
+        mock_update.assert_not_called()
+        mock_send.assert_not_called()
+        mock_mark.assert_not_called()
+
+    async def test_high_confidence_sends_notification(self, db_conn: sqlite3.Connection) -> None:
+        """New info with confidence above threshold → normal flow."""
+        topic = _make_topic(db_conn)
+        create_knowledge_state(
+            db_conn,
+            KnowledgeState(topic_id=topic.id, summary_text="Known facts.", token_count=20),
+        )
+        db_conn.commit()
+        settings = _make_settings(min_confidence_threshold=0.6)
+
+        articles = [_make_article(topic_id=topic.id)]
+        novelty = NoveltyResult(
+            has_new_info=True,
+            summary="Confirmed new release date",
+            confidence=0.9,
+        )
+
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=articles, total_feed_entries=len(articles)),
+            ),
+            patch(
+                "app.checker.analyze_articles",
+                new_callable=AsyncMock,
+                return_value=novelty,
+            ),
+            patch("app.checker.update_knowledge", new_callable=AsyncMock) as mock_update,
+            patch("app.checker.send_notification", return_value=True) as mock_send,
+        ):
+            result = await check_topic(topic, db_conn, settings)
+
+        assert result.has_new_info is True
+        assert result.notification_sent is True
+        mock_update.assert_called_once()
+        mock_send.assert_called_once()
+
 
 # --- check_all_topics ---
 
@@ -401,7 +484,7 @@ class TestCheckAllTopics:
         with patch(
             "app.checker.fetch_new_articles_for_topic",
             new_callable=AsyncMock,
-            return_value=[],
+            return_value=FetchResult(articles=[], total_feed_entries=0),
         ):
             results = await check_all_topics(db_conn, settings)
 
@@ -415,7 +498,7 @@ class TestCheckAllTopics:
         with patch(
             "app.checker.fetch_new_articles_for_topic",
             new_callable=AsyncMock,
-            return_value=[],
+            return_value=FetchResult(articles=[], total_feed_entries=0),
         ):
             results = await check_all_topics(db_conn, settings)
 
@@ -427,10 +510,10 @@ class TestCheckAllTopics:
         _make_topic(db_conn, name="Bad Topic")
         settings = _make_settings()
 
-        async def mock_fetch(topic, conn, max_articles=10):
+        async def mock_fetch(topic, conn, max_articles=10, **kwargs):
             if topic.name == "Bad Topic":
                 raise Exception("Unexpected error")
-            return []
+            return FetchResult(articles=[], total_feed_entries=0)
 
         with patch(
             "app.checker.fetch_new_articles_for_topic",
@@ -455,7 +538,7 @@ class TestCheckAllTopics:
         with patch(
             "app.checker.fetch_new_articles_for_topic",
             new_callable=AsyncMock,
-            return_value=[],
+            return_value=FetchResult(articles=[], total_feed_entries=0),
         ):
             results = await check_all_topics(db_conn, settings)
 
@@ -479,7 +562,7 @@ class TestCheckAllTopics:
             patch(
                 "app.checker.fetch_new_articles_for_topic",
                 new_callable=AsyncMock,
-                return_value=[],
+                return_value=FetchResult(articles=[], total_feed_entries=0),
             ),
         ):
             results = await check_all_topics(db_conn, settings)

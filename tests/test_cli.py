@@ -9,6 +9,7 @@ from app.cli import _cmd_check, _cmd_init, _cmd_list
 from app.config import LLMSettings, Settings
 from app.crud import create_topic, get_topic
 from app.models import Article, Topic, TopicStatus
+from app.scraping import FetchResult
 
 
 def _make_settings(**overrides) -> Settings:
@@ -37,7 +38,7 @@ class TestCmdCheck:
             patch(
                 "app.checker.fetch_new_articles_for_topic",
                 new_callable=AsyncMock,
-                return_value=[],
+                return_value=FetchResult(articles=[], total_feed_entries=0),
             ),
         ):
             mock_get_db.return_value.__enter__ = lambda s: db_conn
@@ -74,23 +75,59 @@ class TestCmdInit:
             with pytest.raises(SystemExit, match="1"):
                 await _cmd_init("Nonexistent")
 
-    async def test_init_already_ready_exits_0(self, db_conn: sqlite3.Connection) -> None:
-        create_topic(
+    async def test_init_ready_topic_reinitializes(self, db_conn: sqlite3.Connection) -> None:
+        """READY topics should be re-initialized, not rejected."""
+        from app.analysis.llm import KnowledgeStateUpdate
+        from app.crud import create_knowledge_state, get_knowledge_state
+        from app.models import KnowledgeState
+
+        topic = create_topic(
             db_conn,
             Topic(name="Ready", description="d", status=TopicStatus.READY),
         )
+        # Pre-existing knowledge state
+        create_knowledge_state(
+            db_conn,
+            KnowledgeState(topic_id=topic.id, summary_text="Old knowledge.", token_count=10),
+        )
         db_conn.commit()
         settings = _make_settings()
+
+        mock_article = Article(
+            topic_id=topic.id,
+            title="Art",
+            url="https://example.com/1",
+            content_hash="h",
+            source_feed="f",
+        )
+        llm_result = KnowledgeStateUpdate(
+            sufficient_data=True, confidence=0.9, updated_summary="New knowledge.", token_count=15
+        )
 
         with (
             patch("app.cli.load_settings", return_value=settings),
             patch("app.cli.init_db"),
             patch("app.cli.get_db") as mock_get_db,
+            patch(
+                "app.scraping.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[mock_article], total_feed_entries=1),
+            ),
+            patch(
+                "app.analysis.knowledge.generate_initial_knowledge",
+                new_callable=AsyncMock,
+                return_value=llm_result,
+            ),
         ):
             mock_get_db.return_value.__enter__ = lambda s: db_conn
             mock_get_db.return_value.__exit__ = lambda s, *a: None
-            with pytest.raises(SystemExit, match="0"):
-                await _cmd_init("Ready")
+            await _cmd_init("Ready")
+
+        updated = get_topic(db_conn, topic.id)
+        assert updated.status == TopicStatus.READY
+        state = get_knowledge_state(db_conn, topic.id)
+        assert state is not None
+        assert state.summary_text == "New knowledge."
 
     async def test_init_scraping_failure_sets_error(self, db_conn: sqlite3.Connection) -> None:
         topic = create_topic(
@@ -175,7 +212,7 @@ class TestCmdInit:
             patch(
                 "app.scraping.fetch_new_articles_for_topic",
                 new_callable=AsyncMock,
-                return_value=[mock_article],
+                return_value=FetchResult(articles=[mock_article], total_feed_entries=1),
             ),
             patch(
                 "app.analysis.knowledge.generate_initial_knowledge",

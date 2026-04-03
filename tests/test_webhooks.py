@@ -79,7 +79,7 @@ class TestBuildWebhookPayload:
     def test_payload_has_all_expected_fields(self) -> None:
         novelty = _make_novelty()
         payload = _build_webhook_payload("T", novelty)
-        expected_keys = {"topic", "summary", "key_facts", "source_urls", "confidence", "timestamp"}
+        expected_keys = {"topic", "reasoning", "summary", "key_facts", "source_urls", "confidence", "timestamp"}
         assert set(payload.keys()) == expected_keys
 
     def test_key_facts_is_list_type(self) -> None:
@@ -91,6 +91,16 @@ class TestBuildWebhookPayload:
         novelty = _make_novelty(source_urls=[])
         payload = _build_webhook_payload("T", novelty)
         assert isinstance(payload["source_urls"], list)
+
+    def test_payload_contains_reasoning(self) -> None:
+        novelty = _make_novelty(reasoning="Article [1] mentions a new date.")
+        payload = _build_webhook_payload("T", novelty)
+        assert payload["reasoning"] == "Article [1] mentions a new date."
+
+    def test_payload_reasoning_defaults_to_empty(self) -> None:
+        novelty = _make_novelty()
+        payload = _build_webhook_payload("T", novelty)
+        assert payload["reasoning"] == ""
 
     def test_confidence_is_float_type(self) -> None:
         novelty = _make_novelty(confidence=1.0)

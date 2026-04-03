@@ -10,7 +10,8 @@ import pytest
 from app.config import LLMSettings, NotificationSettings, Settings
 from app.crud import create_topic, get_topic
 from app.database import get_connection, init_db
-from app.models import Topic, TopicStatus
+from app.models import Article, Topic, TopicStatus
+from app.scraping import FetchResult
 from app.web.routes import _run_check_all, _run_init
 
 
@@ -109,7 +110,6 @@ class TestRunInitTimeout:
 
     async def test_normal_completion_sets_topic_to_ready(self, db_path: Path) -> None:
         """When everything succeeds, topic is set to READY."""
-        from app.models import Article
 
         settings = _make_settings()
 
@@ -134,7 +134,7 @@ class TestRunInitTimeout:
             patch(
                 "app.scraping.fetch_new_articles_for_topic",
                 new_callable=AsyncMock,
-                return_value=[fake_article],
+                return_value=FetchResult(articles=[fake_article], total_feed_entries=1),
             ),
             patch(
                 "app.analysis.knowledge.initialize_knowledge",

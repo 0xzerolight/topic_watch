@@ -185,6 +185,13 @@
         <button type="submit" class="contrast" style="margin: 0;">Retry Research</button>
     </form>
     {% endif %}
+    {% if topic.status.value == "ready" %}
+    <form method="post" action="/topics/{{ topic.id }}/init" style="margin: 0;"
+          onsubmit="return confirm('Re-initialize knowledge? This will delete the current knowledge state and re-run research.')">
+        <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
+        <button type="submit" class="secondary outline" style="margin: 0;">Re-initialize</button>
+    </form>
+    {% endif %}
     {% if topic.is_active and topic.status.value == "ready" %}
     <form method="post" action="/topics/{{ topic.id }}/check" style="margin: 0;">
         <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">

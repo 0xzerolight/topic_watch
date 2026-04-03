@@ -29,7 +29,7 @@ notifications:
 
   # Custom webhook URLs for JSON POST notifications
   # Each URL receives a POST with JSON body:
-  # {"topic": "name", "summary": "...", "key_facts": [...], "source_urls": [...], "confidence": 0.85, "timestamp": "..."}
+  # {"topic": "name", "reasoning": "...", "summary": "...", "key_facts": [...], "source_urls": [...], "confidence": 0.85, "timestamp": "..."}
   webhook_urls: []
     # - "https://your-server.com/webhook/topic-watch"
     # - "https://hooks.example.com/trigger"
@@ -50,6 +50,8 @@ knowledge_state_max_tokens: 2000
 article_retention_days: 90
 
 # --- Advanced settings (optional, sensible defaults) ---
+# llm_temperature: 0.2
+# min_confidence_threshold: 0.6
 # web_page_size: 20
 # feed_max_retries: 2
 # content_fetch_concurrency: 3

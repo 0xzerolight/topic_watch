@@ -79,6 +79,24 @@ class TestFormatNotification:
         assert title == "Topic Watch: Test"
         assert isinstance(body, str)
 
+    def test_body_includes_confidence_percentage(self) -> None:
+        novelty = NoveltyResult(
+            has_new_info=True,
+            summary="Update",
+            confidence=0.9,
+        )
+        _, body = format_notification("Test", novelty)
+        assert "Confidence: 90%" in body
+
+    def test_body_confidence_truncates_to_int(self) -> None:
+        novelty = NoveltyResult(
+            has_new_info=True,
+            summary="Update",
+            confidence=0.856,
+        )
+        _, body = format_notification("Test", novelty)
+        assert "Confidence: 85%" in body
+
 
 # --- send_notification ---
 

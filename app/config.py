@@ -126,6 +126,15 @@ class Settings(BaseSettings):
         description="Random jitter in seconds added to each scheduler tick to prevent thundering herd",
     )
     llm_max_retries: int = Field(default=2, ge=0, le=10, description="Maximum retries for LLM API calls")
+    llm_temperature: float = Field(
+        default=0.2, ge=0.0, le=2.0, description="LLM sampling temperature (lower = more factual)"
+    )
+    min_confidence_threshold: float = Field(
+        default=0.6,
+        ge=0.0,
+        le=1.0,
+        description="Minimum LLM confidence to act on novelty results",
+    )
 
     def is_configured(self) -> bool:
         """Return True if minimal required configuration is present."""
@@ -248,6 +257,8 @@ def save_settings_to_yaml(settings: "Settings", config_path: Path | None = None)
         "scheduler_misfire_grace_time": settings.scheduler_misfire_grace_time,
         "scheduler_jitter_seconds": settings.scheduler_jitter_seconds,
         "llm_max_retries": settings.llm_max_retries,
+        "llm_temperature": settings.llm_temperature,
+        "min_confidence_threshold": settings.min_confidence_threshold,
     }
 
     if settings.llm.base_url and not is_cloud_provider(settings.llm.model):

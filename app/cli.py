@@ -87,14 +87,14 @@ async def _cmd_init(topic_name: str) -> None:
             sys.exit(1)
 
         if topic.status == TopicStatus.READY:
-            logger.warning("Topic '%s' is already in READY status", topic_name)
-            sys.exit(0)
-
-        print(f"Initializing knowledge for '{topic_name}'...")
+            print(f"Re-initializing knowledge for '{topic_name}'...")
+        else:
+            print(f"Initializing knowledge for '{topic_name}'...")
 
         # Fetch articles
         try:
-            articles = await fetch_new_articles_for_topic(topic, conn, max_articles=settings.max_articles_per_check)
+            fetch_result = await fetch_new_articles_for_topic(topic, conn, max_articles=settings.max_articles_per_check)
+            articles = fetch_result.articles
         except Exception:
             logger.error("Failed to fetch articles for '%s'", topic_name, exc_info=True)
             topic.status = TopicStatus.ERROR
@@ -111,7 +111,9 @@ async def _cmd_init(topic_name: str) -> None:
 
         print(f"  Fetched {len(articles)} articles")
 
-        # Build initial knowledge state
+        # Build initial knowledge state (create_knowledge_state uses INSERT OR REPLACE,
+        # so re-init of READY topics works without a separate delete step)
+        assert topic.id is not None
         try:
             state = await initialize_knowledge(topic, articles, conn, settings)
         except Exception:

@@ -345,8 +345,8 @@ class TestKnowledgeStateCRUD:
         assert retrieved.summary_text == "V2 - updated with new info"
         assert retrieved.token_count == 120
 
-    def test_one_per_topic(self, db_conn: sqlite3.Connection) -> None:
-        """Only one knowledge state per topic (UNIQUE constraint)."""
+    def test_one_per_topic_upsert(self, db_conn: sqlite3.Connection) -> None:
+        """Duplicate insert for same topic replaces existing state (INSERT OR REPLACE)."""
         topic = create_topic(db_conn, Topic(name="KSUnique", description="desc"))
         create_knowledge_state(
             db_conn,
@@ -354,11 +354,16 @@ class TestKnowledgeStateCRUD:
         )
         db_conn.commit()
 
-        with pytest.raises(sqlite3.IntegrityError):
-            create_knowledge_state(
-                db_conn,
-                KnowledgeState(topic_id=topic.id, summary_text="Second", token_count=20),
-            )
+        create_knowledge_state(
+            db_conn,
+            KnowledgeState(topic_id=topic.id, summary_text="Second", token_count=20),
+        )
+        db_conn.commit()
+
+        state = get_knowledge_state(db_conn, topic.id)
+        assert state is not None
+        assert state.summary_text == "Second"
+        assert state.token_count == 20
 
 
 class TestCheckResultCRUD:

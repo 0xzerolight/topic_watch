@@ -59,6 +59,16 @@ async def initialize_knowledge(
 
     result = await generate_initial_knowledge(articles, topic, settings)
 
+    if not result.sufficient_data:
+        logger.warning(
+            "Insufficient data for topic '%s' (confidence=%.2f): %s",
+            topic.name,
+            result.confidence,
+            result.updated_summary,
+        )
+        # Still store it — the summary explains what's missing, which is useful
+        # context for the next check cycle. The topic still transitions to READY.
+
     if result.token_count > settings.knowledge_state_max_tokens:
         logger.warning(
             "Knowledge state for topic '%s' exceeds token budget (%d > %d)",
@@ -112,6 +122,13 @@ async def update_knowledge(
         raise ValueError(f"No knowledge state found for topic '{topic.name}' (id={topic.id})")
 
     result = await generate_knowledge_update(current.summary_text, novelty_result, topic, settings)
+
+    if not result.sufficient_data:
+        logger.warning(
+            "Knowledge update for topic '%s' had insufficient data, preserving existing state",
+            topic.name,
+        )
+        return current
 
     if result.token_count > settings.knowledge_state_max_tokens:
         logger.warning(
