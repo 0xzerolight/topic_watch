@@ -16,6 +16,7 @@ from app.analysis.llm import (
     generate_knowledge_update,
 )
 from app.analysis.prompts import (
+    _content_quality_tag,
     _format_articles,
     build_knowledge_init_messages,
     build_knowledge_update_messages,
@@ -107,11 +108,21 @@ class TestNoveltyResult:
         assert result.summary is None
         assert result.key_facts == []
         assert result.source_urls == []
+        assert result.reasoning == ""
 
     def test_no_summary_when_no_new_info(self) -> None:
         result = NoveltyResult(has_new_info=False, confidence=0.9)
         assert result.has_new_info is False
         assert result.summary is None
+
+    def test_reasoning_field(self) -> None:
+        result = NoveltyResult(
+            has_new_info=True,
+            reasoning="Article [1] mentions a new date not in the knowledge state.",
+            summary="New date found",
+            confidence=0.9,
+        )
+        assert "new date" in result.reasoning
 
 
 # ============================================================
@@ -122,17 +133,61 @@ class TestNoveltyResult:
 class TestKnowledgeStateUpdate:
     def test_valid_construction(self) -> None:
         update = KnowledgeStateUpdate(
+            sufficient_data=True,
+            confidence=0.9,
             updated_summary="Summary of known facts.",
             token_count=150,
         )
         assert update.updated_summary == "Summary of known facts."
         assert update.token_count == 150
+        assert update.sufficient_data is True
+        assert update.confidence == 0.9
+
+    def test_token_count_defaults_to_zero(self) -> None:
+        update = KnowledgeStateUpdate(
+            sufficient_data=True,
+            confidence=0.8,
+            updated_summary="text",
+        )
+        assert update.token_count == 0
 
     def test_required_fields(self) -> None:
         with pytest.raises(ValidationError):
-            KnowledgeStateUpdate(updated_summary="text")  # missing token_count
+            KnowledgeStateUpdate(sufficient_data=True, confidence=0.9)  # missing updated_summary
+
+    def test_insufficient_data_construction(self) -> None:
+        update = KnowledgeStateUpdate(
+            sufficient_data=False,
+            confidence=0.3,
+            updated_summary="Articles did not contain relevant release date information.",
+        )
+        assert update.sufficient_data is False
+        assert update.confidence == 0.3
+
+    def test_confidence_bounds(self) -> None:
         with pytest.raises(ValidationError):
-            KnowledgeStateUpdate(token_count=100)  # missing updated_summary
+            KnowledgeStateUpdate(sufficient_data=True, confidence=1.5, updated_summary="x")
+        with pytest.raises(ValidationError):
+            KnowledgeStateUpdate(sufficient_data=True, confidence=-0.1, updated_summary="x")
+
+
+# ============================================================
+# TestContentQualityTag
+# ============================================================
+
+
+class TestContentQualityTag:
+    def test_no_content(self) -> None:
+        assert _content_quality_tag(None) == "[NO CONTENT]"
+        assert _content_quality_tag("") == "[NO CONTENT]"
+
+    def test_stub_content(self) -> None:
+        tag = _content_quality_tag("Short snippet only.")
+        assert "[STUB" in tag
+
+    def test_sufficient_content(self) -> None:
+        tag = _content_quality_tag("x" * 200)
+        assert tag == ""
 
 
 # ============================================================
@@ -152,18 +207,36 @@ class TestFormatArticles:
         assert "URL: https://example.com/1" in result
         assert "URL: https://example.com/2" in result
 
+    def test_includes_source_feed(self) -> None:
+        article = _make_article(source_feed="https://news.google.com/rss/search?q=test")
+        result = _format_articles([article])
+        assert "Source: https://news.google.com/rss/search?q=test" in result
+
     def test_handles_none_content(self) -> None:
         article = _make_article(raw_content=None)
         result = _format_articles([article])
         assert "(no content available)" in result
+        assert "[NO CONTENT]" in result
+
+    def test_stub_content_tagged(self) -> None:
+        article = _make_article(raw_content="Short.")
+        result = _format_articles([article])
+        assert "[STUB" in result
 
     def test_truncates_long_content(self) -> None:
-        long_content = "x" * 2000
+        long_content = "word " * 400
         article = _make_article(raw_content=long_content)
         result = _format_articles([article], max_content_chars=100)
-        # Content should be truncated to 100 chars + "..."
-        assert "x" * 100 + "..." in result
-        assert "x" * 101 not in result
+        # Content should be truncated — not the full original
+        assert len(result) < len(long_content)
+
+    def test_sentence_boundary_truncation(self) -> None:
+        # Content with clear sentence boundaries
+        content = "First sentence here. Second sentence here. Third sentence here. " + "x" * 1500
+        article = _make_article(raw_content=content)
+        result = _format_articles([article], max_content_chars=80)
+        # Should prefer sentence boundary over hard cut
+        assert "..." in result or result.rstrip().endswith(".")
 
 
 # ============================================================
@@ -179,6 +252,15 @@ class TestBuildNoveltyMessages:
         assert len(messages) == 2
         assert messages[0]["role"] == "system"
         assert messages[1]["role"] == "user"
+
+    def test_system_message_contains_grounding(self) -> None:
+        topic = _make_topic()
+        articles = [_make_article()]
+        messages = build_novelty_messages(articles, "Known facts.", topic)
+        system_msg = messages[0]["content"]
+        assert "CRITICAL RULES" in system_msg
+        assert "ONLY" in system_msg
+        assert "training data" in system_msg
 
     def test_user_message_includes_context(self) -> None:
         topic = _make_topic(name="Elden Ring DLC")
@@ -209,6 +291,15 @@ class TestBuildKnowledgeInitMessages:
         messages = build_knowledge_init_messages(articles, topic, max_tokens=2000)
         system_msg = messages[0]["content"]
         assert "2000" in system_msg
+
+    def test_system_message_contains_grounding(self) -> None:
+        topic = _make_topic()
+        articles = [_make_article()]
+        messages = build_knowledge_init_messages(articles, topic, max_tokens=2000)
+        system_msg = messages[0]["content"]
+        assert "CRITICAL RULES" in system_msg
+        assert "ONLY" in system_msg
+        assert "Do NOT add facts" in system_msg
 
     def test_formats_articles_in_user_message(self) -> None:
         topic = _make_topic()
@@ -249,6 +340,19 @@ class TestBuildKnowledgeUpdateMessages:
         )
         system_msg = messages[0]["content"]
         assert "1500" in system_msg
+
+    def test_system_message_contains_grounding(self) -> None:
+        topic = _make_topic()
+        messages = build_knowledge_update_messages(
+            current_summary="Summary.",
+            novelty_summary="Update.",
+            key_facts=[],
+            topic=topic,
+            max_tokens=2000,
+        )
+        system_msg = messages[0]["content"]
+        assert "CRITICAL RULES" in system_msg
+        assert "training data" in system_msg
 
 
 # ============================================================
@@ -322,6 +426,7 @@ class TestAnalyzeArticles:
         call_kwargs = mock_create.call_args.kwargs
         assert call_kwargs["model"] == "openai/gpt-4o-mini"
         assert call_kwargs["response_model"] is NoveltyResult
+        assert call_kwargs["temperature"] == 0.2
         # Verify messages include the knowledge state and topic info
         messages = call_kwargs["messages"]
         assert len(messages) == 2
@@ -351,6 +456,16 @@ class TestAnalyzeArticles:
         assert call_kwargs.kwargs["model"] == "anthropic/claude-haiku"
         assert call_kwargs.kwargs["api_key"] == "sk-test-123"
 
+    async def test_passes_temperature(self) -> None:
+        expected = NoveltyResult(has_new_info=False, confidence=0.5)
+        mock_client, mock_create = _mock_instructor_client(expected)
+        settings = _make_settings(llm_temperature=0.0)
+
+        with patch("app.analysis.llm._get_client", return_value=mock_client):
+            await analyze_articles([_make_article()], "", _make_topic(), settings)
+
+        assert mock_create.call_args.kwargs["temperature"] == 0.0
+
 
 # ============================================================
 # TestGenerateInitialKnowledge (async, mocked LLM)
@@ -361,8 +476,10 @@ class TestGenerateInitialKnowledge:
     async def test_passes_correct_args_and_recomputes_tokens(self) -> None:
         """Verify correct model/messages are passed and token count is recomputed."""
         expected = KnowledgeStateUpdate(
+            sufficient_data=True,
+            confidence=0.9,
             updated_summary="Initial knowledge summary.",
-            token_count=0,  # will be recomputed
+            token_count=0,
         )
         mock_client, mock_create = _mock_instructor_client(expected)
         settings = _make_settings()
@@ -380,13 +497,16 @@ class TestGenerateInitialKnowledge:
         call_kwargs = mock_create.call_args.kwargs
         assert call_kwargs["model"] == "openai/gpt-4o-mini"
         assert call_kwargs["response_model"] is KnowledgeStateUpdate
+        assert call_kwargs["temperature"] == 0.2
         messages = call_kwargs["messages"]
         assert "Init Topic" in messages[1]["content"]
 
     async def test_recomputes_token_count(self) -> None:
         expected = KnowledgeStateUpdate(
+            sufficient_data=True,
+            confidence=0.9,
             updated_summary="Some text here.",
-            token_count=999,  # LLM's guess
+            token_count=999,
         )
         mock_client, _ = _mock_instructor_client(expected)
         settings = _make_settings()
@@ -420,6 +540,8 @@ class TestGenerateKnowledgeUpdate:
     async def test_passes_correct_args_and_recomputes_tokens(self) -> None:
         """Verify current summary and novelty are passed in messages, tokens recomputed."""
         expected = KnowledgeStateUpdate(
+            sufficient_data=True,
+            confidence=0.9,
             updated_summary="Updated summary with new facts.",
             token_count=0,
         )
@@ -442,6 +564,7 @@ class TestGenerateKnowledgeUpdate:
         # Verify the messages include current summary and new findings
         call_kwargs = mock_create.call_args.kwargs
         assert call_kwargs["response_model"] is KnowledgeStateUpdate
+        assert call_kwargs["temperature"] == 0.2
         messages = call_kwargs["messages"]
         user_msg = messages[1]["content"]
         assert "Old summary." in user_msg
@@ -449,7 +572,7 @@ class TestGenerateKnowledgeUpdate:
         assert "$39.99" in user_msg
 
     async def test_recomputes_token_count(self) -> None:
-        expected = KnowledgeStateUpdate(updated_summary="Text.", token_count=999)
+        expected = KnowledgeStateUpdate(sufficient_data=True, confidence=0.9, updated_summary="Text.", token_count=999)
         mock_client, _ = _mock_instructor_client(expected)
         novelty = NoveltyResult(has_new_info=True, summary="X", confidence=0.8)
         settings = _make_settings()
@@ -488,7 +611,9 @@ class TestInitializeKnowledge:
         articles = [_make_article(topic_id=topic.id)]
         settings = _make_settings()
 
-        llm_result = KnowledgeStateUpdate(updated_summary="Initial summary.", token_count=30)
+        llm_result = KnowledgeStateUpdate(
+            sufficient_data=True, confidence=0.9, updated_summary="Initial summary.", token_count=30
+        )
         with patch(
             "app.analysis.knowledge.generate_initial_knowledge",
             new_callable=AsyncMock,
@@ -512,7 +637,7 @@ class TestInitializeKnowledge:
         db_conn.commit()
         settings = _make_settings()
 
-        llm_result = KnowledgeStateUpdate(updated_summary="S", token_count=5)
+        llm_result = KnowledgeStateUpdate(sufficient_data=True, confidence=0.9, updated_summary="S", token_count=5)
         with patch(
             "app.analysis.knowledge.generate_initial_knowledge",
             new_callable=AsyncMock,
@@ -542,6 +667,32 @@ class TestInitializeKnowledge:
         # Verify nothing was stored
         assert get_knowledge_state(db_conn, topic.id) is None
 
+    async def test_insufficient_data_still_stores(self, db_conn: sqlite3.Connection) -> None:
+        """When LLM reports insufficient data, we still store the explanation."""
+        topic = Topic(name="Thin", description="Desc", feed_urls=[])
+        topic = create_topic(db_conn, topic)
+        db_conn.commit()
+        settings = _make_settings()
+
+        llm_result = KnowledgeStateUpdate(
+            sufficient_data=False,
+            confidence=0.2,
+            updated_summary="Articles did not contain relevant information about the topic.",
+            token_count=10,
+        )
+        with patch(
+            "app.analysis.knowledge.generate_initial_knowledge",
+            new_callable=AsyncMock,
+            return_value=llm_result,
+        ):
+            state = await initialize_knowledge(topic, [], db_conn, settings)
+
+        assert state.id is not None
+        assert "did not contain" in state.summary_text
+
+        stored = get_knowledge_state(db_conn, topic.id)
+        assert stored is not None
+
 
 # ============================================================
 # TestUpdateKnowledge (async, db_conn)
@@ -566,6 +717,8 @@ class TestUpdateKnowledge:
             confidence=0.9,
         )
         llm_result = KnowledgeStateUpdate(
+            sufficient_data=True,
+            confidence=0.9,
             updated_summary="Updated summary with Fact 1.",
             token_count=35,
         )
@@ -621,3 +774,35 @@ class TestUpdateKnowledge:
         # Verify original state unchanged
         stored = get_knowledge_state(db_conn, topic.id)
         assert stored.summary_text == "Old."
+
+    async def test_insufficient_data_preserves_existing(self, db_conn: sqlite3.Connection) -> None:
+        """When LLM reports insufficient data on update, preserve the existing state."""
+        topic = Topic(name="U4", description="D4", feed_urls=[])
+        topic = create_topic(db_conn, topic)
+        db_conn.commit()
+
+        initial = KnowledgeState(topic_id=topic.id, summary_text="Existing knowledge.", token_count=15)
+        create_knowledge_state(db_conn, initial)
+        db_conn.commit()
+
+        novelty = NoveltyResult(has_new_info=True, summary="Vague update", confidence=0.5)
+        llm_result = KnowledgeStateUpdate(
+            sufficient_data=False,
+            confidence=0.2,
+            updated_summary="Findings too vague to incorporate.",
+        )
+        settings = _make_settings()
+
+        with patch(
+            "app.analysis.knowledge.generate_knowledge_update",
+            new_callable=AsyncMock,
+            return_value=llm_result,
+        ):
+            state = await update_knowledge(topic, novelty, db_conn, settings)
+
+        # Should return the original state unchanged
+        assert state.summary_text == "Existing knowledge."
+        assert state.token_count == 15
+
+        stored = get_knowledge_state(db_conn, topic.id)
+        assert stored.summary_text == "Existing knowledge."

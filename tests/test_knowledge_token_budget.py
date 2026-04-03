@@ -138,6 +138,8 @@ class TestInitializeKnowledgeTruncation:
         # Budget=500 → only "Sentence one here." (3 words = 300 tokens) fits.
         long_summary = "Sentence one here. Sentence two here. Sentence three here."
         llm_result = KnowledgeStateUpdate(
+            sufficient_data=True,
+            confidence=0.9,
             updated_summary=long_summary,
             token_count=9999,  # LLM's (wrong) self-reported count
         )
@@ -170,6 +172,8 @@ class TestInitializeKnowledgeTruncation:
         # 2 words → 2 tokens (with word-count mock), well under 500
         short_summary = "Short summary."
         llm_result = KnowledgeStateUpdate(
+            sufficient_data=True,
+            confidence=0.9,
             updated_summary=short_summary,
             token_count=2,
         )
@@ -197,6 +201,8 @@ class TestInitializeKnowledgeTruncation:
 
         long_summary = "Alpha beta gamma. Delta epsilon zeta. Eta theta iota."
         llm_result = KnowledgeStateUpdate(
+            sufficient_data=True,
+            confidence=0.9,
             updated_summary=long_summary,
             token_count=9999,
         )
@@ -242,6 +248,8 @@ class TestUpdateKnowledgeTruncation:
         # Each word = 100 tokens; budget=500 → only first sentence fits
         long_summary = "New fact one. New fact two. New fact three."
         llm_result = KnowledgeStateUpdate(
+            sufficient_data=True,
+            confidence=0.9,
             updated_summary=long_summary,
             token_count=9999,
         )
@@ -284,6 +292,8 @@ class TestUpdateKnowledgeTruncation:
         # 2 words → 2 tokens, well under 500
         updated_summary = "Short update."
         llm_result = KnowledgeStateUpdate(
+            sufficient_data=True,
+            confidence=0.9,
             updated_summary=updated_summary,
             token_count=2,
         )
@@ -316,6 +326,8 @@ class TestUpdateKnowledgeTruncation:
 
         long_summary = "One two three. Four five six. Seven eight nine."
         llm_result = KnowledgeStateUpdate(
+            sufficient_data=True,
+            confidence=0.9,
             updated_summary=long_summary,
             token_count=9999,
         )

@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 class NoveltyResult(BaseModel):
     """LLM response for novelty detection."""
 
+    reasoning: str = Field(default="", description="Brief chain-of-thought: what you compared, why you decided.")
     has_new_info: bool
     summary: str | None = None
     key_facts: list[str] = []
@@ -39,8 +40,16 @@ class NoveltyResult(BaseModel):
 class KnowledgeStateUpdate(BaseModel):
     """LLM response for knowledge state init/update."""
 
-    updated_summary: str
-    token_count: int
+    sufficient_data: bool = Field(
+        description="False if the articles lack enough relevant information to build a useful summary."
+    )
+    confidence: float = Field(
+        ge=0.0, le=1.0, description="How confident you are in the accuracy of this summary based on source articles."
+    )
+    updated_summary: str = Field(
+        description="The knowledge summary. If sufficient_data is false, explain what information was missing."
+    )
+    token_count: int = 0
 
 
 # --- Helpers ---
@@ -129,6 +138,7 @@ async def analyze_articles(
             api_key=settings.llm.api_key,
             api_base=_effective_base_url(settings),
             timeout=settings.llm_analysis_timeout,
+            temperature=settings.llm_temperature,
         )
 
     try:
@@ -160,6 +170,7 @@ async def generate_initial_knowledge(
             api_key=settings.llm.api_key,
             api_base=_effective_base_url(settings),
             timeout=settings.llm_knowledge_timeout,
+            temperature=settings.llm_temperature,
         )
 
     result: KnowledgeStateUpdate = await _call_with_rate_limit_retry(_do_call)
@@ -195,6 +206,7 @@ async def generate_knowledge_update(
             api_key=settings.llm.api_key,
             api_base=_effective_base_url(settings),
             timeout=settings.llm_knowledge_timeout,
+            temperature=settings.llm_temperature,
         )
 
     result: KnowledgeStateUpdate = await _call_with_rate_limit_retry(_do_call)

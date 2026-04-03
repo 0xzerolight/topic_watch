@@ -402,15 +402,25 @@ def delete_old_articles(conn: sqlite3.Connection, retention_days: int) -> int:
 
 
 def create_knowledge_state(conn: sqlite3.Connection, state: KnowledgeState) -> KnowledgeState:
-    """Insert a new knowledge state for a topic."""
+    """Insert or replace knowledge state for a topic.
+
+    Uses INSERT OR REPLACE so re-initialization of READY topics works
+    atomically without a separate delete step.
+    """
     data = state.to_insert_dict()
     cursor = conn.execute(
-        """INSERT INTO knowledge_states (topic_id, summary_text, token_count, updated_at)
+        """INSERT OR REPLACE INTO knowledge_states (topic_id, summary_text, token_count, updated_at)
            VALUES (:topic_id, :summary_text, :token_count, :updated_at)""",
         data,
     )
     state.id = cursor.lastrowid
     return state
+
+
+def delete_knowledge_state(conn: sqlite3.Connection, topic_id: int) -> bool:
+    """Delete knowledge state for a topic. Returns True if deleted."""
+    cursor = conn.execute("DELETE FROM knowledge_states WHERE topic_id = ?", (topic_id,))
+    return cursor.rowcount > 0
 
 
 def get_knowledge_state(conn: sqlite3.Connection, topic_id: int) -> KnowledgeState | None:
