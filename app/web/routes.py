@@ -170,6 +170,29 @@ def _confidence_badge(llm_response: str | None) -> str:
 
 templates.env.filters["confidence_badge"] = _confidence_badge
 
+
+def _feed_source_name(feed_url: str) -> str:
+    """Convert a feed URL to a human-readable source name."""
+    from urllib.parse import urlparse
+
+    try:
+        host = urlparse(feed_url).hostname or feed_url
+    except Exception:
+        return feed_url
+    host = host.lower()
+    if "google.com" in host:
+        return "Google News"
+    if "bing.com" in host:
+        return "Bing News"
+    # Strip common prefixes for other feeds
+    for prefix in ("www.", "news.", "feeds.", "rss.", "feed."):
+        if host.startswith(prefix):
+            host = host[len(prefix) :]
+    return host
+
+
+templates.env.filters["feed_source_name"] = _feed_source_name
+
 router = APIRouter()
 
 # Simple in-memory rate limiter for feed validation
