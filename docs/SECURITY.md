@@ -25,7 +25,7 @@ Please include: steps to reproduce, potential impact, and any suggested fix.
 
 Topic Watch is designed as a personal, self-hosted tool. Adding authentication would mean managing users, passwords, and sessions - complexity that doesn't make sense for a single-user application.
 
-If you deploy on a remote server, place Topic Watch behind a reverse proxy with your preferred auth layer (Authelia, Caddy basicauth, Nginx basic auth, etc.). See the [README](README.md#security) for examples.
+If you deploy on a remote server, place Topic Watch behind a reverse proxy with your preferred auth layer (Authelia, Caddy basicauth, Nginx basic auth, etc.). See the [README](../README.md#security) for examples.
 
 Your `data/config.yml` contains sensitive values (API keys, notification URLs). Ensure it is not world-readable.
 

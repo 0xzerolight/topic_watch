@@ -30,13 +30,16 @@ htmlcov/
 .coverage
 
 # Documentation (keep README.md for hatchling metadata)
+docs/
 *.md
 !README.md
 
 # Dev tooling configs
 .pre-commit-config.yaml
 Makefile
-ruff.toml
+
+# Scripts
+scripts/
 
 # IDE
 .vscode/
