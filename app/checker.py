@@ -7,8 +7,9 @@ state, sends notifications for genuine updates, and records the outcome.
 
 import logging
 import sqlite3
+from datetime import UTC, datetime
 
-from app.analysis.knowledge import update_knowledge
+from app.analysis.knowledge import initialize_knowledge, update_knowledge
 from app.analysis.llm import analyze_articles
 from app.check_context import check_id_var, generate_check_id
 from app.config import Settings
@@ -22,6 +23,7 @@ from app.crud import (
     increment_notification_retry,
     list_pending_notifications,
     mark_articles_processed,
+    update_topic,
 )
 from app.models import CheckResult, PendingNotification, Topic, TopicStatus
 from app.notifications import format_notification, send_notification
@@ -288,3 +290,66 @@ async def check_all_topics(
         sum(1 for r in results if r.has_new_info),
     )
     return results
+
+
+async def initialize_new_topic(
+    topic: Topic,
+    conn: sqlite3.Connection,
+    settings: Settings,
+) -> None:
+    """Initialize a topic's knowledge state from its first batch of articles.
+
+    Transitions: NEW/RESEARCHING → RESEARCHING → READY (or ERROR on failure).
+    Called by both the web layer (background task) and the scheduler (gradual init).
+    """
+    if topic.id is None:
+        raise ValueError("Topic must have an ID")
+
+    # Immediately mark as RESEARCHING (concurrency guard: UI shows spinner, prevents re-trigger)
+    topic.status = TopicStatus.RESEARCHING
+    topic.status_changed_at = datetime.now(UTC)
+    topic.error_message = None
+    update_topic(conn, topic)
+    conn.commit()
+
+    logger.info("Initializing knowledge for topic '%s' (id=%d)", topic.name, topic.id)
+
+    try:
+        fetch_result = await fetch_new_articles_for_topic(
+            topic,
+            conn,
+            max_articles=settings.max_articles_per_check,
+            feed_fetch_timeout=settings.feed_fetch_timeout,
+            article_fetch_timeout=settings.article_fetch_timeout,
+            feed_max_retries=settings.feed_max_retries,
+            concurrency=settings.content_fetch_concurrency,
+        )
+        articles = fetch_result.articles
+
+        if not articles:
+            topic.status = TopicStatus.ERROR
+            topic.error_message = "No articles found during initialization"
+            update_topic(conn, topic)
+            conn.commit()
+            return
+
+        # create_knowledge_state uses INSERT OR REPLACE, so re-init works atomically
+        await initialize_knowledge(topic, articles, conn, settings)
+
+        article_ids = [a.id for a in articles if a.id is not None]
+        if article_ids:
+            mark_articles_processed(conn, article_ids)
+
+        topic.status = TopicStatus.READY
+        topic.error_message = None
+        update_topic(conn, topic)
+        conn.commit()
+
+        logger.info("Knowledge initialized for topic '%s' — now READY", topic.name)
+
+    except Exception as exc:
+        logger.error("Knowledge init failed for topic '%s'", topic.name, exc_info=True)
+        topic.status = TopicStatus.ERROR
+        topic.error_message = str(exc)
+        update_topic(conn, topic)
+        conn.commit()

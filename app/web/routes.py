@@ -34,6 +34,7 @@ from app.crud import (
     delete_topic,
     get_check_result,
     get_dashboard_data,
+    get_dashboard_stats,
     get_feed_health,
     get_knowledge_state,
     get_topic,
@@ -175,6 +176,10 @@ router = APIRouter()
 _rate_limit_store: dict[str, list[float]] = {}
 _RATE_LIMIT_MAX = 10
 _RATE_LIMIT_WINDOW = 60  # seconds
+
+# Dashboard stats cache (single-worker safe)
+_stats_cache: dict = {"data": None, "expires": 0.0}
+_STATS_CACHE_TTL = 60  # seconds
 
 
 def _check_rate_limit(ip: str) -> bool:
@@ -366,9 +371,16 @@ async def dashboard(
     if tag:
         topic_data = [item for item in topic_data if tag in item["topic"].tags]
 
-    status_counts = {"ready": 0, "researching": 0, "error": 0}
+    status_counts = {"ready": 0, "researching": 0, "error": 0, "new": 0}
     for item in topic_data:
         status_counts[item["topic"].status.value] += 1
+
+    # Dashboard stats with caching
+    now = time.time()
+    if _stats_cache["data"] is None or now > _stats_cache["expires"]:
+        _stats_cache["data"] = get_dashboard_stats(conn)
+        _stats_cache["expires"] = now + _STATS_CACHE_TTL
+    stats = _stats_cache["data"]
 
     return templates.TemplateResponse(
         request,
@@ -378,6 +390,7 @@ async def dashboard(
             "status_counts": status_counts,
             "all_tags": all_tags,
             "active_tag": tag,
+            "stats": stats,
         },
     )
 
@@ -858,6 +871,101 @@ async def export_all_topics_json(
     )
 
 
+@router.get("/export/opml")
+async def export_opml_handler(
+    conn: sqlite3.Connection = Depends(get_db_conn),
+):
+    """Export all topics as OPML XML."""
+    from app.opml import export_opml
+
+    topics = list_topics(conn)
+    topic_dicts = [{"name": t.name, "feed_urls": t.feed_urls, "tags": t.tags} for t in topics]
+    xml_content = export_opml(topic_dicts)
+
+    return StreamingResponse(
+        iter([xml_content]),
+        media_type="application/xml",
+        headers={"Content-Disposition": 'attachment; filename="topic_watch_export.opml"'},
+    )
+
+
+@router.post("/import/opml", dependencies=[Depends(verify_csrf)])
+async def import_opml_handler(
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_db_conn),
+    settings: Settings = Depends(get_settings),
+):
+    """Import topics from an OPML file."""
+    import asyncio
+
+    from fastapi import UploadFile
+
+    from app.crud import create_topic, get_all_feed_urls
+    from app.opml import parse_opml
+
+    form = await request.form()
+    opml_file = form.get("opml_file")
+    if not isinstance(opml_file, UploadFile) or opml_file.filename == "":
+        return RedirectResponse(url="/?error=No+file+selected", status_code=303)
+
+    # Read file with 1MB size cap
+    content_bytes = await opml_file.read(1024 * 1024 + 1)
+    if len(content_bytes) > 1024 * 1024:
+        return RedirectResponse(url="/?error=File+too+large+(max+1MB)", status_code=303)
+
+    try:
+        content = content_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return RedirectResponse(url="/?error=Invalid+file+encoding+(must+be+UTF-8)", status_code=303)
+
+    existing_urls = get_all_feed_urls(conn)
+
+    # Run OPML parsing (includes SSRF validation with DNS lookups) in a thread
+    result = await asyncio.to_thread(parse_opml, content, existing_urls)
+
+    if result.warnings and not result.topics:
+        warning_msg = result.warnings[0][:200]
+        return RedirectResponse(url=f"/?error={warning_msg}", status_code=303)
+
+    # Create topics with NEW status
+    created = 0
+    skipped_name_dupes = 0
+    for topic_data in result.topics:
+        # Check for name collision
+        existing = conn.execute("SELECT 1 FROM topics WHERE name = ?", (topic_data["name"],)).fetchone()
+        if existing:
+            skipped_name_dupes += 1
+            continue
+
+        default_interval = settings.check_interval_minutes
+        topic = Topic(
+            name=topic_data["name"],
+            description=f"News monitoring for {topic_data['name']}",
+            feed_urls=topic_data["feed_urls"],
+            feed_mode=FeedMode.MANUAL,
+            status=TopicStatus.NEW,
+            check_interval_minutes=default_interval,
+            tags=topic_data.get("tags", []),
+        )
+        create_topic(conn, topic)
+        created += 1
+
+    conn.commit()
+
+    # Build summary message
+    parts = [f"Imported {created} topic(s)"]
+    total_skipped = result.skipped_dupes + skipped_name_dupes
+    if total_skipped:
+        parts.append(f"skipped {total_skipped} duplicate(s)")
+    if result.skipped_invalid:
+        parts.append(f"skipped {result.skipped_invalid} invalid URL(s)")
+    if created > 0:
+        parts.append("topics will initialize gradually (~1/min)")
+    msg = ", ".join(parts) + "."
+
+    return RedirectResponse(url=f"/?msg={msg}", status_code=303)
+
+
 @router.get("/topics/{topic_id}/export/json")
 async def export_topic_json(
     topic_id: int,
@@ -1246,12 +1354,11 @@ async def _run_init(topic_id: int, settings: Settings, db_path: Path | None = No
     """Background task: fetch articles and build initial knowledge state.
 
     Creates its own database connection since the request connection
-    is closed by the time this runs.
+    is closed by the time this runs. Delegates to initialize_new_topic()
+    for the actual init logic.
     """
-    from app.analysis.knowledge import initialize_knowledge
-    from app.crud import mark_articles_processed
+    from app.checker import initialize_new_topic
     from app.database import get_db
-    from app.scraping import fetch_new_articles_for_topic
 
     if not await _checking_state.start_check(topic_id):
         logger.info("Init background task: topic %d already being initialized, skipping", topic_id)
@@ -1264,38 +1371,8 @@ async def _run_init(topic_id: int, settings: Settings, db_path: Path | None = No
                 logger.error("Init background task: topic %d not found", topic_id)
                 return
 
-            async def _do_init_work(topic, conn):
-                fetch_result = await fetch_new_articles_for_topic(
-                    topic,
-                    conn,
-                    max_articles=settings.max_articles_per_check,
-                    feed_fetch_timeout=settings.feed_fetch_timeout,
-                    article_fetch_timeout=settings.article_fetch_timeout,
-                    feed_max_retries=settings.feed_max_retries,
-                    concurrency=settings.content_fetch_concurrency,
-                )
-                articles = fetch_result.articles
-
-                if not articles:
-                    topic.status = TopicStatus.ERROR
-                    topic.error_message = "No articles found during initialization"
-                    update_topic(conn, topic)
-                    return
-
-                # create_knowledge_state uses INSERT OR REPLACE, so re-init works
-                # atomically without a separate delete step
-                await initialize_knowledge(topic, articles, conn, settings)
-
-                article_ids = [a.id for a in articles if a.id is not None]
-                if article_ids:
-                    mark_articles_processed(conn, article_ids)
-
-                topic.status = TopicStatus.READY
-                topic.error_message = None
-                update_topic(conn, topic)
-
             try:
-                await asyncio.wait_for(_do_init_work(topic, conn), timeout=_INIT_TIMEOUT_SECONDS)
+                await asyncio.wait_for(initialize_new_topic(topic, conn, settings), timeout=_INIT_TIMEOUT_SECONDS)
             except TimeoutError:
                 logger.error(
                     "Init timed out for topic '%s' after %d seconds",
@@ -1304,11 +1381,6 @@ async def _run_init(topic_id: int, settings: Settings, db_path: Path | None = No
                 )
                 topic.status = TopicStatus.ERROR
                 topic.error_message = "Research timed out. Click Retry."
-                update_topic(conn, topic)
-            except Exception as exc:
-                logger.error("Init failed for topic '%s'", topic.name, exc_info=True)
-                topic.status = TopicStatus.ERROR
-                topic.error_message = str(exc)
                 update_topic(conn, topic)
     finally:
         await _checking_state.finish_check(topic_id)

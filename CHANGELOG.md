@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- OPML import/export for migrating feeds from RSS readers (FreshRSS, Miniflux, Tiny Tiny RSS)
+- JSON API at `/api/v1/` for scripting and monitoring (topics, checks, knowledge state, trigger)
+- Dashboard stats bar (total checks, new info found, last notification)
+- Dark mode auto-detection via `prefers-color-scheme` media query
+- Ollama quick start with `docker-compose.override.example.yml`
+- `TopicStatus.NEW` for gradual OPML import initialization (~1 topic/min)
+- Multi-provider RSS fallback (Bing News + Google News)
+
 ## [1.0.0] - 2026-03-20
 
 ### Added

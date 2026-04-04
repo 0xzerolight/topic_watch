@@ -772,3 +772,108 @@ class TestGetDashboardData:
         assert len(data) == 2
         assert data[0]["topic"].name == "Alpha"
         assert data[1]["topic"].name == "Zeta"
+
+
+class TestGetNewTopics:
+    """Tests for get_new_topics (OPML gradual init)."""
+
+    def test_returns_new_topics_oldest_first(self, db_conn: sqlite3.Connection) -> None:
+        from app.crud import get_new_topics
+
+        t1 = Topic(name="First", description="d", status=TopicStatus.NEW)
+        t2 = Topic(name="Second", description="d", status=TopicStatus.NEW)
+        create_topic(db_conn, t1)
+        create_topic(db_conn, t2)
+        db_conn.commit()
+
+        result = get_new_topics(db_conn, limit=1)
+        assert len(result) == 1
+        assert result[0].name == "First"
+
+    def test_ignores_non_new_topics(self, db_conn: sqlite3.Connection) -> None:
+        from app.crud import get_new_topics
+
+        create_topic(db_conn, Topic(name="Ready", description="d", status=TopicStatus.READY))
+        create_topic(db_conn, Topic(name="New", description="d", status=TopicStatus.NEW))
+        db_conn.commit()
+
+        result = get_new_topics(db_conn, limit=10)
+        assert len(result) == 1
+        assert result[0].name == "New"
+
+    def test_empty_when_no_new_topics(self, db_conn: sqlite3.Connection) -> None:
+        from app.crud import get_new_topics
+
+        create_topic(db_conn, Topic(name="Ready", description="d", status=TopicStatus.READY))
+        db_conn.commit()
+
+        result = get_new_topics(db_conn)
+        assert result == []
+
+
+class TestGetAllFeedUrls:
+    """Tests for get_all_feed_urls (OPML dedup)."""
+
+    def test_returns_all_feed_urls(self, db_conn: sqlite3.Connection) -> None:
+        from app.crud import get_all_feed_urls
+
+        create_topic(
+            db_conn,
+            Topic(
+                name="T1",
+                description="d",
+                feed_urls=["https://a.com/feed", "https://b.com/feed"],
+            ),
+        )
+        create_topic(
+            db_conn,
+            Topic(
+                name="T2",
+                description="d",
+                feed_urls=["https://c.com/feed"],
+            ),
+        )
+        db_conn.commit()
+
+        urls = get_all_feed_urls(db_conn)
+        assert urls == {"https://a.com/feed", "https://b.com/feed", "https://c.com/feed"}
+
+    def test_empty_when_no_topics(self, db_conn: sqlite3.Connection) -> None:
+        from app.crud import get_all_feed_urls
+
+        urls = get_all_feed_urls(db_conn)
+        assert urls == set()
+
+
+class TestGetDashboardStats:
+    """Tests for get_dashboard_stats."""
+
+    def test_stats_with_no_data(self, db_conn: sqlite3.Connection) -> None:
+        from app.crud import get_dashboard_stats
+
+        stats = get_dashboard_stats(db_conn)
+        assert stats.total_topics == 0
+        assert stats.active_topics == 0
+        assert stats.checks_24h == 0
+        assert stats.checks_total == 0
+        assert stats.new_info_24h == 0
+        assert stats.new_info_total == 0
+        assert stats.last_notification_at is None
+
+    def test_stats_with_data(self, db_conn: sqlite3.Connection) -> None:
+        from app.crud import get_dashboard_stats
+
+        t1 = create_topic(db_conn, Topic(name="Active", description="d", status=TopicStatus.READY))
+        create_topic(db_conn, Topic(name="Inactive", description="d", status=TopicStatus.READY, is_active=False))
+        create_check_result(
+            db_conn, CheckResult(topic_id=t1.id, articles_found=5, has_new_info=True, notification_sent=True)
+        )
+        create_check_result(db_conn, CheckResult(topic_id=t1.id, articles_found=3, has_new_info=False))
+        db_conn.commit()
+
+        stats = get_dashboard_stats(db_conn)
+        assert stats.total_topics == 2
+        assert stats.active_topics == 1
+        assert stats.checks_total == 2
+        assert stats.new_info_total == 1
+        assert stats.last_notification_at is not None

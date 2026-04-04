@@ -28,3 +28,9 @@ Topic Watch is designed as a personal, self-hosted tool. Adding authentication w
 If you deploy on a remote server, place Topic Watch behind a reverse proxy with your preferred auth layer (Authelia, Caddy basicauth, Nginx basic auth, etc.). See the [README](README.md#security) for examples.
 
 Your `data/config.yml` contains sensitive values (API keys, notification URLs). Ensure it is not world-readable.
+
+## JSON API
+
+The `/api/v1/` JSON API endpoints are unauthenticated, the same as the web UI. GET endpoints provide read access to all topic data including knowledge states. The single mutation endpoint (`POST /api/v1/topics/{id}/check`) is protected by CSRF.
+
+If you expose Topic Watch to a network, apply the same reverse proxy authentication to API endpoints as you do to the web UI.

@@ -31,6 +31,10 @@
     } catch (e) {
       // localStorage may be unavailable
     }
+    // Auto-detect dark mode preference for first-time visitors
+    if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) {
+      return "dark";
+    }
     return DEFAULT_THEME;
   }
 

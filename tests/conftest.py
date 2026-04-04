@@ -20,6 +20,18 @@ def _safe_config_path(tmp_path: Path):
     app.state.config_path = tmp_path / "config.yml"
 
 
+@pytest.fixture(autouse=True)
+def _reset_stats_cache():
+    """Reset the dashboard stats cache between tests to prevent bleed."""
+    from app.web import routes
+
+    routes._stats_cache["data"] = None
+    routes._stats_cache["expires"] = 0.0
+    yield
+    routes._stats_cache["data"] = None
+    routes._stats_cache["expires"] = 0.0
+
+
 @pytest.fixture
 def db_conn(tmp_path: Path) -> Generator[sqlite3.Connection, None, None]:
     """Provide a fresh database with schema initialized."""
