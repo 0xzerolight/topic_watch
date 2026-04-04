@@ -20,6 +20,7 @@ from app.crud import recover_stuck_topics
 from app.database import get_db, init_db
 from app.logging_config import setup_logging
 from app.scheduler import start_scheduler, stop_scheduler
+from app.web.api import router as api_router
 from app.web.csrf import CSRFMiddleware
 from app.web.routes import router
 from app.web.setup_middleware import SetupRedirectMiddleware
@@ -56,6 +57,7 @@ app = FastAPI(title="Topic Watch", lifespan=lifespan)
 app.add_middleware(CSRFMiddleware)
 app.add_middleware(SetupRedirectMiddleware)
 app.include_router(router)
+app.include_router(api_router)
 app.mount("/static", StaticFiles(directory=str(Path(__file__).resolve().parent / "static")), name="static")
 
 _error_templates = Jinja2Templates(directory=str(Path(__file__).resolve().parent / "templates"))

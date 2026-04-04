@@ -64,7 +64,7 @@ class TestRunInitTimeout:
         with (
             patch("app.web.routes._INIT_TIMEOUT_SECONDS", 0.05),
             patch(
-                "app.scraping.fetch_new_articles_for_topic",
+                "app.checker.fetch_new_articles_for_topic",
                 side_effect=_hang,
             ),
         ):
@@ -99,7 +99,7 @@ class TestRunInitTimeout:
         with (
             patch("app.web.routes._INIT_TIMEOUT_SECONDS", 0.05),
             patch(
-                "app.scraping.fetch_new_articles_for_topic",
+                "app.checker.fetch_new_articles_for_topic",
                 side_effect=_hang,
             ),
             caplog.at_level(logging.ERROR, logger="app.web.routes"),
@@ -132,17 +132,17 @@ class TestRunInitTimeout:
 
         with (
             patch(
-                "app.scraping.fetch_new_articles_for_topic",
+                "app.checker.fetch_new_articles_for_topic",
                 new_callable=AsyncMock,
                 return_value=FetchResult(articles=[fake_article], total_feed_entries=1),
             ),
             patch(
-                "app.analysis.knowledge.initialize_knowledge",
+                "app.checker.initialize_knowledge",
                 new_callable=AsyncMock,
                 return_value=None,
             ),
             patch(
-                "app.crud.mark_articles_processed",
+                "app.checker.mark_articles_processed",
                 return_value=None,
             ),
         ):

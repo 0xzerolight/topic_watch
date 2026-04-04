@@ -92,6 +92,23 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 Then visit [http://localhost:8000](http://localhost:8000) to configure.
 
+### Running with Ollama (no API key needed)
+
+If you run [Ollama](https://ollama.ai) locally, Topic Watch can use it for free LLM-powered novelty detection:
+
+```bash
+# 1. Start Ollama and pull a model (8B+ recommended for novelty detection)
+ollama pull llama3.3
+
+# 2. Start Topic Watch with Ollama config
+cp docker-compose.override.example.yml docker-compose.override.yml
+docker compose up -d
+```
+
+The override file sets `ollama/llama3.3` as the model and points to your local Ollama instance. No API key required.
+
+**Model recommendations:** Models with 8B+ parameters and 8K+ context windows work best. Tested with `llama3.3` (8B), `mistral` (7B), and `qwen2.5` (7B). Smaller models may miss subtle novelty signals.
+
 ## Configuration
 
 Settings live in `data/config.yml`. First run auto-copies `config.example.yml`. Editable via the web UI Settings page or directly in the file.

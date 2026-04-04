@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 class TopicStatus(StrEnum):
     """Status of a topic's lifecycle."""
 
+    NEW = "new"
     RESEARCHING = "researching"
     READY = "ready"
     ERROR = "error"
@@ -174,6 +175,18 @@ class FeedHealth(BaseModel):
                 except (ValueError, TypeError):
                     data[field] = None
         return cls(**data)
+
+
+class DashboardStats(BaseModel):
+    """Aggregate statistics for the dashboard."""
+
+    total_topics: int = 0
+    active_topics: int = 0
+    checks_24h: int = 0
+    checks_total: int = 0
+    new_info_24h: int = 0
+    new_info_total: int = 0
+    last_notification_at: datetime | None = None
 
 
 class PendingNotification(BaseModel):

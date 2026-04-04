@@ -13,15 +13,26 @@
             </button>
         </form>
         {% endif %}
-        <a href="/export/topics/json" role="button" class="outline secondary">Export All</a>
+        <a href="/export/topics/json" role="button" class="outline secondary">Export JSON</a>
+        <a href="/export/opml" role="button" class="outline secondary">Export OPML</a>
+        <button type="button" class="outline secondary" onclick="document.getElementById('opml-import-dialog').showModal()">Import OPML</button>
     </div>
 </div>
+
+{% if stats and stats.total_topics > 0 %}
+<div style="display: flex; flex-wrap: wrap; gap: 1.5em; margin-bottom: 1em; padding: 0.75em; background: var(--pico-card-background-color); border-radius: 0.25em;">
+    <div><small><strong>{{ stats.active_topics }}</strong>/{{ stats.total_topics }} active</small></div>
+    <div><small><strong>{{ stats.checks_24h }}</strong> checks (24h) / {{ stats.checks_total }} total</small></div>
+    <div><small><strong>{{ stats.new_info_24h }}</strong> new info (24h) / {{ stats.new_info_total }} total</small></div>
+    {% if stats.last_notification_at %}<div><small>Last notified {{ stats.last_notification_at | timeago }}</small></div>{% endif %}
+</div>
+{% endif %}
 
 {% if topic_data or active_tag %}
 {% if status_counts %}
 <p>
     <small>
-        {{ status_counts.ready }} ready{% if status_counts.researching %}, {{ status_counts.researching }} researching{% endif %}{% if status_counts.error %}, {{ status_counts.error }} error{% endif %}
+        {{ status_counts.ready }} ready{% if status_counts.new %}, {{ status_counts.new }} new{% endif %}{% if status_counts.researching %}, {{ status_counts.researching }} researching{% endif %}{% if status_counts.error %}, {{ status_counts.error }} error{% endif %}
     </small>
 </p>
 {% endif %}
@@ -54,6 +65,7 @@
             hx-include="[name='q']"
             style="margin-bottom: 0; width: auto;">
         <option value="all">All Statuses</option>
+        <option value="new">New</option>
         <option value="ready">Ready</option>
         <option value="researching">Researching</option>
         <option value="error">Error</option>
@@ -172,4 +184,22 @@ document.body.addEventListener("htmx:afterSwap", function(event) {
     }
 });
 </script>
+
+<dialog id="opml-import-dialog">
+    <article>
+        <header>
+            <button aria-label="Close" rel="prev" onclick="document.getElementById('opml-import-dialog').close()"></button>
+            <h3>Import OPML</h3>
+        </header>
+        <form method="post" action="/import/opml" enctype="multipart/form-data">
+            <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
+            <p>Upload an OPML file from your RSS reader (FreshRSS, Miniflux, Tiny Tiny RSS, etc.).</p>
+            <input type="file" name="opml_file" accept=".opml,.xml" required>
+            <small>Max 500 feeds per import. Duplicate feeds will be skipped.</small>
+            <footer>
+                <button type="submit">Import</button>
+            </footer>
+        </form>
+    </article>
+</dialog>
 {% endblock %}
