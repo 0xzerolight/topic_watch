@@ -21,7 +21,7 @@
 </article>
 
 {% elif knowledge %}
-<details open>
+<details open class="knowledge-state">
     <summary>
         <strong>Knowledge State</strong>
         <small style="margin-left: 0.5em; font-weight: normal;">
@@ -35,7 +35,7 @@
             <small>Token budget: {{ usage_pct }}% used</small>
             <progress value="{{ knowledge.token_count }}" max="{{ knowledge_state_max_tokens }}" style="width: 100%;"></progress>
         </div>
-        <div style="white-space: pre-wrap;">{{ knowledge.summary_text }}</div>
+        <div class="knowledge-text">{{ knowledge.summary_text }}</div>
     </article>
 </details>
 

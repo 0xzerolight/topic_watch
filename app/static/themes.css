@@ -244,3 +244,47 @@ html[data-custom-theme="tokyo-night"] {
   border: none;
   font-size: 0.875rem;
 }
+
+
+/* --- Semantic status colors --- */
+.status-healthy { color: var(--pico-ins-color, #2ecc40); }
+.status-degraded { color: var(--pico-color-orange-500, #f57c00); }
+.status-error { color: var(--pico-del-color, #c62828); }
+.status-unknown { color: var(--pico-muted-color, gray); }
+
+
+/* --- Knowledge state constraint --- */
+details.knowledge-state > article > div.knowledge-text {
+  max-height: 24rem;
+  overflow-y: auto;
+  white-space: pre-wrap;
+}
+
+
+/* --- Feed URL truncation --- */
+.feed-url {
+  display: inline-block;
+  max-width: 30rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+
+/* --- Table horizontal scroll --- */
+.table-scroll {
+  overflow-x: auto;
+}
+
+
+/* --- Danger button --- */
+.btn-danger {
+  color: var(--pico-del-color, #c62828);
+  border-color: var(--pico-del-color, #c62828);
+}
+.btn-danger:hover {
+  background-color: var(--pico-del-color, #c62828);
+  color: var(--pico-primary-inverse, #fff);
+  border-color: var(--pico-del-color, #c62828);
+}

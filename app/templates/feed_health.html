@@ -4,6 +4,7 @@
 <h1>Feed Health</h1>
 
 {% if feeds %}
+<div class="table-scroll">
 <table>
     <thead>
         <tr>
@@ -21,14 +22,14 @@
         <tr>
             <td>
                 {% if feed.consecutive_failures == 0 %}
-                    <span style="color: green" title="Healthy">&#9679; Healthy</span>
+                    <span class="status-healthy" title="Healthy">&#9679; Healthy</span>
                 {% elif feed.consecutive_failures <= 2 %}
-                    <span style="color: orange" title="Degraded">&#9679; Degraded</span>
+                    <span class="status-degraded" title="Degraded">&#9679; Degraded</span>
                 {% else %}
-                    <span style="color: red" title="Unhealthy">&#9679; Unhealthy</span>
+                    <span class="status-error" title="Unhealthy">&#9679; Unhealthy</span>
                 {% endif %}
             </td>
-            <td><a href="{{ feed.feed_url }}" target="_blank"><small>{{ feed.feed_url|truncate(60) }}</small></a></td>
+            <td><a href="{{ feed.feed_url }}" target="_blank" class="feed-url" title="{{ feed.feed_url }}"><small>{{ feed.feed_url|truncate(60) }}</small></a></td>
             <td>{{ feed.last_success_at|timeago if feed.last_success_at else "Never" }}</td>
             <td>
                 {% if feed.last_error_at %}
@@ -50,6 +51,7 @@
         {% endfor %}
     </tbody>
 </table>
+</div>
 {% else %}
 <p>No feed health data yet. Feed health is tracked automatically after feeds are fetched.</p>
 {% endif %}

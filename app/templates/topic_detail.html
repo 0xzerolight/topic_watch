@@ -26,14 +26,14 @@
     {% if auto_feed_url in feed_health_map %}
         {% set fh = feed_health_map[auto_feed_url] %}
         {% if fh.consecutive_failures == 0 %}
-            <span style="color: green" title="Healthy ({{ fh.total_fetches }} fetches, {{ fh.total_failures }} failures)">&#9679;</span>
+            <span class="status-healthy" title="Healthy ({{ fh.total_fetches }} fetches, {{ fh.total_failures }} failures)">&#9679; Healthy</span>
         {% elif fh.consecutive_failures <= 2 %}
-            <span style="color: orange" title="Degraded ({{ fh.consecutive_failures }} consecutive failures)">&#9679;</span>
+            <span class="status-degraded" title="Degraded ({{ fh.consecutive_failures }} consecutive failures)">&#9679; Degraded</span>
         {% else %}
-            <span style="color: red" title="Unhealthy ({{ fh.consecutive_failures }} consecutive failures): {{ fh.last_error_message }}">&#9679;</span>
+            <span class="status-error" title="Unhealthy ({{ fh.consecutive_failures }} consecutive failures): {{ fh.last_error_message }}">&#9679; Unhealthy</span>
         {% endif %}
     {% else %}
-        <span style="color: gray" title="No health data">&#9679;</span>
+        <span class="status-unknown" title="No health data">&#9679; Unknown</span>
     {% endif %}
     <a href="{{ auto_feed_url }}" target="_blank">{{ auto_feed_url }}</a>
 </p>
@@ -46,14 +46,14 @@
         {% if url in feed_health_map %}
             {% set fh = feed_health_map[url] %}
             {% if fh.consecutive_failures == 0 %}
-                <span style="color: green" title="Healthy ({{ fh.total_fetches }} fetches, {{ fh.total_failures }} failures)">&#9679;</span>
+                <span class="status-healthy" title="Healthy ({{ fh.total_fetches }} fetches, {{ fh.total_failures }} failures)">&#9679; Healthy</span>
             {% elif fh.consecutive_failures <= 2 %}
-                <span style="color: orange" title="Degraded ({{ fh.consecutive_failures }} consecutive failures)">&#9679;</span>
+                <span class="status-degraded" title="Degraded ({{ fh.consecutive_failures }} consecutive failures)">&#9679; Degraded</span>
             {% else %}
-                <span style="color: red" title="Unhealthy ({{ fh.consecutive_failures }} consecutive failures): {{ fh.last_error_message }}">&#9679;</span>
+                <span class="status-error" title="Unhealthy ({{ fh.consecutive_failures }} consecutive failures): {{ fh.last_error_message }}">&#9679; Unhealthy</span>
             {% endif %}
         {% else %}
-            <span style="color: gray" title="No health data">&#9679;</span>
+            <span class="status-unknown" title="No health data">&#9679; Unknown</span>
         {% endif %}
         <a href="{{ url }}" target="_blank">{{ url }}</a>
     </li>
@@ -211,7 +211,7 @@
           style="margin: 0; margin-left: auto;"
           onsubmit="return confirm('Delete this topic and all its data?')">
         <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
-        <button type="submit" class="outline" style="font-size: 0.875rem; padding: 0.25rem 0.75rem; margin: 0; color: var(--pico-del-color, #c62828);">Delete Topic</button>
+        <button type="submit" class="outline btn-danger" style="font-size: 0.875rem; padding: 0.25rem 0.75rem; margin: 0;">Delete Topic</button>
     </form>
 </div>
 
