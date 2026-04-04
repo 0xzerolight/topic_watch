@@ -264,7 +264,7 @@ details.knowledge-state > article > div.knowledge-text {
 /* --- Feed URL truncation --- */
 .feed-url {
   display: inline-block;
-  max-width: 30rem;
+  max-width: 20rem;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
