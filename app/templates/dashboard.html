@@ -74,6 +74,7 @@
     </button>
 </div>
 
+<div class="table-scroll">
 <table>
     <thead>
         <tr>
@@ -89,6 +90,7 @@
         {% include "_topic_list.html" %}
     </tbody>
 </table>
+</div>
 {% else %}
 {% if active_tag %}
 <p>No topics found with tag <kbd>{{ active_tag }}</kbd>. <a href="/">Clear filter</a>.</p>
