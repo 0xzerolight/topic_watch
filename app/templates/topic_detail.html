@@ -20,23 +20,28 @@
 
 <h2>Feed Source</h2>
 {% if topic.feed_mode.value == "auto" %}
-<p>
-    <strong>Mode:</strong> Automatic (Google News)<br>
-    <strong>Search URL:</strong>
-    {% if auto_feed_url in feed_health_map %}
-        {% set fh = feed_health_map[auto_feed_url] %}
-        {% if fh.consecutive_failures == 0 %}
-            <span class="status-healthy" title="Healthy ({{ fh.total_fetches }} fetches, {{ fh.total_failures }} failures)">&#9679; Healthy</span>
-        {% elif fh.consecutive_failures <= 2 %}
-            <span class="status-degraded" title="Degraded ({{ fh.consecutive_failures }} consecutive failures)">&#9679; Degraded</span>
+<p><strong>Mode:</strong> Automatic</p>
+{% if auto_feed_urls %}
+<ul>
+    {% for url in auto_feed_urls %}
+    <li>
+        {% if url in feed_health_map %}
+            {% set fh = feed_health_map[url] %}
+            {% if fh.consecutive_failures == 0 %}
+                <span class="status-healthy" title="Healthy ({{ fh.total_fetches }} fetches, {{ fh.total_failures }} failures)">&#9679; Healthy</span>
+            {% elif fh.consecutive_failures <= 2 %}
+                <span class="status-degraded" title="Degraded ({{ fh.consecutive_failures }} consecutive failures)">&#9679; Degraded</span>
+            {% else %}
+                <span class="status-error" title="Unhealthy ({{ fh.consecutive_failures }} consecutive failures): {{ fh.last_error_message }}">&#9679; Unhealthy</span>
+            {% endif %}
         {% else %}
-            <span class="status-error" title="Unhealthy ({{ fh.consecutive_failures }} consecutive failures): {{ fh.last_error_message }}">&#9679; Unhealthy</span>
+            <span class="status-unknown" title="No health data">&#9679; Unknown</span>
         {% endif %}
-    {% else %}
-        <span class="status-unknown" title="No health data">&#9679; Unknown</span>
-    {% endif %}
-    <a href="{{ auto_feed_url }}" target="_blank">{{ auto_feed_url }}</a>
-</p>
+        <a href="{{ url }}" target="_blank">{{ url|truncate(80) }}</a>
+    </li>
+    {% endfor %}
+</ul>
+{% endif %}
 {% else %}
 <p><strong>Mode:</strong> Manual</p>
 {% if topic.feed_urls %}
