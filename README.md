@@ -7,6 +7,10 @@
 
 Self-hosted news monitoring with LLM-powered novelty detection. Watches topics via RSS feeds, notifies you only when genuinely new information appears. BYOK (bring your own key).
 
+<p align="center">
+  <img src="docs/themes-showcase.gif" alt="Topic Watch — theme showcase" width="720">
+</p>
+
 ## How It Works
 
 1. Define topics with RSS feed URLs, or let it auto-generate a Google News feed
