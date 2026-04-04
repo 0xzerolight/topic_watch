@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from app.models import (
     Article,
     CheckResult,
+    DashboardStats,
     FeedHealth,
     KnowledgeState,
     PendingNotification,
@@ -579,3 +580,56 @@ def list_all_feed_health(conn: sqlite3.Connection) -> list[FeedHealth]:
     """List health info for all tracked feeds."""
     rows = conn.execute("SELECT * FROM feed_health ORDER BY consecutive_failures DESC, feed_url").fetchall()
     return [FeedHealth.from_row(row) for row in rows]
+
+
+# --- NEW topic CRUD ---
+
+
+def get_new_topics(conn: sqlite3.Connection, limit: int = 1) -> list[Topic]:
+    """Get topics in NEW status, oldest first (for gradual scheduler init)."""
+    rows = conn.execute(
+        "SELECT * FROM topics WHERE status = ? ORDER BY created_at ASC LIMIT ?",
+        (TopicStatus.NEW.value, limit),
+    ).fetchall()
+    return [Topic.from_row(row) for row in rows]
+
+
+def get_all_feed_urls(conn: sqlite3.Connection) -> set[str]:
+    """Get all feed URLs across all topics for OPML dedup."""
+    rows = conn.execute("SELECT DISTINCT json_each.value FROM topics, json_each(topics.feed_urls)").fetchall()
+    return {row[0] for row in rows}
+
+
+# --- Dashboard Stats ---
+
+
+def get_dashboard_stats(conn: sqlite3.Connection) -> DashboardStats:
+    """Get aggregate statistics for the dashboard."""
+    row = conn.execute(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM topics) AS total_topics,
+            (SELECT COUNT(*) FROM topics WHERE is_active = 1) AS active_topics,
+            (SELECT COUNT(*) FROM check_results WHERE checked_at >= datetime('now', '-1 day')) AS checks_24h,
+            (SELECT COUNT(*) FROM check_results) AS checks_total,
+            (SELECT COUNT(*) FROM check_results WHERE has_new_info = 1 AND checked_at >= datetime('now', '-1 day')) AS new_info_24h,
+            (SELECT COUNT(*) FROM check_results WHERE has_new_info = 1) AS new_info_total,
+            (SELECT MAX(checked_at) FROM check_results WHERE notification_sent = 1) AS last_notification_at
+        """
+    ).fetchone()
+    assert row is not None
+    last_notif = None
+    if row["last_notification_at"]:
+        import contextlib
+
+        with contextlib.suppress(ValueError, TypeError):
+            last_notif = datetime.fromisoformat(row["last_notification_at"])
+    return DashboardStats(
+        total_topics=row["total_topics"],
+        active_topics=row["active_topics"],
+        checks_24h=row["checks_24h"],
+        checks_total=row["checks_total"],
+        new_info_24h=row["new_info_24h"],
+        new_info_total=row["new_info_total"],
+        last_notification_at=last_notif,
+    )

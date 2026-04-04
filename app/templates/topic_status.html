@@ -1,4 +1,14 @@
-{% if topic.status.value == "researching" %}
+{% if topic.status.value == "new" %}
+<article>
+    <header>Pending Initialization</header>
+    <p>This topic will be initialized on the next scheduler cycle (~1 minute). Articles will be fetched and an initial knowledge state will be built automatically.</p>
+    <form method="post" action="/topics/{{ topic.id }}/init" style="display:inline">
+        <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
+        <button type="submit" class="contrast outline" style="font-size: 0.875rem;">Initialize Now</button>
+    </form>
+</article>
+
+{% elif topic.status.value == "researching" %}
 <article aria-busy="true"
          hx-get="/topics/{{ topic.id }}/status"
          hx-trigger="every 3s"

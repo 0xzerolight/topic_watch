@@ -1,0 +1,12 @@
+# Ollama configuration for Topic Watch
+# Copy to docker-compose.override.yml and docker compose up -d
+#
+# Assumes Ollama is running on the host at port 11434.
+# Pull a model first: ollama pull llama3.3
+
+services:
+  topic-watch:
+    environment:
+      - TOPIC_WATCH_LLM__MODEL=ollama/llama3.3
+      - TOPIC_WATCH_LLM__API_KEY=unused
+      - TOPIC_WATCH_LLM__BASE_URL=http://host.docker.internal:11434

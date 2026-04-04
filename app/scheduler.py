@@ -10,9 +10,9 @@ from pathlib import Path
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from app.checker import check_all_topics
+from app.checker import check_all_topics, initialize_new_topic
 from app.config import Settings
-from app.crud import delete_old_articles, recover_stuck_researching
+from app.crud import delete_old_articles, get_new_topics, recover_stuck_researching
 from app.database import get_db
 
 logger = logging.getLogger(__name__)
@@ -52,10 +52,26 @@ async def _recover_stuck(timeout_minutes: int = 15, db_path: Path | None = None)
         logger.warning("Stuck topic recovery failed", exc_info=True)
 
 
+async def _init_new_topics(settings: Settings, db_path: Path | None = None) -> None:
+    """Initialize one NEW topic per tick for gradual knowledge building.
+
+    OPML imports create topics with NEW status. This processes them
+    one at a time (~1 per minute) to avoid hammering the LLM API.
+    """
+    try:
+        with get_db(db_path) as conn:
+            new_topics = get_new_topics(conn, limit=1)
+            if new_topics:
+                await initialize_new_topic(new_topics[0], conn, settings)
+    except Exception:
+        logger.error("NEW topic initialization failed", exc_info=True)
+
+
 async def _scheduled_check(settings: Settings, db_path: Path | None = None) -> None:
     """Callback invoked by APScheduler on each interval.
 
     Creates a fresh database connection for each check cycle.
+    Also initializes one NEW topic per tick for gradual OPML import processing.
     """
     logger.debug("Scheduled check tick")
     try:
@@ -63,6 +79,9 @@ async def _scheduled_check(settings: Settings, db_path: Path | None = None) -> N
             await check_all_topics(conn, settings)
     except Exception:
         logger.error("Scheduled check cycle failed", exc_info=True)
+
+    # Process one NEW topic per tick (separate connection for isolation)
+    await _init_new_topics(settings, db_path)
 
 
 def start_scheduler(
