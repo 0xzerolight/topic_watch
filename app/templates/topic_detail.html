@@ -167,17 +167,17 @@
 {% endif %}
 
 {% if topic.status.value == "error" %}
-<article style="border-left: 4px solid var(--pico-color-orange-500, #f57c00); padding: 1rem; margin-bottom: 1rem;">
+<div class="alert alert-warning" role="alert">
     <strong>Research failed.</strong>
     {% if topic.error_message %}
     <small>{{ topic.error_message | sanitize_error }}</small>
     {% endif %}
     <p>Click "Retry Research" below to retry the initial research phase.</p>
-</article>
+</div>
 {% endif %}
 
 <h2>Actions</h2>
-<div style="display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; margin-bottom: 1rem;">
+<div class="action-row" style="margin-bottom: 1rem;">
     {% if topic.status.value == "error" %}
     <form method="post" action="/topics/{{ topic.id }}/init" style="margin: 0;">
         <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
@@ -203,7 +203,7 @@
     </form>
     <a href="/topics/{{ topic.id }}/edit" role="button" class="secondary" style="margin: 0;">Edit</a>
 </div>
-<div style="display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center;">
+<div class="action-row">
     <a href="/topics/{{ topic.id }}/export/json" role="button" class="outline secondary" style="font-size: 0.875rem; padding: 0.25rem 0.75rem; margin: 0;">Export JSON</a>
     <a href="/topics/{{ topic.id }}/export/csv" role="button" class="outline secondary" style="font-size: 0.875rem; padding: 0.25rem 0.75rem; margin: 0;">Export CSV</a>
     <form method="post" action="/topics/{{ topic.id }}/delete"

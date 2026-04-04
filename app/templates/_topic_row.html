@@ -30,7 +30,7 @@
     </td>
     <td>{{ article_count }}</td>
     <td>
-        <div style="display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;">
+        <div class="action-row">
         {% if topic.is_active and topic.status.value == "ready" %}
         <button
             hx-post="/topics/{{ topic.id }}/check"
