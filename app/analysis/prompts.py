@@ -21,6 +21,9 @@ knowledge state. Do NOT use your training data to fill gaps or resolve ambiguity
 2. Be CONSERVATIVE. The user only wants to be notified about meaningful updates — \
 not reworded versions of known facts, not speculation that repeats existing rumors, \
 not "roundup" articles that summarize old news.
+3. SCOPE to the topic description. The description defines what the user cares about. \
+Only flag information as new if it directly relates to those specific aspects. Ignore \
+facts about the broader topic that fall outside the described scope.
 
 === MARK has_new_info=true ONLY WHEN ===
 - Concrete new facts (specific dates, names, numbers, decisions) not in the \
@@ -35,6 +38,9 @@ knowledge state, clearly stated in an article (not inferred)
 - Articles contain speculation or opinion without new supporting evidence
 - The article covers a related but different subject
 - Articles are thin stubs with only headlines and no substantive content
+- Information is approximate, estimated, or hedged ("might", "could", "expected to", \
+"analysts predict", "sources suggest") without a concrete verifiable fact
+- Rumors or unverified claims from unnamed sources
 
 === EDGE CASES ===
 - If the knowledge state is empty or says "No existing knowledge state": treat \
@@ -49,7 +55,15 @@ False negatives (missing an update) are much less harmful than false positives \
 In your reasoning field, briefly explain what you compared and why you reached \
 your conclusion. If has_new_info is true, list ONLY the specific new facts in \
 key_facts (not restatements of known info) and the source article URLs in source_urls. \
-Set confidence to reflect how certain you are (0.0-1.0)."""
+Set confidence using this scale:
+- 0.9-1.0: Official/primary source, unambiguous new fact, directly answers the topic description
+- 0.7-0.8: Credible secondary source, clear new fact, directly relevant to description
+- 0.5-0.6: Single source or partially ambiguous, but concrete and relevant
+- 0.3-0.4: Weak sourcing, tangentially relevant, or not clearly new
+- 0.1-0.2: Speculative, rumored, or only marginally related to description
+Do NOT default to 0.7-0.8. Calibrate deliberately using the criteria above.
+Set relevance to indicate how directly the new information addresses the topic \
+description (0.0 = tangentially related, 1.0 = exactly what the user asked about)."""
 
 _NOVELTY_USER = """\
 Topic: {topic_name}
@@ -65,7 +79,10 @@ New Articles:
 
 _KNOWLEDGE_INIT_SYSTEM = """\
 You are an information extraction system. Your job is to read the provided \
-articles about a topic and extract a structured summary of the facts they contain.
+articles about a topic and extract a structured summary of facts \
+**relevant to the topic description**. The description tells you what the user \
+wants to monitor. Focus extraction on those aspects. Omit tangential facts even \
+if they appear in the articles.
 
 === CRITICAL RULES ===
 1. Use ONLY information that is explicitly stated in the provided articles. \
@@ -117,6 +134,8 @@ information (e.g., "release date: TBD" updated to "release date: March 2026").
 4. Maintain the same structured format. Only use categories that have content.
 5. If approaching the token limit, compress older facts by combining related \
 points — but do not delete them entirely unless they are fully superseded.
+6. Drop facts from the knowledge state that are not relevant to the topic description. \
+The summary should stay focused on what the user asked to monitor.
 
 Stay under {max_tokens} tokens. Set sufficient_data=false only if the new \
 findings are too vague or contradictory to incorporate meaningfully."""

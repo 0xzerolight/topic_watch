@@ -205,3 +205,52 @@ class TestSaveSettingsBaseUrlGuard:
 
         data = yaml.safe_load(config_file.read_text())
         assert data["llm"]["base_url"] == "http://localhost:11434"
+
+
+class TestThresholdDefaults:
+    """Test default values and bounds for confidence/relevance thresholds."""
+
+    def test_min_confidence_threshold_default(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("TOPIC_WATCH_MIN_CONFIDENCE_THRESHOLD", raising=False)
+        monkeypatch.delenv("TOPIC_WATCH_LLM__API_KEY", raising=False)
+        monkeypatch.delenv("TOPIC_WATCH_LLM__MODEL", raising=False)
+        config = tmp_path / "config.yml"
+        config.write_text('llm:\n  model: "openai/gpt-4o-mini"\n  api_key: "sk-test"\n')
+        settings = load_settings(config_path=config)
+        assert settings.min_confidence_threshold == 0.7
+
+    def test_min_relevance_threshold_default(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("TOPIC_WATCH_MIN_RELEVANCE_THRESHOLD", raising=False)
+        monkeypatch.delenv("TOPIC_WATCH_LLM__API_KEY", raising=False)
+        monkeypatch.delenv("TOPIC_WATCH_LLM__MODEL", raising=False)
+        config = tmp_path / "config.yml"
+        config.write_text('llm:\n  model: "openai/gpt-4o-mini"\n  api_key: "sk-test"\n')
+        settings = load_settings(config_path=config)
+        assert settings.min_relevance_threshold == 0.5
+
+    def test_min_relevance_threshold_bounds(self) -> None:
+        with pytest.raises(ValidationError):
+            Settings(
+                llm={"model": "openai/gpt-4o-mini", "api_key": "sk-test"},
+                min_relevance_threshold=1.5,
+            )  # type: ignore[call-arg]
+        with pytest.raises(ValidationError):
+            Settings(
+                llm={"model": "openai/gpt-4o-mini", "api_key": "sk-test"},
+                min_relevance_threshold=-0.1,
+            )  # type: ignore[call-arg]
+
+    def test_relevance_threshold_in_saved_yaml(self, tmp_path: Path) -> None:
+        import yaml
+
+        from app.config import LLMSettings, save_settings_to_yaml
+
+        settings = Settings(
+            llm=LLMSettings(model="openai/gpt-4o-mini", api_key="sk-test"),
+            min_relevance_threshold=0.6,
+        )  # type: ignore[call-arg]
+        config_file = tmp_path / "config.yml"
+        save_settings_to_yaml(settings, config_file)
+
+        data = yaml.safe_load(config_file.read_text())
+        assert data["min_relevance_threshold"] == 0.6

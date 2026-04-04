@@ -26,6 +26,7 @@
         Description (what you care about)
         <input type="text" id="description" name="description" required
                value="{{ description if description is defined else topic.description }}">
+        <small>Be specific. The AI only reports on aspects you describe here. "Release date and pricing" works better than "any news."</small>
     </label>
 
     {% set current_mode = feed_mode if feed_mode is defined else topic.feed_mode.value %}
