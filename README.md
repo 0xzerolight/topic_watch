@@ -46,13 +46,13 @@ Make sure Docker is running before continuing.
 **Linux / macOS:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/0xzerolight/topic_watch/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/0xzerolight/topic_watch/main/scripts/install.sh | bash
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-irm https://raw.githubusercontent.com/0xzerolight/topic_watch/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/0xzerolight/topic_watch/main/scripts/install.ps1 | iex
 ```
 
 Pulls the image, starts the container, creates a desktop shortcut + auto-start, and opens the setup wizard. Set your LLM API key in the wizard.
@@ -61,10 +61,10 @@ Override install location and port:
 
 ```bash
 # Linux / macOS
-TOPIC_WATCH_DIR=~/my-path TOPIC_WATCH_PORT=9000 curl -fsSL .../install.sh | bash
+TOPIC_WATCH_DIR=~/my-path TOPIC_WATCH_PORT=9000 curl -fsSL .../scripts/install.sh | bash
 
 # Windows (PowerShell)
-$env:TOPIC_WATCH_DIR="C:\TopicWatch"; $env:TOPIC_WATCH_PORT="9000"; irm .../install.ps1 | iex
+$env:TOPIC_WATCH_DIR="C:\TopicWatch"; $env:TOPIC_WATCH_PORT="9000"; irm .../scripts/install.ps1 | iex
 ```
 
 <details>
@@ -318,7 +318,7 @@ Create credentials: `htpasswd -c /etc/nginx/.htpasswd admin`
 
 API keys stored in `data/config.yml` (gitignored) or env vars. All data stays on your machine; outbound connections only go to RSS feeds, your LLM provider, and notification services.
 
-See [SECURITY.md](SECURITY.md) for vulnerability reporting.
+See [SECURITY.md](docs/SECURITY.md) for vulnerability reporting.
 
 ## Troubleshooting
 
@@ -350,4 +350,4 @@ See [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+See [CONTRIBUTING.md](docs/CONTRIBUTING.md).

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Topic Watch installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/0xzerolight/topic_watch/main/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/0xzerolight/topic_watch/main/scripts/install.sh | bash
 set -euo pipefail
 
 REPO="0xzerolight/topic_watch"

@@ -1,5 +1,5 @@
 # Topic Watch installer for Windows
-# Usage: irm https://raw.githubusercontent.com/0xzerolight/topic_watch/main/install.ps1 | iex
+# Usage: irm https://raw.githubusercontent.com/0xzerolight/topic_watch/main/scripts/install.ps1 | iex
 #   or:  powershell -ExecutionPolicy Bypass -File install.ps1
 
 $ErrorActionPreference = 'Stop'
