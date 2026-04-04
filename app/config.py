@@ -156,6 +156,10 @@ class Settings(BaseSettings):
         le=1.0,
         description="Minimum relevance score to act on novelty results (how related to topic description)",
     )
+    secure_cookies: bool = Field(
+        default=False,
+        description="Set Secure flag on cookies (enable when TLS is terminated at reverse proxy)",
+    )
 
     def is_configured(self) -> bool:
         """Return True if minimal required configuration is present."""
@@ -291,6 +295,7 @@ def save_settings_to_yaml(settings: "Settings", config_path: Path) -> None:
         "llm_temperature": settings.llm_temperature,
         "min_confidence_threshold": settings.min_confidence_threshold,
         "min_relevance_threshold": settings.min_relevance_threshold,
+        "secure_cookies": settings.secure_cookies,
     }
 
     if settings.llm.base_url and not is_cloud_provider(settings.llm.model):

@@ -33,14 +33,13 @@ class CSRFMiddleware(BaseHTTPMiddleware):
         response = cast(Response, await call_next(request))
 
         if new_token and token is not None:
-            # secure=True is intentionally omitted: this app commonly runs
-            # on localhost over plain HTTP. HTTPS is handled at the reverse
-            # proxy layer for public deployments (see SECURITY.md).
+            secure = getattr(getattr(request.app.state, "settings", None), "secure_cookies", False)
             response.set_cookie(
                 COOKIE_NAME,
                 token,
                 httponly=False,
                 samesite="lax",
+                secure=secure,
             )
 
         return response

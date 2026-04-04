@@ -3,6 +3,7 @@
 [![CI](https://github.com/0xzerolight/topic_watch/actions/workflows/ci.yml/badge.svg)](https://github.com/0xzerolight/topic_watch/actions/workflows/ci.yml)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![Coverage](https://img.shields.io/badge/coverage-92%25-brightgreen.svg)](https://github.com/0xzerolight/topic_watch)
 
 Self-hosted news monitoring with LLM-powered novelty detection. Watches topics via RSS feeds, notifies you only when genuinely new information appears. BYOK (bring your own key).
 

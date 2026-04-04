@@ -172,6 +172,18 @@ class TestSendWebhook:
 
         assert result is False
 
+    async def test_blocks_private_url(self) -> None:
+        result = await send_webhook("http://localhost:9200/hook", {"key": "value"})
+        assert result is False
+
+    async def test_blocks_internal_ip(self) -> None:
+        result = await send_webhook("http://169.254.169.254/metadata", {})
+        assert result is False
+
+    async def test_blocks_loopback_ip(self) -> None:
+        result = await send_webhook("http://127.0.0.1:8080/hook", {})
+        assert result is False
+
     async def test_posts_to_correct_url(self) -> None:
         mock_response = MagicMock()
         mock_response.status_code = 204
