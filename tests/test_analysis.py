@@ -109,6 +109,7 @@ class TestNoveltyResult:
         assert result.key_facts == []
         assert result.source_urls == []
         assert result.reasoning == ""
+        assert result.relevance == 0.0
 
     def test_no_summary_when_no_new_info(self) -> None:
         result = NoveltyResult(has_new_info=False, confidence=0.9)
@@ -123,6 +124,16 @@ class TestNoveltyResult:
             confidence=0.9,
         )
         assert "new date" in result.reasoning
+
+    def test_relevance_field(self) -> None:
+        result = NoveltyResult(has_new_info=True, confidence=0.9, relevance=0.85)
+        assert result.relevance == 0.85
+
+    def test_relevance_bounds(self) -> None:
+        with pytest.raises(ValidationError):
+            NoveltyResult(has_new_info=False, confidence=0.5, relevance=1.5)
+        with pytest.raises(ValidationError):
+            NoveltyResult(has_new_info=False, confidence=0.5, relevance=-0.1)
 
 
 # ============================================================
@@ -278,6 +289,36 @@ class TestBuildNoveltyMessages:
         user_msg = messages[1]["content"]
         assert "No existing knowledge state." in user_msg
 
+    def test_system_message_contains_calibration_scale(self) -> None:
+        topic = _make_topic()
+        articles = [_make_article()]
+        messages = build_novelty_messages(articles, "Known.", topic)
+        system_msg = messages[0]["content"]
+        assert "0.9-1.0" in system_msg
+        assert "0.3-0.4" in system_msg
+        assert "Do NOT default to 0.7-0.8" in system_msg
+
+    def test_system_message_contains_scope_instruction(self) -> None:
+        topic = _make_topic()
+        articles = [_make_article()]
+        messages = build_novelty_messages(articles, "Known.", topic)
+        system_msg = messages[0]["content"]
+        assert "SCOPE to the topic description" in system_msg
+
+    def test_system_message_rejects_speculation(self) -> None:
+        topic = _make_topic()
+        articles = [_make_article()]
+        messages = build_novelty_messages(articles, "Known.", topic)
+        system_msg = messages[0]["content"]
+        assert "Rumors or unverified claims" in system_msg
+
+    def test_system_message_contains_relevance_instruction(self) -> None:
+        topic = _make_topic()
+        articles = [_make_article()]
+        messages = build_novelty_messages(articles, "Known.", topic)
+        system_msg = messages[0]["content"]
+        assert "Set relevance" in system_msg
+
 
 # ============================================================
 # TestBuildKnowledgeInitMessages
@@ -307,6 +348,13 @@ class TestBuildKnowledgeInitMessages:
         messages = build_knowledge_init_messages(articles, topic, max_tokens=2000)
         user_msg = messages[1]["content"]
         assert "Important Article" in user_msg
+
+    def test_system_message_scoped_to_description(self) -> None:
+        topic = _make_topic()
+        articles = [_make_article()]
+        messages = build_knowledge_init_messages(articles, topic, max_tokens=2000)
+        system_msg = messages[0]["content"]
+        assert "relevant to the topic description" in system_msg
 
 
 # ============================================================

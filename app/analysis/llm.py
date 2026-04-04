@@ -35,6 +35,12 @@ class NoveltyResult(BaseModel):
     key_facts: list[str] = []
     source_urls: list[str] = []
     confidence: float = Field(ge=0.0, le=1.0)
+    relevance: float = Field(
+        ge=0.0,
+        le=1.0,
+        default=0.0,
+        description="How relevant the new information is to the topic description (0=off-topic, 1=exactly what user asked)",
+    )
 
 
 class KnowledgeStateUpdate(BaseModel):
