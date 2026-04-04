@@ -16,6 +16,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Ollama quick start with `docker-compose.override.example.yml`
 - `TopicStatus.NEW` for gradual OPML import initialization (~1 topic/min)
 - Multi-provider RSS fallback (Bing News + Google News)
+- Human-readable check intervals (`6h`, `1w 3d`, `2h 30m`) replacing integer hours. Range: 10 minutes to 6 months
+- LLM confidence and relevance thresholds to reduce false notifications (`min_confidence_threshold`, `min_relevance_threshold`)
+- Configurable LLM temperature (`llm_temperature`)
+- Semantic status colors and UI design polish (table scroll, danger button)
+
+### Changed
+
+- Check interval config field renamed from `check_interval_hours` (integer) to `check_interval` (human-readable string). Old format auto-migrated.
+- LLM prompts improved for more conservative novelty detection and better scope filtering
+- Article truncation in prompts increased from 1000 to 1500 chars
+
+### Fixed
+
+- SSRF bypass via IPv6 and alternative IP encodings
+- LLM novelty detection accuracy (reasoning field, relevance scoring, below-threshold article re-examination)
 
 ## [1.0.0] - 2026-03-20
 
