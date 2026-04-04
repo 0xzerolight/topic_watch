@@ -2,9 +2,9 @@
 {% for result in results %}
 <div style="margin-bottom: 0.5em; padding: 0.5em; border-radius: 0.25em; background: var(--pico-card-background-color, #f8f9fa);">
     {% if result.valid %}
-    <small style="color: #2ecc40;">&#10004;</small>
+    <small class="status-healthy">&#10004;</small>
     {% else %}
-    <small style="color: #ff4136;">&#10008;</small>
+    <small class="status-error">&#10008;</small>
     {% endif %}
     <small>
         {% if result.url %}<code>{{ result.url | truncate(60) }}</code> &mdash; {% endif %}

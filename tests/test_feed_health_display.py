@@ -172,7 +172,7 @@ class TestTopicDetailFeedHealthIndicators:
 
         response = await client.get(f"/topics/{topic.id}")
         assert response.status_code == 200
-        assert "color: green" in response.text
+        assert "status-healthy" in response.text
         assert "Healthy" in response.text
 
     async def test_topic_detail_shows_orange_dot_for_degraded_feed(
@@ -187,7 +187,7 @@ class TestTopicDetailFeedHealthIndicators:
 
         response = await client.get(f"/topics/{topic.id}")
         assert response.status_code == 200
-        assert "color: orange" in response.text
+        assert "status-degraded" in response.text
         assert "Degraded" in response.text
 
     async def test_topic_detail_shows_red_dot_for_unhealthy_feed(
@@ -203,7 +203,7 @@ class TestTopicDetailFeedHealthIndicators:
 
         response = await client.get(f"/topics/{topic.id}")
         assert response.status_code == 200
-        assert "color: red" in response.text
+        assert "status-error" in response.text
         assert "Unhealthy" in response.text
 
     async def test_topic_detail_auto_mode_shows_health_indicator(
@@ -219,7 +219,7 @@ class TestTopicDetailFeedHealthIndicators:
 
         response = await client.get(f"/topics/{topic.id}")
         assert response.status_code == 200
-        assert "color: green" in response.text
+        assert "status-healthy" in response.text
         assert "Healthy" in response.text
 
     async def test_topic_detail_auto_mode_gray_when_no_health(
