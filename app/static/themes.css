@@ -325,6 +325,10 @@ details.knowledge-state > article > div.knowledge-text {
   align-items: center;
   flex-wrap: wrap;
 }
+.action-row button,
+.action-row [role="button"] {
+  margin-bottom: 0;
+}
 
 .stats-bar {
   display: flex;
