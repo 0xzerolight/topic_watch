@@ -270,6 +270,37 @@ python -m app.cli check-all           # Check all topics
 python -m app.cli init "Topic Name"   # Re-initialize knowledge state
 ```
 
+## Updating
+
+**Docker (one-line install):**
+
+```bash
+cd ~/topic-watch  # or your install directory
+docker compose pull
+docker compose up -d
+```
+
+The database is automatically backed up before any schema migration.
+
+**Docker (git clone):**
+
+```bash
+cd topic_watch
+git pull
+docker compose up -d --build
+```
+
+**Without Docker:**
+
+```bash
+cd topic_watch
+git pull
+pip install .
+# Restart your uvicorn process
+```
+
+Check the [CHANGELOG](docs/CHANGELOG.md) before upgrading for breaking changes.
+
 ## Security
 
 **No built-in authentication** by design (single-user tool).

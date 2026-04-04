@@ -10,11 +10,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.exceptions import HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app import __version__ as _app_version
 from app.config import DEFAULT_CONFIG_PATH, load_settings, resolve_db_path
 from app.crud import recover_stuck_topics
 from app.database import get_db, init_db
@@ -53,7 +55,7 @@ async def lifespan(app: FastAPI):
     logger.info("Topic Watch web UI stopped")
 
 
-app = FastAPI(title="Topic Watch", lifespan=lifespan)
+app = FastAPI(title="Topic Watch", version=_app_version, lifespan=lifespan)
 app.add_middleware(CSRFMiddleware)
 app.add_middleware(SetupRedirectMiddleware)
 app.include_router(router)
@@ -63,9 +65,18 @@ app.mount("/static", StaticFiles(directory=str(Path(__file__).resolve().parent /
 _error_templates = Jinja2Templates(directory=str(Path(__file__).resolve().parent / "templates"))
 
 
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException) -> HTMLResponse:
-    """Render HTTP errors using the app's error template instead of raw JSON."""
+def _wants_json(request: Request) -> bool:
+    """Return True if the request is for the JSON API (not browser HTML)."""
+    accept = request.headers.get("accept", "")
+    return request.url.path.startswith("/api/") or ("application/json" in accept and "text/html" not in accept)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> HTMLResponse | JSONResponse:
+    """Render HTTP errors as HTML for browsers, JSON for API clients."""
+    if _wants_json(request):
+        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+
     from app import __version__
 
     return _error_templates.TemplateResponse(
@@ -73,4 +84,20 @@ async def http_exception_handler(request: Request, exc: HTTPException) -> HTMLRe
         "error.html",
         {"status_code": exc.status_code, "detail": exc.detail, "version": __version__},
         status_code=exc.status_code,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError) -> HTMLResponse | JSONResponse:
+    """Render validation errors as HTML for browsers, JSON for API clients."""
+    if _wants_json(request):
+        return JSONResponse({"detail": exc.errors()}, status_code=422)
+
+    from app import __version__
+
+    return _error_templates.TemplateResponse(
+        request,
+        "error.html",
+        {"status_code": 422, "detail": "Invalid request", "version": __version__},
+        status_code=422,
     )
