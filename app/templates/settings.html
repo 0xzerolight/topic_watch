@@ -4,21 +4,21 @@
 <h1>Settings</h1>
 
 {% if request.query_params.get("saved") %}
-<article style="border-left: 4px solid var(--pico-ins-color, #2e7d32); padding: 1rem; margin-bottom: 1rem;">
+<div class="alert alert-success" role="status">
     <strong>&#10003; Settings saved successfully.</strong>
     <small>Changes are active immediately.</small>
-</article>
+</div>
 {% endif %}
 
 {% if errors %}
-<article aria-label="Validation errors" style="border-left: 4px solid var(--pico-del-color, #c62828); padding: 1rem; margin-bottom: 1rem;">
+<div class="alert alert-error" role="alert">
     <strong>Validation errors — settings were not saved.</strong>
     <ul style="margin: 0.5rem 0 0;">
         {% for error in errors %}
         <li>{{ error }}</li>
         {% endfor %}
     </ul>
-</article>
+</div>
 {% endif %}
 
 <article>
@@ -75,7 +75,7 @@
 
     <h2>Checking</h2>
 
-    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+    <div class="settings-grid">
         <label for="check_interval">
             Default Check Interval
             <input type="text" id="check_interval" name="check_interval" required
@@ -96,7 +96,7 @@
         <summary><strong>Advanced Settings</strong></summary>
         <div style="padding-top: 1rem;">
 
-            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+            <div class="settings-grid">
                 <label for="knowledge_state_max_tokens">
                     Knowledge State Max Tokens
                     <input type="number" id="knowledge_state_max_tokens" name="knowledge_state_max_tokens"

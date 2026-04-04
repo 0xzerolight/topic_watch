@@ -35,18 +35,20 @@
         <label>
             <input type="radio" name="feed_mode" value="auto"
                    {{ 'checked' if current_mode == 'auto' }}
-                   onchange="document.getElementById('manual-feeds').style.display='none'">
+                   aria-controls="manual-feeds"
+                   onchange="document.getElementById('manual-feeds').style.display='none'; document.getElementById('manual-feeds').setAttribute('aria-hidden','true')">
             Automatic (Google News)
         </label>
         <label>
             <input type="radio" name="feed_mode" value="manual"
                    {{ 'checked' if current_mode == 'manual' }}
-                   onchange="document.getElementById('manual-feeds').style.display='block'">
+                   aria-controls="manual-feeds"
+                   onchange="document.getElementById('manual-feeds').style.display='block'; document.getElementById('manual-feeds').setAttribute('aria-hidden','false')">
             Manual (provide RSS URLs)
         </label>
     </fieldset>
 
-    <div id="manual-feeds" style="{{ 'display:block' if current_mode == 'manual' else 'display:none' }}">
+    <div id="manual-feeds" aria-hidden="{{ 'false' if current_mode == 'manual' else 'true' }}" style="{{ 'display:block' if current_mode == 'manual' else 'display:none' }}">
         <label for="feed_urls">
             RSS Feed URLs (one per line)
             <textarea id="feed_urls" name="feed_urls" rows="4">{{ feed_urls if feed_urls is defined else topic.feed_urls | join('\n') }}</textarea>

@@ -288,3 +288,114 @@ details.knowledge-state > article > div.knowledge-text {
   color: var(--pico-primary-inverse, #fff);
   border-color: var(--pico-del-color, #c62828);
 }
+
+
+/* --- Alert / feedback messages --- */
+.alert {
+  padding: 1rem;
+  margin-bottom: 1rem;
+  border-radius: var(--pico-border-radius, 0.25rem);
+  background: var(--pico-card-background-color);
+}
+.alert-success {
+  background: color-mix(in srgb, var(--pico-ins-color, #2ecc40) 12%, var(--pico-card-background-color));
+}
+.alert-error {
+  background: color-mix(in srgb, var(--pico-del-color, #c62828) 12%, var(--pico-card-background-color));
+}
+.alert-warning {
+  background: color-mix(in srgb, var(--pico-color-orange-500, #f57c00) 12%, var(--pico-card-background-color));
+}
+
+
+/* --- Layout utilities --- */
+.page-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+.page-header h1 { margin-bottom: 0; }
+
+.action-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.stats-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.5rem;
+  margin-bottom: 1rem;
+  padding: 0.75rem;
+  background: var(--pico-card-background-color);
+  border-radius: var(--pico-border-radius, 0.25rem);
+}
+
+.search-row {
+  display: flex;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+.search-row input,
+.search-row select {
+  margin-bottom: 0;
+}
+.search-row select {
+  width: auto;
+}
+
+.settings-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+}
+
+.bulk-bar {
+  display: none;
+  margin-bottom: 1rem;
+  padding: 0.75rem;
+  background: var(--pico-card-background-color);
+  border-radius: var(--pico-border-radius, 0.25rem);
+}
+
+.tag-filter {
+  margin-bottom: 1rem;
+}
+.tag-filter a[role="button"] {
+  padding: 0.15rem 0.5rem;
+  font-size: 0.85rem;
+  margin-right: 0.25rem;
+}
+
+
+/* --- Footer --- */
+.site-footer {
+  text-align: center;
+  opacity: 0.6;
+  font-size: 0.85rem;
+  padding: 1rem 0;
+}
+
+
+/* --- Responsive --- */
+@media (max-width: 768px) {
+  .page-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  .settings-grid {
+    grid-template-columns: 1fr;
+  }
+  .search-row {
+    flex-direction: column;
+  }
+  nav ul {
+    flex-wrap: wrap;
+    gap: 0.25rem;
+  }
+}

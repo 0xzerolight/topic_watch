@@ -1,9 +1,9 @@
 {% extends "base.html" %}
 {% block title %}Dashboard - Topic Watch{% endblock %}
 {% block content %}
-<div style="display:flex; justify-content:space-between; align-items:center">
+<div class="page-header">
     <h1>Topics</h1>
-    <div style="display: flex; gap: 0.5rem; align-items: center;">
+    <div class="action-row">
         {% if topic_data %}
         <form method="post" action="/check-all" style="display:inline">
             <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
@@ -13,14 +13,16 @@
             </button>
         </form>
         {% endif %}
+        {% if topic_data %}
         <a href="/export/topics/json" role="button" class="outline secondary">Export JSON</a>
         <a href="/export/opml" role="button" class="outline secondary">Export OPML</a>
+        {% endif %}
         <button type="button" class="outline secondary" onclick="document.getElementById('opml-import-dialog').showModal()">Import OPML</button>
     </div>
 </div>
 
 {% if stats and stats.total_topics > 0 %}
-<div style="display: flex; flex-wrap: wrap; gap: 1.5em; margin-bottom: 1em; padding: 0.75em; background: var(--pico-card-background-color); border-radius: 0.25em;">
+<div class="stats-bar">
     <div><small><strong>{{ stats.active_topics }}</strong>/{{ stats.total_topics }} active</small></div>
     <div><small><strong>{{ stats.checks_24h }}</strong> checks (24h) / {{ stats.checks_total }} total</small></div>
     <div><small><strong>{{ stats.new_info_24h }}</strong> new info (24h) / {{ stats.new_info_total }} total</small></div>
@@ -38,32 +40,30 @@
 {% endif %}
 
 {% if all_tags %}
-<div style="margin-bottom: 1em;">
+<div class="tag-filter">
     <small>
         Filter by tag:
         {% for t in all_tags %}
-        <a href="/?tag={{ t }}" role="button" class="{% if active_tag == t %}{% else %}secondary {% endif %}outline" style="padding: 0.15em 0.5em; font-size: 0.85em; margin-right: 0.25em;">{{ t }}</a>
+        <a href="/?tag={{ t }}" role="button" class="{% if active_tag == t %}{% else %}secondary {% endif %}outline">{{ t }}</a>
         {% endfor %}
         {% if active_tag %}
-        <a href="/" role="button" class="secondary outline" style="padding: 0.15em 0.5em; font-size: 0.85em;">&#x2715; Clear</a>
+        <a href="/" role="button" class="secondary outline">&#x2715; Clear</a>
         {% endif %}
     </small>
 </div>
 {% endif %}
 
-<div style="display: flex; gap: 1em; margin-bottom: 1em;">
+<div class="search-row">
     <input type="search" name="q" placeholder="Search topics..."
            hx-get="/topics/search"
            hx-trigger="keyup changed delay:300ms, search"
            hx-target="#topic-list"
-           hx-include="[name='status']"
-           style="margin-bottom: 0;">
+           hx-include="[name='status']">
     <select name="status"
             hx-get="/topics/search"
             hx-trigger="change"
             hx-target="#topic-list"
-            hx-include="[name='q']"
-            style="margin-bottom: 0; width: auto;">
+            hx-include="[name='q']">
         <option value="all">All Statuses</option>
         <option value="new">New</option>
         <option value="ready">Ready</option>
@@ -72,7 +72,7 @@
     </select>
 </div>
 
-<div id="bulk-bar" style="display:none; margin-bottom:1em; padding:0.75em; background:var(--pico-card-background-color, #f8f9fa); border-radius:0.25em;">
+<div id="bulk-bar" class="bulk-bar">
     <span id="selected-count">0</span> topic(s) selected:
     <button type="button" class="secondary"
             onclick="return submitBulk('/topics/bulk-delete')"
@@ -107,7 +107,7 @@
 {% if active_tag %}
 <p>No topics found with tag <kbd>{{ active_tag }}</kbd>. <a href="/">Clear filter</a>.</p>
 {% else %}
-<p>No topics configured. <a href="/topics/new">Add your first topic</a>.</p>
+<p>Get started by <a href="/topics/new">adding your first topic</a>.</p>
 {% endif %}
 {% endif %}
 
