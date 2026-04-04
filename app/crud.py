@@ -275,12 +275,12 @@ def delete_topic(conn: sqlite3.Connection, topic_id: int) -> bool:
     return deleted
 
 
-def get_topics_due_for_check(conn: sqlite3.Connection, default_interval_hours: int) -> list[Topic]:
+def get_topics_due_for_check(conn: sqlite3.Connection, default_interval_minutes: int) -> list[Topic]:
     """Get active READY topics whose check interval has elapsed.
 
     Uses topic.check_interval_minutes if set, otherwise falls back to
-    default_interval_hours (converted to minutes). Topics with no check
-    results are always due.
+    default_interval_minutes. Topics with no check results are always due.
+    NULLIF guards against a stored 0 falling through COALESCE as non-NULL.
     """
     rows = conn.execute(
         """
@@ -296,12 +296,12 @@ def get_topics_due_for_check(conn: sqlite3.Connection, default_interval_hours: i
           AND (
               cr.last_checked_at IS NULL
               OR datetime(cr.last_checked_at,
-                  '+' || COALESCE(t.check_interval_minutes, ? * 60) || ' minutes'
+                  '+' || COALESCE(NULLIF(t.check_interval_minutes, 0), ?) || ' minutes'
               ) <= datetime('now')
           )
         ORDER BY t.name
         """,
-        (default_interval_hours,),
+        (default_interval_minutes,),
     ).fetchall()
     return [Topic.from_row(row) for row in rows]
 

@@ -255,7 +255,7 @@ async def check_all_topics(
     # Retry any failed notifications from previous cycles
     await retry_pending_notifications(conn, settings)
 
-    due_topics = get_topics_due_for_check(conn, settings.check_interval_hours)
+    due_topics = get_topics_due_for_check(conn, settings.check_interval_minutes)
 
     if not due_topics:
         return []

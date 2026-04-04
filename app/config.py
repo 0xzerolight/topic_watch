@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Self
 
 import yaml
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -101,7 +101,22 @@ class Settings(BaseSettings):
 
     llm: LLMSettings = LLMSettings()
     notifications: NotificationSettings = NotificationSettings()
-    check_interval_hours: int = Field(default=6, ge=1, le=168)
+    check_interval: str = Field(default="6h", description="Default check interval, e.g. '6h', '1d', '2w', '1M'")
+
+    @field_validator("check_interval")
+    @classmethod
+    def validate_check_interval(cls, v: str) -> str:
+        from app.interval import parse_interval
+
+        parse_interval(v)  # raises ValueError on bad input
+        return v
+
+    @property
+    def check_interval_minutes(self) -> int:
+        from app.interval import parse_interval
+
+        return parse_interval(self.check_interval)
+
     max_articles_per_check: int = Field(default=10, ge=1, le=100)
     knowledge_state_max_tokens: int = Field(default=2000, ge=500, le=10000)
     article_retention_days: int = Field(default=90, ge=1, le=3650)
@@ -139,6 +154,16 @@ class Settings(BaseSettings):
     def is_configured(self) -> bool:
         """Return True if minimal required configuration is present."""
         return bool(self.llm.model and self.llm.api_key and self.llm.api_key != "your-api-key-here")
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_check_interval_hours(cls, data: dict) -> dict:  # type: ignore[override]
+        """Backward compat: convert old check_interval_hours to check_interval string."""
+        if isinstance(data, dict) and "check_interval_hours" in data:
+            hours = data.pop("check_interval_hours")
+            if "check_interval" not in data and hours is not None:
+                data["check_interval"] = f"{int(hours)}h"
+        return data
 
     @model_validator(mode="after")
     def validate_llm_model_format(self) -> Self:
@@ -242,7 +267,7 @@ def save_settings_to_yaml(settings: "Settings", config_path: Path) -> None:
             "api_key": settings.llm.api_key,
         },
         "notifications": {},
-        "check_interval_hours": settings.check_interval_hours,
+        "check_interval": settings.check_interval,
         "max_articles_per_check": settings.max_articles_per_check,
         "knowledge_state_max_tokens": settings.knowledge_state_max_tokens,
         "article_retention_days": settings.article_retention_days,

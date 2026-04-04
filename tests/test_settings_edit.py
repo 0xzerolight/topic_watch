@@ -135,12 +135,12 @@ class TestSaveSettingsToYaml:
         """Scalar settings (interval, max articles, etc.) are written correctly."""
         from app.config import save_settings_to_yaml
 
-        settings = _make_settings(check_interval_hours=12, max_articles_per_check=25)
+        settings = _make_settings(check_interval="12h", max_articles_per_check=25)
         config_file = tmp_path / "config.yml"
         save_settings_to_yaml(settings, config_file)
 
         data = yaml.safe_load(config_file.read_text())
-        assert data["check_interval_hours"] == 12
+        assert data["check_interval"] == "12h"
         assert data["max_articles_per_check"] == 25
 
 
@@ -164,9 +164,9 @@ class TestSettingsGet:
         assert "openai/gpt-4o-mini" in response.text
 
     async def test_settings_page_has_interval_field(self, client: httpx.AsyncClient) -> None:
-        """Settings page includes check_interval_hours field."""
+        """Settings page includes check_interval field."""
         response = await client.get("/settings")
-        assert "check_interval_hours" in response.text
+        assert "check_interval" in response.text
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +184,7 @@ class TestSettingsPost:
             "llm_base_url": "",
             "notification_urls": "",
             "webhook_urls": "",
-            "check_interval_hours": "6",
+            "check_interval": "6h",
             "max_articles_per_check": "10",
             "knowledge_state_max_tokens": "2000",
             "article_retention_days": "90",
@@ -216,13 +216,13 @@ class TestSettingsPost:
                 "/settings",
                 data=self._valid_form_data(
                     llm_model="anthropic/claude-3-haiku-20240307",
-                    check_interval_hours="12",
+                    check_interval="12h",
                 ),
                 follow_redirects=False,
             )
 
         assert app.state.settings.llm.model == "anthropic/claude-3-haiku-20240307"
-        assert app.state.settings.check_interval_hours == 12
+        assert app.state.settings.check_interval == "12h"
 
     async def test_valid_post_calls_save(self, client: httpx.AsyncClient) -> None:
         """POST /settings calls save_settings_to_yaml."""
@@ -235,14 +235,14 @@ class TestSettingsPost:
             mock_save.assert_called_once()
 
     async def test_invalid_interval_returns_error(self, client: httpx.AsyncClient) -> None:
-        """POST with check_interval_hours=0 returns 422 with an error."""
+        """POST with invalid check_interval returns 422 with an error."""
         response = await client.post(
             "/settings",
-            data=self._valid_form_data(check_interval_hours="0"),
+            data=self._valid_form_data(check_interval="bogus"),
             follow_redirects=False,
         )
         assert response.status_code == 422
-        assert "check_interval_hours" in response.text.lower() or "error" in response.text.lower()
+        assert "error" in response.text.lower()
 
     async def test_empty_llm_model_returns_error(self, client: httpx.AsyncClient) -> None:
         """POST with empty llm_model returns 422."""
@@ -276,7 +276,7 @@ class TestSettingsPost:
                     "/settings",
                     data={
                         "llm_model": "openai/gpt-4o-mini",
-                        "check_interval_hours": "6",
+                        "check_interval": "6h",
                         "max_articles_per_check": "10",
                     },
                     follow_redirects=False,
@@ -326,7 +326,7 @@ class TestSettingsPost:
                 "/settings",
                 data=self._valid_form_data(
                     llm_model="openai/gpt-4o-mini",
-                    check_interval_hours="8",
+                    check_interval="8h",
                 ),
                 follow_redirects=False,
             )
@@ -334,7 +334,7 @@ class TestSettingsPost:
         assert config_file.exists()
         data = yaml.safe_load(config_file.read_text())
         assert data["llm"]["model"] == "openai/gpt-4o-mini"
-        assert data["check_interval_hours"] == 8
+        assert data["check_interval"] == "8h"
 
     async def test_yaml_parse_error_returns_422(self, client: httpx.AsyncClient) -> None:
         """Non-ValidationError (e.g. YAML ScannerError) returns 422, not 500."""
@@ -363,8 +363,8 @@ class TestSettingsPost:
 
     async def test_settings_page_calls_load_settings(self, db_conn: sqlite3.Connection) -> None:
         """GET /settings calls load_settings() to show fresh values from disk."""
-        fresh_settings = _make_settings(check_interval_hours=24)
-        app.state.settings = _make_settings(check_interval_hours=6)
+        fresh_settings = _make_settings(check_interval="1d")
+        app.state.settings = _make_settings(check_interval="6h")
 
         def override_db():
             yield db_conn
@@ -381,8 +381,8 @@ class TestSettingsPost:
                     response = await ac.get("/settings")
                 mock_load.assert_called_once()
                 assert response.status_code == 200
-                # Fresh value (24) should appear, not stale value (6)
-                assert 'value="24"' in response.text
+                # Fresh value (1d) should appear, not stale value (6h)
+                assert "1d" in response.text
         finally:
             app.dependency_overrides.clear()
 

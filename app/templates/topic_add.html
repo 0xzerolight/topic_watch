@@ -64,26 +64,12 @@
         <div id="feed-validation-results"></div>
     </div>
 
-    <label>
+    <label for="check_interval">
         Check Interval
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem;">
-            <input type="number" id="interval_value" name="interval_value"
-                   min="1" step="1"
-                   value="{{ interval_value or '' }}"
-                   placeholder="Default"
-                   oninput="updateIntervalMinutes()"
-                   style="margin-bottom: 0;">
-            <select id="interval_unit" name="interval_unit"
-                    onchange="updateIntervalMinutes(); updateIntervalRange();"
-                    style="margin-bottom: 0;">
-                <option value="minutes">Minutes</option>
-                <option value="hours">Hours</option>
-                <option value="days">Days</option>
-                <option value="weeks">Weeks</option>
-            </select>
-        </div>
-        <input type="hidden" id="check_interval_minutes" name="check_interval_minutes" value="{{ check_interval_minutes or '' }}">
-        <small>Leave empty to use the global default.</small>
+        <input type="text" id="check_interval" name="check_interval"
+               value="{{ check_interval or '' }}"
+               placeholder="e.g., 6h, 1d, 2w, 1M, 1w 3d">
+        <small>Leave empty to use the global default. Units: m (minutes), h (hours), d (days), w (weeks), M (months).</small>
     </label>
 
     <label for="tags">
@@ -96,47 +82,4 @@
 
     <button type="submit">Create Topic</button>
 </form>
-
-<script>
-var UNIT_MULTIPLIERS = { minutes: 1, hours: 60, days: 1440, weeks: 10080 };
-var UNIT_RANGES = {
-    minutes: { min: 10, max: 60 },
-    hours: { min: 1, max: 168 },
-    days: { min: 1, max: 7 },
-    weeks: { min: 1, max: 1 }
-};
-
-function updateIntervalMinutes() {
-    var val = document.getElementById("interval_value").value;
-    var unit = document.getElementById("interval_unit").value;
-    var hidden = document.getElementById("check_interval_minutes");
-    if (val === "" || val === null) {
-        hidden.value = "";
-    } else {
-        hidden.value = parseInt(val, 10) * UNIT_MULTIPLIERS[unit];
-    }
-}
-
-function updateIntervalRange() {
-    var input = document.getElementById("interval_value");
-    var unit = document.getElementById("interval_unit").value;
-    var range = UNIT_RANGES[unit];
-    input.min = range.min;
-    input.max = range.max;
-    // Clamp current value if out of range
-    if (input.value !== "" && parseInt(input.value, 10) > range.max) {
-        input.value = range.max;
-        updateIntervalMinutes();
-    }
-    if (input.value !== "" && parseInt(input.value, 10) < range.min) {
-        input.value = range.min;
-        updateIntervalMinutes();
-    }
-}
-
-// Initialize range on page load
-document.addEventListener("DOMContentLoaded", function() {
-    updateIntervalRange();
-});
-</script>
 {% endblock %}

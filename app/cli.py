@@ -156,7 +156,12 @@ def _cmd_list() -> None:
     print("-" * 63)
     for topic in topics:
         active = "yes" if topic.is_active else "no"
-        interval = f"{topic.check_interval_minutes}m" if topic.check_interval_minutes else "default"
+        if topic.check_interval_minutes:
+            from app.interval import format_interval
+
+            interval = format_interval(topic.check_interval_minutes)
+        else:
+            interval = "default"
         print(f"{topic.name:<30} {topic.status.value:<15} {active:<8} {interval:<10}")
 
 

@@ -345,7 +345,7 @@ class TestSchedulerHasRecoverJob:
 
         settings = Settings(
             llm=LLMSettings(model="openai/gpt-4o-mini", api_key="test-key"),
-            check_interval_hours=4,
+            check_interval="4h",
         )
         scheduler = start_scheduler(settings)
         try:
@@ -365,7 +365,7 @@ class TestSchedulerHasRecoverJob:
 
         settings = Settings(
             llm=LLMSettings(model="openai/gpt-4o-mini", api_key="test-key"),
-            check_interval_hours=4,
+            check_interval="4h",
         )
         scheduler = start_scheduler(settings)
         try:

@@ -398,10 +398,12 @@ async def create_topic_handler(
     description: str = Form(...),
     feed_urls: str = Form(""),
     feed_mode: str = Form("auto"),
-    check_interval_minutes: str = Form(""),
+    check_interval: str = Form(""),
     tags: str = Form(""),
 ):
     """Create a new topic and kick off initial research in the background."""
+    from app.interval import parse_interval
+
     mode = FeedMode.AUTO if feed_mode == "auto" else FeedMode.MANUAL
 
     urls: list[str] = []
@@ -411,14 +413,11 @@ async def create_topic_handler(
         errors = validate_feed_urls(urls)
 
     parsed_interval: int | None = None
-    if check_interval_minutes.strip():
+    if check_interval.strip():
         try:
-            parsed_interval = int(check_interval_minutes)
-            if parsed_interval < 10 or parsed_interval > 10080:
-                errors.append("Check interval must be between 10 and 10080 minutes.")
-                parsed_interval = None
-        except ValueError:
-            errors.append("Check interval must be a whole number.")
+            parsed_interval = parse_interval(check_interval)
+        except ValueError as e:
+            errors.append(str(e))
 
     tag_list = [t.strip() for t in tags.split(",") if t.strip()]
 
@@ -432,7 +431,7 @@ async def create_topic_handler(
                 "description": description,
                 "feed_urls": feed_urls,
                 "feed_mode": feed_mode,
-                "check_interval_minutes": check_interval_minutes,
+                "check_interval": check_interval,
                 "tags": tags,
             },
             status_code=422,
@@ -487,6 +486,8 @@ async def topic_detail(
     page: int = 1,
 ):
     """Topic detail page: knowledge state, check history, actions."""
+    from app.interval import format_interval
+
     topic = get_topic(conn, topic_id)
     if topic is None:
         raise HTTPException(status_code=404, detail="Topic not found")
@@ -519,6 +520,7 @@ async def topic_detail(
             if health:
                 feed_health_map[url] = health
 
+    formatted = format_interval(topic.check_interval_minutes) if topic.check_interval_minutes else ""
     return templates.TemplateResponse(
         request,
         "topic_detail.html",
@@ -531,7 +533,8 @@ async def topic_detail(
             "page": page,
             "total_pages": total_pages,
             "auto_feed_url": auto_feed_url,
-            "default_interval": settings.check_interval_hours,
+            "formatted_interval": formatted,
+            "default_interval": settings.check_interval,
             "knowledge_state_max_tokens": settings.knowledge_state_max_tokens,
             "feed_health_map": feed_health_map,
         },
@@ -698,15 +701,19 @@ async def topic_edit_form(
     settings: Settings = Depends(get_settings),
 ):
     """Render the edit topic form."""
+    from app.interval import format_interval
+
     topic = get_topic(conn, topic_id)
     if topic is None:
         raise HTTPException(status_code=404, detail="Topic not found")
+    formatted = format_interval(topic.check_interval_minutes) if topic.check_interval_minutes else ""
     return templates.TemplateResponse(
         request,
         "topic_edit.html",
         {
             "topic": topic,
-            "default_interval": settings.check_interval_hours,
+            "formatted_interval": formatted,
+            "default_interval": settings.check_interval,
             "tags_string": ", ".join(topic.tags),
         },
     )
@@ -722,10 +729,12 @@ async def edit_topic_handler(
     description: str = Form(...),
     feed_urls: str = Form(""),
     feed_mode: str = Form("auto"),
-    check_interval_minutes: str = Form(""),
+    check_interval: str = Form(""),
     tags: str = Form(""),
 ):
     """Update an existing topic's name, description, feed URLs, and feed mode."""
+    from app.interval import parse_interval
+
     topic = get_topic(conn, topic_id)
     if topic is None:
         raise HTTPException(status_code=404, detail="Topic not found")
@@ -739,14 +748,11 @@ async def edit_topic_handler(
         errors = validate_feed_urls(urls)
 
     parsed_interval: int | None = None
-    if check_interval_minutes.strip():
+    if check_interval.strip():
         try:
-            parsed_interval = int(check_interval_minutes)
-            if parsed_interval < 10 or parsed_interval > 10080:
-                errors.append("Check interval must be between 10 and 10080 minutes.")
-                parsed_interval = None
-        except ValueError:
-            errors.append("Check interval must be a whole number.")
+            parsed_interval = parse_interval(check_interval)
+        except ValueError as e:
+            errors.append(str(e))
 
     tag_list = [t.strip() for t in tags.split(",") if t.strip()]
 
@@ -761,9 +767,9 @@ async def edit_topic_handler(
                 "description": description,
                 "feed_urls": feed_urls,
                 "feed_mode": feed_mode,
-                "check_interval_minutes": check_interval_minutes,
+                "check_interval": check_interval,
                 "tags": tags,
-                "default_interval": settings.check_interval_hours,
+                "default_interval": settings.check_interval,
             },
             status_code=422,
         )
@@ -1030,7 +1036,7 @@ async def update_settings(
     llm_base_url: str = Form(""),
     notification_urls: str = Form(""),
     webhook_urls: str = Form(""),
-    check_interval_hours: int = Form(...),
+    check_interval: str = Form(...),
     max_articles_per_check: int = Form(...),
     knowledge_state_max_tokens: int = Form(2000),
     article_retention_days: int = Form(90),
@@ -1064,7 +1070,7 @@ async def update_settings(
         "llm_base_url": llm_base_url,
         "notification_urls": notification_urls,
         "webhook_urls": webhook_urls,
-        "check_interval_hours": check_interval_hours,
+        "check_interval": check_interval,
         "max_articles_per_check": max_articles_per_check,
         "knowledge_state_max_tokens": knowledge_state_max_tokens,
         "article_retention_days": article_retention_days,
@@ -1086,7 +1092,7 @@ async def update_settings(
                 urls=parsed_notification_urls,
                 webhook_urls=parsed_webhook_urls,
             ),
-            check_interval_hours=check_interval_hours,
+            check_interval=check_interval,
             max_articles_per_check=max_articles_per_check,
             knowledge_state_max_tokens=knowledge_state_max_tokens,
             article_retention_days=article_retention_days,
