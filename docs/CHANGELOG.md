@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-04-04
+
+### Fixed
+
+- Fix failing test for empty dashboard message (test expected old wording)
+
 ## [1.1.1] - 2026-04-04
 
 ### Added
