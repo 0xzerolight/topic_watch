@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-04-04
+
 ### Added
 
 - OPML import/export for migrating feeds from RSS readers (FreshRSS, Miniflux, Tiny Tiny RSS)
@@ -20,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - LLM confidence and relevance thresholds to reduce false notifications (`min_confidence_threshold`, `min_relevance_threshold`)
 - Configurable LLM temperature (`llm_temperature`)
 - Semantic status colors and UI design polish (table scroll, danger button)
+- Docker image `latest` tag on GitHub releases (previously missing)
+- Automatic cleanup of old untagged container images
 
 ### Changed
 
@@ -31,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - SSRF bypass via IPv6 and alternative IP encodings
 - LLM novelty detection accuracy (reasoning field, relevance scoring, below-threshold article re-examination)
+- Docker install script failing with `unauthorized` (GHCR package visibility + missing `latest` tag)
 
 ## [1.0.0] - 2026-03-20
 
