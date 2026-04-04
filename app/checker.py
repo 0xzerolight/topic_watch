@@ -123,7 +123,7 @@ async def _check_topic_inner(
     result.llm_response = novelty.model_dump_json()
 
     # Step 4: If new info, update knowledge and notify
-    low_confidence = False
+    below_threshold = False
     if novelty.has_new_info:
         if novelty.confidence < settings.min_confidence_threshold:
             logger.info(
@@ -132,7 +132,15 @@ async def _check_topic_inner(
                 novelty.confidence,
                 settings.min_confidence_threshold,
             )
-            low_confidence = True
+            below_threshold = True
+        elif novelty.relevance < settings.min_relevance_threshold:
+            logger.info(
+                "Topic '%s': new info detected but relevance %.2f below threshold %.2f, skipping notification",
+                topic.name,
+                novelty.relevance,
+                settings.min_relevance_threshold,
+            )
+            below_threshold = True
         else:
             try:
                 await update_knowledge(topic, novelty, conn, settings)
@@ -169,8 +177,8 @@ async def _check_topic_inner(
                     exc_info=True,
                 )
 
-    # Step 5: Mark articles as processed (skip if low confidence — re-examine next cycle)
-    if not low_confidence:
+    # Step 5: Mark articles as processed (skip if below threshold — re-examine next cycle)
+    if not below_threshold:
         article_ids = [a.id for a in new_articles if a.id is not None]
         if article_ids:
             mark_articles_processed(conn, article_ids)

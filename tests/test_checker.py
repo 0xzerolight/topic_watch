@@ -82,6 +82,7 @@ class TestCheckTopic:
             key_facts=["June 2025"],
             source_urls=["https://example.com/article-1"],
             confidence=0.9,
+            relevance=0.9,
         )
 
         with (
@@ -203,7 +204,7 @@ class TestCheckTopic:
         settings = _make_settings()
 
         articles = [_make_article(topic_id=topic.id)]
-        novelty = NoveltyResult(has_new_info=True, summary="Update", confidence=0.9)
+        novelty = NoveltyResult(has_new_info=True, summary="Update", confidence=0.9, relevance=0.9)
 
         with (
             patch(
@@ -245,7 +246,7 @@ class TestCheckTopic:
         settings = _make_settings()
 
         articles = [_make_article(topic_id=topic.id)]
-        novelty = NoveltyResult(has_new_info=True, summary="Update", confidence=0.9)
+        novelty = NoveltyResult(has_new_info=True, summary="Update", confidence=0.9, relevance=0.9)
 
         with (
             patch(
@@ -288,6 +289,7 @@ class TestCheckTopic:
             has_new_info=True,
             summary="New thing",
             confidence=0.85,
+            relevance=0.9,
         )
 
         with (
@@ -357,7 +359,7 @@ class TestCheckTopic:
         settings = _make_settings()
 
         articles = [_make_article(topic_id=topic.id)]
-        novelty = NoveltyResult(has_new_info=True, summary="New info", confidence=0.9)
+        novelty = NoveltyResult(has_new_info=True, summary="New info", confidence=0.9, relevance=0.9)
 
         with (
             patch(
@@ -446,6 +448,7 @@ class TestCheckTopic:
             has_new_info=True,
             summary="Confirmed new release date",
             confidence=0.9,
+            relevance=0.9,
         )
 
         with (
@@ -468,6 +471,47 @@ class TestCheckTopic:
         assert result.notification_sent is True
         mock_update.assert_called_once()
         mock_send.assert_called_once()
+
+    async def test_low_relevance_skips_notification(self, db_conn: sqlite3.Connection) -> None:
+        """New info with high confidence but low relevance → no notification, articles not processed."""
+        topic = _make_topic(db_conn)
+        create_knowledge_state(
+            db_conn,
+            KnowledgeState(topic_id=topic.id, summary_text="Known facts.", token_count=20),
+        )
+        db_conn.commit()
+        settings = _make_settings(min_relevance_threshold=0.5)
+
+        articles = [_make_article(topic_id=topic.id)]
+        novelty = NoveltyResult(
+            has_new_info=True,
+            summary="Tangentially related info",
+            confidence=0.9,
+            relevance=0.2,
+        )
+
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=articles, total_feed_entries=len(articles)),
+            ),
+            patch(
+                "app.checker.analyze_articles",
+                new_callable=AsyncMock,
+                return_value=novelty,
+            ),
+            patch("app.checker.update_knowledge", new_callable=AsyncMock) as mock_update,
+            patch("app.checker.send_notification") as mock_send,
+            patch("app.checker.mark_articles_processed") as mock_mark,
+        ):
+            result = await check_topic(topic, db_conn, settings)
+
+        assert result.has_new_info is True
+        assert result.notification_sent is False
+        mock_update.assert_not_called()
+        mock_send.assert_not_called()
+        mock_mark.assert_not_called()
 
 
 # --- check_all_topics ---

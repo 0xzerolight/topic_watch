@@ -145,10 +145,16 @@ class Settings(BaseSettings):
         default=0.2, ge=0.0, le=2.0, description="LLM sampling temperature (lower = more factual)"
     )
     min_confidence_threshold: float = Field(
-        default=0.6,
+        default=0.7,
         ge=0.0,
         le=1.0,
         description="Minimum LLM confidence to act on novelty results",
+    )
+    min_relevance_threshold: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Minimum relevance score to act on novelty results (how related to topic description)",
     )
 
     def is_configured(self) -> bool:
@@ -284,6 +290,7 @@ def save_settings_to_yaml(settings: "Settings", config_path: Path) -> None:
         "llm_max_retries": settings.llm_max_retries,
         "llm_temperature": settings.llm_temperature,
         "min_confidence_threshold": settings.min_confidence_threshold,
+        "min_relevance_threshold": settings.min_relevance_threshold,
     }
 
     if settings.llm.base_url and not is_cloud_provider(settings.llm.model):
