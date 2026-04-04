@@ -45,6 +45,44 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["app"]
 
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # isort (import sorting)
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "N",    # pep8-naming
+    "S",    # flake8-bandit (security)
+    "T20",  # flake8-print (no print statements)
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "B008",   # do not perform function calls in argument defaults (needed for FastAPI Depends())
+    "N818",   # exception name should end in Error (not always appropriate)
+    "S101",   # assert usage (used intentionally in app for invariant checks)
+    "S608",   # SQL injection false positive (we use parameterized queries)
+    "S704",   # Markup usage is intentional and pre-escaped
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["B011", "S101", "S105"]  # allow asserts and test secrets in tests
+"app/cli.py" = ["T201"]  # CLI is supposed to print output
+"app/migrations/**/*.py" = ["E501"]  # migrations can have long lines
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
 [tool.mypy]
 python_version = "3.11"
 warn_return_any = true
