@@ -5,9 +5,11 @@ Provides connection factory and schema initialization.
 """
 
 import logging
+import shutil
 import sqlite3
 from collections.abc import Generator
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -116,10 +118,35 @@ def get_db(db_path: Path | None = None) -> Generator[sqlite3.Connection, None, N
         conn.close()
 
 
-def run_migrations(conn: sqlite3.Connection) -> None:
+def _backup_db(db_path: Path) -> Path | None:
+    """Create a timestamped backup of the database before running migrations.
+
+    Keeps at most 5 backups, removing the oldest when exceeded.
+    Returns the backup path, or None if the DB file doesn't exist yet.
+    """
+    if not db_path.exists():
+        return None
+
+    backup_dir = db_path.parent / "backups"
+    backup_dir.mkdir(exist_ok=True)
+
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    backup_path = backup_dir / f"topic_watch.{timestamp}.db"
+    shutil.copy2(db_path, backup_path)
+    logger.info("Database backup created: %s", backup_path.name)
+
+    backups = sorted(backup_dir.glob("topic_watch.*.db"))
+    for old_backup in backups[:-5]:
+        old_backup.unlink()
+
+    return backup_path
+
+
+def run_migrations(conn: sqlite3.Connection, db_path: Path | None = None) -> None:
     """Apply any pending database migrations.
 
-    Tracks applied migrations in a schema_version table.
+    Creates a backup before applying new migrations. Tracks applied
+    migrations in a schema_version table.
     """
     conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)")
     row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
@@ -127,11 +154,18 @@ def run_migrations(conn: sqlite3.Connection) -> None:
 
     from app.migrations import MIGRATIONS
 
-    for version, description, up_func in MIGRATIONS:
-        if version > current:
-            up_func(conn)
-            conn.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
-            logger.info("Applied migration %d: %s", version, description)
+    pending = [(v, d, f) for v, d, f in MIGRATIONS if v > current]
+    if not pending:
+        return
+
+    path = db_path or DEFAULT_DB_PATH
+    _backup_db(path)
+    logger.info("Running %d pending migration(s) from version %d", len(pending), current)
+
+    for version, description, up_func in pending:
+        up_func(conn)
+        conn.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+        logger.info("Applied migration %d: %s", version, description)
     conn.commit()
 
 
@@ -142,5 +176,5 @@ def init_db(db_path: Path | None = None) -> None:
     """
     with get_db(db_path) as conn:
         conn.executescript(_SCHEMA)
-        run_migrations(conn)
+        run_migrations(conn, db_path=db_path)
     logger.info("Database initialized at %s", db_path or DEFAULT_DB_PATH)
