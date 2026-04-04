@@ -16,7 +16,7 @@ Self-hosted news monitoring with LLM-powered novelty detection. Watches topics v
 ## Features
 
 - Auto feeds (Google News) or manual RSS/Atom URLs
-- Per-topic check intervals (10 min to 1 week)
+- Per-topic check intervals (10 min to 6 months, human-readable: `6h`, `1w 3d`, `2h 30m`)
 - Topic tags
 - 100+ notification services via [Apprise](https://github.com/caronc/apprise/wiki) (Discord, Slack, Telegram, email, ntfy, etc.)
 - Custom JSON webhooks
@@ -120,7 +120,7 @@ Settings live in `data/config.yml`. First run auto-copies `config.example.yml`. 
 | `llm.base_url` | string | - | Base URL for self-hosted providers (Ollama, etc.) |
 | `notifications.urls` | list | `[]` | [Apprise](https://github.com/caronc/apprise/wiki) notification URLs |
 | `notifications.webhook_urls` | list | `[]` | Webhook endpoints for JSON POST (see [Webhooks](#webhooks)) |
-| `check_interval_hours` | int | `6` | Default hours between checks per topic (1-168) |
+| `check_interval` | string | `"6h"` | Default check interval. Units: m (minutes), h (hours), d (days), w (weeks), M (months). Combine: `1w 3d`, `2h 30m`. Min 10m, max 6M. |
 | `max_articles_per_check` | int | `10` | Articles to process per check per topic (1-100) |
 | `knowledge_state_max_tokens` | int | `2000` | Token budget for knowledge state (500-10,000) |
 | `article_retention_days` | int | `90` | Days to keep articles before cleanup (1-3,650) |
@@ -141,6 +141,9 @@ Settings live in `data/config.yml`. First run auto-copies `config.example.yml`. 
 | `scheduler_misfire_grace_time` | int | `300` | APScheduler misfire grace time (seconds, 30-3,600) |
 | `scheduler_jitter_seconds` | int | `30` | Random jitter per scheduler tick (seconds, 0-120) |
 | `llm_max_retries` | int | `2` | LLM API call retries (0-10) |
+| `llm_temperature` | float | `0.2` | LLM sampling temperature (0.0-2.0, lower = more factual) |
+| `min_confidence_threshold` | float | `0.7` | Minimum LLM confidence to send notifications (0.0-1.0) |
+| `min_relevance_threshold` | float | `0.5` | Minimum relevance to topic description to send notifications (0.0-1.0) |
 
 </details>
 
@@ -151,7 +154,7 @@ All settings can be overridden with `TOPIC_WATCH_` prefix. Double underscores fo
 ```bash
 TOPIC_WATCH_LLM__API_KEY=sk-abc123
 TOPIC_WATCH_LLM__MODEL=openai/gpt-5.4-nano
-TOPIC_WATCH_CHECK_INTERVAL_HOURS=4
+TOPIC_WATCH_CHECK_INTERVAL=4h
 TOPIC_WATCH_NOTIFICATIONS__WEBHOOK_URLS='["https://example.com/hook"]'
 ```
 
@@ -238,6 +241,7 @@ Payload:
 ```json
 {
   "topic": "Topic Name",
+  "reasoning": "Brief explanation of why this was flagged as new...",
   "summary": "...",
   "key_facts": ["...", "..."],
   "source_urls": ["https://..."],
