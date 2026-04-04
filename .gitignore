@@ -4,6 +4,11 @@ data/*.db
 data/*.db-wal
 data/*.db-shm
 
+# Environment variables (may contain API keys)
+.env
+.env.*
+!.env.example
+
 # Python
 __pycache__/
 *.py[cod]
