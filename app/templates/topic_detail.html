@@ -65,16 +65,10 @@
 {% endif %}
 
 <p><strong>Check Interval:</strong>
-    {% if topic.check_interval_minutes %}
-        {% if topic.check_interval_minutes % 60 == 0 %}
-            Every {{ topic.check_interval_minutes // 60 }}h (custom)
-        {% elif topic.check_interval_minutes >= 60 %}
-            Every {{ topic.check_interval_minutes // 60 }}h {{ topic.check_interval_minutes % 60 }}m (custom)
-        {% else %}
-            Every {{ topic.check_interval_minutes }}m (custom)
-        {% endif %}
+    {% if formatted_interval %}
+        Every {{ formatted_interval }} (custom)
     {% else %}
-        Every {{ default_interval }} hour(s) (global default)
+        Every {{ default_interval }} (global default)
     {% endif %}
 </p>
 

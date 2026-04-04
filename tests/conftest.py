@@ -46,7 +46,7 @@ notifications:
   urls:
     - "json://localhost"
 
-check_interval_hours: 6
+check_interval: "6h"
 max_articles_per_check: 10
 knowledge_state_max_tokens: 2000
 """
