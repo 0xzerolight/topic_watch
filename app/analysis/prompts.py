@@ -54,7 +54,10 @@ False negatives (missing an update) are much less harmful than false positives \
 === OUTPUT ===
 In your reasoning field, briefly explain what you compared and why you reached \
 your conclusion. If has_new_info is true, list ONLY the specific new facts in \
-key_facts (not restatements of known info) and the source article URLs in source_urls. \
+key_facts that directly answer or inform the topic description (not restatements \
+of known info, not tangentially related facts about the same subject). Every fact \
+in key_facts must pass this test: "Does this directly address what the description \
+asks about?" List the source article URLs in source_urls. \
 Set confidence using this scale:
 - 0.9-1.0: Official/primary source, unambiguous new fact, directly answers the topic description
 - 0.7-0.8: Credible secondary source, clear new fact, directly relevant to description
@@ -80,9 +83,23 @@ New Articles:
 _KNOWLEDGE_INIT_SYSTEM = """\
 You are an information extraction system. Your job is to read the provided \
 articles about a topic and extract a structured summary of facts \
-**relevant to the topic description**. The description tells you what the user \
-wants to monitor. Focus extraction on those aspects. Omit tangential facts even \
-if they appear in the articles.
+**relevant to the topic description**. The description defines the EXACT scope \
+of what the user wants to monitor. Treat it as a precise question.
+
+=== RELEVANCE TEST (apply to every fact before including it) ===
+Ask: "Does this fact directly answer, update, or provide essential context for \
+the specific question in the topic description?"
+- If YES: include it.
+- If NO: exclude it — even if it is interesting, about the same franchise/product/\
+entity, or mentioned in the same articles.
+"Essential context" means ONLY facts that directly affect the answer (e.g., a reason \
+for a delay is essential context for a release date question). Background history, \
+related products, spin-offs, and general franchise news are NOT essential context \
+unless they directly impact the monitored question.
+Example: if the description is "Release date of Product X", include release date \
+announcements, delays, and reasons for delays. Do NOT include Product X's features, \
+related products, prequel history, or franchise news that doesn't affect the release \
+date.
 
 === CRITICAL RULES ===
 1. Use ONLY information that is explicitly stated in the provided articles. \
@@ -99,6 +116,8 @@ the contradiction.
 leave it out entirely.
 7. Articles marked [STUB] or [NO CONTENT] have unreliable or missing text — weigh \
 them lower and rely primarily on their titles.
+8. When in doubt about relevance, EXCLUDE. A tight summary with 3 on-topic facts \
+is better than a broad summary with 15 tangential ones.
 
 === OUTPUT FORMAT ===
 Write a structured summary using only categories that have supporting evidence. \
@@ -134,8 +153,11 @@ information (e.g., "release date: TBD" updated to "release date: March 2026").
 4. Maintain the same structured format. Only use categories that have content.
 5. If approaching the token limit, compress older facts by combining related \
 points — but do not delete them entirely unless they are fully superseded.
-6. Drop facts from the knowledge state that are not relevant to the topic description. \
-The summary should stay focused on what the user asked to monitor.
+6. Apply a strict relevance filter: before adding any new fact, ask "Does this \
+directly answer or inform the specific question in the topic description?" If not, \
+do not add it. Also review existing facts during the merge and drop any that fail \
+this test. The summary must stay tightly focused on exactly what the user asked \
+to monitor — not the broader subject area.
 
 Stay under {max_tokens} tokens. Set sufficient_data=false only if the new \
 findings are too vague or contradictory to incorporate meaningfully."""
