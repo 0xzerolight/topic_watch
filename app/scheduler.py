@@ -74,7 +74,7 @@ def start_scheduler(
     Schedules check_all_topics to run at the configured interval.
 
     Args:
-        settings: Application settings (provides check_interval_hours).
+        settings: Application settings (provides check_interval).
         db_path: Optional database path override for testing.
 
     Returns:
@@ -133,9 +133,9 @@ def start_scheduler(
     _scheduler = scheduler
 
     logger.info(
-        "Scheduler started: ticking every minute (jitter=%ds), default interval %d hour(s)",
+        "Scheduler started: ticking every minute (jitter=%ds), default interval %s",
         settings.scheduler_jitter_seconds,
-        settings.check_interval_hours,
+        settings.check_interval,
     )
     return scheduler
 

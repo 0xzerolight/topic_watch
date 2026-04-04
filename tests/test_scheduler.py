@@ -10,7 +10,7 @@ from app.scheduler import _scheduled_check, _vacuum_db, start_scheduler, stop_sc
 def _make_settings(**overrides) -> Settings:
     defaults = {
         "llm": LLMSettings(model="openai/gpt-4o-mini", api_key="test-key"),
-        "check_interval_hours": 4,
+        "check_interval": "4h",
     }
     defaults.update(overrides)
     return Settings(**defaults)
@@ -34,7 +34,7 @@ class TestStartStopScheduler:
             stop_scheduler()
 
     async def test_check_job_ticks_every_minute(self) -> None:
-        settings = _make_settings(check_interval_hours=12)
+        settings = _make_settings(check_interval="12h")
         scheduler = start_scheduler(settings)
         try:
             job = scheduler.get_job("check_all_topics")

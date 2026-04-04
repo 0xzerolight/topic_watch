@@ -17,7 +17,8 @@ class TestConfigLoading:
         settings = load_settings(config_path=sample_config_yaml)
         assert settings.llm.model == "openai/gpt-4o-mini"
         assert settings.llm.api_key == "test-api-key-12345"
-        assert settings.check_interval_hours == 6
+        assert settings.check_interval == "6h"
+        assert settings.check_interval_minutes == 360
         assert settings.max_articles_per_check == 10
         assert settings.knowledge_state_max_tokens == 2000
         assert len(settings.notifications.urls) == 1
@@ -25,7 +26,7 @@ class TestConfigLoading:
     def test_load_minimal_config(self, minimal_config_yaml: Path) -> None:
         settings = load_settings(config_path=minimal_config_yaml)
         assert settings.llm.model == "openai/gpt-4o-mini"
-        assert settings.check_interval_hours == 6
+        assert settings.check_interval == "6h"
         assert settings.max_articles_per_check == 10
         assert settings.notifications.urls == []
 
@@ -39,7 +40,7 @@ class TestConfigLoading:
         monkeypatch.delenv("TOPIC_WATCH_LLM__API_KEY", raising=False)
         monkeypatch.delenv("TOPIC_WATCH_LLM__MODEL", raising=False)
         config = tmp_path / "config.yml"
-        config.write_text("check_interval_hours: 6\n")
+        config.write_text('check_interval: "6h"\n')
         settings = load_settings(config_path=config)
         assert not settings.is_configured()
 
@@ -54,15 +55,23 @@ class TestConfigLoading:
 
     def test_invalid_check_interval_too_low(self, tmp_path: Path) -> None:
         config = tmp_path / "config.yml"
-        config.write_text('llm:\n  model: "openai/gpt-4o-mini"\n  api_key: "k"\ncheck_interval_hours: 0\n')
+        config.write_text('llm:\n  model: "openai/gpt-4o-mini"\n  api_key: "k"\ncheck_interval: "5m"\n')
         with pytest.raises(ValidationError):
             load_settings(config_path=config)
 
-    def test_invalid_check_interval_too_high(self, tmp_path: Path) -> None:
+    def test_invalid_check_interval_bad_format(self, tmp_path: Path) -> None:
         config = tmp_path / "config.yml"
-        config.write_text('llm:\n  model: "openai/gpt-4o-mini"\n  api_key: "k"\ncheck_interval_hours: 200\n')
+        config.write_text('llm:\n  model: "openai/gpt-4o-mini"\n  api_key: "k"\ncheck_interval: "bogus"\n')
         with pytest.raises(ValidationError):
             load_settings(config_path=config)
+
+    def test_backward_compat_check_interval_hours(self, tmp_path: Path) -> None:
+        """Old check_interval_hours YAML key is auto-converted to check_interval string."""
+        config = tmp_path / "config.yml"
+        config.write_text('llm:\n  model: "openai/gpt-4o-mini"\n  api_key: "k"\ncheck_interval_hours: 12\n')
+        settings = load_settings(config_path=config)
+        assert settings.check_interval == "12h"
+        assert settings.check_interval_minutes == 720
 
     def test_invalid_max_articles(self, tmp_path: Path) -> None:
         config = tmp_path / "config.yml"
@@ -124,9 +133,10 @@ class TestEnvVarOverrides:
         assert settings.llm.api_key == "env-override-key"
 
     def test_env_overrides_check_interval(self, sample_config_yaml: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("TOPIC_WATCH_CHECK_INTERVAL_HOURS", "12")
+        monkeypatch.setenv("TOPIC_WATCH_CHECK_INTERVAL", "12h")
         settings = load_settings(config_path=sample_config_yaml)
-        assert settings.check_interval_hours == 12
+        assert settings.check_interval == "12h"
+        assert settings.check_interval_minutes == 720
 
 
 class TestProviderDetection:

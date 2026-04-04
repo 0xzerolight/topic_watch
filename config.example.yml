@@ -34,8 +34,10 @@ notifications:
     # - "https://your-server.com/webhook/topic-watch"
     # - "https://hooks.example.com/trigger"
 
-# Check interval in hours (how often to check each topic for updates)
-check_interval_hours: 6
+# Default check interval (how often to check each topic for updates)
+# Supported units: m (minutes), h (hours), d (days), w (weeks), M (months)
+# Combine units: "1w 3d", "2h 30m" — min 10m, max 6M
+check_interval: "6h"
 
 # Maximum number of articles to process per check per topic
 # Higher values use more LLM tokens but catch more updates

@@ -76,11 +76,12 @@
     <h2>Checking</h2>
 
     <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
-        <label for="check_interval_hours">
-            Default Check Interval (hours)
-            <input type="number" id="check_interval_hours" name="check_interval_hours" required
-                   min="1" max="168"
-                   value="{{ form.check_interval_hours if form else settings.check_interval_hours }}">
+        <label for="check_interval">
+            Default Check Interval
+            <input type="text" id="check_interval" name="check_interval" required
+                   placeholder="e.g., 6h, 1d, 2w, 1M"
+                   value="{{ form.check_interval if form else settings.check_interval }}">
+            <small>Units: m (minutes), h (hours), d (days), w (weeks), M (months). Combine: 1w 3d</small>
         </label>
 
         <label for="max_articles_per_check">

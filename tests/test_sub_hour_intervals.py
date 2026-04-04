@@ -195,7 +195,7 @@ class TestGetTopicsDueForCheck:
 
     def test_topic_with_no_checks_is_always_due(self, db_conn: sqlite3.Connection) -> None:
         self._make_ready_topic(db_conn, "NeverChecked", interval_minutes=30)
-        due = get_topics_due_for_check(db_conn, default_interval_hours=6)
+        due = get_topics_due_for_check(db_conn, default_interval_minutes=360)
         assert any(t.name == "NeverChecked" for t in due)
 
     def test_topic_due_after_interval(self, db_conn: sqlite3.Connection) -> None:
@@ -209,7 +209,7 @@ class TestGetTopicsDueForCheck:
         )
         db_conn.commit()
 
-        due = get_topics_due_for_check(db_conn, default_interval_hours=6)
+        due = get_topics_due_for_check(db_conn, default_interval_minutes=360)
         assert any(t.name == "ThirtyMin" for t in due)
 
     def test_topic_not_due_before_interval(self, db_conn: sqlite3.Connection) -> None:
@@ -223,7 +223,7 @@ class TestGetTopicsDueForCheck:
         )
         db_conn.commit()
 
-        due = get_topics_due_for_check(db_conn, default_interval_hours=6)
+        due = get_topics_due_for_check(db_conn, default_interval_minutes=360)
         assert not any(t.name == "NotYet" for t in due)
 
     def test_null_interval_uses_global_default(self, db_conn: sqlite3.Connection) -> None:
@@ -237,7 +237,7 @@ class TestGetTopicsDueForCheck:
         )
         db_conn.commit()
 
-        due = get_topics_due_for_check(db_conn, default_interval_hours=6)
+        due = get_topics_due_for_check(db_conn, default_interval_minutes=360)
         assert not any(t.name == "DefaultInterval" for t in due)
 
     def test_null_interval_becomes_due_after_default(self, db_conn: sqlite3.Connection) -> None:
@@ -251,7 +251,7 @@ class TestGetTopicsDueForCheck:
         )
         db_conn.commit()
 
-        due = get_topics_due_for_check(db_conn, default_interval_hours=6)
+        due = get_topics_due_for_check(db_conn, default_interval_minutes=360)
         assert any(t.name == "DefaultDue" for t in due)
 
     def test_inactive_topic_not_included(self, db_conn: sqlite3.Connection) -> None:
@@ -268,7 +268,7 @@ class TestGetTopicsDueForCheck:
         )
         db_conn.commit()
 
-        due = get_topics_due_for_check(db_conn, default_interval_hours=6)
+        due = get_topics_due_for_check(db_conn, default_interval_minutes=360)
         assert not any(t.name == "Inactive" for t in due)
 
     def test_sub_hour_interval_10_minutes(self, db_conn: sqlite3.Connection) -> None:
@@ -281,7 +281,7 @@ class TestGetTopicsDueForCheck:
         )
         db_conn.commit()
 
-        due = get_topics_due_for_check(db_conn, default_interval_hours=6)
+        due = get_topics_due_for_check(db_conn, default_interval_minutes=360)
         assert any(t.name == "TenMin" for t in due)
 
     def test_sub_hour_interval_10_minutes_not_yet_due(self, db_conn: sqlite3.Connection) -> None:
@@ -294,22 +294,22 @@ class TestGetTopicsDueForCheck:
         )
         db_conn.commit()
 
-        due = get_topics_due_for_check(db_conn, default_interval_hours=6)
+        due = get_topics_due_for_check(db_conn, default_interval_minutes=360)
         assert not any(t.name == "TenMinNotYet" for t in due)
 
 
 class TestFormValidation:
     """Test web form validation for check_interval_minutes."""
 
-    async def test_create_topic_valid_minutes(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
-        """Creating a topic with a valid interval (60 minutes) succeeds."""
+    async def test_create_topic_valid_interval(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        """Creating a topic with a valid interval string succeeds."""
         response = await client.post(
             "/topics",
             data={
                 "name": "Valid Minutes Topic",
                 "description": "Test description",
                 "feed_mode": "auto",
-                "check_interval_minutes": "60",
+                "check_interval": "1h",
                 "tags": "",
             },
         )
@@ -329,7 +329,7 @@ class TestFormValidation:
                 "name": "Too Frequent",
                 "description": "Test description",
                 "feed_mode": "auto",
-                "check_interval_minutes": "5",
+                "check_interval": "5m",
                 "tags": "",
             },
         )
@@ -337,29 +337,28 @@ class TestFormValidation:
         assert b"10" in response.content  # Error message mentions the minimum
 
     async def test_create_topic_reject_above_maximum(self, client: httpx.AsyncClient) -> None:
-        """Creating a topic with interval > 10080 minutes is rejected."""
+        """Creating a topic with interval > 6M is rejected."""
         response = await client.post(
             "/topics",
             data={
                 "name": "Too Infrequent",
                 "description": "Test description",
                 "feed_mode": "auto",
-                "check_interval_minutes": "99999",
+                "check_interval": "7M",
                 "tags": "",
             },
         )
         assert response.status_code == 422
-        assert b"10080" in response.content
 
-    async def test_create_topic_reject_non_integer(self, client: httpx.AsyncClient) -> None:
-        """Creating a topic with non-integer interval is rejected."""
+    async def test_create_topic_reject_bad_format(self, client: httpx.AsyncClient) -> None:
+        """Creating a topic with invalid interval format is rejected."""
         response = await client.post(
             "/topics",
             data={
                 "name": "Bad Interval",
                 "description": "Test description",
                 "feed_mode": "auto",
-                "check_interval_minutes": "abc",
+                "check_interval": "abc",
                 "tags": "",
             },
         )
@@ -375,7 +374,7 @@ class TestFormValidation:
                 "name": "Default Interval Topic",
                 "description": "Test description",
                 "feed_mode": "auto",
-                "check_interval_minutes": "",
+                "check_interval": "",
                 "tags": "",
             },
         )
@@ -387,8 +386,8 @@ class TestFormValidation:
         assert topic is not None
         assert topic.check_interval_minutes is None
 
-    async def test_edit_topic_valid_minutes(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
-        """Editing a topic with a valid interval (30 minutes) succeeds."""
+    async def test_edit_topic_valid_interval(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        """Editing a topic with a valid interval string succeeds."""
         topic = create_topic(
             db_conn,
             Topic(
@@ -406,7 +405,7 @@ class TestFormValidation:
                 "name": "EditableMinutes",
                 "description": "d",
                 "feed_mode": "auto",
-                "check_interval_minutes": "30",
+                "check_interval": "30m",
                 "tags": "",
             },
         )
@@ -436,7 +435,7 @@ class TestFormValidation:
                 "name": "TooFrequentEdit",
                 "description": "d",
                 "feed_mode": "auto",
-                "check_interval_minutes": "1",
+                "check_interval": "1m",
                 "tags": "",
             },
         )
