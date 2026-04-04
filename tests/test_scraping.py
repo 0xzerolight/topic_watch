@@ -897,3 +897,19 @@ class TestSSRFBlockInFetch:
     async def test_blocks_loopback(self) -> None:
         entries = await fetch_feed("http://127.0.0.1/feed.xml")
         assert entries == []
+
+    async def test_blocks_ipv6_loopback(self) -> None:
+        entries = await fetch_feed("http://[::1]/feed.xml")
+        assert entries == []
+
+    async def test_blocks_ipv6_ula(self) -> None:
+        entries = await fetch_feed("http://[fd00::1]/feed.xml")
+        assert entries == []
+
+    async def test_blocks_ipv6_link_local(self) -> None:
+        entries = await fetch_feed("http://[fe80::1]/feed.xml")
+        assert entries == []
+
+    async def test_blocks_ipv6_mapped_ipv4(self) -> None:
+        entries = await fetch_feed("http://[::ffff:127.0.0.1]/feed.xml")
+        assert entries == []
