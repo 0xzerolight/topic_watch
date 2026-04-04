@@ -94,7 +94,7 @@
             {% for article in articles %}
             <tr>
                 <td><a href="{{ article.url }}" target="_blank">{{ article.title }}</a></td>
-                <td><small>{{ article.source_feed|truncate(40) }}</small></td>
+                <td><small>{{ article.source_feed|feed_source_name }}</small></td>
                 <td>{{ article.fetched_at.strftime("%Y-%m-%d %H:%M") }}</td>
             </tr>
             {% endfor %}
