@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-04-04
+
+### Added
+
+- Theme showcase GIF in README
+- Contributor Covenant v3.0 Code of Conduct
+- "Updating" section in README with upgrade instructions
+- `--version` flag for the CLI
+- GitHub Discussions enabled
+
+### Fixed
+
+- Generic 404/422 pages now render styled HTML instead of raw JSON for browser requests
+- OpenAPI version synced with app version
+- Version display now reads from pyproject.toml (single source of truth)
+- Feed Health table column truncation on desktop
+- Auto-mode topics now show all feed URLs on detail page
+- Readable source names in articles table instead of raw feed URLs
+- Page header alignment and footer positioning
+- Button vertical alignment in action rows
+
 ## [1.1.0] - 2026-04-04
 
 ### Added
