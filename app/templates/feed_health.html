@@ -12,9 +12,9 @@
             <th>Feed URL</th>
             <th>Last Success</th>
             <th>Last Error</th>
-            <th title="Consecutive Failures">Consec. Failures</th>
-            <th>Total Fetches</th>
-            <th title="Failure Rate">Fail Rate</th>
+            <th title="Consecutive Failures">Consec. Fail</th>
+            <th>Fetches</th>
+            <th title="Failure Rate">Fail %</th>
         </tr>
     </thead>
     <tbody>
@@ -29,7 +29,7 @@
                     <span class="status-error" title="Unhealthy">&#9679; Unhealthy</span>
                 {% endif %}
             </td>
-            <td><a href="{{ feed.feed_url }}" target="_blank" class="feed-url" title="{{ feed.feed_url }}"><small>{{ feed.feed_url|truncate(60) }}</small></a></td>
+            <td><a href="{{ feed.feed_url }}" target="_blank" class="feed-url" title="{{ feed.feed_url }}"><small>{{ feed.feed_url|truncate(45) }}</small></a></td>
             <td>{{ feed.last_success_at|timeago if feed.last_success_at else "Never" }}</td>
             <td>
                 {% if feed.last_error_at %}
