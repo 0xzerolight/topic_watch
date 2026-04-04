@@ -58,7 +58,7 @@ All application code lives under `app/`.
 | Module | Responsibility |
 |--------|---------------|
 | `analysis/llm.py` | LiteLLM + Instructor wrappers. Defines `NoveltyResult` and `KnowledgeStateUpdate` response models. Rate limit backoff with exponential delay. Returns safe default (`has_new_info=False`) on analysis failure. |
-| `analysis/prompts.py` | System and user prompt templates for novelty detection and knowledge management. Articles truncated to 1000 chars in prompts. |
+| `analysis/prompts.py` | System and user prompt templates for novelty detection and knowledge management. Articles truncated to 1500 chars in prompts. |
 | `analysis/knowledge.py` | Knowledge state initialization and updates. Token budget enforcement via sentence-level truncation. |
 
 ### Scraping
@@ -76,7 +76,7 @@ All application code lives under `app/`.
 | `models.py` | Pydantic models: `Topic`, `Article`, `KnowledgeState`, `CheckResult`, `FeedHealth`, `PendingNotification`. Enums: `TopicStatus`, `FeedMode`. Each model has `from_row()` and `to_insert_dict()` for SQLite interop. |
 | `crud.py` | All database operations grouped by model. Topic/Article/KnowledgeState/CheckResult CRUD, feed health upserts, pending notification queue, dashboard aggregation, article retention cleanup, stuck topic recovery. |
 | `database.py` | SQLite connection factory (WAL mode, foreign keys, busy timeout). Schema initialization. Migration runner. |
-| `migrations/` | 8 sequential migrations registered in `__init__.py` as `(version, description, up_function)` tuples. Tracked in `schema_version` table. |
+| `migrations/` | 9 sequential migrations registered in `__init__.py` as `(version, description, up_function)` tuples. Tracked in `schema_version` table. |
 
 ### Web
 
@@ -100,7 +100,7 @@ All application code lives under `app/`.
 
 ### Frontend
 
-- `templates/` - 13 Jinja2 templates. Base layout with Pico CSS + HTMX. HTMX partials for dynamic updates.
+- `templates/` - 14 Jinja2 templates. Base layout with Pico CSS + HTMX. HTMX partials for dynamic updates.
 - `static/themes.css` - Custom color themes (Nord, Dracula, Solarized, High Contrast, Tokyo Night).
 - `static/theme.js` - Theme switcher with localStorage persistence.
 - `static/notifications.js` - Browser push notification wrapper.
