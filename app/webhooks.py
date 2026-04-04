@@ -12,6 +12,7 @@ import httpx
 
 from app.analysis.llm import NoveltyResult
 from app.config import Settings
+from app.url_validation import is_private_url
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,10 @@ async def send_webhook(url: str, payload: dict, timeout: float = _WEBHOOK_TIMEOU
     Returns True on success (2xx response), False on failure.
     Never raises — all errors are caught and logged.
     """
+    if is_private_url(url):
+        logger.warning("Blocked webhook to private/reserved URL: %s", url)
+        return False
+
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(url, json=payload)

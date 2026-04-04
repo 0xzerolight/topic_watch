@@ -106,7 +106,7 @@ def parse_opml(content: str, existing_feed_urls: set[str]) -> OPMLResult:
     result = OPMLResult()
 
     try:
-        root = ET.fromstring(content)  # noqa: S314 — depth cap + 1MB limit, Python 3.13 has expat billion laughs protection
+        root = ET.fromstring(content)  # noqa: S314 — entity expansion disabled by default in Python 3.11+ expat; 1MB size cap adds defense-in-depth
     except ET.ParseError as exc:
         result.warnings.append(f"Invalid XML: {exc}")
         return result

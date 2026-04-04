@@ -3,6 +3,7 @@ data/config.yml
 data/*.db
 data/*.db-wal
 data/*.db-shm
+data/*.db-journal
 
 # Environment variables (may contain API keys)
 .env
