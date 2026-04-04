@@ -90,7 +90,7 @@ class TestDashboard:
         """Empty database shows 'no topics' message."""
         response = await client.get("/")
         assert response.status_code == 200
-        assert "No topics configured" in response.text
+        assert "adding your first topic" in response.text
 
     async def test_dashboard_shows_topics(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
         """Dashboard lists topics with names."""
