@@ -506,8 +506,10 @@ async def topic_detail(
         raise HTTPException(status_code=404, detail="Topic not found")
 
     auto_feed_url = None
+    auto_feed_urls: list[str] = []
     if topic.feed_mode == FeedMode.AUTO:
         auto_feed_url = provider_router.get_provider().build_feed_url(topic)
+        auto_feed_urls = [p.build_feed_url(topic) for p in provider_router.providers]
 
     per_page = settings.web_page_size
     offset = (max(1, page) - 1) * per_page
@@ -546,6 +548,7 @@ async def topic_detail(
             "page": page,
             "total_pages": total_pages,
             "auto_feed_url": auto_feed_url,
+            "auto_feed_urls": auto_feed_urls,
             "formatted_interval": formatted,
             "default_interval": settings.check_interval,
             "knowledge_state_max_tokens": settings.knowledge_state_max_tokens,
