@@ -313,11 +313,11 @@ details.knowledge-state > article > div.knowledge-text {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  flex-wrap: wrap;
   gap: 1rem;
   margin-bottom: 1rem;
 }
 .page-header h1 { margin-bottom: 0; }
+.page-header .action-row { flex-shrink: 0; }
 
 .action-row {
   display: flex;
@@ -373,7 +373,15 @@ details.knowledge-state > article > div.knowledge-text {
 }
 
 
-/* --- Footer --- */
+/* --- Sticky footer --- */
+body {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+body > main {
+  flex: 1;
+}
 .site-footer {
   text-align: center;
   opacity: 0.6;
