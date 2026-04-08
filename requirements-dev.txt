@@ -783,9 +783,9 @@ httpx==0.28.1 \
     #   litellm
     #   openai
     #   topic-watch (pyproject.toml)
-huggingface-hub==1.9.0 \
-    --hash=sha256:0ea5be7a56135c91797cae6ad726e38eaeb6eb4b77cefff5c9d38ba0ecf874f7 \
-    --hash=sha256:2999328c058d39fd19ab748dd09bd4da2fbaa4f4c1ddea823eab103051e14a1f
+huggingface-hub==1.9.2 \
+    --hash=sha256:8d09d080a186bd950a361bfc04b862dfb04d6a2b41d48e9ba1b37507cfd3f1e1 \
+    --hash=sha256:e1e62ce237d4fbeca9f970aeb15176fbd503e04c25577bfd22f44aa7aa2b5243
     # via tokenizers
 identify==2.6.18 \
     --hash=sha256:873ac56a5e3fd63e7438a7ecbc4d91aca692eb3fefa4534db2b7913f3fc352fd \
