@@ -1512,9 +1512,9 @@ python-dotenv==1.0.1 \
     #   litellm
     #   pydantic-settings
     #   uvicorn
-python-multipart==0.0.22 \
-    --hash=sha256:2b2cd894c83d21bf49d702499531c7bafd057d730c201782048f7945d82de155 \
-    --hash=sha256:7340bef99a7e0032613f56dc36027b959fd3b30a787ed62d310e951f7c3a3a58
+python-multipart==0.0.24 \
+    --hash=sha256:9574c97e1c026e00bc30340ef7c7d76739512ab4dfd428fec8c330fa6a5cc3c8 \
+    --hash=sha256:9b110a98db707df01a53c194f0af075e736a770dc5058089650d70b4a182f950
     # via topic-watch (pyproject.toml)
 pytz==2026.1.post1 \
     --hash=sha256:3378dde6a0c3d26719182142c56e60c7f9af7e968076f31aae569d72a0358ee1 \
