@@ -2319,9 +2319,9 @@ trafilatura==2.0.0 \
     --hash=sha256:77eb5d1e993747f6f20938e1de2d840020719735690c840b9a1024803a4cd51d \
     --hash=sha256:ceb7094a6ecc97e72fea73c7dba36714c5c5b577b6470e4520dca893706d6247
     # via topic-watch (pyproject.toml)
-typer==0.24.1 \
-    --hash=sha256:112c1f0ce578bfb4cab9ffdabc68f031416ebcc216536611ba21f04e9aa84c9e \
-    --hash=sha256:e39b4732d65fbdcde189ae76cf7cd48aeae72919dea1fdfc16593be016256b45
+typer==0.23.1 \
+    --hash=sha256:2070374e4d31c83e7b61362fd859aa683576432fd5b026b060ad6b4cd3b86134 \
+    --hash=sha256:3291ad0d3c701cbf522012faccfbb29352ff16ad262db2139e6b01f15781f14e
     # via
     #   huggingface-hub
     #   instructor
