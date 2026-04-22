@@ -1028,9 +1028,9 @@ librt==0.8.1 \
     --hash=sha256:fd1a720332ea335ceb544cf0a03f81df92abd4bb887679fd1e460976b0e6214b \
     --hash=sha256:ff8baf1f8d3f4b6b7257fcb75a501f2a5499d0dda57645baa09d4d0d34b19444
     # via mypy
-litellm==1.83.1 \
-    --hash=sha256:2becb86c60e4d9738d321e563dc0a1bf4712f8f725c4d6e9d76a1f49a246bc42 \
-    --hash=sha256:a0fa79b3010b97da1b40fb91adf9097d4f2d6f9b01d13a8efeff82381521430b
+litellm==1.83.11 \
+    --hash=sha256:c091d2254f1d17a6779dbc28c176bf918525495eff944bd0d5f9b8c357dd6077 \
+    --hash=sha256:f1d508fb0ad5900796299fd20ec81e8a13111193473823236109739b43fda9ba
     # via topic-watch (pyproject.toml)
 lxml==6.0.2 \
     --hash=sha256:058027e261afed589eddcfe530fcc6f3402d7fd7e89bfd0532df82ebc1563dba \
