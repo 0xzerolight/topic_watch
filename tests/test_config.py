@@ -207,6 +207,40 @@ class TestSaveSettingsBaseUrlGuard:
         assert data["llm"]["base_url"] == "http://localhost:11434"
 
 
+class TestSaveSettingsCreatesParentDir:
+    """save_settings_to_yaml must create a missing parent directory before writing."""
+
+    def test_creates_missing_parent_dir(self, tmp_path: Path) -> None:
+        """Saving to a path whose parent does not exist creates it and succeeds."""
+        import yaml
+
+        from app.config import LLMSettings, save_settings_to_yaml
+
+        settings = Settings(
+            llm=LLMSettings(model="openai/gpt-4o-mini", api_key="sk-test"),
+        )  # type: ignore[call-arg]
+        # Parent directory "data" does not exist yet.
+        config_file = tmp_path / "data" / "config.yml"
+        assert not config_file.parent.exists()
+
+        save_settings_to_yaml(settings, config_file)
+
+        assert config_file.exists()
+        data = yaml.safe_load(config_file.read_text())
+        assert data["llm"]["model"] == "openai/gpt-4o-mini"
+
+    def test_creates_nested_missing_parents(self, tmp_path: Path) -> None:
+        """Multiple levels of missing parents are created (parents=True)."""
+        from app.config import LLMSettings, save_settings_to_yaml
+
+        settings = Settings(
+            llm=LLMSettings(model="openai/gpt-4o-mini", api_key="sk-test"),
+        )  # type: ignore[call-arg]
+        config_file = tmp_path / "a" / "b" / "c" / "config.yml"
+        save_settings_to_yaml(settings, config_file)
+        assert config_file.exists()
+
+
 class TestThresholdDefaults:
     """Test default values and bounds for confidence/relevance thresholds."""
 
