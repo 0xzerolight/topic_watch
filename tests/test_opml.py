@@ -1,5 +1,7 @@
 """Tests for OPML import/export functionality."""
 
+from unittest.mock import patch
+
 from app.opml import MAX_IMPORT_TOPICS, export_opml, parse_opml
 
 VALID_OPML = """<?xml version="1.0" encoding="UTF-8"?>
@@ -105,7 +107,10 @@ class TestParseOPML:
             for i in range(MAX_IMPORT_TOPICS + 50)
         )
         opml = f'<?xml version="1.0"?><opml version="2.0"><body>{outlines}</body></opml>'
-        result = parse_opml(opml, set())
+        # Mock URL validation to avoid 550 real DNS lookups (is_private_url resolves
+        # each host); this test exercises truncation logic, not SSRF validation.
+        with patch("app.opml.validate_feed_url", return_value=None):
+            result = parse_opml(opml, set())
         assert len(result.topics) == MAX_IMPORT_TOPICS
         assert any("Imported first" in w for w in result.warnings)
 
