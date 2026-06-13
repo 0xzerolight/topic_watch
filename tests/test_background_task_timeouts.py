@@ -12,7 +12,7 @@ from app.crud import create_topic, get_topic
 from app.database import get_connection, init_db
 from app.models import Article, Topic, TopicStatus
 from app.scraping import FetchResult
-from app.web.routes import _run_check_all, _run_init
+from app.web.routers.background import _run_check_all, _run_init
 
 
 def _make_settings(**overrides) -> Settings:
@@ -62,7 +62,7 @@ class TestRunInitTimeout:
             await asyncio.sleep(9999)
 
         with (
-            patch("app.web.routes._INIT_TIMEOUT_SECONDS", 0.05),
+            patch("app.web.routers.background._INIT_TIMEOUT_SECONDS", 0.05),
             patch(
                 "app.checker.fetch_new_articles_for_topic",
                 side_effect=_hang,
@@ -97,12 +97,12 @@ class TestRunInitTimeout:
             await asyncio.sleep(9999)
 
         with (
-            patch("app.web.routes._INIT_TIMEOUT_SECONDS", 0.05),
+            patch("app.web.routers.background._INIT_TIMEOUT_SECONDS", 0.05),
             patch(
                 "app.checker.fetch_new_articles_for_topic",
                 side_effect=_hang,
             ),
-            caplog.at_level(logging.ERROR, logger="app.web.routes"),
+            caplog.at_level(logging.ERROR, logger="app.web.routers.background"),
         ):
             await _run_init(topic_id, settings, db_path)
 
@@ -177,9 +177,9 @@ class TestRunCheckAllTimeout:
             await asyncio.sleep(9999)
 
         with (
-            patch("app.web.routes._CHECK_ALL_TIMEOUT_SECONDS", 0.05),
-            patch("app.web.routes.check_all_topics", side_effect=_hang),
-            caplog.at_level(logging.ERROR, logger="app.web.routes"),
+            patch("app.web.routers.background._CHECK_ALL_TIMEOUT_SECONDS", 0.05),
+            patch("app.web.routers.background.check_all_topics", side_effect=_hang),
+            caplog.at_level(logging.ERROR, logger="app.web.routers.background"),
         ):
             # Should complete without raising
             await _run_check_all(settings, db_path)
@@ -188,7 +188,7 @@ class TestRunCheckAllTimeout:
 
     async def test_timeout_clears_checking_state(self, db_path: Path) -> None:
         """After a timeout, the checking-all flag is cleared so the next run can proceed."""
-        from app.web.routes import _checking_state
+        from app.web.state import _checking_state
 
         settings = _make_settings()
 
@@ -196,8 +196,8 @@ class TestRunCheckAllTimeout:
             await asyncio.sleep(9999)
 
         with (
-            patch("app.web.routes._CHECK_ALL_TIMEOUT_SECONDS", 0.05),
-            patch("app.web.routes.check_all_topics", side_effect=_hang),
+            patch("app.web.routers.background._CHECK_ALL_TIMEOUT_SECONDS", 0.05),
+            patch("app.web.routers.background.check_all_topics", side_effect=_hang),
         ):
             await _run_check_all(settings, db_path)
 
@@ -205,12 +205,12 @@ class TestRunCheckAllTimeout:
 
     async def test_normal_completion_returns_cleanly(self, db_path: Path) -> None:
         """When check_all_topics completes normally, the task finishes without error."""
-        from app.web.routes import _checking_state
+        from app.web.state import _checking_state
 
         settings = _make_settings()
 
         with patch(
-            "app.web.routes.check_all_topics",
+            "app.web.routers.background.check_all_topics",
             new_callable=AsyncMock,
             return_value=[],
         ):
@@ -226,11 +226,11 @@ class TestRunCheckAllTimeout:
 
         with (
             patch(
-                "app.web.routes.check_all_topics",
+                "app.web.routers.background.check_all_topics",
                 new_callable=AsyncMock,
                 return_value=[],
             ),
-            caplog.at_level(logging.ERROR, logger="app.web.routes"),
+            caplog.at_level(logging.ERROR, logger="app.web.routers.background"),
         ):
             await _run_check_all(settings, db_path)
 

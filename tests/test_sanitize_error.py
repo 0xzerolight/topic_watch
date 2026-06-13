@@ -1,6 +1,6 @@
 """Tests for the _sanitize_error Jinja2 filter."""
 
-from app.web.routes import _sanitize_error
+from app.web.routers.templates import _sanitize_error
 
 
 def test_none_input_returns_default_message():

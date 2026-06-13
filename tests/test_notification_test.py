@@ -82,7 +82,7 @@ async def client_no_urls(
 
 async def test_test_notification_success(client: httpx.AsyncClient) -> None:
     """Successful send_notification returns a green success message."""
-    with patch("app.web.routes.send_notification", new_callable=AsyncMock) as mock_send:
+    with patch("app.web.routers.settings.send_notification", new_callable=AsyncMock) as mock_send:
         mock_send.return_value = True
         response = await client.post("/notifications/test")
 
@@ -93,7 +93,7 @@ async def test_test_notification_success(client: httpx.AsyncClient) -> None:
 
 async def test_test_notification_calls_send_with_correct_args(client: httpx.AsyncClient) -> None:
     """Route calls send_notification with the expected title and body."""
-    with patch("app.web.routes.send_notification", new_callable=AsyncMock) as mock_send:
+    with patch("app.web.routers.settings.send_notification", new_callable=AsyncMock) as mock_send:
         mock_send.return_value = True
         await client.post("/notifications/test")
 
@@ -109,7 +109,7 @@ async def test_test_notification_calls_send_with_correct_args(client: httpx.Asyn
 
 async def test_test_notification_delivery_failure(client: httpx.AsyncClient) -> None:
     """When send_notification returns False, a red failure message is shown."""
-    with patch("app.web.routes.send_notification", new_callable=AsyncMock) as mock_send:
+    with patch("app.web.routers.settings.send_notification", new_callable=AsyncMock) as mock_send:
         mock_send.return_value = False
         response = await client.post("/notifications/test")
 
@@ -123,7 +123,7 @@ async def test_test_notification_delivery_failure(client: httpx.AsyncClient) -> 
 
 async def test_test_notification_exception(client: httpx.AsyncClient) -> None:
     """When send_notification raises, a red error message is shown."""
-    with patch("app.web.routes.send_notification", new_callable=AsyncMock) as mock_send:
+    with patch("app.web.routers.settings.send_notification", new_callable=AsyncMock) as mock_send:
         mock_send.side_effect = RuntimeError("connection refused")
         response = await client.post("/notifications/test")
 
@@ -137,7 +137,7 @@ async def test_test_notification_exception(client: httpx.AsyncClient) -> None:
 
 async def test_test_notification_no_urls(client_no_urls: httpx.AsyncClient) -> None:
     """When no notification URLs are configured, returns an informative message."""
-    with patch("app.web.routes.send_notification", new_callable=AsyncMock) as mock_send:
+    with patch("app.web.routers.settings.send_notification", new_callable=AsyncMock) as mock_send:
         response = await client_no_urls.post("/notifications/test")
 
     assert response.status_code == 200
