@@ -1,9 +1,18 @@
 """URL validation utilities shared across the application."""
 
 import ipaddress
+import logging
 import re
 import socket
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
+
+import httpx
+
+logger = logging.getLogger(__name__)
+
+# Bound on redirect hops we will follow while re-validating each target.
+# Mirrors httpx's own default to keep behaviour familiar.
+_MAX_REDIRECTS = 20
 
 # Patterns that indicate a private/reserved network address
 _PRIVATE_NETLOC_PATTERNS = [
@@ -81,3 +90,71 @@ def validate_feed_urls(urls: list[str]) -> list[str]:
         if error:
             errors.append(error)
     return errors
+
+
+class PrivateRedirectError(httpx.HTTPError):
+    """Raised when a redirect target points to a private/reserved address.
+
+    Subclasses ``httpx.HTTPError`` so existing call sites that catch
+    ``httpx.HTTPError`` (e.g. google_news) treat a blocked redirect as a
+    fetch failure rather than crashing.
+    """
+
+
+def _is_redirect_status(status_code: int) -> bool:
+    return status_code in (301, 302, 303, 307, 308)
+
+
+async def safe_send(
+    client: httpx.AsyncClient,
+    request: httpx.Request,
+    *,
+    max_redirects: int = _MAX_REDIRECTS,
+) -> httpx.Response:
+    """Send a request, manually following redirects with per-hop SSRF checks.
+
+    The client MUST be configured with ``follow_redirects=False`` (the default
+    of this helper assumes httpx will not auto-follow). Each ``Location`` target
+    is validated with :func:`is_private_url` BEFORE the next hop is sent, so an
+    attacker-controlled public host cannot 3xx-redirect into loopback/RFC-1918.
+
+    Raises :class:`PrivateRedirectError` if any redirect target is private or if
+    the redirect limit is exceeded.
+    """
+    response = await client.send(request)
+    redirects = 0
+    while _is_redirect_status(response.status_code):
+        location = response.headers.get("location")
+        if not location:
+            return response
+        next_url = urljoin(str(request.url), location)
+        if is_private_url(next_url):
+            await response.aclose()
+            logger.warning("Blocked redirect to private/reserved URL: %s", next_url)
+            raise PrivateRedirectError(f"Redirect to private/reserved address blocked: {next_url}")
+        redirects += 1
+        if redirects > max_redirects:
+            await response.aclose()
+            raise PrivateRedirectError(f"Exceeded maximum of {max_redirects} redirects")
+        # 303, and 301/302 in practice, downgrade to GET with no body.
+        method = "GET" if response.status_code == 303 else request.method
+        new_headers = dict(request.headers)
+        new_content = None if method == "GET" else request.content
+        if method == "GET":
+            new_headers.pop("content-length", None)
+            new_headers.pop("content-type", None)
+        await response.aclose()
+        request = client.build_request(method, next_url, headers=new_headers, content=new_content)
+        response = await client.send(request)
+    return response
+
+
+async def safe_get(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    max_redirects: int = _MAX_REDIRECTS,
+) -> httpx.Response:
+    """GET ``url`` with redirect-target SSRF validation on every hop."""
+    request = client.build_request("GET", url)
+    return await safe_send(client, request, max_redirects=max_redirects)

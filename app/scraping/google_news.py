@@ -16,6 +16,8 @@ from urllib.parse import quote, urlparse
 
 import httpx
 
+from app.url_validation import safe_get, safe_send
+
 logger = logging.getLogger(__name__)
 
 # Cookie to bypass GDPR consent page on news.google.com.
@@ -59,7 +61,7 @@ async def _get_decoding_params(
     for path_prefix in ("articles", "rss/articles"):
         url = f"https://news.google.com/{path_prefix}/{article_id}"
         try:
-            response = await client.get(url)
+            response = await safe_get(client, url)
             if response.status_code == 429:
                 logger.warning("Google News rate limited (429) fetching decoding params")
                 return None
@@ -111,11 +113,13 @@ async def _decode_url(
     form_data = f"f.req={quote(json.dumps([[payload_inner]]))}"
 
     try:
-        response = await client.post(
+        request = client.build_request(
+            "POST",
             _BATCHEXECUTE_URL,
             content=form_data,
             headers={"Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"},
         )
+        response = await safe_send(client, request)
         if response.status_code == 429:
             logger.warning("Google News rate limited (429) during URL decode")
             return None
@@ -193,7 +197,7 @@ async def resolve_google_news_urls(
         cookies=_CONSENT_COOKIE,
         headers={"User-Agent": _USER_AGENT},
         timeout=timeout,
-        follow_redirects=True,
+        follow_redirects=False,
     ) as client:
         for i, url in enumerate(google_urls):
             if i > 0:

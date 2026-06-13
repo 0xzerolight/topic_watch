@@ -913,3 +913,100 @@ class TestSSRFBlockInFetch:
     async def test_blocks_ipv6_mapped_ipv4(self) -> None:
         entries = await fetch_feed("http://[::ffff:127.0.0.1]/feed.xml")
         assert entries == []
+
+
+# ============================================================
+# TestSSRFRedirectProtection (redirect re-validation)
+# ============================================================
+
+
+class TestSSRFRedirectProtection:
+    """A public URL that 3xx-redirects to a private/loopback host must be
+    blocked: the private target is never fetched."""
+
+    async def test_feed_fetch_blocks_redirect_to_loopback(self) -> None:
+        """Uses the Phase-0 build_redirect_transport helper: a public feed URL
+        302-redirects to loopback; the private target must never be fetched."""
+        from tests.helpers.redirect_transport import build_redirect_transport
+
+        target = "http://127.0.0.1/secret.xml"
+        base = build_redirect_transport(target, match="public.example.com")
+        fetched: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            fetched.append(str(request.url))
+            return base.handler(request)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=False) as client:
+            entries = await fetch_feed("https://public.example.com/feed.xml", client)
+
+        assert entries == []
+        # The loopback target must NOT have been fetched.
+        assert not any("127.0.0.1" in u for u in fetched)
+
+    async def test_feed_fetch_blocks_redirect_to_metadata_ip(self) -> None:
+        fetched: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            fetched.append(url)
+            if "169.254.169.254" in url:
+                return httpx.Response(200, text=_SAMPLE_RSS)
+            return httpx.Response(302, headers={"location": "http://169.254.169.254/latest/meta-data"})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=False) as client:
+            entries = await fetch_feed("https://public.example.com/feed.xml", client)
+
+        assert entries == []
+        assert not any("169.254.169.254" in u for u in fetched)
+
+    async def test_feed_fetch_allows_public_no_redirect(self) -> None:
+        """A normal, non-redirecting public fetch still works."""
+        transport = httpx.MockTransport(lambda req: httpx.Response(200, text=_SAMPLE_RSS))
+        async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+            entries = await fetch_feed("https://public.example.com/feed.xml", client)
+        assert len(entries) == 2
+
+    async def test_feed_fetch_follows_public_redirect(self) -> None:
+        """A redirect to another PUBLIC host is followed and parsed."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "final.example.org" in url:
+                return httpx.Response(200, text=_SAMPLE_RSS)
+            return httpx.Response(302, headers={"location": "https://final.example.org/feed.xml"})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=False) as client:
+            entries = await fetch_feed("https://public.example.com/feed.xml", client)
+        assert len(entries) == 2
+
+    async def test_content_fetch_blocks_redirect_to_loopback(self) -> None:
+        fetched: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            fetched.append(url)
+            if "127.0.0.1" in url:
+                return httpx.Response(200, text=_SAMPLE_HTML)
+            return httpx.Response(302, headers={"location": "http://127.0.0.1/secret"})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=False) as client:
+            content = await extract_article_content(
+                "https://public.example.com/article",
+                fallback_summary="the fallback summary",
+                client=client,
+            )
+
+        # Falls back to summary because the private redirect was blocked.
+        assert content == "the fallback summary"
+        assert not any("127.0.0.1" in u for u in fetched)
+
+    async def test_content_fetch_allows_public_no_redirect(self) -> None:
+        transport = httpx.MockTransport(lambda req: httpx.Response(200, text=_SAMPLE_HTML))
+        async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+            content = await extract_article_content(
+                "https://public.example.com/article",
+                fallback_summary="fallback",
+                client=client,
+            )
+        assert "additional context" in content.lower() or len(content) > 20
