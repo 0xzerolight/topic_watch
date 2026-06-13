@@ -35,6 +35,12 @@ class FetchResult:
 
     articles: list[Article]
     total_feed_entries: int
+    dropped_duplicates: int = 0
+    """Articles dropped because a concurrent insert won the UNIQUE race.
+
+    Surfaces otherwise-silent article loss so callers/monitoring can detect it.
+    Each increment corresponds to a WARNING-level log entry.
+    """
 
 
 async def fetch_new_articles_for_topic(
@@ -156,6 +162,7 @@ async def fetch_new_articles_for_topic(
 
     # 5. Create and store articles
     stored: list[Article] = []
+    dropped_duplicates = 0
 
     # 5a. Articles with reused content
     for entry, content_hash, reused_content in reuse_batch:
@@ -172,7 +179,12 @@ async def fetch_new_articles_for_topic(
             created = create_article(conn, article)
             stored.append(created)
         except sqlite3.IntegrityError:
-            logger.debug("Duplicate article (race condition): %s", entry.url)
+            dropped_duplicates += 1
+            logger.warning(
+                "Dropped duplicate article (concurrent insert race) for topic '%s': %s",
+                topic.name,
+                entry.url,
+            )
 
     # 5b. Articles with freshly fetched content
     for (entry, content_hash), content in zip(fetch_batch, contents, strict=False):
@@ -193,13 +205,28 @@ async def fetch_new_articles_for_topic(
             created = create_article(conn, article)
             stored.append(created)
         except sqlite3.IntegrityError:
-            logger.debug("Duplicate article (race condition): %s", entry.url)
+            dropped_duplicates += 1
+            logger.warning(
+                "Dropped duplicate article (concurrent insert race) for topic '%s': %s",
+                topic.name,
+                entry.url,
+            )
 
     conn.commit()
+    if dropped_duplicates:
+        logger.warning(
+            "Topic '%s': %d article(s) dropped as duplicates during concurrent inserts",
+            topic.name,
+            dropped_duplicates,
+        )
     logger.info(
         "Topic '%s': %d new articles stored (from %d feed entries)",
         topic.name,
         len(stored),
         len(entries),
     )
-    return FetchResult(articles=stored, total_feed_entries=len(entries))
+    return FetchResult(
+        articles=stored,
+        total_feed_entries=len(entries),
+        dropped_duplicates=dropped_duplicates,
+    )

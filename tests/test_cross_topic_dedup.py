@@ -7,6 +7,7 @@ Verifies that:
 - Within-topic dedup still prevents duplicate articles for the same topic
 """
 
+import logging
 import sqlite3
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
@@ -363,3 +364,90 @@ class TestFetchNewArticlesCrossTopicDedup:
 
         # Only the new article needed an HTTP fetch
         extract_mock.assert_called_once()
+
+
+# ============================================================
+# Tests for race-condition duplicate observability
+# ============================================================
+
+
+class TestDuplicateRaceObservable:
+    """When a concurrent insert races and loses to UNIQUE(topic_id, content_hash),
+    the dropped article must be OBSERVABLE — counted in the result and logged at
+    WARNING — not silently discarded.
+    """
+
+    def _make_entry(self, url: str, title: str) -> FeedEntry:
+        return FeedEntry(
+            title=title,
+            url=url,
+            summary="Summary text",
+            source_feed="https://example.com/feed.xml",
+        )
+
+    async def test_race_drop_is_counted_in_result(self, db_conn: sqlite3.Connection) -> None:
+        """A losing concurrent insert (IntegrityError) is counted in dropped_duplicates."""
+        topic = _make_topic(db_conn, "Topic A")
+        entry = self._make_entry("https://example.com/raced", "Raced Article")
+
+        real_create = create_article
+
+        def racing_create(conn: sqlite3.Connection, article: Article) -> Article:
+            # Simulate the other concurrent fetch winning: insert the same
+            # (topic_id, content_hash) row first, so this insert hits UNIQUE.
+            real_create(
+                conn,
+                Article(
+                    topic_id=article.topic_id,
+                    title=article.title,
+                    url=article.url,
+                    content_hash=article.content_hash,
+                    raw_content="winner content",
+                    source_feed=article.source_feed,
+                ),
+            )
+            return real_create(conn, article)  # raises sqlite3.IntegrityError
+
+        with (
+            patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=[entry])),
+            patch("app.scraping.extract_article_content", AsyncMock(return_value="loser content")),
+            patch("app.scraping.create_article", side_effect=racing_create),
+        ):
+            result = await fetch_new_articles_for_topic(topic, db_conn)
+
+        # The racing insert lost — no article returned for it, but it must be counted.
+        assert result.articles == []
+        assert result.dropped_duplicates == 1
+
+    async def test_race_drop_is_logged_at_warning(self, db_conn: sqlite3.Connection, caplog) -> None:
+        """The dropped duplicate is logged at WARNING, not swallowed at DEBUG."""
+        topic = _make_topic(db_conn, "Topic A")
+        entry = self._make_entry("https://example.com/raced2", "Raced Article 2")
+
+        real_create = create_article
+
+        def racing_create(conn: sqlite3.Connection, article: Article) -> Article:
+            real_create(
+                conn,
+                Article(
+                    topic_id=article.topic_id,
+                    title=article.title,
+                    url=article.url,
+                    content_hash=article.content_hash,
+                    raw_content="winner content",
+                    source_feed=article.source_feed,
+                ),
+            )
+            return real_create(conn, article)
+
+        with (
+            patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=[entry])),
+            patch("app.scraping.extract_article_content", AsyncMock(return_value="loser content")),
+            patch("app.scraping.create_article", side_effect=racing_create),
+            caplog.at_level(logging.WARNING, logger="app.scraping"),
+        ):
+            await fetch_new_articles_for_topic(topic, db_conn)
+
+        assert any(
+            record.levelno >= logging.WARNING and "duplicate" in record.message.lower() for record in caplog.records
+        ), "expected a WARNING-level log about the dropped duplicate"
