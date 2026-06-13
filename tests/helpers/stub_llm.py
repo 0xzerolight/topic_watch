@@ -5,10 +5,11 @@ which returns an instructor-patched async client. Every public function in
 ``app.analysis.llm`` calls ``client.chat.completions.create(...)`` with a
 ``response_model`` of either ``NoveltyResult`` or ``KnowledgeStateUpdate``.
 
-``stub_llm_boundary`` patches ``_get_client`` to return a mock whose ``create``
-dispatches on that ``response_model``, returning the canned result you supply.
-Because the patch is at ``_get_client``, the production message-building, token
-recomputation, and persistence code all run for real — only the network call is
+``stub_llm_boundary`` patches ``_get_client`` to return a mock whose
+``create_with_completion`` (and legacy ``create``) dispatches on that
+``response_model``, returning the canned result you supply. Because the patch is
+at ``_get_client``, the production message-building, token recomputation, usage
+extraction, and persistence code all run for real — only the network call is
 replaced.
 """
 
@@ -19,6 +20,21 @@ from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.analysis.llm import KnowledgeStateUpdate, NoveltyResult
+
+
+class _StubUsage:
+    """Minimal stand-in for litellm's usage block (prompt/completion tokens)."""
+
+    def __init__(self, prompt_tokens: int = 12, completion_tokens: int = 8) -> None:
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+
+
+class _StubCompletion:
+    """Minimal stand-in for a raw litellm completion exposing ``.usage``."""
+
+    def __init__(self, usage: _StubUsage | None = None) -> None:
+        self.usage = usage if usage is not None else _StubUsage()
 
 
 def make_knowledge_update(
@@ -84,7 +100,7 @@ def stub_llm_boundary(
 
     state = {"knowledge_calls": 0}
 
-    async def _create(*_args: object, **kwargs: object) -> object:
+    def _dispatch(kwargs: dict) -> object:
         response_model = kwargs.get("response_model")
         if response_model is NoveltyResult:
             return novelty_result
@@ -95,9 +111,18 @@ def stub_llm_boundary(
             return update_result
         raise AssertionError(f"Unexpected response_model in stubbed LLM call: {response_model!r}")
 
-    mock_create = AsyncMock(side_effect=_create)
+    async def _create(*_args: object, **kwargs: object) -> object:
+        return _dispatch(kwargs)
+
+    async def _create_with_completion(*_args: object, **kwargs: object) -> tuple[object, object]:
+        return _dispatch(kwargs), _StubCompletion()
+
+    mock_create = AsyncMock(side_effect=_create_with_completion)
     mock_completions = MagicMock()
-    mock_completions.create = mock_create
+    # compress_knowledge_summary still uses .create; everything else uses
+    # create_with_completion. Wire both so the whole pipeline stays offline.
+    mock_completions.create = AsyncMock(side_effect=_create)
+    mock_completions.create_with_completion = mock_create
     mock_chat = MagicMock()
     mock_chat.completions = mock_completions
     mock_client = MagicMock()
