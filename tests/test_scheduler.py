@@ -16,6 +16,15 @@ def _make_settings(**overrides) -> Settings:
     return Settings(**defaults)
 
 
+def _make_ready_topic(conn, name: str = "Topic"):
+    from app.crud import create_topic
+    from app.models import Topic, TopicStatus
+
+    topic = create_topic(conn, Topic(name=name, description="d", status=TopicStatus.READY))
+    conn.commit()
+    return topic
+
+
 class TestStartStopScheduler:
     """Tests for scheduler lifecycle."""
 
@@ -94,7 +103,7 @@ class TestStartStopScheduler:
 class TestScheduledCheck:
     """Tests for the _scheduled_check callback."""
 
-    async def test_calls_check_all_topics(self, tmp_path: Path) -> None:
+    async def test_runs_check_cycle(self, tmp_path: Path) -> None:
         db_path = tmp_path / "test.db"
         from app.database import init_db
 
@@ -102,13 +111,12 @@ class TestScheduledCheck:
         settings = _make_settings()
 
         with patch(
-            "app.scheduler.check_all_topics",
+            "app.scheduler._run_check_cycle",
             new_callable=AsyncMock,
-            return_value=[],
-        ) as mock_check:
+        ) as mock_cycle:
             await _scheduled_check(settings, db_path)
 
-        mock_check.assert_called_once()
+        mock_cycle.assert_awaited_once()
 
     async def test_does_not_raise_on_error(self, tmp_path: Path) -> None:
         """Scheduled check should catch exceptions, not crash the scheduler."""
@@ -119,12 +127,51 @@ class TestScheduledCheck:
         settings = _make_settings()
 
         with patch(
-            "app.scheduler.check_all_topics",
+            "app.scheduler._run_check_cycle",
             new_callable=AsyncMock,
             side_effect=Exception("DB error"),
         ):
             # Should not raise
             await _scheduled_check(settings, db_path)
+
+    async def test_uses_fresh_connection_per_topic(self, tmp_path: Path) -> None:
+        """The check cycle must open a new short-lived connection per topic check
+        rather than holding one connection across the whole cycle."""
+        db_path = tmp_path / "test.db"
+        from app.database import get_connection, init_db
+
+        init_db(db_path)
+        settings = _make_settings()
+
+        # Two due topics, each with their own check.
+        conn = get_connection(db_path)
+        topics = [_make_ready_topic(conn, name=f"T{i}") for i in range(2)]
+        conn.close()
+
+        seen_conn_ids: list[int] = []
+
+        async def fake_check_topic(topic, c, s):
+            seen_conn_ids.append(id(c))
+            from app.models import CheckResult
+
+            return CheckResult(topic_id=topic.id)
+
+        from app.scheduler import _run_check_cycle
+
+        with (
+            patch("app.scheduler.check_topic", side_effect=fake_check_topic),
+            patch("app.scheduler.retry_pending_notifications", new_callable=AsyncMock),
+            patch("app.scheduler.retry_pending_webhooks", new_callable=AsyncMock),
+            patch(
+                "app.scheduler.get_topics_due_for_check",
+                return_value=topics,
+            ),
+        ):
+            await _run_check_cycle(settings, db_path)
+
+        # Each topic check received a distinct connection object.
+        assert len(seen_conn_ids) == 2
+        assert len(set(seen_conn_ids)) == 2
 
 
 class TestVacuumDb:
@@ -143,3 +190,19 @@ class TestVacuumDb:
         """VACUUM failure should be caught, not crash the scheduler."""
         # Non-existent path will cause an error
         await _vacuum_db(Path("/nonexistent/path.db"))
+
+    async def test_runs_in_thread(self, tmp_path: Path) -> None:
+        """VACUUM must run off the event loop via asyncio.to_thread."""
+        db_path = tmp_path / "test.db"
+        from app.database import init_db
+
+        init_db(db_path)
+
+        with patch("app.scheduler.asyncio.to_thread", new_callable=AsyncMock) as mock_to_thread:
+            await _vacuum_db(db_path)
+
+        mock_to_thread.assert_awaited_once()
+        # The blocking VACUUM helper is what's offloaded to the thread.
+        from app.scheduler import _vacuum_db_sync
+
+        assert mock_to_thread.await_args.args[0] is _vacuum_db_sync
