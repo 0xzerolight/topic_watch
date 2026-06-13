@@ -11,7 +11,7 @@ from app.config import LLMSettings, NotificationSettings, Settings
 from app.main import app
 from app.scraping.rss import FeedEntry
 from app.web.dependencies import get_db_conn, get_settings
-from app.web.routes import _check_rate_limit, _rate_limit_store
+from app.web.state import _check_rate_limit, _rate_limit_store
 
 
 def _make_settings(**overrides) -> Settings:
