@@ -4,8 +4,26 @@ version = "1.1.2"
 description = "Self-hosted news watchdog with AI-powered novelty detection"
 license = "GPL-3.0-or-later"
 readme = "README.md"
+authors = [{ name = "0xzerolight" }]
+maintainers = [{ name = "0xzerolight" }]
 keywords = ["rss", "news", "llm", "notifications", "self-hosted", "novelty-detection"]
 requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Web Environment",
+    "Framework :: FastAPI",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+    "Topic :: Communications",
+    "Topic :: Office/Business :: News/Diary",
+]
 dependencies = [
     "fastapi>=0.115,<1.0",
     "uvicorn[standard]>=0.32,<1.0",
