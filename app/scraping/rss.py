@@ -134,9 +134,34 @@ async def fetch_feed(
     health_callback: FeedHealthCallback | None = None,
 ) -> list[FeedEntry]:
     """Fetch and parse a single RSS/Atom feed. Returns [] on any error."""
+    entries, _ = await fetch_feed_with_status(
+        feed_url,
+        client,
+        timeout=timeout,
+        max_attempts=max_attempts,
+        health_callback=health_callback,
+    )
+    return entries
+
+
+async def fetch_feed_with_status(
+    feed_url: str,
+    client: httpx.AsyncClient | None = None,
+    timeout: float = _FEED_FETCH_TIMEOUT,
+    max_attempts: int = 2,
+    health_callback: FeedHealthCallback | None = None,
+) -> tuple[list[FeedEntry], bool]:
+    """Fetch and parse a single feed, also reporting whether the fetch succeeded.
+
+    Returns ``(entries, fetch_ok)``. ``fetch_ok`` is True when the feed was
+    fetched and parsed successfully — even if it legitimately contained zero
+    entries — and False on any error (blocked URL, timeout, HTTP error, etc.).
+    This lets callers distinguish "fetched OK but empty" from "fetch failed" so
+    an empty-but-valid feed does not get treated as a provider failure.
+    """
     if is_private_url(feed_url):
         logger.warning("Blocked fetch to private URL: %s", feed_url)
-        return []
+        return [], False
     owns_client = client is None
     if owns_client:
         client = httpx.AsyncClient(
@@ -158,7 +183,7 @@ async def fetch_feed(
                         entries.append(entry)
                 if health_callback:
                     health_callback(feed_url, True, None)
-                return entries
+                return entries, True
             except httpx.TimeoutException as exc:
                 if attempt < max_attempts - 1:
                     logger.debug("Timeout fetching feed (attempt %d): %s", attempt + 1, feed_url)
@@ -167,7 +192,7 @@ async def fetch_feed(
                 logger.warning("Timeout fetching feed after %d attempts: %s", max_attempts, feed_url)
                 if health_callback:
                     health_callback(feed_url, False, f"Timeout after {max_attempts} attempts: {exc}")
-                return []
+                return [], False
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code >= 500 and attempt < max_attempts - 1:
                     logger.debug(
@@ -178,7 +203,7 @@ async def fetch_feed(
                 logger.warning("HTTP %d fetching feed: %s", exc.response.status_code, feed_url)
                 if health_callback:
                     health_callback(feed_url, False, f"HTTP {exc.response.status_code}")
-                return []
+                return [], False
             except httpx.NetworkError as exc:
                 if attempt < max_attempts - 1:
                     logger.debug(
@@ -197,13 +222,13 @@ async def fetch_feed(
                 )
                 if health_callback:
                     health_callback(feed_url, False, f"Network error: {type(exc).__name__}: {exc}")
-                return []
+                return [], False
             except Exception as exc:
                 logger.warning("Error fetching feed: %s", feed_url, exc_info=True)
                 if health_callback:
                     health_callback(feed_url, False, f"{type(exc).__name__}: {exc}")
-                return []
-        return []  # pragma: no cover
+                return [], False
+        return [], False  # pragma: no cover
     finally:
         if owns_client:
             await client.aclose()
@@ -248,7 +273,7 @@ async def _fetch_auto(
         follow_redirects=False,
     ) as client:
         feed_url = provider.build_feed_url(topic)
-        entries = await fetch_feed(
+        entries, fetch_ok = await fetch_feed_with_status(
             feed_url, client, timeout=timeout, max_attempts=max_attempts, health_callback=health_callback
         )
 
@@ -260,15 +285,17 @@ async def _fetch_auto(
                 needs_url_resolution=provider.needs_url_resolution(),
             )
 
-        # First provider failed or empty — try fallback
-        router.mark_unhealthy(provider.name)
+        # No entries. Only a real fetch error marks the provider unhealthy —
+        # a legitimately-empty-but-successful feed must not trigger cascade/cooldown.
+        if not fetch_ok:
+            router.mark_unhealthy(provider.name)
         next_provider = router.get_next_provider(provider)
         if next_provider is None:
             return FeedResponse(entries=[], provider_name=provider.name, needs_url_resolution=False)
 
         logger.info("Provider %s returned no entries, falling back to %s", provider.name, next_provider.name)
         feed_url = next_provider.build_feed_url(topic)
-        entries = await fetch_feed(
+        entries, fetch_ok = await fetch_feed_with_status(
             feed_url, client, timeout=timeout, max_attempts=max_attempts, health_callback=health_callback
         )
 
@@ -280,7 +307,8 @@ async def _fetch_auto(
                 needs_url_resolution=next_provider.needs_url_resolution(),
             )
 
-        router.mark_unhealthy(next_provider.name)
+        if not fetch_ok:
+            router.mark_unhealthy(next_provider.name)
         return FeedResponse(entries=[], provider_name=next_provider.name, needs_url_resolution=False)
 
 

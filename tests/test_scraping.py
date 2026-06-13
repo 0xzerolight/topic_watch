@@ -575,6 +575,62 @@ class TestFetchFeedsForTopic:
         assert "bing_news" in router._health
         assert "google_news" in router._health
 
+    async def test_empty_but_ok_feed_does_not_mark_unhealthy(self) -> None:
+        """A 200 response with zero entries is NOT a failure — provider health unchanged."""
+        from app.scraping.providers import BingNewsProvider, GoogleNewsProvider
+        from app.scraping.routing import ProviderRouter
+
+        transport = _mock_transport(
+            {
+                "bing.com": (200, _EMPTY_RSS),
+                "news.google.com": (200, _EMPTY_RSS),
+            }
+        )
+        topic = Topic(name="Test", description="d", feed_mode=FeedMode.AUTO)
+        router = ProviderRouter(providers=[BingNewsProvider(), GoogleNewsProvider()])
+
+        original_init = httpx.AsyncClient.__init__
+
+        def patched_init(self_client, **kwargs):
+            kwargs["transport"] = transport
+            original_init(self_client, **kwargs)
+
+        with patch.object(httpx.AsyncClient, "__init__", patched_init):
+            response = await fetch_feeds_for_topic(topic, router=router)
+
+        assert response.entries == []
+        # Legitimately-empty feeds must NOT count as provider failures.
+        assert "bing_news" not in router._health
+        assert "google_news" not in router._health
+
+    async def test_fetch_error_still_marks_unhealthy(self) -> None:
+        """A real fetch error (HTTP 500) still marks the provider unhealthy."""
+        from app.scraping.providers import BingNewsProvider, GoogleNewsProvider
+        from app.scraping.routing import ProviderRouter
+
+        transport = _mock_transport(
+            {
+                "bing.com": (500, "Error"),
+                "news.google.com": (200, _EMPTY_RSS),
+            }
+        )
+        topic = Topic(name="Test", description="d", feed_mode=FeedMode.AUTO)
+        router = ProviderRouter(providers=[BingNewsProvider(), GoogleNewsProvider()])
+
+        original_init = httpx.AsyncClient.__init__
+
+        def patched_init(self_client, **kwargs):
+            kwargs["transport"] = transport
+            original_init(self_client, **kwargs)
+
+        with patch.object(httpx.AsyncClient, "__init__", patched_init):
+            await fetch_feeds_for_topic(topic, router=router)
+
+        # Bing genuinely errored — must be marked unhealthy.
+        assert "bing_news" in router._health
+        # Google returned empty-but-OK — must NOT be marked unhealthy.
+        assert "google_news" not in router._health
+
 
 # ============================================================
 # TestExtractArticleContent (async, mocked)
