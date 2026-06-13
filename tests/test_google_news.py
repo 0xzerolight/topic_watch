@@ -237,6 +237,25 @@ class TestResolveGoogleNewsUrl:
             result = await resolve_google_news_url(_GOOGLE_RSS_URL, client)
         assert result == _REAL_ARTICLE_URL
 
+    async def test_blocks_redirect_to_private_host(self) -> None:
+        """If the Google News article page 3xx-redirects to a private host,
+        the private target must never be fetched and resolution falls back."""
+        fetched: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            fetched.append(url)
+            if "127.0.0.1" in url:
+                return httpx.Response(200, text=_google_article_html())
+            # Article page redirects to loopback (SSRF attempt).
+            return httpx.Response(302, headers={"location": "http://127.0.0.1/internal"})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=False) as client:
+            result = await resolve_google_news_url(_GOOGLE_RSS_URL, client)
+
+        assert result == _GOOGLE_RSS_URL  # fell back, no resolution
+        assert not any("127.0.0.1" in u for u in fetched)
+
 
 # ============================================================
 # TestResolveGoogleNewsUrls (batch)

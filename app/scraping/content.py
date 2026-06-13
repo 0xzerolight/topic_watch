@@ -11,7 +11,7 @@ from typing import cast
 import httpx
 import trafilatura
 
-from app.url_validation import is_private_url
+from app.url_validation import is_private_url, safe_get
 
 logger = logging.getLogger(__name__)
 
@@ -42,13 +42,13 @@ async def _fetch_html(
         return None
     owns_client = client is None
     if owns_client:
-        client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
+        client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
     assert client is not None
     max_attempts = 2
     try:
         for attempt in range(max_attempts):
             try:
-                response = await client.get(url)
+                response = await safe_get(client, url)
                 response.raise_for_status()
                 return response.text
             except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
