@@ -12,6 +12,77 @@ from app.crud import (
     upsert_feed_health_failure,
     upsert_feed_health_success,
 )
+from app.models import FeedHealth
+
+
+class TestFeedHealthFromRow:
+    """Tests for FeedHealth.from_row datetime handling."""
+
+    def test_empty_string_datetimes_become_none(self) -> None:
+        """Empty-string datetime cells must coerce to None, not raise."""
+        row = {
+            "id": 1,
+            "feed_url": "https://example.com/feed.xml",
+            "last_success_at": "",
+            "last_error_at": "",
+            "last_error_message": None,
+            "consecutive_failures": 0,
+            "total_fetches": 0,
+            "total_failures": 0,
+        }
+        health = FeedHealth.from_row(row)
+        assert health.last_success_at is None
+        assert health.last_error_at is None
+
+    def test_whitespace_only_datetimes_become_none(self) -> None:
+        """Whitespace-only datetime cells must coerce to None, not raise."""
+        row = {
+            "id": 1,
+            "feed_url": "https://example.com/feed.xml",
+            "last_success_at": "   ",
+            "last_error_at": "\t",
+            "last_error_message": None,
+            "consecutive_failures": 0,
+            "total_fetches": 0,
+            "total_failures": 0,
+        }
+        health = FeedHealth.from_row(row)
+        assert health.last_success_at is None
+        assert health.last_error_at is None
+
+    def test_valid_isoformat_datetimes_parse(self) -> None:
+        """Valid isoformat strings must parse into datetime instances."""
+        row = {
+            "id": 1,
+            "feed_url": "https://example.com/feed.xml",
+            "last_success_at": "2026-06-13T12:00:00+00:00",
+            "last_error_at": "2026-06-12T09:30:00+00:00",
+            "last_error_message": "boom",
+            "consecutive_failures": 2,
+            "total_fetches": 5,
+            "total_failures": 2,
+        }
+        health = FeedHealth.from_row(row)
+        assert health.last_success_at is not None
+        assert health.last_success_at.year == 2026
+        assert health.last_error_at is not None
+        assert health.last_error_at.month == 6
+
+    def test_malformed_datetimes_become_none(self) -> None:
+        """Unparseable non-empty strings fall back to None."""
+        row = {
+            "id": 1,
+            "feed_url": "https://example.com/feed.xml",
+            "last_success_at": "not-a-date",
+            "last_error_at": "also-bad",
+            "last_error_message": None,
+            "consecutive_failures": 0,
+            "total_fetches": 0,
+            "total_failures": 0,
+        }
+        health = FeedHealth.from_row(row)
+        assert health.last_success_at is None
+        assert health.last_error_at is None
 
 
 class TestUpsertFeedHealthSuccess:
