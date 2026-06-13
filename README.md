@@ -136,9 +136,27 @@ The override file sets `ollama/llama3.3` as the model and points to your local O
 
 **Model recommendations:** Models with 8B+ parameters and 8K+ context windows work best. Tested with `llama3.3` (8B), `mistral` (7B), and `qwen2.5` (7B). Smaller models may miss subtle novelty signals.
 
+## Setup Wizard
+
+On first launch with no valid configuration, Topic Watch redirects to a setup
+wizard at `/setup`. Enter your LLM model string (LiteLLM `provider/model-name`
+format) and API key; a base URL field appears for self-hosted providers like
+Ollama. On submit, the wizard runs a quick pre-flight check against your
+provider — if the key, model, or base URL is wrong, it tells you what failed
+instead of saving a broken config. Once it passes, settings are written to
+`data/config.yml` and the app starts checking.
+
+You can re-edit everything later from the web UI **Settings** page or by editing
+`data/config.yml` directly.
+
 ## Configuration
 
-Settings live in `data/config.yml`. First run auto-copies `config.example.yml`. Editable via the web UI Settings page or directly in the file.
+Settings live in `data/config.yml`. First run auto-copies `config.example.yml`
+(or run `mkdir -p data && cp config.example.yml data/config.yml` yourself).
+Editable via the web UI Settings page or directly in the file.
+
+**Priority (highest to lowest):** environment variables (`TOPIC_WATCH_` prefix)
+> `data/config.yml` > built-in defaults.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
