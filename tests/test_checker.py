@@ -4,7 +4,8 @@ import json
 import sqlite3
 from unittest.mock import AsyncMock, patch
 
-from app.analysis.llm import NoveltyResult
+from app.analysis.knowledge import KnowledgeWriteResult
+from app.analysis.llm import NoveltyResult, TokenUsage
 from app.checker import check_all_topics, check_topic, retry_pending_notifications
 from app.config import LLMSettings, NotificationSettings, Settings
 from app.crud import (
@@ -12,6 +13,7 @@ from app.crud import (
     create_knowledge_state,
     create_pending_notification,
     create_topic,
+    get_topic,
     list_pending_notifications,
 )
 from app.models import (
@@ -44,6 +46,17 @@ def _make_topic(conn: sqlite3.Connection, **overrides) -> Topic:
     topic = create_topic(conn, Topic(**defaults))
     conn.commit()
     return topic
+
+
+def _make_write_result(
+    *, prompt_tokens: int = 0, completion_tokens: int = 0, sufficient_data: bool = True
+) -> KnowledgeWriteResult:
+    """Build a KnowledgeWriteResult for mocking initialize/update_knowledge returns."""
+    return KnowledgeWriteResult(
+        state=KnowledgeState(topic_id=1, summary_text="state", token_count=0),
+        usage=TokenUsage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens),
+        sufficient_data=sufficient_data,
+    )
 
 
 def _make_article(**overrides) -> Article:
@@ -100,6 +113,7 @@ class TestCheckTopic:
             patch(
                 "app.checker.update_knowledge",
                 new_callable=AsyncMock,
+                return_value=_make_write_result(),
             ) as mock_update,
             patch(
                 "app.checker.send_notification",
@@ -218,7 +232,7 @@ class TestCheckTopic:
                 new_callable=AsyncMock,
                 return_value=novelty,
             ),
-            patch("app.checker.update_knowledge", new_callable=AsyncMock),
+            patch("app.checker.update_knowledge", new_callable=AsyncMock, return_value=_make_write_result()),
             patch(
                 "app.checker.send_notification",
                 side_effect=Exception("SMTP error"),
@@ -260,7 +274,7 @@ class TestCheckTopic:
                 new_callable=AsyncMock,
                 return_value=novelty,
             ),
-            patch("app.checker.update_knowledge", new_callable=AsyncMock),
+            patch("app.checker.update_knowledge", new_callable=AsyncMock, return_value=_make_write_result()),
             patch(
                 "app.checker.send_notification",
                 return_value=False,
@@ -304,7 +318,7 @@ class TestCheckTopic:
                 new_callable=AsyncMock,
                 return_value=novelty,
             ),
-            patch("app.checker.update_knowledge", new_callable=AsyncMock),
+            patch("app.checker.update_knowledge", new_callable=AsyncMock, return_value=_make_write_result()),
             patch("app.checker.send_notification", return_value=True),
         ):
             result = await check_topic(topic, db_conn, settings)
@@ -420,7 +434,9 @@ class TestCheckTopic:
                 new_callable=AsyncMock,
                 return_value=novelty,
             ) as mock_analyze,
-            patch("app.checker.update_knowledge", new_callable=AsyncMock) as mock_update,
+            patch(
+                "app.checker.update_knowledge", new_callable=AsyncMock, return_value=_make_write_result()
+            ) as mock_update,
             patch("app.checker.send_notification") as mock_send,
         ):
             result = await check_topic(topic, db_conn, settings)
@@ -479,7 +495,9 @@ class TestCheckTopic:
                 new_callable=AsyncMock,
                 return_value=novelty,
             ),
-            patch("app.checker.update_knowledge", new_callable=AsyncMock) as mock_update,
+            patch(
+                "app.checker.update_knowledge", new_callable=AsyncMock, return_value=_make_write_result()
+            ) as mock_update,
             patch("app.checker.send_notification", return_value=True) as mock_send,
         ):
             result = await check_topic(topic, db_conn, settings)
@@ -518,7 +536,9 @@ class TestCheckTopic:
                 new_callable=AsyncMock,
                 return_value=novelty,
             ),
-            patch("app.checker.update_knowledge", new_callable=AsyncMock) as mock_update,
+            patch(
+                "app.checker.update_knowledge", new_callable=AsyncMock, return_value=_make_write_result()
+            ) as mock_update,
             patch("app.checker.send_notification") as mock_send,
         ):
             result = await check_topic(topic, db_conn, settings)
@@ -551,7 +571,11 @@ class TestInitializeNewTopicStatusChangedAt:
                 new_callable=AsyncMock,
                 return_value=FetchResult(articles=articles, total_feed_entries=1),
             ),
-            patch("app.checker.initialize_knowledge", new_callable=AsyncMock),
+            patch(
+                "app.checker.initialize_knowledge",
+                new_callable=AsyncMock,
+                return_value=_make_write_result(),
+            ),
         ):
             await initialize_new_topic(topic, db_conn, settings)
 
@@ -604,6 +628,191 @@ class TestInitializeNewTopicStatusChangedAt:
         updated = get_topic(db_conn, topic.id)
         assert updated.status == TopicStatus.ERROR
         assert updated.status_changed_at is not None
+
+
+class TestPerTopicThresholds:
+    """Per-topic confidence/relevance overrides gate notifications."""
+
+    async def _run(self, db_conn, topic, novelty, settings):
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
+        db_conn.commit()
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[article], total_feed_entries=1),
+            ),
+            patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
+            patch("app.checker.update_knowledge", new_callable=AsyncMock, return_value=_make_write_result()),
+            patch("app.checker.send_notification", return_value=True) as mock_send,
+        ):
+            result = await check_topic(topic, db_conn, settings)
+        return result, mock_send
+
+    async def test_high_per_topic_confidence_suppresses_notification(self, db_conn: sqlite3.Connection) -> None:
+        """A 0.9 per-topic confidence threshold suppresses a 0.8-confidence notification."""
+        topic = _make_topic(db_conn, confidence_threshold=0.9)
+        settings = _make_settings(min_confidence_threshold=0.7)
+        novelty = NoveltyResult(has_new_info=True, summary="x", confidence=0.8, relevance=0.9)
+
+        result, mock_send = await self._run(db_conn, topic, novelty, settings)
+
+        assert result.has_new_info is True
+        assert result.notification_sent is False
+        mock_send.assert_not_called()
+
+    async def test_blank_threshold_inherits_global(self, db_conn: sqlite3.Connection) -> None:
+        """No per-topic override → global 0.7 lets a 0.8-confidence notification through."""
+        topic = _make_topic(db_conn, confidence_threshold=None, relevance_threshold=None)
+        settings = _make_settings(min_confidence_threshold=0.7, min_relevance_threshold=0.5)
+        novelty = NoveltyResult(has_new_info=True, summary="x", confidence=0.8, relevance=0.9)
+
+        result, mock_send = await self._run(db_conn, topic, novelty, settings)
+
+        assert result.notification_sent is True
+        mock_send.assert_called_once()
+
+    async def test_per_topic_relevance_threshold_suppresses(self, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn, relevance_threshold=0.9)
+        settings = _make_settings(min_relevance_threshold=0.3)
+        novelty = NoveltyResult(has_new_info=True, summary="x", confidence=0.95, relevance=0.5)
+
+        result, mock_send = await self._run(db_conn, topic, novelty, settings)
+
+        assert result.notification_sent is False
+        mock_send.assert_not_called()
+
+
+class TestCheckResultTokens:
+    """check_results record the summed analysis + knowledge tokens."""
+
+    async def test_tokens_summed_from_analysis_and_knowledge(self, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn)
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
+        db_conn.commit()
+        settings = _make_settings(min_confidence_threshold=0.5, min_relevance_threshold=0.5)
+
+        novelty = NoveltyResult(
+            has_new_info=True, summary="x", confidence=0.9, relevance=0.9, prompt_tokens=100, completion_tokens=40
+        )
+
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[article], total_feed_entries=1),
+            ),
+            patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
+            patch(
+                "app.checker.update_knowledge",
+                new_callable=AsyncMock,
+                return_value=_make_write_result(prompt_tokens=30, completion_tokens=10),
+            ),
+            patch("app.checker.send_notification", return_value=True),
+        ):
+            result = await check_topic(topic, db_conn, settings)
+
+        assert result.prompt_tokens == 130
+        assert result.completion_tokens == 50
+        row = db_conn.execute(
+            "SELECT prompt_tokens, completion_tokens FROM check_results WHERE id = ?", (result.id,)
+        ).fetchone()
+        assert row["prompt_tokens"] == 130
+        assert row["completion_tokens"] == 50
+
+    async def test_early_return_records_zero_tokens(self, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn)
+        settings = _make_settings()
+
+        with patch(
+            "app.checker.fetch_new_articles_for_topic",
+            new_callable=AsyncMock,
+            return_value=FetchResult(articles=[], total_feed_entries=0),
+        ):
+            result = await check_topic(topic, db_conn, settings)
+
+        assert result.prompt_tokens == 0
+        assert result.completion_tokens == 0
+        row = db_conn.execute(
+            "SELECT prompt_tokens, completion_tokens FROM check_results WHERE id = ?", (result.id,)
+        ).fetchone()
+        assert row["prompt_tokens"] == 0
+        assert row["completion_tokens"] == 0
+
+    async def test_tokens_only_analysis_when_below_threshold(self, db_conn: sqlite3.Connection) -> None:
+        """Below-threshold check still records analysis tokens (no knowledge update runs)."""
+        topic = _make_topic(db_conn, confidence_threshold=0.99)
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
+        db_conn.commit()
+        settings = _make_settings()
+
+        novelty = NoveltyResult(
+            has_new_info=True, summary="x", confidence=0.5, relevance=0.9, prompt_tokens=70, completion_tokens=20
+        )
+
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[article], total_feed_entries=1),
+            ),
+            patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
+            patch("app.checker.update_knowledge", new_callable=AsyncMock) as mock_update,
+        ):
+            result = await check_topic(topic, db_conn, settings)
+
+        mock_update.assert_not_called()
+        assert result.prompt_tokens == 70
+        assert result.completion_tokens == 20
+
+
+class TestMultiRoundInitialization:
+    """Insufficient init retries across cycles until MAX, then forces READY."""
+
+    async def _init(self, db_conn, topic, settings, *, sufficient: bool):
+        from app.checker import initialize_new_topic
+
+        articles = [_make_article(id=None, topic_id=topic.id)]
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=articles, total_feed_entries=1),
+            ),
+            patch(
+                "app.checker.initialize_knowledge",
+                new_callable=AsyncMock,
+                return_value=_make_write_result(sufficient_data=sufficient),
+            ),
+        ):
+            await initialize_new_topic(topic, db_conn, settings)
+        return get_topic(db_conn, topic.id)
+
+    async def test_insufficient_returns_to_new_and_increments(self, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn, status=TopicStatus.NEW, status_changed_at=None)
+        settings = _make_settings()
+
+        updated = await self._init(db_conn, topic, settings, sufficient=False)
+        assert updated.status == TopicStatus.NEW
+        assert updated.init_attempts == 1
+        assert updated.status_changed_at is not None
+
+    async def test_exhausted_attempts_force_ready(self, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn, status=TopicStatus.NEW, status_changed_at=None, init_attempts=3)
+        settings = _make_settings()
+
+        updated = await self._init(db_conn, topic, settings, sufficient=False)
+        assert updated.status == TopicStatus.READY
+        # attempts reset on READY transition
+        assert updated.init_attempts == 0
+
+    async def test_sufficient_goes_ready_and_resets(self, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn, status=TopicStatus.NEW, status_changed_at=None, init_attempts=2)
+        settings = _make_settings()
+
+        updated = await self._init(db_conn, topic, settings, sufficient=True)
+        assert updated.status == TopicStatus.READY
+        assert updated.init_attempts == 0
 
 
 # --- check_all_topics ---

@@ -15,6 +15,7 @@ from app.crud import (
     delete_expired_notifications,
     delete_pending_notification,
     delete_topic,
+    get_check_result,
     get_dashboard_data,
     get_knowledge_state,
     get_topic,
@@ -520,6 +521,56 @@ class TestMigrations:
             "SELECT name FROM sqlite_master WHERE type='table' AND name='pending_webhooks'"
         ).fetchall()
         assert len(tables) == 1
+
+    def test_topic_threshold_columns_exist(self, db_conn: sqlite3.Connection) -> None:
+        """Migration m011 adds nullable confidence/relevance threshold columns."""
+        columns = {row[1]: row for row in db_conn.execute("PRAGMA table_info(topics)").fetchall()}
+        assert "confidence_threshold" in columns
+        assert "relevance_threshold" in columns
+
+    def test_check_result_token_columns_exist(self, db_conn: sqlite3.Connection) -> None:
+        """Migration m012 adds prompt/completion token columns to check_results."""
+        columns = {row[1] for row in db_conn.execute("PRAGMA table_info(check_results)").fetchall()}
+        assert "prompt_tokens" in columns
+        assert "completion_tokens" in columns
+
+    def test_topic_init_attempts_column_exists(self, db_conn: sqlite3.Connection) -> None:
+        """Migration m013 adds init_attempts column to topics."""
+        columns = {row[1] for row in db_conn.execute("PRAGMA table_info(topics)").fetchall()}
+        assert "init_attempts" in columns
+
+    def test_topic_threshold_roundtrip(self, db_conn: sqlite3.Connection) -> None:
+        """Per-topic thresholds and init_attempts persist and load back."""
+        topic = create_topic(
+            db_conn,
+            Topic(
+                name="Thresholds",
+                description="d",
+                confidence_threshold=0.9,
+                relevance_threshold=0.5,
+                init_attempts=2,
+            ),
+        )
+        db_conn.commit()
+        loaded = get_topic(db_conn, topic.id)
+        assert loaded is not None
+        assert loaded.confidence_threshold == 0.9
+        assert loaded.relevance_threshold == 0.5
+        assert loaded.init_attempts == 2
+
+    def test_check_result_token_roundtrip(self, db_conn: sqlite3.Connection) -> None:
+        """CheckResult token columns persist and load back."""
+        topic = create_topic(db_conn, Topic(name="Tok", description="d"))
+        db_conn.commit()
+        result = create_check_result(
+            db_conn,
+            CheckResult(topic_id=topic.id, prompt_tokens=123, completion_tokens=45),
+        )
+        db_conn.commit()
+        loaded = get_check_result(db_conn, result.id)
+        assert loaded is not None
+        assert loaded.prompt_tokens == 123
+        assert loaded.completion_tokens == 45
 
 
 class TestRecoverStuckTopics:

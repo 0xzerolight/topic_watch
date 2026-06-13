@@ -33,7 +33,10 @@ def mem_conn():
             error_message TEXT,
             check_interval_hours INTEGER,
             check_interval_minutes INTEGER,
-            tags TEXT NOT NULL DEFAULT '[]'
+            tags TEXT NOT NULL DEFAULT '[]',
+            confidence_threshold REAL DEFAULT NULL,
+            relevance_threshold REAL DEFAULT NULL,
+            init_attempts INTEGER NOT NULL DEFAULT 0
         );
         """
     )

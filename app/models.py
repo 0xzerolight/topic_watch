@@ -91,6 +91,9 @@ class Topic(BaseModel):
     error_message: str | None = None
     check_interval_minutes: int | None = None
     tags: list[str] = Field(default_factory=list)
+    confidence_threshold: float | None = None
+    relevance_threshold: float | None = None
+    init_attempts: int = 0
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Self:
@@ -187,6 +190,8 @@ class CheckResult(BaseModel):
     llm_response: str | None = None
     notification_sent: bool = False
     notification_error: str | None = None
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Self:

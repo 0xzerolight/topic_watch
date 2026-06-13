@@ -31,9 +31,11 @@ def create_topic(conn: sqlite3.Connection, topic: Topic) -> Topic:
     data = topic.to_insert_dict()
     cursor = conn.execute(
         """INSERT INTO topics (name, description, feed_urls, feed_mode,
-           created_at, status_changed_at, is_active, status, error_message, check_interval_minutes, tags)
+           created_at, status_changed_at, is_active, status, error_message, check_interval_minutes, tags,
+           confidence_threshold, relevance_threshold, init_attempts)
            VALUES (:name, :description, :feed_urls, :feed_mode,
-           :created_at, :status_changed_at, :is_active, :status, :error_message, :check_interval_minutes, :tags)""",
+           :created_at, :status_changed_at, :is_active, :status, :error_message, :check_interval_minutes, :tags,
+           :confidence_threshold, :relevance_threshold, :init_attempts)""",
         data,
     )
     topic.id = cursor.lastrowid
@@ -93,7 +95,8 @@ def update_topic(conn: sqlite3.Connection, topic: Topic) -> Topic:
            feed_urls=:feed_urls, feed_mode=:feed_mode,
            is_active=:is_active, status=:status, status_changed_at=:status_changed_at,
            error_message=:error_message, check_interval_minutes=:check_interval_minutes,
-           tags=:tags
+           tags=:tags, confidence_threshold=:confidence_threshold,
+           relevance_threshold=:relevance_threshold, init_attempts=:init_attempts
            WHERE id=:id""",
         data,
     )
@@ -455,10 +458,10 @@ def create_check_result(conn: sqlite3.Connection, result: CheckResult) -> CheckR
     cursor = conn.execute(
         """INSERT INTO check_results (topic_id, checked_at, articles_found,
            articles_new, has_new_info, llm_response, notification_sent,
-           notification_error)
+           notification_error, prompt_tokens, completion_tokens)
            VALUES (:topic_id, :checked_at, :articles_found, :articles_new,
            :has_new_info, :llm_response, :notification_sent,
-           :notification_error)""",
+           :notification_error, :prompt_tokens, :completion_tokens)""",
         data,
     )
     result.id = cursor.lastrowid
@@ -489,6 +492,16 @@ def count_check_results(conn: sqlite3.Connection, topic_id: int) -> int:
     """Count total check results for a topic."""
     row = conn.execute("SELECT COUNT(*) FROM check_results WHERE topic_id = ?", (topic_id,)).fetchone()
     return int(row[0])
+
+
+def sum_check_tokens(conn: sqlite3.Connection, topic_id: int) -> tuple[int, int]:
+    """Return (total_prompt_tokens, total_completion_tokens) across all checks."""
+    row = conn.execute(
+        """SELECT COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0)
+           FROM check_results WHERE topic_id = ?""",
+        (topic_id,),
+    ).fetchone()
+    return int(row[0]), int(row[1])
 
 
 # --- PendingNotification CRUD ---

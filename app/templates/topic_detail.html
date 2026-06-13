@@ -107,6 +107,10 @@
 {% endif %}
 
 <h2>Check History</h2>
+{% if (total_prompt_tokens + total_completion_tokens) %}
+<p><small>Total LLM cost: {{ total_prompt_tokens + total_completion_tokens }} tokens
+({{ total_prompt_tokens }} prompt + {{ total_completion_tokens }} completion)</small></p>
+{% endif %}
 {% if checks %}
 <div style="overflow-x: auto;">
 <table>
@@ -117,6 +121,7 @@
             <th>New Articles</th>
             <th>New Info</th>
             <th>Confidence</th>
+            <th>Tokens</th>
             <th>Notified</th>
             <th>Actions</th>
         </tr>
@@ -129,6 +134,14 @@
             <td>{{ check.articles_new }}</td>
             <td>{{ "Yes" if check.has_new_info else "No" }}</td>
             <td>{{ check.llm_response | confidence_badge }}</td>
+            <td>
+                {% set check_tokens = check.prompt_tokens + check.completion_tokens %}
+                {% if check_tokens %}
+                    <span title="{{ check.prompt_tokens }} prompt + {{ check.completion_tokens }} completion">{{ check_tokens }}</span>
+                {% else %}
+                    -
+                {% endif %}
+            </td>
             <td>
                 {% if check.notification_sent %}
                     Sent
