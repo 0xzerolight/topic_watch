@@ -4,6 +4,7 @@ All functions accept a sqlite3.Connection as their first parameter
 for explicit dependency injection and testability.
 """
 
+import json
 import logging
 import sqlite3
 from datetime import UTC, datetime
@@ -533,6 +534,76 @@ def delete_pending_notification(conn: sqlite3.Connection, notification_id: int) 
 def delete_expired_notifications(conn: sqlite3.Connection) -> int:
     """Delete notifications that have exceeded their max retries."""
     cursor = conn.execute("DELETE FROM pending_notifications WHERE retry_count >= max_retries")
+    return cursor.rowcount
+
+
+# --- PendingWebhook CRUD ---
+#
+# The webhook retry queue mirrors pending_notifications. To avoid editing
+# models.py (owned elsewhere), rows are represented as plain dicts rather than
+# a Pydantic model. The payload is stored as a JSON TEXT column.
+
+
+def create_pending_webhook(
+    conn: sqlite3.Connection,
+    topic_id: int,
+    url: str,
+    payload: dict,
+    check_result_id: int | None = None,
+    max_retries: int = 3,
+) -> int:
+    """Store a failed webhook delivery for later retry. Returns the new row id."""
+    cursor = conn.execute(
+        """INSERT INTO pending_webhooks (topic_id, check_result_id, url, payload,
+           created_at, retry_count, max_retries)
+           VALUES (?, ?, ?, ?, ?, 0, ?)""",
+        (
+            topic_id,
+            check_result_id,
+            url,
+            json.dumps(payload),
+            datetime.now(UTC).isoformat(),
+            max_retries,
+        ),
+    )
+    return int(cursor.lastrowid or 0)
+
+
+def list_pending_webhooks(conn: sqlite3.Connection) -> list[dict]:
+    """Get all pending webhooks that haven't exceeded max retries.
+
+    Each row is returned as a dict with the payload already decoded from JSON.
+    """
+    rows = conn.execute(
+        "SELECT * FROM pending_webhooks WHERE retry_count < max_retries ORDER BY created_at ASC"
+    ).fetchall()
+    result: list[dict] = []
+    for row in rows:
+        data = dict(row)
+        try:
+            data["payload"] = json.loads(data["payload"])
+        except (ValueError, TypeError):
+            data["payload"] = {}
+        result.append(data)
+    return result
+
+
+def increment_webhook_retry(conn: sqlite3.Connection, webhook_id: int) -> None:
+    """Increment the retry count for a pending webhook."""
+    conn.execute(
+        "UPDATE pending_webhooks SET retry_count = retry_count + 1 WHERE id = ?",
+        (webhook_id,),
+    )
+
+
+def delete_pending_webhook(conn: sqlite3.Connection, webhook_id: int) -> None:
+    """Delete a pending webhook (after successful send or max retries)."""
+    conn.execute("DELETE FROM pending_webhooks WHERE id = ?", (webhook_id,))
+
+
+def delete_expired_webhooks(conn: sqlite3.Connection) -> int:
+    """Delete webhooks that have exceeded their max retries."""
+    cursor = conn.execute("DELETE FROM pending_webhooks WHERE retry_count >= max_retries")
     return cursor.rowcount
 
 
