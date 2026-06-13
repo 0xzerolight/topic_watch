@@ -1178,8 +1178,17 @@ async def update_settings(
     article_fetch_timeout: float = Form(20.0),
     llm_analysis_timeout: int = Form(60),
     llm_knowledge_timeout: int = Form(120),
+    apprise_timeout_seconds: int = Form(30),
     web_page_size: int = Form(20),
-    min_confidence_threshold: float = Form(0.6),
+    min_confidence_threshold: float = Form(0.7),
+    min_relevance_threshold: float = Form(0.5),
+    secure_cookies: bool = Form(False),
+    feed_max_retries: int = Form(2),
+    content_fetch_concurrency: int = Form(3),
+    scheduler_misfire_grace_time: int = Form(300),
+    scheduler_jitter_seconds: int = Form(30),
+    llm_max_retries: int = Form(2),
+    llm_temperature: float = Form(0.2),
 ):
     """Save updated settings to config file and reload into app state."""
     from pydantic import ValidationError
@@ -1212,8 +1221,17 @@ async def update_settings(
         "article_fetch_timeout": article_fetch_timeout,
         "llm_analysis_timeout": llm_analysis_timeout,
         "llm_knowledge_timeout": llm_knowledge_timeout,
+        "apprise_timeout_seconds": apprise_timeout_seconds,
         "web_page_size": web_page_size,
         "min_confidence_threshold": min_confidence_threshold,
+        "min_relevance_threshold": min_relevance_threshold,
+        "secure_cookies": secure_cookies,
+        "feed_max_retries": feed_max_retries,
+        "content_fetch_concurrency": content_fetch_concurrency,
+        "scheduler_misfire_grace_time": scheduler_misfire_grace_time,
+        "scheduler_jitter_seconds": scheduler_jitter_seconds,
+        "llm_max_retries": llm_max_retries,
+        "llm_temperature": llm_temperature,
     }
     try:
         new_settings = Settings(  # type: ignore[call-arg]
@@ -1234,16 +1252,19 @@ async def update_settings(
             article_fetch_timeout=article_fetch_timeout,
             llm_analysis_timeout=llm_analysis_timeout,
             llm_knowledge_timeout=llm_knowledge_timeout,
+            apprise_timeout_seconds=apprise_timeout_seconds,
             web_page_size=web_page_size,
             min_confidence_threshold=min_confidence_threshold,
-            # Preserve values not in form from current app settings
+            min_relevance_threshold=min_relevance_threshold,
+            secure_cookies=secure_cookies,
+            feed_max_retries=feed_max_retries,
+            content_fetch_concurrency=content_fetch_concurrency,
+            scheduler_misfire_grace_time=scheduler_misfire_grace_time,
+            scheduler_jitter_seconds=scheduler_jitter_seconds,
+            llm_max_retries=llm_max_retries,
+            llm_temperature=llm_temperature,
+            # db_path is infra-only (read-only in the UI); preserve current value.
             db_path=request.app.state.settings.db_path,
-            feed_max_retries=request.app.state.settings.feed_max_retries,
-            content_fetch_concurrency=request.app.state.settings.content_fetch_concurrency,
-            scheduler_misfire_grace_time=request.app.state.settings.scheduler_misfire_grace_time,
-            scheduler_jitter_seconds=request.app.state.settings.scheduler_jitter_seconds,
-            llm_max_retries=request.app.state.settings.llm_max_retries,
-            llm_temperature=request.app.state.settings.llm_temperature,
         )
         save_settings_to_yaml(new_settings, request.app.state.config_path)
         request.app.state.settings = new_settings
