@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 
 from app.analysis.llm import (
     NoveltyResult,
+    compress_knowledge_summary,
     count_tokens,
     generate_initial_knowledge,
     generate_knowledge_update,
@@ -44,6 +45,59 @@ def _truncate_to_budget(text: str, max_tokens: int, model: str) -> tuple[str, in
     return final, count_tokens(final, model)
 
 
+async def compress_knowledge(
+    text: str,
+    topic: Topic,
+    settings: Settings,
+) -> tuple[str, int]:
+    """Fit a knowledge summary into the token budget without losing facts.
+
+    Calls the LLM to condense ``text`` to within ``knowledge_state_max_tokens``,
+    preserving all distinct facts (unlike trailing-sentence truncation, which
+    silently drops them and causes spurious re-detection downstream).
+
+    Degrades gracefully: if the LLM compression fails — or produces output that
+    still exceeds the budget — it falls back to lossy ``_truncate_to_budget``
+    rather than raising, so an over-budget update never crashes the pipeline.
+
+    Returns:
+        ``(summary_text, token_count)`` guaranteed to fit the budget. The
+        ``token_count`` is recomputed with the authoritative ``count_tokens``.
+    """
+    max_tokens = settings.knowledge_state_max_tokens
+    model = settings.llm.model
+    try:
+        result = await compress_knowledge_summary(text, topic, settings)
+    except Exception:
+        logger.warning(
+            "Knowledge compression failed for topic '%s'; falling back to truncation",
+            topic.name,
+            exc_info=True,
+        )
+        return _truncate_to_budget(text, max_tokens, model)
+
+    # Recompute authoritatively — never trust a self-reported count.
+    compressed = result.compressed_summary
+    token_count = count_tokens(compressed, model)
+    if token_count > max_tokens:
+        # Compression undershot the budget — truncate what it produced rather
+        # than persist an over-budget state.
+        logger.warning(
+            "Compressed knowledge for topic '%s' still over budget (%d > %d); truncating",
+            topic.name,
+            token_count,
+            max_tokens,
+        )
+        return _truncate_to_budget(compressed, max_tokens, model)
+
+    logger.info(
+        "Compressed knowledge for topic '%s' to %d tokens",
+        topic.name,
+        token_count,
+    )
+    return compressed, token_count
+
+
 async def initialize_knowledge(
     topic: Topic,
     articles: list[Article],
@@ -71,20 +125,15 @@ async def initialize_knowledge(
 
     if result.token_count > settings.knowledge_state_max_tokens:
         logger.warning(
-            "Knowledge state for topic '%s' exceeds token budget (%d > %d)",
+            "Knowledge state for topic '%s' exceeds token budget (%d > %d), compressing",
             topic.name,
             result.token_count,
             settings.knowledge_state_max_tokens,
         )
-        result.updated_summary, result.token_count = _truncate_to_budget(
+        result.updated_summary, result.token_count = await compress_knowledge(
             result.updated_summary,
-            settings.knowledge_state_max_tokens,
-            settings.llm.model,
-        )
-        logger.info(
-            "Truncated knowledge state for topic '%s' to %d tokens",
-            topic.name,
-            result.token_count,
+            topic,
+            settings,
         )
 
     state = KnowledgeState(
@@ -132,20 +181,15 @@ async def update_knowledge(
 
     if result.token_count > settings.knowledge_state_max_tokens:
         logger.warning(
-            "Knowledge state for topic '%s' exceeds token budget (%d > %d)",
+            "Knowledge state for topic '%s' exceeds token budget (%d > %d), compressing",
             topic.name,
             result.token_count,
             settings.knowledge_state_max_tokens,
         )
-        result.updated_summary, result.token_count = _truncate_to_budget(
+        result.updated_summary, result.token_count = await compress_knowledge(
             result.updated_summary,
-            settings.knowledge_state_max_tokens,
-            settings.llm.model,
-        )
-        logger.info(
-            "Truncated knowledge state for topic '%s' to %d tokens",
-            topic.name,
-            result.token_count,
+            topic,
+            settings,
         )
 
     current.summary_text = result.updated_summary

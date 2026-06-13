@@ -175,6 +175,39 @@ Key Facts:
 {key_facts}"""
 
 
+# --- Knowledge compression ---
+
+_KNOWLEDGE_COMPRESS_SYSTEM = """\
+You are a knowledge-state compressor for a news monitoring system. You are given \
+an existing knowledge summary that has grown past its token budget. Your job is to \
+condense it to fit within ~{max_tokens} tokens WITHOUT losing any distinct fact.
+
+=== CRITICAL RULES ===
+1. Use ONLY information already present in the provided summary. Do NOT add facts, \
+dates, names, numbers, or context from your training data, and do NOT infer or \
+speculate to fill gaps.
+2. PRESERVE every distinct concrete fact, milestone, date, name, number, decision, \
+and noted contradiction. Dropping a real fact causes the system to re-flag it later \
+as "new" — this is the failure you must avoid.
+3. Compress by removing ONLY redundancy and verbosity: merge restated points, cut \
+filler words, collapse repetitive phrasing, and combine closely related facts into \
+denser statements. Never delete a fact merely to save space.
+4. Preserve sourcing qualifiers ("according to [source]", "reportedly", "rumored", \
+"single-source") and keep recorded contradictions with both versions intact.
+5. Maintain the same structured format and category headings. Only keep categories \
+that still have content.
+
+Prioritize fact density over prose. The result must read as a factual, grounded \
+summary — just shorter. Stay under {max_tokens} tokens."""
+
+_KNOWLEDGE_COMPRESS_USER = """\
+Topic: {topic_name}
+Description: {topic_description}
+
+Knowledge State to Compress:
+{current_summary}"""
+
+
 def _content_quality_tag(content: str | None) -> str:
     """Classify article content quality for the LLM."""
     if not content:
@@ -239,6 +272,28 @@ def build_knowledge_init_messages(articles: list[Article], topic: Topic, max_tok
                 topic_name=topic.name,
                 topic_description=topic.description,
                 articles=_format_articles(articles),
+            ),
+        },
+    ]
+
+
+def build_knowledge_compress_messages(
+    current_summary: str,
+    topic: Topic,
+    max_tokens: int,
+) -> list[dict]:
+    """Build chat messages for compressing an over-budget knowledge state."""
+    return [
+        {
+            "role": "system",
+            "content": _KNOWLEDGE_COMPRESS_SYSTEM.format(max_tokens=max_tokens),
+        },
+        {
+            "role": "user",
+            "content": _KNOWLEDGE_COMPRESS_USER.format(
+                topic_name=topic.name,
+                topic_description=topic.description,
+                current_summary=current_summary,
             ),
         },
     ]

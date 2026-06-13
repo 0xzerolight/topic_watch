@@ -8,9 +8,11 @@ from pydantic import ValidationError
 
 from app.analysis.knowledge import initialize_knowledge, update_knowledge
 from app.analysis.llm import (
+    CompressedKnowledge,
     KnowledgeStateUpdate,
     NoveltyResult,
     analyze_articles,
+    compress_knowledge_summary,
     count_tokens,
     generate_initial_knowledge,
     generate_knowledge_update,
@@ -18,6 +20,7 @@ from app.analysis.llm import (
 from app.analysis.prompts import (
     _content_quality_tag,
     _format_articles,
+    build_knowledge_compress_messages,
     build_knowledge_init_messages,
     build_knowledge_update_messages,
     build_novelty_messages,
@@ -401,6 +404,96 @@ class TestBuildKnowledgeUpdateMessages:
         system_msg = messages[0]["content"]
         assert "CRITICAL RULES" in system_msg
         assert "training data" in system_msg
+
+
+# ============================================================
+# TestBuildKnowledgeCompressMessages
+# ============================================================
+
+
+class TestBuildKnowledgeCompressMessages:
+    def test_includes_current_summary(self) -> None:
+        topic = _make_topic()
+        messages = build_knowledge_compress_messages(
+            current_summary="Verbose old knowledge state with many facts.",
+            topic=topic,
+            max_tokens=1500,
+        )
+        assert len(messages) == 2
+        assert messages[0]["role"] == "system"
+        assert messages[1]["role"] == "user"
+        assert "Verbose old knowledge state" in messages[1]["content"]
+
+    def test_includes_max_tokens_budget(self) -> None:
+        topic = _make_topic()
+        messages = build_knowledge_compress_messages(current_summary="Summary.", topic=topic, max_tokens=1234)
+        assert "1234" in messages[0]["content"]
+
+    def test_system_message_preserves_facts_and_grounding(self) -> None:
+        topic = _make_topic()
+        messages = build_knowledge_compress_messages(current_summary="Summary.", topic=topic, max_tokens=2000)
+        system_msg = messages[0]["content"]
+        assert "CRITICAL RULES" in system_msg
+        assert "PRESERVE" in system_msg
+        assert "training data" in system_msg
+
+
+# ============================================================
+# TestCompressedKnowledge
+# ============================================================
+
+
+class TestCompressedKnowledge:
+    def test_valid_construction(self) -> None:
+        result = CompressedKnowledge(compressed_summary="Dense facts.", token_count=12)
+        assert result.compressed_summary == "Dense facts."
+        assert result.token_count == 12
+
+    def test_token_count_defaults_to_zero(self) -> None:
+        result = CompressedKnowledge(compressed_summary="text")
+        assert result.token_count == 0
+
+    def test_required_field(self) -> None:
+        with pytest.raises(ValidationError):
+            CompressedKnowledge()  # missing compressed_summary
+
+
+# ============================================================
+# TestCompressKnowledgeSummary (async, mocked LLM)
+# ============================================================
+
+
+class TestCompressKnowledgeSummary:
+    async def test_passes_correct_args_and_recomputes_tokens(self) -> None:
+        expected = CompressedKnowledge(compressed_summary="Condensed knowledge.", token_count=0)
+        mock_client, mock_create = _mock_instructor_client(expected)
+        settings = _make_settings()
+        topic = _make_topic(name="Compress Topic")
+
+        with (
+            patch("app.analysis.llm._get_client", return_value=mock_client),
+            patch("app.analysis.llm.count_tokens", return_value=11),
+        ):
+            result = await compress_knowledge_summary("Verbose summary.", topic, settings)
+
+        assert result.token_count == 11  # recomputed, not the LLM's 0
+        call_kwargs = mock_create.call_args.kwargs
+        assert call_kwargs["model"] == "openai/gpt-4o-mini"
+        assert call_kwargs["response_model"] is CompressedKnowledge
+        assert call_kwargs["temperature"] == 0.2
+        assert "Verbose summary." in call_kwargs["messages"][1]["content"]
+        assert "Compress Topic" in call_kwargs["messages"][1]["content"]
+
+    async def test_raises_on_llm_error(self) -> None:
+        mock_client, mock_create = _mock_instructor_client(None)
+        mock_create.side_effect = Exception("compress failed")
+        settings = _make_settings()
+
+        with (
+            patch("app.analysis.llm._get_client", return_value=mock_client),
+            pytest.raises(Exception, match="compress failed"),
+        ):
+            await compress_knowledge_summary("text", _make_topic(), settings)
 
 
 # ============================================================

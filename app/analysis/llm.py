@@ -13,6 +13,7 @@ import litellm
 from pydantic import BaseModel, Field
 
 from app.analysis.prompts import (
+    build_knowledge_compress_messages,
     build_knowledge_init_messages,
     build_knowledge_update_messages,
     build_novelty_messages,
@@ -54,6 +55,15 @@ class KnowledgeStateUpdate(BaseModel):
     )
     updated_summary: str = Field(
         description="The knowledge summary. If sufficient_data is false, explain what information was missing."
+    )
+    token_count: int = 0
+
+
+class CompressedKnowledge(BaseModel):
+    """LLM response for knowledge-state compression."""
+
+    compressed_summary: str = Field(
+        description="The condensed knowledge summary: same facts, less verbosity, within the token budget."
     )
     token_count: int = 0
 
@@ -181,6 +191,40 @@ async def generate_initial_knowledge(
 
     result: KnowledgeStateUpdate = await _call_with_rate_limit_retry(_do_call)
     result.token_count = count_tokens(result.updated_summary, settings.llm.model)
+    return result
+
+
+async def compress_knowledge_summary(
+    current_summary: str,
+    topic: Topic,
+    settings: Settings,
+) -> CompressedKnowledge:
+    """Compress an over-budget knowledge summary while preserving its facts.
+
+    Raises on failure — the caller decides how to degrade (e.g. fall back to
+    lossy truncation). The returned ``token_count`` is recomputed authoritatively.
+    """
+
+    async def _do_call() -> CompressedKnowledge:
+        client = _get_client(settings)
+        messages = build_knowledge_compress_messages(
+            current_summary=current_summary,
+            topic=topic,
+            max_tokens=settings.knowledge_state_max_tokens,
+        )
+        return await client.chat.completions.create(  # type: ignore[no-any-return]
+            model=settings.llm.model,
+            response_model=CompressedKnowledge,
+            messages=messages,  # type: ignore[arg-type]
+            max_retries=settings.llm_max_retries,
+            api_key=settings.llm.api_key,
+            api_base=_effective_base_url(settings),
+            timeout=settings.llm_knowledge_timeout,
+            temperature=settings.llm_temperature,
+        )
+
+    result: CompressedKnowledge = await _call_with_rate_limit_retry(_do_call)
+    result.token_count = count_tokens(result.compressed_summary, settings.llm.model)
     return result
 
 
