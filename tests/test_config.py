@@ -254,3 +254,59 @@ class TestThresholdDefaults:
 
         data = yaml.safe_load(config_file.read_text())
         assert data["min_relevance_threshold"] == 0.6
+
+
+class TestTimeoutValidation:
+    """Timeouts must be strictly positive; zero/negative breaks every HTTP/LLM call."""
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "feed_fetch_timeout",
+            "article_fetch_timeout",
+            "llm_analysis_timeout",
+            "llm_knowledge_timeout",
+            "apprise_timeout_seconds",
+        ],
+    )
+    @pytest.mark.parametrize("value", [0, -1, -15.0])
+    def test_non_positive_timeout_rejected(self, field: str, value: float) -> None:
+        with pytest.raises(ValidationError):
+            Settings(
+                llm={"model": "openai/gpt-4o-mini", "api_key": "sk-test"},
+                **{field: value},
+            )  # type: ignore[call-arg]
+
+    def test_positive_timeouts_accepted(self) -> None:
+        settings = Settings(
+            llm={"model": "openai/gpt-4o-mini", "api_key": "sk-test"},
+            feed_fetch_timeout=5.0,
+            article_fetch_timeout=10.0,
+            llm_analysis_timeout=30,
+            llm_knowledge_timeout=60,
+            apprise_timeout_seconds=15,
+        )  # type: ignore[call-arg]
+        assert settings.feed_fetch_timeout == 5.0
+        assert settings.apprise_timeout_seconds == 15
+
+    def test_apprise_timeout_default(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("TOPIC_WATCH_APPRISE_TIMEOUT_SECONDS", raising=False)
+        config = tmp_path / "config.yml"
+        config.write_text('llm:\n  model: "openai/gpt-4o-mini"\n  api_key: "sk-test"\n')
+        settings = load_settings(config_path=config)
+        assert settings.apprise_timeout_seconds == 30
+
+    def test_apprise_timeout_in_saved_yaml(self, tmp_path: Path) -> None:
+        import yaml
+
+        from app.config import LLMSettings, save_settings_to_yaml
+
+        settings = Settings(
+            llm=LLMSettings(model="openai/gpt-4o-mini", api_key="sk-test"),
+            apprise_timeout_seconds=45,
+        )  # type: ignore[call-arg]
+        config_file = tmp_path / "config.yml"
+        save_settings_to_yaml(settings, config_file)
+
+        data = yaml.safe_load(config_file.read_text())
+        assert data["apprise_timeout_seconds"] == 45

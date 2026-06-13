@@ -124,10 +124,15 @@ class Settings(BaseSettings):
         default="data/topic_watch.db",
         description="Path to the SQLite database file (relative to project root or absolute)",
     )
-    feed_fetch_timeout: float = Field(default=15.0, description="Timeout in seconds for RSS feed fetches")
-    article_fetch_timeout: float = Field(default=20.0, description="Timeout in seconds for article content fetches")
-    llm_analysis_timeout: int = Field(default=60, description="Timeout in seconds for LLM novelty analysis")
-    llm_knowledge_timeout: int = Field(default=120, description="Timeout in seconds for LLM knowledge generation")
+    feed_fetch_timeout: float = Field(default=15.0, gt=0, description="Timeout in seconds for RSS feed fetches")
+    article_fetch_timeout: float = Field(
+        default=20.0, gt=0, description="Timeout in seconds for article content fetches"
+    )
+    llm_analysis_timeout: int = Field(default=60, gt=0, description="Timeout in seconds for LLM novelty analysis")
+    llm_knowledge_timeout: int = Field(default=120, gt=0, description="Timeout in seconds for LLM knowledge generation")
+    apprise_timeout_seconds: int = Field(
+        default=30, gt=0, description="Timeout in seconds for a single Apprise notification send"
+    )
     web_page_size: int = Field(default=20, ge=5, le=200, description="Number of items per page in web UI")
     feed_max_retries: int = Field(default=2, ge=1, le=10, description="Maximum retry attempts for feed fetching")
     content_fetch_concurrency: int = Field(default=3, ge=1, le=20, description="Max concurrent article content fetches")
@@ -286,6 +291,7 @@ def save_settings_to_yaml(settings: "Settings", config_path: Path) -> None:
         "article_fetch_timeout": settings.article_fetch_timeout,
         "llm_analysis_timeout": settings.llm_analysis_timeout,
         "llm_knowledge_timeout": settings.llm_knowledge_timeout,
+        "apprise_timeout_seconds": settings.apprise_timeout_seconds,
         "web_page_size": settings.web_page_size,
         "feed_max_retries": settings.feed_max_retries,
         "content_fetch_concurrency": settings.content_fetch_concurrency,
