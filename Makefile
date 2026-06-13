@@ -1,4 +1,4 @@
-.PHONY: dev test lint format typecheck coverage docker docker-run run clean ci lock help
+.PHONY: dev test smoke lint format typecheck coverage docker docker-run run clean ci lock help
 
 help: ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -15,6 +15,9 @@ lock: ## Regenerate pinned requirements lockfiles from pyproject.toml
 
 test: ## Run tests with pytest
 	pytest --tb=short
+
+smoke: ## Run hermetic end-to-end smoke tests
+	pytest tests/smoke -q --no-cov
 
 lint: ## Run Ruff linter and mypy type checker
 	ruff check .
