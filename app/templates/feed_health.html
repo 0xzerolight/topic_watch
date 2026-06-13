@@ -53,6 +53,9 @@
 </table>
 </div>
 {% else %}
-<p>No feed health data yet. Feed health is tracked automatically after feeds are fetched.</p>
+<div class="empty-state">
+    <p><strong>No feed health data yet.</strong></p>
+    <p class="empty-state-hint">Feed health is tracked automatically after feeds are fetched. Once your topics run their first checks, each feed's status, success rate, and recent errors will show up here.</p>
+</div>
 {% endif %}
 {% endblock %}

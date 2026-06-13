@@ -3,7 +3,7 @@
     {% if last_check and last_check.has_new_info %}data-new-info="true"{% endif %}>
     <td>
         <input type="checkbox" name="topic_ids" value="{{ topic.id }}"
-               class="topic-select" onchange="updateBulkBar()">
+               class="topic-select" aria-label="Select {{ topic.name }}" onchange="updateBulkBar()">
     </td>
     <td>
         <a href="/topics/{{ topic.id }}">{{ topic.name }}</a>

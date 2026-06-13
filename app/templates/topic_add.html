@@ -47,6 +47,7 @@
                    onchange="document.getElementById('manual-feeds').style.display='block'; document.getElementById('manual-feeds').setAttribute('aria-hidden','false')">
             Manual (provide RSS URLs)
         </label>
+        <small>Automatic builds a Google News feed from the topic name. Manual lets you supply your own RSS/Atom feed URLs.</small>
     </fieldset>
 
     <div id="manual-feeds" aria-hidden="{{ 'false' if (feed_mode or 'auto') == 'manual' else 'true' }}" style="{{ 'display:block' if (feed_mode or 'auto') == 'manual' else 'display:none' }}">

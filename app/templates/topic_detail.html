@@ -65,7 +65,7 @@
     {% endfor %}
 </ul>
 {% else %}
-<p>No feed URLs configured.</p>
+<p>No feed URLs configured. <a href="/topics/{{ topic.id }}/edit">Edit this topic</a> to add one.</p>
 {% endif %}
 {% endif %}
 
@@ -103,12 +103,15 @@
     </div>
 </details>
 {% else %}
-<p>No articles fetched yet.</p>
+<div class="empty-state">
+    <p>No articles fetched yet.</p>
+    <p class="empty-state-hint">Articles appear here after the first feed fetch. New topics are fetched on the next scheduler cycle (~1 minute), or use "Check Now" below.</p>
+</div>
 {% endif %}
 
 <h2>Check History</h2>
 {% if (total_prompt_tokens + total_completion_tokens) %}
-<p><small>Total LLM cost: {{ total_prompt_tokens + total_completion_tokens }} tokens
+<p><small>Total LLM cost across all checks: {{ total_prompt_tokens + total_completion_tokens }} tokens
 ({{ total_prompt_tokens }} prompt + {{ total_completion_tokens }} completion)</small></p>
 {% endif %}
 {% if checks %}
@@ -121,7 +124,7 @@
             <th>New Articles</th>
             <th>New Info</th>
             <th>Confidence</th>
-            <th>Tokens</th>
+            <th title="LLM tokens used by this check (prompt + completion)">Tokens</th>
             <th>Notified</th>
             <th>Actions</th>
         </tr>
@@ -176,7 +179,10 @@
 </div>
 {{ render_pagination(page, total_pages, "/topics/" ~ topic.id) }}
 {% else %}
-<p>No checks performed yet.</p>
+<div class="empty-state">
+    <p>No checks performed yet.</p>
+    <p class="empty-state-hint">Each check fetches the latest articles and asks the AI whether anything is genuinely new. Results, confidence, and token cost will be listed here.</p>
+</div>
 {% endif %}
 
 {% if topic.status.value == "error" %}
