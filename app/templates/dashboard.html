@@ -1,6 +1,9 @@
 {% extends "base.html" %}
 {% block title %}Dashboard - Topic Watch{% endblock %}
 {% block content %}
+{% if error %}
+<article class="error-banner" role="alert">{{ error }}</article>
+{% endif %}
 <div class="page-header">
     <h1>Topics</h1>
     <div class="action-row">
@@ -55,11 +58,13 @@
 
 <div class="search-row">
     <input type="search" name="q" placeholder="Search topics..."
+           aria-label="Search topics by name or description"
            hx-get="/topics/search"
            hx-trigger="keyup changed delay:300ms, search"
            hx-target="#topic-list"
            hx-include="[name='status']">
     <select name="status"
+            aria-label="Filter topics by status"
             hx-get="/topics/search"
             hx-trigger="change"
             hx-target="#topic-list"
@@ -90,7 +95,7 @@
 <table>
     <thead>
         <tr>
-            <th><input type="checkbox" id="select-all" onchange="toggleAll(this)"></th>
+            <th><input type="checkbox" id="select-all" aria-label="Select all topics" onchange="toggleAll(this)"></th>
             <th>Name</th>
             <th>Status</th>
             <th>Last Check</th>
@@ -105,9 +110,15 @@
 </div>
 {% else %}
 {% if active_tag %}
-<p>No topics found with tag <kbd>{{ active_tag }}</kbd>. <a href="/">Clear filter</a>.</p>
+<div class="empty-state">
+    <p>No topics found with tag <kbd>{{ active_tag }}</kbd>.</p>
+    <p class="empty-state-hint"><a href="/">Clear filter</a> to see all topics.</p>
+</div>
 {% else %}
-<p>Get started by <a href="/topics/new">adding your first topic</a>.</p>
+<div class="empty-state">
+    <p><strong>No topics yet — add one to start watching.</strong></p>
+    <p class="empty-state-hint">Get started by <a href="/topics/new">adding your first topic</a>. Topic Watch monitors RSS feeds and notifies you only when there's genuinely new information.</p>
+</div>
 {% endif %}
 {% endif %}
 
