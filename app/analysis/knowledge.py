@@ -7,10 +7,12 @@ summary for each topic, with database persistence.
 import logging
 import re
 import sqlite3
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from app.analysis.llm import (
     NoveltyResult,
+    TokenUsage,
     compress_knowledge_summary,
     count_tokens,
     generate_initial_knowledge,
@@ -21,6 +23,26 @@ from app.crud import create_knowledge_state, get_knowledge_state, update_knowled
 from app.models import Article, KnowledgeState, Topic
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class KnowledgeWriteResult:
+    """Outcome of an init/update knowledge write, with cost + sufficiency signals.
+
+    Fields:
+        state: The persisted (or, for an insufficient update, the preserved
+            existing) ``KnowledgeState``.
+        usage: ``TokenUsage`` consumed by the LLM call (prompt/completion tokens;
+            both 0 if the provider omitted usage).
+        sufficient_data: The LLM's ``sufficient_data`` verdict. For init, ``False``
+            means "insufficient data, worth retrying" (the state was still stored
+            with an explanation); ``True`` means good knowledge was built. For
+            update, ``False`` means the existing state was preserved unchanged.
+    """
+
+    state: KnowledgeState
+    usage: TokenUsage = field(default_factory=TokenUsage)
+    sufficient_data: bool = True
 
 
 def _truncate_to_budget(text: str, max_tokens: int, model: str) -> tuple[str, int]:
@@ -103,10 +125,18 @@ async def initialize_knowledge(
     articles: list[Article],
     conn: sqlite3.Connection,
     settings: Settings,
-) -> KnowledgeState:
+) -> KnowledgeWriteResult:
     """Build an initial knowledge state from articles and store it.
 
     Raises on LLM failure — the caller should set the topic status to 'error'.
+
+    Returns a ``KnowledgeWriteResult``. ``result.sufficient_data`` is the clean,
+    string-free signal the caller can branch on:
+
+    * raises (hard error) -> set topic status to 'error'
+    * ``sufficient_data is False`` -> insufficient data, worth retrying in a later
+      cycle (the explanatory summary was still persisted)
+    * ``sufficient_data is True`` -> good knowledge was built and stored
     """
     if topic.id is None:
         raise ValueError("Topic must have an ID")
@@ -149,7 +179,11 @@ async def initialize_knowledge(
         topic.name,
         result.token_count,
     )
-    return created
+    return KnowledgeWriteResult(
+        state=created,
+        usage=TokenUsage(result.prompt_tokens, result.completion_tokens),
+        sufficient_data=result.sufficient_data,
+    )
 
 
 async def update_knowledge(
@@ -157,11 +191,15 @@ async def update_knowledge(
     novelty_result: NoveltyResult,
     conn: sqlite3.Connection,
     settings: Settings,
-) -> KnowledgeState:
+) -> KnowledgeWriteResult:
     """Update the knowledge state with new findings and persist.
 
     Raises ValueError if no existing knowledge state is found.
     Raises on LLM failure — the caller should handle gracefully.
+
+    Returns a ``KnowledgeWriteResult`` carrying the persisted (or preserved)
+    state, the LLM ``usage``, and ``sufficient_data`` (``False`` means the LLM
+    found the new findings too vague to merge, so the existing state was kept).
     """
     if topic.id is None:
         raise ValueError("Topic must have an ID")
@@ -171,13 +209,14 @@ async def update_knowledge(
         raise ValueError(f"No knowledge state found for topic '{topic.name}' (id={topic.id})")
 
     result = await generate_knowledge_update(current.summary_text, novelty_result, topic, settings)
+    usage = TokenUsage(result.prompt_tokens, result.completion_tokens)
 
     if not result.sufficient_data:
         logger.warning(
             "Knowledge update for topic '%s' had insufficient data, preserving existing state",
             topic.name,
         )
-        return current
+        return KnowledgeWriteResult(state=current, usage=usage, sufficient_data=False)
 
     if result.token_count > settings.knowledge_state_max_tokens:
         logger.warning(
@@ -204,4 +243,4 @@ async def update_knowledge(
         topic.name,
         result.token_count,
     )
-    return current
+    return KnowledgeWriteResult(state=current, usage=usage, sufficient_data=True)

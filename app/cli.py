@@ -118,7 +118,7 @@ async def _cmd_init(topic_name: str) -> None:
         # so re-init of READY topics works without a separate delete step)
         assert topic.id is not None
         try:
-            state = await initialize_knowledge(topic, articles, conn, settings)
+            write_result = await initialize_knowledge(topic, articles, conn, settings)
         except Exception:
             logger.error(
                 "Knowledge initialization failed for '%s'",
@@ -142,7 +142,7 @@ async def _cmd_init(topic_name: str) -> None:
         topic.error_message = None
         update_topic(conn, topic)
 
-        print(f"  Knowledge state built ({state.token_count} tokens)")
+        print(f"  Knowledge state built ({write_result.state.token_count} tokens)")
         print(f"  Topic '{topic_name}' is now READY")
 
 

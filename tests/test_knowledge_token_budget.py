@@ -235,7 +235,7 @@ class TestInitializeKnowledgeBudget:
             ),
             patch("app.analysis.knowledge.count_tokens", side_effect=_heavy_word_count),
         ):
-            state = await initialize_knowledge(topic, [], db_conn, settings)
+            state = (await initialize_knowledge(topic, [], db_conn, settings)).state
 
         assert state.token_count <= 500
         assert state.summary_text == "S1 S2 S3."
@@ -273,7 +273,7 @@ class TestInitializeKnowledgeBudget:
             ),
             patch("app.analysis.knowledge.count_tokens", side_effect=_heavy_word_count),
         ):
-            state = await initialize_knowledge(topic, [], db_conn, settings)
+            state = (await initialize_knowledge(topic, [], db_conn, settings)).state
 
         assert state.token_count <= 500
         assert "Sentence three here." not in state.summary_text
@@ -302,7 +302,7 @@ class TestInitializeKnowledgeBudget:
             patch("app.analysis.knowledge.compress_knowledge_summary", compress_mock),
             patch("app.analysis.knowledge.count_tokens", side_effect=_word_count_tokens),
         ):
-            state = await initialize_knowledge(topic, [], db_conn, settings)
+            state = (await initialize_knowledge(topic, [], db_conn, settings)).state
 
         assert state.summary_text == short_summary
         compress_mock.assert_not_called()
@@ -349,7 +349,7 @@ class TestUpdateKnowledgeBudget:
             ),
             patch("app.analysis.knowledge.count_tokens", side_effect=_heavy_word_count),
         ):
-            state = await update_knowledge(topic, novelty, db_conn, settings)
+            state = (await update_knowledge(topic, novelty, db_conn, settings)).state
 
         assert state.token_count <= 500
         # The third fact survives compression — a trailing truncation would have dropped it.
@@ -392,7 +392,7 @@ class TestUpdateKnowledgeBudget:
             ),
             patch("app.analysis.knowledge.count_tokens", side_effect=_heavy_word_count),
         ):
-            state = await update_knowledge(topic, novelty, db_conn, settings)
+            state = (await update_knowledge(topic, novelty, db_conn, settings)).state
 
         assert state.token_count <= 500
         assert "New fact three." not in state.summary_text
@@ -426,7 +426,7 @@ class TestUpdateKnowledgeBudget:
             patch("app.analysis.knowledge.compress_knowledge_summary", compress_mock),
             patch("app.analysis.knowledge.count_tokens", side_effect=_word_count_tokens),
         ):
-            state = await update_knowledge(topic, novelty, db_conn, settings)
+            state = (await update_knowledge(topic, novelty, db_conn, settings)).state
 
         assert state.summary_text == updated_summary
         compress_mock.assert_not_called()
