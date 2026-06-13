@@ -77,13 +77,20 @@ def _walk_outlines(
 
             name = text.strip() if text.strip() else _derive_name_from_url(xml_url)
 
-            result.topics.append(
-                {
-                    "name": name,
-                    "feed_urls": [xml_url],
-                    "tags": list(parent_tags),
-                }
-            )
+            # Merge feeds that share a topic name so a multi-feed topic
+            # round-trips intact (export writes one <outline> per feed_url,
+            # all sharing the topic name).
+            existing_topic = next((t for t in result.topics if t["name"] == name), None)
+            if existing_topic is not None:
+                existing_topic["feed_urls"].append(xml_url)
+            else:
+                result.topics.append(
+                    {
+                        "name": name,
+                        "feed_urls": [xml_url],
+                        "tags": list(parent_tags),
+                    }
+                )
             # Track this URL as existing for in-import dedup
             existing_feed_urls.add(xml_url)
         else:
