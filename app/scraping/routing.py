@@ -48,13 +48,27 @@ class ProviderRouter:
         return self.providers[0]
 
     def get_next_provider(self, after: NewsProvider) -> NewsProvider | None:
-        """Return the next healthy provider after the given one, or None."""
+        """Return the next provider after the given one, or None.
+
+        Prefers a healthy provider after ``after``. When every provider is
+        unhealthy, falls back to the first OTHER provider (mirroring
+        :meth:`get_provider`'s all-unhealthy best-effort behaviour) so the
+        within-cycle retry still attempts the second provider during the
+        shared 30-minute cooldown instead of silently returning nothing.
+        """
         found = False
         for provider in self.providers:
             if found and self._is_healthy(provider.name):
                 return provider
             if provider.name == after.name:
                 found = True
+        # No healthy successor. If ALL providers are unhealthy, fall back to
+        # the first provider that isn't ``after`` (best effort, same as
+        # get_provider's all-unhealthy path).
+        if not any(self._is_healthy(p.name) for p in self.providers):
+            for provider in self.providers:
+                if provider.name != after.name:
+                    return provider
         return None
 
     def mark_unhealthy(self, provider_name: str) -> None:
