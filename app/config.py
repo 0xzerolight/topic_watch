@@ -312,6 +312,9 @@ def save_settings_to_yaml(settings: "Settings", config_path: Path) -> None:
     if settings.notifications.webhook_urls:
         data["notifications"]["webhook_urls"] = settings.notifications.webhook_urls
 
+    # Ensure the parent directory exists (first-run / fresh data/ dir).
+    effective_path.parent.mkdir(parents=True, exist_ok=True)
+
     with open(effective_path, "w") as f:
         yaml.dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
 
