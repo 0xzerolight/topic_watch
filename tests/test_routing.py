@@ -60,6 +60,18 @@ class TestGetNextProvider:
             router.mark_unhealthy("google_news")
         assert router.get_next_provider(bing) is None
 
+    def test_falls_back_when_all_unhealthy(self) -> None:
+        """When BOTH providers are unhealthy, get_next_provider still returns
+        the other provider (best effort), matching get_provider's behaviour."""
+        router = _make_router()
+        bing = router.providers[0]
+        for _ in range(_FAILURE_THRESHOLD):
+            router.mark_unhealthy("bing_news")
+            router.mark_unhealthy("google_news")
+        next_provider = router.get_next_provider(bing)
+        assert next_provider is not None
+        assert next_provider.name == "google_news"
+
 
 class TestMarkUnhealthy:
     def test_single_failure_stays_healthy(self) -> None:
