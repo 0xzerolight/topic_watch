@@ -328,6 +328,63 @@ class TestAddTopic:
             )
         assert response.status_code == 303
 
+    async def test_create_topic_persists_thresholds(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """Per-topic confidence/relevance thresholds are persisted on create."""
+        with patch("app.web.routers.background._run_init", new_callable=AsyncMock):
+            await client.post(
+                "/topics",
+                data={
+                    "name": "Thresholded",
+                    "description": "Test",
+                    "feed_urls": "",
+                    "confidence_threshold": "0.9",
+                    "relevance_threshold": "0.5",
+                },
+                follow_redirects=False,
+            )
+
+        from app.crud import get_topic_by_name
+
+        topic = get_topic_by_name(db_conn, "Thresholded")
+        assert topic is not None
+        assert topic.confidence_threshold == 0.9
+        assert topic.relevance_threshold == 0.5
+
+    async def test_create_topic_blank_thresholds_inherit(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """Blank threshold inputs store NULL (inherit global)."""
+        with patch("app.web.routers.background._run_init", new_callable=AsyncMock):
+            await client.post(
+                "/topics",
+                data={"name": "NoThresh", "description": "Test", "feed_urls": ""},
+                follow_redirects=False,
+            )
+
+        from app.crud import get_topic_by_name
+
+        topic = get_topic_by_name(db_conn, "NoThresh")
+        assert topic is not None
+        assert topic.confidence_threshold is None
+        assert topic.relevance_threshold is None
+
+    async def test_create_topic_rejects_out_of_range_threshold(self, client: httpx.AsyncClient) -> None:
+        """Out-of-range threshold values return 422."""
+        response = await client.post(
+            "/topics",
+            data={
+                "name": "BadThresh",
+                "description": "Test",
+                "feed_urls": "",
+                "confidence_threshold": "1.5",
+            },
+            follow_redirects=False,
+        )
+        assert response.status_code == 422
+        assert "between 0.0 and 1.0" in response.text
+
 
 # --- Topic Detail ---
 

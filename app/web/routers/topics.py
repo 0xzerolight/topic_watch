@@ -25,6 +25,7 @@ from app.crud import (
     get_topic,
     list_articles_for_topic,
     list_check_results,
+    sum_check_tokens,
     update_topic,
 )
 from app.models import FeedMode, Topic, TopicStatus
@@ -33,7 +34,7 @@ from app.scraping.routing import router as provider_router
 from app.web.csrf import verify_csrf
 from app.web.dependencies import get_db_conn, get_settings
 from app.web.routers import background
-from app.web.routers._validation import validate_topic_form
+from app.web.routers._validation import parse_threshold, validate_topic_form
 from app.web.routers.templates import templates
 from app.web.state import _checking_state
 
@@ -43,9 +44,16 @@ router = APIRouter()
 
 
 @router.get("/topics/new", response_class=HTMLResponse)
-async def topic_add_form(request: Request):
+async def topic_add_form(request: Request, settings: Settings = Depends(get_settings)):
     """Render the add topic form."""
-    return templates.TemplateResponse(request, "topic_add.html", {})
+    return templates.TemplateResponse(
+        request,
+        "topic_add.html",
+        {
+            "global_confidence_threshold": settings.min_confidence_threshold,
+            "global_relevance_threshold": settings.min_relevance_threshold,
+        },
+    )
 
 
 @router.post("/topics", dependencies=[Depends(verify_csrf)])
@@ -60,10 +68,14 @@ async def create_topic_handler(
     feed_mode: str = Form("auto"),
     check_interval: str = Form(""),
     tags: str = Form(""),
+    confidence_threshold: str = Form(""),
+    relevance_threshold: str = Form(""),
 ):
     """Create a new topic and kick off initial research in the background."""
     mode, urls, parsed_interval, errors = validate_topic_form(feed_mode, feed_urls, check_interval)
     tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+    conf_threshold = parse_threshold(confidence_threshold, "Confidence threshold", errors)
+    rel_threshold = parse_threshold(relevance_threshold, "Relevance threshold", errors)
 
     if errors:
         return templates.TemplateResponse(
@@ -77,6 +89,10 @@ async def create_topic_handler(
                 "feed_mode": feed_mode,
                 "check_interval": check_interval,
                 "tags": tags,
+                "confidence_threshold": confidence_threshold,
+                "relevance_threshold": relevance_threshold,
+                "global_confidence_threshold": settings.min_confidence_threshold,
+                "global_relevance_threshold": settings.min_relevance_threshold,
             },
             status_code=422,
         )
@@ -90,6 +106,8 @@ async def create_topic_handler(
         status_changed_at=datetime.now(UTC),
         check_interval_minutes=parsed_interval,
         tags=tag_list,
+        confidence_threshold=conf_threshold,
+        relevance_threshold=rel_threshold,
     )
     created = create_topic(conn, topic)
     conn.commit()
@@ -128,6 +146,7 @@ async def topic_detail(
     knowledge = get_knowledge_state(conn, topic_id)
     checks = list_check_results(conn, topic_id, limit=per_page, offset=offset)
     total_checks = count_check_results(conn, topic_id)
+    total_prompt_tokens, total_completion_tokens = sum_check_tokens(conn, topic_id)
     articles = list_articles_for_topic(conn, topic_id, limit=per_page)
     article_count = count_articles_for_topic(conn, topic_id)
     total_pages = max(1, (total_checks + per_page - 1) // per_page)
@@ -164,6 +183,8 @@ async def topic_detail(
             "default_interval": settings.check_interval,
             "knowledge_state_max_tokens": settings.knowledge_state_max_tokens,
             "feed_health_map": feed_health_map,
+            "total_prompt_tokens": total_prompt_tokens,
+            "total_completion_tokens": total_completion_tokens,
         },
     )
 
@@ -336,6 +357,8 @@ async def topic_edit_form(
             "formatted_interval": formatted,
             "default_interval": settings.check_interval,
             "tags_string": ", ".join(topic.tags),
+            "global_confidence_threshold": settings.min_confidence_threshold,
+            "global_relevance_threshold": settings.min_relevance_threshold,
         },
     )
 
@@ -352,6 +375,8 @@ async def edit_topic_handler(
     feed_mode: str = Form("auto"),
     check_interval: str = Form(""),
     tags: str = Form(""),
+    confidence_threshold: str = Form(""),
+    relevance_threshold: str = Form(""),
 ):
     """Update an existing topic's name, description, feed URLs, and feed mode."""
     topic = get_topic(conn, topic_id)
@@ -360,6 +385,8 @@ async def edit_topic_handler(
 
     mode, urls, parsed_interval, errors = validate_topic_form(feed_mode, feed_urls, check_interval)
     tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+    conf_threshold = parse_threshold(confidence_threshold, "Confidence threshold", errors)
+    rel_threshold = parse_threshold(relevance_threshold, "Relevance threshold", errors)
 
     if errors:
         return templates.TemplateResponse(
@@ -374,7 +401,11 @@ async def edit_topic_handler(
                 "feed_mode": feed_mode,
                 "check_interval": check_interval,
                 "tags": tags,
+                "confidence_threshold": confidence_threshold,
+                "relevance_threshold": relevance_threshold,
                 "default_interval": settings.check_interval,
+                "global_confidence_threshold": settings.min_confidence_threshold,
+                "global_relevance_threshold": settings.min_relevance_threshold,
             },
             status_code=422,
         )
@@ -385,6 +416,8 @@ async def edit_topic_handler(
     topic.feed_mode = mode
     topic.check_interval_minutes = parsed_interval
     topic.tags = tag_list
+    topic.confidence_threshold = conf_threshold
+    topic.relevance_threshold = rel_threshold
     update_topic(conn, topic)
     conn.commit()
 

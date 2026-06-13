@@ -32,3 +32,23 @@ def validate_topic_form(
             errors.append(str(e))
 
     return mode, urls, parsed_interval, errors
+
+
+def parse_threshold(value: str, label: str, errors: list[str]) -> float | None:
+    """Parse an optional 0.0-1.0 threshold field.
+
+    Blank input returns ``None`` (inherit the global threshold). Non-numeric or
+    out-of-range input appends a message to ``errors`` and returns ``None``.
+    """
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        parsed = float(text)
+    except ValueError:
+        errors.append(f"{label} must be a number between 0.0 and 1.0")
+        return None
+    if not 0.0 <= parsed <= 1.0:
+        errors.append(f"{label} must be between 0.0 and 1.0")
+        return None
+    return parsed

@@ -32,6 +32,10 @@ from app.webhooks import send_webhooks
 
 logger = logging.getLogger(__name__)
 
+# Maximum number of initialization passes before a thin topic is forced READY
+# with whatever (insufficient) knowledge exists, to avoid looping forever.
+MAX_INIT_ATTEMPTS = 3
+
 
 async def check_topic(
     topic: Topic,
@@ -123,26 +127,38 @@ async def _check_topic_inner(
     novelty = await analyze_articles(new_articles, knowledge_summary, topic, settings)
     result.has_new_info = novelty.has_new_info
     result.llm_response = novelty.model_dump_json()
+    result.prompt_tokens += novelty.prompt_tokens
+    result.completion_tokens += novelty.completion_tokens
+
+    # Effective thresholds: per-topic override (NULL = inherit global).
+    confidence_threshold = (
+        topic.confidence_threshold if topic.confidence_threshold is not None else settings.min_confidence_threshold
+    )
+    relevance_threshold = (
+        topic.relevance_threshold if topic.relevance_threshold is not None else settings.min_relevance_threshold
+    )
 
     # Step 4: If new info, update knowledge and notify
     if novelty.has_new_info:
-        if novelty.confidence < settings.min_confidence_threshold:
+        if novelty.confidence < confidence_threshold:
             logger.info(
                 "Topic '%s': new info detected but confidence %.2f below threshold %.2f, skipping notification",
                 topic.name,
                 novelty.confidence,
-                settings.min_confidence_threshold,
+                confidence_threshold,
             )
-        elif novelty.relevance < settings.min_relevance_threshold:
+        elif novelty.relevance < relevance_threshold:
             logger.info(
                 "Topic '%s': new info detected but relevance %.2f below threshold %.2f, skipping notification",
                 topic.name,
                 novelty.relevance,
-                settings.min_relevance_threshold,
+                relevance_threshold,
             )
         else:
             try:
-                await update_knowledge(topic, novelty, conn, settings)
+                write_result = await update_knowledge(topic, novelty, conn, settings)
+                result.prompt_tokens += write_result.usage.prompt_tokens
+                result.completion_tokens += write_result.usage.completion_tokens
             except Exception:
                 logger.warning(
                     "Knowledge update failed for topic '%s'",
@@ -337,19 +353,46 @@ async def initialize_new_topic(
             return
 
         # create_knowledge_state uses INSERT OR REPLACE, so re-init works atomically
-        await initialize_knowledge(topic, articles, conn, settings)
+        write_result = await initialize_knowledge(topic, articles, conn, settings)
 
         article_ids = [a.id for a in articles if a.id is not None]
         if article_ids:
             mark_articles_processed(conn, article_ids)
 
+        if not write_result.sufficient_data and topic.init_attempts < MAX_INIT_ATTEMPTS:
+            # Thin data: retry on a later cycle. Bump attempts and send the topic
+            # back to NEW so the scheduler's gradual init re-runs it. Do NOT mark
+            # READY yet.
+            topic.init_attempts += 1
+            topic.status = TopicStatus.NEW
+            topic.status_changed_at = datetime.now(UTC)
+            topic.error_message = None
+            update_topic(conn, topic)
+            conn.commit()
+            logger.info(
+                "Knowledge for topic '%s' insufficient — retry %d/%d, back to NEW",
+                topic.name,
+                topic.init_attempts,
+                MAX_INIT_ATTEMPTS,
+            )
+            return
+
+        # Either knowledge is sufficient, or attempts are exhausted: go READY.
         topic.status = TopicStatus.READY
         topic.status_changed_at = datetime.now(UTC)
         topic.error_message = None
+        topic.init_attempts = 0
         update_topic(conn, topic)
         conn.commit()
 
-        logger.info("Knowledge initialized for topic '%s' — now READY", topic.name)
+        if write_result.sufficient_data:
+            logger.info("Knowledge initialized for topic '%s' — now READY", topic.name)
+        else:
+            logger.warning(
+                "Topic '%s' READY with insufficient knowledge after %d attempts",
+                topic.name,
+                MAX_INIT_ATTEMPTS,
+            )
 
     except Exception as exc:
         logger.error("Knowledge init failed for topic '%s'", topic.name, exc_info=True)
