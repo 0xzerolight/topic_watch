@@ -275,7 +275,7 @@ class TestResolveGoogleNewsUrls:
                 return _REAL_ARTICLE_URL
             return url
 
-        with patch("app.scraping.google_news.resolve_google_news_url", side_effect=mock_resolve):
+        with patch("app.scraping.google_news._resolve_or_raise", side_effect=mock_resolve):
             resolved = await resolve_google_news_urls(urls, request_delay=0)
 
         assert _GOOGLE_RSS_URL in resolved
@@ -296,26 +296,63 @@ class TestResolveGoogleNewsUrls:
         async def mock_resolve(url, client):
             return url  # No resolution — returns same URL
 
-        with patch("app.scraping.google_news.resolve_google_news_url", side_effect=mock_resolve):
+        with patch("app.scraping.google_news._resolve_or_raise", side_effect=mock_resolve):
             resolved = await resolve_google_news_urls([_GOOGLE_RSS_URL], request_delay=0)
 
         assert resolved == {}
 
-    async def test_early_termination_on_first_failure(self) -> None:
-        """Stops resolving remaining URLs if the first one fails (likely rate limited)."""
+    async def test_single_failure_does_not_skip_remaining(self) -> None:
+        """One URL failing to resolve must NOT abort the rest — resolve as many as possible."""
+        google_url2 = "https://news.google.com/rss/articles/CBMiSecondArticle?oc=5"
+        google_url3 = "https://news.google.com/rss/articles/CBMiThirdArticle?oc=5"
+
+        async def mock_resolve(url, client):
+            # First URL fails (returns original); the others resolve fine.
+            if url == _GOOGLE_RSS_URL:
+                return url
+            return f"https://real.example.com/{_extract_article_id(url)}"
+
+        with patch("app.scraping.google_news._resolve_or_raise", side_effect=mock_resolve):
+            resolved = await resolve_google_news_urls([_GOOGLE_RSS_URL, google_url2, google_url3], request_delay=0)
+
+        # First failed and is excluded, but the other two are still resolved.
+        assert _GOOGLE_RSS_URL not in resolved
+        assert google_url2 in resolved
+        assert google_url3 in resolved
+
+    async def test_all_urls_attempted_despite_failures(self) -> None:
+        """Every URL is attempted even when earlier ones fail (no early abort)."""
         call_count = 0
 
         async def mock_resolve(url, client):
             nonlocal call_count
             call_count += 1
-            return url  # All fail
+            return url  # All fail (return original)
 
         google_url2 = "https://news.google.com/rss/articles/CBMiSecondArticle?oc=5"
-        with patch("app.scraping.google_news.resolve_google_news_url", side_effect=mock_resolve):
+        with patch("app.scraping.google_news._resolve_or_raise", side_effect=mock_resolve):
             resolved = await resolve_google_news_urls([_GOOGLE_RSS_URL, google_url2], request_delay=0)
 
         assert resolved == {}
-        assert call_count == 1  # Only tried the first URL
+        assert call_count == 2  # Both URLs attempted, not just the first
+
+    async def test_rate_limit_stops_remaining(self) -> None:
+        """A genuine 429 rate-limit DOES stop the batch (continuing would just be throttled)."""
+        call_count = 0
+
+        async def fake_get(client, url):
+            nonlocal call_count
+            call_count += 1
+            return httpx.Response(429, request=httpx.Request("GET", url))
+
+        google_url2 = "https://news.google.com/rss/articles/CBMiSecondArticle?oc=5"
+        google_url3 = "https://news.google.com/rss/articles/CBMiThirdArticle?oc=5"
+        with patch("app.scraping.google_news.safe_get", side_effect=fake_get):
+            resolved = await resolve_google_news_urls([_GOOGLE_RSS_URL, google_url2, google_url3], request_delay=0)
+
+        assert resolved == {}
+        # Stopped after the first URL's rate-limit (one page-fetch attempt only).
+        assert call_count == 1
 
 
 # ============================================================

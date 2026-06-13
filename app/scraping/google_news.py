@@ -50,6 +50,14 @@ def _extract_article_id(url: str) -> str | None:
     return None
 
 
+class _RateLimitedError(Exception):
+    """Raised internally when Google News returns HTTP 429.
+
+    Distinguishes a genuine rate-limit (where retrying further URLs is futile)
+    from an ordinary per-URL resolution failure (where the batch should continue).
+    """
+
+
 async def _get_decoding_params(
     article_id: str,
     client: httpx.AsyncClient,
@@ -57,6 +65,9 @@ async def _get_decoding_params(
     """Fetch signature and timestamp from the Google News article page.
 
     Returns (signature, timestamp) tuple or None on failure.
+
+    Raises:
+        _RateLimitedError: if Google returns HTTP 429.
     """
     for path_prefix in ("articles", "rss/articles"):
         url = f"https://news.google.com/{path_prefix}/{article_id}"
@@ -64,7 +75,7 @@ async def _get_decoding_params(
             response = await safe_get(client, url)
             if response.status_code == 429:
                 logger.warning("Google News rate limited (429) fetching decoding params")
-                return None
+                raise _RateLimitedError
             response.raise_for_status()
         except httpx.HTTPError as exc:
             logger.debug("Failed to fetch Google News article page (%s): %s", path_prefix, exc)
@@ -122,7 +133,7 @@ async def _decode_url(
         response = await safe_send(client, request)
         if response.status_code == 429:
             logger.warning("Google News rate limited (429) during URL decode")
-            return None
+            raise _RateLimitedError
         response.raise_for_status()
     except httpx.HTTPError as exc:
         logger.debug("batchexecute request failed: %s", exc)
@@ -149,7 +160,24 @@ async def resolve_google_news_url(
 ) -> str:
     """Resolve a single Google News redirect URL to the actual article URL.
 
-    Returns the resolved URL, or the original URL if resolution fails.
+    Returns the resolved URL, or the original URL if resolution fails
+    (including when rate-limited).
+    """
+    try:
+        return await _resolve_or_raise(url, client)
+    except _RateLimitedError:
+        return url
+
+
+async def _resolve_or_raise(
+    url: str,
+    client: httpx.AsyncClient,
+) -> str:
+    """Resolve a single URL, propagating ``_RateLimitedError`` on HTTP 429.
+
+    Returns the resolved URL, or the original URL on ordinary (non-rate-limit)
+    failure. The batch resolver uses the raised ``_RateLimitedError`` to decide
+    whether to abort the remaining URLs.
     """
     article_id = _extract_article_id(url)
     if not article_id:
@@ -176,7 +204,10 @@ async def resolve_google_news_urls(
     """Batch-resolve Google News redirect URLs to actual article URLs.
 
     Resolves URLs sequentially with a delay between requests to avoid
-    triggering Google's rate limiter. Stops early if a 429 is encountered.
+    triggering Google's rate limiter. A single URL failing to resolve does NOT
+    abort the batch — the resolver continues and resolves as many as possible.
+    Only a genuine HTTP 429 rate-limit aborts the remaining URLs, since
+    continuing would just be throttled too.
 
     Args:
         urls: List of URLs (may include non-Google News URLs, which are skipped).
@@ -192,6 +223,7 @@ async def resolve_google_news_urls(
         return {}
 
     resolved: dict[str, str] = {}
+    failures = 0
 
     async with httpx.AsyncClient(
         cookies=_CONSENT_COOKIE,
@@ -203,26 +235,29 @@ async def resolve_google_news_urls(
             if i > 0:
                 await asyncio.sleep(request_delay)
 
-            result = await resolve_google_news_url(url, client)
+            try:
+                result = await _resolve_or_raise(url, client)
+            except _RateLimitedError:
+                logger.warning(
+                    "Google News rate-limited (429); aborting remaining %d URL(s)",
+                    len(google_urls) - i - 1,
+                )
+                break
+
             if result == url:
-                # Check if this was a rate limit failure — if so, stop trying
-                # (resolve_google_news_url returns the original URL on any failure,
-                # including 429. We detect rate limiting by checking if the first
-                # resolution attempt fails, which strongly suggests all will fail.)
-                if i == 0:
-                    logger.warning(
-                        "First Google News URL resolution failed, skipping remaining %d URLs",
-                        len(google_urls) - 1,
-                    )
-                    break
+                # Ordinary resolution failure for this URL — log and keep going
+                # so one bad URL doesn't drop the rest of the batch.
+                failures += 1
+                logger.debug("Could not resolve Google News URL, continuing: %s", url[:80])
             else:
                 resolved[url] = result
+
+    if failures:
+        logger.info("Google News batch: %d URL(s) could not be resolved", failures)
 
     if resolved:
         logger.info("Resolved %d/%d Google News URLs to actual article URLs", len(resolved), len(google_urls))
     elif google_urls:
         logger.warning("Failed to resolve any of %d Google News URLs", len(google_urls))
-
-    return resolved
 
     return resolved
