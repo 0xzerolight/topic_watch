@@ -38,8 +38,10 @@
     <label for="llm_api_key">
         API Key
         <input type="password" id="llm_api_key" name="llm_api_key" required
-               value="{{ form.llm_api_key if form else '' }}"
                placeholder="Your LLM provider API key">
+        {% if form and form.llm_api_key %}
+        <small>For security, the API key is not echoed back — re-enter it.</small>
+        {% endif %}
     </label>
 
     <div id="base-url-group">
