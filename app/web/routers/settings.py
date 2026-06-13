@@ -2,6 +2,7 @@
 
 import logging
 
+import litellm
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
@@ -21,6 +22,61 @@ from app.web.routers.templates import templates
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Seconds to wait for the pre-flight credential ping before giving up.
+_PREFLIGHT_TIMEOUT = 15.0
+
+
+class LLMValidationError(Exception):
+    """Raised when a pre-flight LLM credential check fails.
+
+    The message is always user-safe: it never contains the API key and explains
+    what went wrong (bad key vs. unreachable base URL vs. bad model) and how to fix it.
+    """
+
+
+async def verify_llm_credentials(model: str, api_key: str, base_url: str | None) -> None:
+    """Make a minimal LLM call to confirm the supplied credentials actually work.
+
+    Sends a tiny ``litellm.acompletion`` ping. Returns ``None`` on success. On any
+    failure, raises :class:`LLMValidationError` with a friendly, key-free message.
+    The api_key is never included in raised messages.
+    """
+    try:
+        await litellm.acompletion(
+            model=model,
+            messages=[{"role": "user", "content": "ping"}],
+            api_key=api_key,
+            api_base=base_url,
+            max_tokens=1,
+            timeout=_PREFLIGHT_TIMEOUT,
+        )
+    except litellm.AuthenticationError as exc:
+        logger.warning("Setup pre-flight: authentication rejected for model %s", model)
+        raise LLMValidationError(
+            "Authentication failed: the API key was rejected by the provider. "
+            "Double-check the key for the correct provider and account."
+        ) from exc
+    except litellm.NotFoundError as exc:
+        logger.warning("Setup pre-flight: model not found for %s", model)
+        raise LLMValidationError(
+            f"The model '{model}' was not found. Check the model string uses the "
+            "LiteLLM 'provider/model-name' format and that the model exists."
+        ) from exc
+    except litellm.APIConnectionError as exc:
+        logger.warning("Setup pre-flight: connection failed for model %s", model)
+        target = base_url or "the provider's endpoint"
+        raise LLMValidationError(
+            f"Could not reach {target}. Check the base URL is correct and the server "
+            "is running and reachable from this machine."
+        ) from exc
+    except Exception as exc:
+        # Catch-all: never leak the api_key, never crash the request.
+        logger.warning("Setup pre-flight: validation failed for model %s (%s)", model, type(exc).__name__)
+        raise LLMValidationError(
+            f"The LLM credential check failed ({type(exc).__name__}). Verify the model, "
+            "API key, and base URL, then try again."
+        ) from exc
 
 
 @router.get("/setup", response_class=HTMLResponse)
@@ -69,10 +125,20 @@ async def complete_setup(
             ),
             notifications=NotificationSettings(),
         )
+        # Pre-flight: confirm the credentials actually work before completing setup,
+        # so a bad key/model/base_url is caught here instead of failing silently later.
+        await verify_llm_credentials(model=llm_model, api_key=llm_api_key, base_url=effective_base_url)
         save_settings_to_yaml(new_settings, request.app.state.config_path)
         request.app.state.settings = new_settings
         request.app.state.setup_required = False
         start_scheduler(new_settings, db_path=request.app.state.db_path)
+    except LLMValidationError as exc:
+        return templates.TemplateResponse(
+            request,
+            "setup.html",
+            {"setup_mode": True, "errors": [str(exc)], "form": form_values, **_provider_ctx},
+            status_code=422,
+        )
     except ValidationError as exc:
         errors = [f"{' → '.join(str(loc) for loc in e['loc'])}: {e['msg']}" for e in exc.errors()]
         return templates.TemplateResponse(
