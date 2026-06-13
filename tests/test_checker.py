@@ -8,6 +8,7 @@ from app.analysis.llm import NoveltyResult
 from app.checker import check_all_topics, check_topic, retry_pending_notifications
 from app.config import LLMSettings, NotificationSettings, Settings
 from app.crud import (
+    create_article,
     create_knowledge_state,
     create_pending_notification,
     create_topic,
@@ -389,20 +390,19 @@ class TestCheckTopic:
         assert result.notification_sent is True
         assert result.has_new_info is True
 
-    async def test_low_confidence_skips_notification_and_leaves_articles_unprocessed(
-        self, db_conn: sqlite3.Connection
-    ) -> None:
+    async def test_low_confidence_skips_notification_but_marks_processed(self, db_conn: sqlite3.Connection) -> None:
         """New info with confidence below threshold → no notification, no knowledge update,
-        and articles are NOT marked as processed (so they get re-examined next cycle)."""
+        but articles ARE marked processed (we evaluated them) so they aren't re-analyzed."""
         topic = _make_topic(db_conn)
         create_knowledge_state(
             db_conn,
             KnowledgeState(topic_id=topic.id, summary_text="Known facts.", token_count=20),
         )
+        # Persist a real article so we can assert its processed flag from the DB.
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
         db_conn.commit()
         settings = _make_settings(min_confidence_threshold=0.6)
 
-        articles = [_make_article(topic_id=topic.id)]
         novelty = NoveltyResult(
             has_new_info=True,
             summary="Possibly new info",
@@ -413,16 +413,15 @@ class TestCheckTopic:
             patch(
                 "app.checker.fetch_new_articles_for_topic",
                 new_callable=AsyncMock,
-                return_value=FetchResult(articles=articles, total_feed_entries=len(articles)),
+                return_value=FetchResult(articles=[article], total_feed_entries=1),
             ),
             patch(
                 "app.checker.analyze_articles",
                 new_callable=AsyncMock,
                 return_value=novelty,
-            ),
+            ) as mock_analyze,
             patch("app.checker.update_knowledge", new_callable=AsyncMock) as mock_update,
             patch("app.checker.send_notification") as mock_send,
-            patch("app.checker.mark_articles_processed") as mock_mark,
         ):
             result = await check_topic(topic, db_conn, settings)
 
@@ -431,7 +430,25 @@ class TestCheckTopic:
         assert result.notification_sent is False
         mock_update.assert_not_called()
         mock_send.assert_not_called()
-        mock_mark.assert_not_called()
+
+        # Below-threshold article is still marked processed.
+        assert article.id is not None
+        row = db_conn.execute("SELECT processed FROM articles WHERE id = ?", (article.id,)).fetchone()
+        assert row["processed"] == 1
+
+        # Next cycle: only unprocessed articles are fetched, so analyze is not
+        # called again — proving no re-analysis loop.
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[], total_feed_entries=1),
+            ),
+            patch("app.checker.analyze_articles", new_callable=AsyncMock) as mock_analyze2,
+        ):
+            await check_topic(topic, db_conn, settings)
+        mock_analyze2.assert_not_called()
+        mock_analyze.assert_called_once()
 
     async def test_high_confidence_sends_notification(self, db_conn: sqlite3.Connection) -> None:
         """New info with confidence above threshold → normal flow."""
@@ -472,17 +489,17 @@ class TestCheckTopic:
         mock_update.assert_called_once()
         mock_send.assert_called_once()
 
-    async def test_low_relevance_skips_notification(self, db_conn: sqlite3.Connection) -> None:
-        """New info with high confidence but low relevance → no notification, articles not processed."""
+    async def test_low_relevance_skips_notification_but_marks_processed(self, db_conn: sqlite3.Connection) -> None:
+        """New info with high confidence but low relevance → no notification, but still processed."""
         topic = _make_topic(db_conn)
         create_knowledge_state(
             db_conn,
             KnowledgeState(topic_id=topic.id, summary_text="Known facts.", token_count=20),
         )
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
         db_conn.commit()
         settings = _make_settings(min_relevance_threshold=0.5)
 
-        articles = [_make_article(topic_id=topic.id)]
         novelty = NoveltyResult(
             has_new_info=True,
             summary="Tangentially related info",
@@ -494,7 +511,7 @@ class TestCheckTopic:
             patch(
                 "app.checker.fetch_new_articles_for_topic",
                 new_callable=AsyncMock,
-                return_value=FetchResult(articles=articles, total_feed_entries=len(articles)),
+                return_value=FetchResult(articles=[article], total_feed_entries=1),
             ),
             patch(
                 "app.checker.analyze_articles",
@@ -503,7 +520,6 @@ class TestCheckTopic:
             ),
             patch("app.checker.update_knowledge", new_callable=AsyncMock) as mock_update,
             patch("app.checker.send_notification") as mock_send,
-            patch("app.checker.mark_articles_processed") as mock_mark,
         ):
             result = await check_topic(topic, db_conn, settings)
 
@@ -511,7 +527,83 @@ class TestCheckTopic:
         assert result.notification_sent is False
         mock_update.assert_not_called()
         mock_send.assert_not_called()
-        mock_mark.assert_not_called()
+
+        assert article.id is not None
+        row = db_conn.execute("SELECT processed FROM articles WHERE id = ?", (article.id,)).fetchone()
+        assert row["processed"] == 1
+
+
+# --- initialize_new_topic ---
+
+
+class TestInitializeNewTopicStatusChangedAt:
+    """status_changed_at must be refreshed on every status transition."""
+
+    async def test_ready_transition_sets_status_changed_at(self, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn, status=TopicStatus.NEW, status_changed_at=None)
+        settings = _make_settings()
+        from app.checker import initialize_new_topic
+
+        articles = [_make_article(id=None, topic_id=topic.id)]
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=articles, total_feed_entries=1),
+            ),
+            patch("app.checker.initialize_knowledge", new_callable=AsyncMock),
+        ):
+            await initialize_new_topic(topic, db_conn, settings)
+
+        from app.crud import get_topic
+
+        updated = get_topic(db_conn, topic.id)
+        assert updated.status == TopicStatus.READY
+        assert updated.status_changed_at is not None
+
+    async def test_no_articles_error_transition_sets_status_changed_at(self, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn, status=TopicStatus.NEW, status_changed_at=None)
+        settings = _make_settings()
+        from app.checker import initialize_new_topic
+
+        with patch(
+            "app.checker.fetch_new_articles_for_topic",
+            new_callable=AsyncMock,
+            return_value=FetchResult(articles=[], total_feed_entries=0),
+        ):
+            await initialize_new_topic(topic, db_conn, settings)
+
+        from app.crud import get_topic
+
+        updated = get_topic(db_conn, topic.id)
+        assert updated.status == TopicStatus.ERROR
+        assert updated.status_changed_at is not None
+
+    async def test_exception_error_transition_sets_status_changed_at(self, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn, status=TopicStatus.NEW, status_changed_at=None)
+        settings = _make_settings()
+        from app.checker import initialize_new_topic
+
+        articles = [_make_article(id=None, topic_id=topic.id)]
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=articles, total_feed_entries=1),
+            ),
+            patch(
+                "app.checker.initialize_knowledge",
+                new_callable=AsyncMock,
+                side_effect=Exception("LLM down"),
+            ),
+        ):
+            await initialize_new_topic(topic, db_conn, settings)
+
+        from app.crud import get_topic
+
+        updated = get_topic(db_conn, topic.id)
+        assert updated.status == TopicStatus.ERROR
+        assert updated.status_changed_at is not None
 
 
 # --- check_all_topics ---
