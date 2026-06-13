@@ -24,6 +24,12 @@ services:
           memory: 512M
     environment:
       - TZ=UTC
+      # Match the bind-mounted ./data ownership to your host user so the
+      # container can write the database/config. Defaults to 1000 (the typical
+      # first Linux user). If `id -u` on your host is not 1000, set PUID/PGID
+      # (e.g. in a .env file) to your host UID/GID.
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
       # Override config via environment variables instead of mounting config.yml:
       # TOPIC_WATCH_LLM__API_KEY: "your-api-key-here"
       # TOPIC_WATCH_LLM__MODEL: "openai/gpt-5.4-nano"
