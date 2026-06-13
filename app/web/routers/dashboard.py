@@ -30,6 +30,7 @@ async def dashboard(
     request: Request,
     conn: sqlite3.Connection = Depends(get_db_conn),
     tag: str | None = None,
+    error: str | None = None,
 ):
     """Dashboard showing all topics with status and last check time."""
     topic_data = get_dashboard_data(conn)
@@ -68,6 +69,7 @@ async def dashboard(
             "all_tags": all_tags,
             "active_tag": tag,
             "stats": stats,
+            "error": error,
         },
     )
 

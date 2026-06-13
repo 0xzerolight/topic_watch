@@ -92,6 +92,13 @@ class TestDashboard:
         assert response.status_code == 200
         assert "adding your first topic" in response.text
 
+    async def test_dashboard_shows_error_banner(self, client: httpx.AsyncClient) -> None:
+        """The ?error= query param (e.g. from a failed OPML import redirect) is surfaced."""
+        response = await client.get("/?error=No+file+selected")
+        assert response.status_code == 200
+        assert "No file selected" in response.text
+        assert "error-banner" in response.text
+
     async def test_dashboard_shows_topics(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
         """Dashboard lists topics with names."""
         _make_topic(db_conn, name="Topic A")
