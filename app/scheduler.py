@@ -5,15 +5,26 @@ an asyncio event loop. Designed to integrate with FastAPI's event
 loop in Session 5.
 """
 
+import asyncio
 import logging
 from pathlib import Path
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from app.checker import check_all_topics, initialize_new_topic
+from app.checker import (
+    check_topic,
+    initialize_new_topic,
+    retry_pending_notifications,
+)
 from app.config import Settings
-from app.crud import delete_old_articles, get_new_topics, recover_stuck_researching
+from app.crud import (
+    delete_old_articles,
+    get_new_topics,
+    get_topics_due_for_check,
+    recover_stuck_researching,
+)
 from app.database import get_db
+from app.webhooks import retry_pending_webhooks
 
 logger = logging.getLogger(__name__)
 
@@ -31,12 +42,21 @@ async def _cleanup_old_articles(settings: Settings, db_path: Path | None = None)
         logger.warning("Article cleanup failed", exc_info=True)
 
 
+def _vacuum_db_sync(db_path: Path | None = None) -> None:
+    """Run VACUUM synchronously with its own short-lived connection.
+
+    VACUUM rewrites the whole database file and can take a long time on a
+    large DB; run it off the event loop (see _vacuum_db).
+    """
+    with get_db(db_path) as conn:
+        conn.execute("VACUUM")
+        logger.info("Database VACUUM completed")
+
+
 async def _vacuum_db(db_path: Path | None = None) -> None:
-    """Run VACUUM on the database to reclaim disk space."""
+    """Run VACUUM in a worker thread so it can't block the event loop."""
     try:
-        with get_db(db_path) as conn:
-            conn.execute("VACUUM")
-            logger.info("Database VACUUM completed")
+        await asyncio.to_thread(_vacuum_db_sync, db_path)
     except Exception:
         logger.warning("Database VACUUM failed", exc_info=True)
 
@@ -67,16 +87,62 @@ async def _init_new_topics(settings: Settings, db_path: Path | None = None) -> N
         logger.error("NEW topic initialization failed", exc_info=True)
 
 
+async def _run_check_cycle(settings: Settings, db_path: Path | None = None) -> None:
+    """Run one check cycle with per-topic connection granularity.
+
+    A single connection held for the whole cycle would stay open across every
+    topic's HTTP + LLM awaits, blocking concurrent web requests (only
+    busy_timeout would save them). Instead each phase uses its own short-lived
+    connection that is committed and closed promptly:
+
+      * retry passes (notifications + webhooks) — one connection
+      * the due-topics query — one connection
+      * each topic check — a fresh connection per topic
+    """
+    # Retry any failed deliveries from previous cycles (short-lived connection).
+    with get_db(db_path) as conn:
+        await retry_pending_notifications(conn, settings)
+        await retry_pending_webhooks(conn, settings)
+
+    # Snapshot the due topics, then release the connection before the long
+    # per-topic HTTP/LLM work begins.
+    with get_db(db_path) as conn:
+        due_topics = get_topics_due_for_check(conn, settings.check_interval_minutes)
+
+    if not due_topics:
+        return
+
+    logger.info("Starting check cycle for %d due topics", len(due_topics))
+
+    new_info_count = 0
+    for topic in due_topics:
+        # Fresh, short-lived connection per topic so no connection is held
+        # across that topic's HTTP/LLM awaits.
+        try:
+            with get_db(db_path) as conn:
+                result = await check_topic(topic, conn, settings)
+            if result.has_new_info:
+                new_info_count += 1
+        except Exception:
+            logger.error("Unexpected error checking topic '%s'", topic.name, exc_info=True)
+
+    logger.info(
+        "Check cycle complete: %d topics checked, %d with new info",
+        len(due_topics),
+        new_info_count,
+    )
+
+
 async def _scheduled_check(settings: Settings, db_path: Path | None = None) -> None:
     """Callback invoked by APScheduler on each interval.
 
-    Creates a fresh database connection for each check cycle.
+    Uses per-topic short-lived connections (see _run_check_cycle) so no
+    connection is held across the long HTTP/LLM awaits of a full cycle.
     Also initializes one NEW topic per tick for gradual OPML import processing.
     """
     logger.debug("Scheduled check tick")
     try:
-        with get_db(db_path) as conn:
-            await check_all_topics(conn, settings)
+        await _run_check_cycle(settings, db_path)
     except Exception:
         logger.error("Scheduled check cycle failed", exc_info=True)
 
