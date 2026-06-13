@@ -8,6 +8,7 @@ import argparse
 import asyncio
 import logging
 import sys
+from datetime import UTC, datetime
 
 from app.config import load_settings
 from app.crud import (
@@ -98,6 +99,7 @@ async def _cmd_init(topic_name: str) -> None:
         except Exception:
             logger.error("Failed to fetch articles for '%s'", topic_name, exc_info=True)
             topic.status = TopicStatus.ERROR
+            topic.status_changed_at = datetime.now(UTC)
             topic.error_message = "Failed to fetch articles during initialization"
             update_topic(conn, topic)
             sys.exit(1)
@@ -105,6 +107,7 @@ async def _cmd_init(topic_name: str) -> None:
         if not articles:
             logger.error("No articles found for '%s'. Check the feed URLs.", topic_name)
             topic.status = TopicStatus.ERROR
+            topic.status_changed_at = datetime.now(UTC)
             topic.error_message = "No articles found during initialization"
             update_topic(conn, topic)
             sys.exit(1)
@@ -123,6 +126,7 @@ async def _cmd_init(topic_name: str) -> None:
                 exc_info=True,
             )
             topic.status = TopicStatus.ERROR
+            topic.status_changed_at = datetime.now(UTC)
             topic.error_message = "LLM failed during knowledge initialization"
             update_topic(conn, topic)
             sys.exit(1)
@@ -134,6 +138,7 @@ async def _cmd_init(topic_name: str) -> None:
 
         # Transition to READY
         topic.status = TopicStatus.READY
+        topic.status_changed_at = datetime.now(UTC)
         topic.error_message = None
         update_topic(conn, topic)
 

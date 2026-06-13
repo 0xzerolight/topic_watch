@@ -125,7 +125,6 @@ async def _check_topic_inner(
     result.llm_response = novelty.model_dump_json()
 
     # Step 4: If new info, update knowledge and notify
-    below_threshold = False
     if novelty.has_new_info:
         if novelty.confidence < settings.min_confidence_threshold:
             logger.info(
@@ -134,7 +133,6 @@ async def _check_topic_inner(
                 novelty.confidence,
                 settings.min_confidence_threshold,
             )
-            below_threshold = True
         elif novelty.relevance < settings.min_relevance_threshold:
             logger.info(
                 "Topic '%s': new info detected but relevance %.2f below threshold %.2f, skipping notification",
@@ -142,7 +140,6 @@ async def _check_topic_inner(
                 novelty.relevance,
                 settings.min_relevance_threshold,
             )
-            below_threshold = True
         else:
             try:
                 await update_knowledge(topic, novelty, conn, settings)
@@ -169,9 +166,11 @@ async def _check_topic_inner(
                 result.notification_error = str(exc)
                 _queue_notification(conn, topic_id, title, body)
 
-            # Send webhooks (independent of Apprise success/failure)
+            # Send webhooks (independent of Apprise success/failure). Pass the
+            # connection + topic_id so failed deliveries are enqueued to
+            # pending_webhooks for retry instead of being dropped.
             try:
-                await send_webhooks(topic.name, novelty, settings)
+                await send_webhooks(topic.name, novelty, settings, conn=conn, topic_id=topic_id)
             except Exception:
                 logger.warning(
                     "Webhook delivery failed for topic '%s'",
@@ -179,11 +178,14 @@ async def _check_topic_inner(
                     exc_info=True,
                 )
 
-    # Step 5: Mark articles as processed (skip if below threshold — re-examine next cycle)
-    if not below_threshold:
-        article_ids = [a.id for a in new_articles if a.id is not None]
-        if article_ids:
-            mark_articles_processed(conn, article_ids)
+    # Step 5: Mark articles as processed. "processed" means "we've evaluated
+    # this article" — set even for below-threshold (new-but-not-notified) and
+    # not-new articles, so they are never re-analyzed. Leaving them unprocessed
+    # would re-fetch + re-analyze them every cycle after retention deletion +
+    # feed reappearance, wasting LLM quota.
+    article_ids = [a.id for a in new_articles if a.id is not None]
+    if article_ids:
+        mark_articles_processed(conn, article_ids)
 
     logger.info(
         "Topic '%s': %d articles, new_info=%s, notified=%s",
@@ -328,6 +330,7 @@ async def initialize_new_topic(
 
         if not articles:
             topic.status = TopicStatus.ERROR
+            topic.status_changed_at = datetime.now(UTC)
             topic.error_message = "No articles found during initialization"
             update_topic(conn, topic)
             conn.commit()
@@ -341,6 +344,7 @@ async def initialize_new_topic(
             mark_articles_processed(conn, article_ids)
 
         topic.status = TopicStatus.READY
+        topic.status_changed_at = datetime.now(UTC)
         topic.error_message = None
         update_topic(conn, topic)
         conn.commit()
@@ -350,6 +354,7 @@ async def initialize_new_topic(
     except Exception as exc:
         logger.error("Knowledge init failed for topic '%s'", topic.name, exc_info=True)
         topic.status = TopicStatus.ERROR
+        topic.status_changed_at = datetime.now(UTC)
         topic.error_message = str(exc)
         update_topic(conn, topic)
         conn.commit()

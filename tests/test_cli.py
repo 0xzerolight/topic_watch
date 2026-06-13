@@ -126,6 +126,8 @@ class TestCmdInit:
 
         updated = get_topic(db_conn, topic.id)
         assert updated.status == TopicStatus.READY
+        # status_changed_at must be refreshed on the READY transition.
+        assert updated.status_changed_at is not None
         state = get_knowledge_state(db_conn, topic.id)
         assert state is not None
         assert state.summary_text == "New knowledge."
@@ -183,6 +185,8 @@ class TestCmdInit:
         updated = get_topic(db_conn, topic.id)
         assert updated.status == TopicStatus.ERROR
         assert "no articles" in updated.error_message.lower()
+        # status_changed_at must be refreshed on the ERROR transition too.
+        assert updated.status_changed_at is not None
 
     async def test_init_knowledge_failure_sets_error(self, db_conn: sqlite3.Connection) -> None:
         topic = create_topic(
