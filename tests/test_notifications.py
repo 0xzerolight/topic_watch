@@ -1,5 +1,6 @@
 """Tests for the notification module: Apprise wrapper and formatting."""
 
+import time
 from unittest.mock import MagicMock, patch
 
 from app.analysis.llm import NoveltyResult
@@ -141,6 +142,23 @@ class TestSendNotification:
         mock_instance.notify.return_value = False
         mock_apprise.return_value = mock_instance
         settings = _make_settings()
+
+        result = await send_notification("Title", "Body", settings)
+
+        assert result is False
+
+    @patch("app.notifications.apprise.Apprise")
+    async def test_returns_false_on_timeout(self, mock_apprise: MagicMock) -> None:
+        """A hung notify is abandoned after apprise_timeout_seconds, returning False."""
+        mock_instance = MagicMock()
+
+        def slow_notify(**_kwargs):
+            time.sleep(5)
+            return True
+
+        mock_instance.notify.side_effect = slow_notify
+        mock_apprise.return_value = mock_instance
+        settings = _make_settings(apprise_timeout_seconds=1)
 
         result = await send_notification("Title", "Body", settings)
 

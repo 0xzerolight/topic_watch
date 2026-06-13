@@ -80,6 +80,20 @@ def _send_notification_sync(title: str, body: str, settings: Settings) -> bool:
 async def send_notification(title: str, body: str, settings: Settings) -> bool:
     """Send a notification without blocking the async event loop.
 
-    Wraps the synchronous Apprise call in a thread executor.
+    Wraps the synchronous Apprise call in a thread executor, bounded by
+    apprise_timeout_seconds so a hung send can't exhaust the to_thread
+    executor and stall the scheduler. On timeout, logs a warning and returns
+    failure so the existing retry-queue path can handle it.
     """
-    return await asyncio.to_thread(_send_notification_sync, title, body, settings)
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_send_notification_sync, title, body, settings),
+            timeout=settings.apprise_timeout_seconds,
+        )
+    except TimeoutError:
+        logger.warning(
+            "Notification timed out after %ss: %s",
+            settings.apprise_timeout_seconds,
+            title,
+        )
+        return False
