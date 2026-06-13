@@ -171,3 +171,39 @@ class TestExportOPML:
         names = {t["name"] for t in result.topics}
         assert "Feed A" in names
         assert "Feed B" in names
+
+    def test_round_trip_multi_feed_topic(self):
+        """A topic with multiple feeds must round-trip as ONE topic with both feeds."""
+        original_topics = [
+            {
+                "name": "Multi",
+                "feed_urls": ["https://a.example.com/feed", "https://b.example.com/feed"],
+                "tags": [],
+            },
+        ]
+        xml = export_opml(original_topics)
+        result = parse_opml(xml, set())
+        assert len(result.topics) == 1
+        assert result.topics[0]["name"] == "Multi"
+        assert set(result.topics[0]["feed_urls"]) == {
+            "https://a.example.com/feed",
+            "https://b.example.com/feed",
+        }
+
+    def test_round_trip_multi_feed_topic_in_folder(self):
+        """Multi-feed topic inside a tag folder also merges into one topic."""
+        original_topics = [
+            {
+                "name": "Multi",
+                "feed_urls": ["https://a.example.com/feed", "https://b.example.com/feed"],
+                "tags": ["Tech"],
+            },
+        ]
+        xml = export_opml(original_topics)
+        result = parse_opml(xml, set())
+        assert len(result.topics) == 1
+        assert result.topics[0]["tags"] == ["Tech"]
+        assert set(result.topics[0]["feed_urls"]) == {
+            "https://a.example.com/feed",
+            "https://b.example.com/feed",
+        }
