@@ -5,12 +5,59 @@ data transfer between layers, and serialization to/from SQLite rows.
 """
 
 import json
+import logging
 import sqlite3
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Self
 
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
+
+
+def _coerce_dt(value: object) -> datetime | None:
+    """Parse a DB datetime cell defensively.
+
+    Mirrors ``FeedHealth.from_row``: empty/whitespace-only strings and
+    unparseable values become ``None`` rather than reaching Pydantic as a raw
+    string and raising ``ValidationError`` on legacy/migrated/corrupt rows.
+    Already-parsed ``datetime`` instances pass through untouched.
+    """
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        if not value.strip():
+            return None
+        try:
+            return datetime.fromisoformat(value)
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def _coerce_required_dt(value: object) -> datetime:
+    """Parse a *required* datetime cell, defaulting to now(UTC) when corrupt.
+
+    Required datetime columns cannot be ``None``. A single bad/empty cell must
+    still not 500 the route that loads it, so fall back to the current time.
+    """
+    parsed = _coerce_dt(value)
+    if parsed is None:
+        if value not in (None, ""):
+            logger.warning("Corrupt required datetime %r in DB row; defaulting to now(UTC)", value)
+        return datetime.now(UTC)
+    return parsed
+
+
+def _safe_json(value: object, default: object) -> object:
+    """Parse a JSON TEXT cell, returning ``default`` on malformed/empty input."""
+    if not isinstance(value, str) or not value.strip():
+        return default
+    try:
+        return json.loads(value)
+    except (ValueError, TypeError):
+        return default
 
 
 class TopicStatus(StrEnum):
@@ -49,9 +96,11 @@ class Topic(BaseModel):
     def from_row(cls, row: sqlite3.Row) -> Self:
         """Construct a Topic from a database row."""
         data = dict(row)
-        data["feed_urls"] = json.loads(data["feed_urls"])
+        data["feed_urls"] = _safe_json(data.get("feed_urls"), [])
         data["is_active"] = bool(data["is_active"])
-        data["tags"] = json.loads(data.get("tags") or "[]")
+        data["tags"] = _safe_json(data.get("tags"), [])
+        data["created_at"] = _coerce_required_dt(data.get("created_at"))
+        data["status_changed_at"] = _coerce_dt(data.get("status_changed_at"))
         # Backwards compatibility: if check_interval_minutes is absent but
         # check_interval_hours is present, convert hours to minutes.
         if data.get("check_interval_minutes") is None and data.get("check_interval_hours") is not None:
@@ -92,6 +141,7 @@ class Article(BaseModel):
         """Construct an Article from a database row."""
         data = dict(row)
         data["processed"] = bool(data["processed"])
+        data["fetched_at"] = _coerce_required_dt(data.get("fetched_at"))
         return cls(**data)
 
     def to_insert_dict(self) -> dict:
@@ -114,7 +164,9 @@ class KnowledgeState(BaseModel):
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Self:
         """Construct a KnowledgeState from a database row."""
-        return cls(**dict(row))
+        data = dict(row)
+        data["updated_at"] = _coerce_required_dt(data.get("updated_at"))
+        return cls(**data)
 
     def to_insert_dict(self) -> dict:
         """Return a dict for SQL INSERT (excludes auto-generated id)."""
@@ -142,6 +194,7 @@ class CheckResult(BaseModel):
         data = dict(row)
         data["has_new_info"] = bool(data["has_new_info"])
         data["notification_sent"] = bool(data["notification_sent"])
+        data["checked_at"] = _coerce_required_dt(data.get("checked_at"))
         return cls(**data)
 
     def to_insert_dict(self) -> dict:
@@ -210,7 +263,9 @@ class PendingNotification(BaseModel):
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Self:
         """Construct a PendingNotification from a database row."""
-        return cls(**dict(row))
+        data = dict(row)
+        data["created_at"] = _coerce_required_dt(data.get("created_at"))
+        return cls(**data)
 
     def to_insert_dict(self) -> dict:
         """Return a dict for SQL INSERT (excludes auto-generated id)."""
