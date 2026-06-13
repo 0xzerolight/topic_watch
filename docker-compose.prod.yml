@@ -24,3 +24,9 @@ services:
           memory: 512M
     environment:
       - TZ=UTC
+      # Match the bind-mounted ./data ownership to your host user so the
+      # container can write the database/config. Defaults to 1000 (the typical
+      # first Linux user). If `id -u` on your host is not 1000, set PUID/PGID
+      # (the install script writes these to .env automatically).
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
