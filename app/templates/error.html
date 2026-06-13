@@ -5,5 +5,12 @@
     <h1>{{ status_code }}</h1>
     <p>{{ detail }}</p>
 </hgroup>
-<p><a href="/">Back to Dashboard</a></p>
+{% if status_code == 404 %}
+<p>That page or topic doesn't exist — it may have been deleted, or the link may be out of date.</p>
+{% elif status_code == 403 %}
+<p>This request couldn't be verified. Reload the page and try again.</p>
+{% elif status_code >= 500 %}
+<p>Something went wrong on the server. Check the application logs for details, then try again.</p>
+{% endif %}
+<p><a href="/" role="button">Back to Dashboard</a></p>
 {% endblock %}
