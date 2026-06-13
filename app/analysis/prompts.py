@@ -55,9 +55,16 @@ False negatives (missing an update) are much less harmful than false positives \
 In your reasoning field, briefly explain what you compared and why you reached \
 your conclusion. If has_new_info is true, list ONLY the specific new facts in \
 key_facts that directly answer or inform the topic description (not restatements \
-of known info, not tangentially related facts about the same subject). Every fact \
-in key_facts must pass this test: "Does this directly address what the description \
-asks about?" List the source article URLs in source_urls. \
+of known info, not tangentially related facts about the same subject). \
+key_facts is a delta, NOT a summary: it must contain ONLY information that is \
+ABSENT from the Current Knowledge State. Before adding any fact, check it against \
+the knowledge state — if that fact (or a paraphrase of it) is already present \
+there, DO NOT include it. Never copy or reword a sentence from the knowledge state \
+into key_facts. Every fact in key_facts must pass BOTH tests: (1) "Is this absent \
+from the current knowledge state?" and (2) "Does this directly address what the \
+description asks about?" If the new development is conveyed by the summary alone \
+and no fact is genuinely new, return an empty key_facts list. \
+List the source article URLs in source_urls. \
 Set confidence using this scale:
 - 0.9-1.0: Official/primary source, unambiguous new fact, directly answers the topic description
 - 0.7-0.8: Credible secondary source, clear new fact, directly relevant to description

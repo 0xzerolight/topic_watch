@@ -6,6 +6,8 @@ validation retry. All LLM calls go through this module.
 
 import asyncio
 import logging
+import re
+from dataclasses import dataclass
 from typing import Any, cast
 
 import instructor
@@ -24,11 +26,58 @@ from app.models import Article, Topic
 logger = logging.getLogger(__name__)
 
 
+# --- Token usage ---
+
+
+@dataclass(frozen=True)
+class TokenUsage:
+    """Per-call LLM token consumption, extracted from the raw completion.
+
+    Both fields default to 0 when usage is unavailable (some providers omit it,
+    or the call short-circuited to a safe default before any LLM round-trip).
+    """
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+
+def _extract_usage(completion: Any) -> TokenUsage:
+    """Pull prompt/completion token counts off a raw litellm completion.
+
+    Returns ``TokenUsage(0, 0)`` if the completion has no usable usage block
+    (missing attribute, None, or non-integer values) so callers never crash on
+    provider-specific shapes.
+    """
+    usage = getattr(completion, "usage", None)
+    if usage is None:
+        return TokenUsage()
+
+    def _coerce(value: Any) -> int:
+        try:
+            return int(value) if value is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    # litellm.Usage supports both attribute and mapping access depending on provider.
+    prompt = getattr(usage, "prompt_tokens", None)
+    completion_tokens = getattr(usage, "completion_tokens", None)
+    if prompt is None and isinstance(usage, dict):
+        prompt = usage.get("prompt_tokens")
+    if completion_tokens is None and isinstance(usage, dict):
+        completion_tokens = usage.get("completion_tokens")
+    return TokenUsage(prompt_tokens=_coerce(prompt), completion_tokens=_coerce(completion_tokens))
+
+
 # --- Response models (structured output) ---
 
 
 class NoveltyResult(BaseModel):
-    """LLM response for novelty detection."""
+    """LLM response for novelty detection.
+
+    ``prompt_tokens`` / ``completion_tokens`` are NOT filled by the LLM — they
+    default to 0 and are populated from the raw completion's usage after the
+    call (0 on the safe-default error path or when the provider omits usage).
+    """
 
     reasoning: str = Field(default="", description="Brief chain-of-thought: what you compared, why you decided.")
     has_new_info: bool
@@ -42,10 +91,17 @@ class NoveltyResult(BaseModel):
         default=0.0,
         description="How relevant the new information is to the topic description (0=off-topic, 1=exactly what user asked)",
     )
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
 
 class KnowledgeStateUpdate(BaseModel):
-    """LLM response for knowledge state init/update."""
+    """LLM response for knowledge state init/update.
+
+    ``prompt_tokens`` / ``completion_tokens`` are populated from the raw
+    completion's usage after the call (not filled by the LLM); they default to
+    0 when the provider omits usage.
+    """
 
     sufficient_data: bool = Field(
         description="False if the articles lack enough relevant information to build a useful summary."
@@ -57,6 +113,8 @@ class KnowledgeStateUpdate(BaseModel):
         description="The knowledge summary. If sufficient_data is false, explain what information was missing."
     )
     token_count: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
 
 class CompressedKnowledge(BaseModel):
@@ -128,6 +186,63 @@ async def _call_with_rate_limit_retry(
     raise last_exc
 
 
+# --- key_facts restatement filtering ---
+
+# A key_fact is dropped only when it is a CLEAR restatement of the existing
+# knowledge summary: either its normalized text already appears verbatim inside
+# the normalized summary, or its content words overlap the summary above this
+# threshold. Conservative by design — a high bar avoids dropping genuinely new facts.
+_RESTATEMENT_OVERLAP_THRESHOLD = 0.9
+_WORD_RE = re.compile(r"\w+")
+
+
+def _normalize_for_match(text: str) -> str:
+    """Lowercase and collapse whitespace for substring comparison."""
+    return " ".join(text.lower().split())
+
+
+def _content_words(text: str) -> set[str]:
+    """Extract lowercased word tokens for overlap comparison."""
+    return {m.group(0) for m in _WORD_RE.finditer(text.lower())}
+
+
+def _is_restatement(fact: str, knowledge_summary: str) -> bool:
+    """True if ``fact`` substantially restates content already in the summary.
+
+    Two conservative signals:
+    * normalized-substring: the fact's normalized text appears verbatim within
+      the normalized knowledge summary; or
+    * token-overlap: ≥ ``_RESTATEMENT_OVERLAP_THRESHOLD`` of the fact's content
+      words are already present in the summary.
+
+    An empty summary or empty fact is never a restatement.
+    """
+    if not knowledge_summary.strip() or not fact.strip():
+        return False
+
+    norm_fact = _normalize_for_match(fact)
+    norm_summary = _normalize_for_match(knowledge_summary)
+    if norm_fact and norm_fact in norm_summary:
+        return True
+
+    fact_words = _content_words(fact)
+    if not fact_words:
+        return False
+    summary_words = _content_words(knowledge_summary)
+    overlap = len(fact_words & summary_words) / len(fact_words)
+    return overlap >= _RESTATEMENT_OVERLAP_THRESHOLD
+
+
+def _filter_restated_key_facts(key_facts: list[str], knowledge_summary: str) -> list[str]:
+    """Drop key_facts that clearly restate the current knowledge summary.
+
+    Kept conservative: only removes clear restatements. If every fact is filtered
+    the caller keeps ``has_new_info`` as-is with an empty ``key_facts`` (the
+    summary still conveys the novelty).
+    """
+    return [fact for fact in key_facts if not _is_restatement(fact, knowledge_summary)]
+
+
 # --- Public API ---
 
 
@@ -140,13 +255,15 @@ async def analyze_articles(
     """Analyze articles for novelty against the current knowledge state.
 
     Returns a safe default (has_new_info=False) on any LLM error
-    to prevent spurious notifications.
+    to prevent spurious notifications. On success, ``prompt_tokens`` /
+    ``completion_tokens`` are populated from the raw completion's usage, and
+    ``key_facts`` that merely restate the knowledge summary are dropped.
     """
 
-    async def _do_call() -> NoveltyResult:
+    async def _do_call() -> tuple[NoveltyResult, Any]:
         client = _get_client(settings)
         messages = build_novelty_messages(articles, knowledge_summary, topic)
-        return await client.chat.completions.create(  # type: ignore[no-any-return]
+        return await client.chat.completions.create_with_completion(  # type: ignore[no-any-return]
             model=settings.llm.model,
             response_model=NoveltyResult,
             messages=messages,  # type: ignore[arg-type]
@@ -158,11 +275,17 @@ async def analyze_articles(
         )
 
     try:
-        result: NoveltyResult = await _call_with_rate_limit_retry(_do_call)
-        return result
+        result, completion = await _call_with_rate_limit_retry(_do_call)
     except Exception:
         logger.warning("LLM analysis failed for topic '%s'", topic.name, exc_info=True)
         return NoveltyResult(has_new_info=False, confidence=0.0)
+
+    novelty: NoveltyResult = result
+    usage = _extract_usage(completion)
+    novelty.prompt_tokens = usage.prompt_tokens
+    novelty.completion_tokens = usage.completion_tokens
+    novelty.key_facts = _filter_restated_key_facts(novelty.key_facts, knowledge_summary)
+    return novelty
 
 
 async def generate_initial_knowledge(
@@ -175,10 +298,10 @@ async def generate_initial_knowledge(
     Raises on failure — knowledge initialization is critical.
     """
 
-    async def _do_call() -> KnowledgeStateUpdate:
+    async def _do_call() -> tuple[KnowledgeStateUpdate, Any]:
         client = _get_client(settings)
         messages = build_knowledge_init_messages(articles, topic, settings.knowledge_state_max_tokens)
-        return await client.chat.completions.create(  # type: ignore[no-any-return]
+        return await client.chat.completions.create_with_completion(  # type: ignore[no-any-return]
             model=settings.llm.model,
             response_model=KnowledgeStateUpdate,
             messages=messages,  # type: ignore[arg-type]
@@ -189,8 +312,12 @@ async def generate_initial_knowledge(
             temperature=settings.llm_temperature,
         )
 
-    result: KnowledgeStateUpdate = await _call_with_rate_limit_retry(_do_call)
+    raw_result, completion = await _call_with_rate_limit_retry(_do_call)
+    result: KnowledgeStateUpdate = raw_result
     result.token_count = count_tokens(result.updated_summary, settings.llm.model)
+    usage = _extract_usage(completion)
+    result.prompt_tokens = usage.prompt_tokens
+    result.completion_tokens = usage.completion_tokens
     return result
 
 
@@ -239,7 +366,7 @@ async def generate_knowledge_update(
     Raises on failure — knowledge updates are critical.
     """
 
-    async def _do_call() -> KnowledgeStateUpdate:
+    async def _do_call() -> tuple[KnowledgeStateUpdate, Any]:
         client = _get_client(settings)
         messages = build_knowledge_update_messages(
             current_summary=current_summary,
@@ -248,7 +375,7 @@ async def generate_knowledge_update(
             topic=topic,
             max_tokens=settings.knowledge_state_max_tokens,
         )
-        return await client.chat.completions.create(  # type: ignore[no-any-return]
+        return await client.chat.completions.create_with_completion(  # type: ignore[no-any-return]
             model=settings.llm.model,
             response_model=KnowledgeStateUpdate,
             messages=messages,  # type: ignore[arg-type]
@@ -259,6 +386,10 @@ async def generate_knowledge_update(
             temperature=settings.llm_temperature,
         )
 
-    result: KnowledgeStateUpdate = await _call_with_rate_limit_retry(_do_call)
+    raw_result, completion = await _call_with_rate_limit_retry(_do_call)
+    result: KnowledgeStateUpdate = raw_result
     result.token_count = count_tokens(result.updated_summary, settings.llm.model)
+    usage = _extract_usage(completion)
+    result.prompt_tokens = usage.prompt_tokens
+    result.completion_tokens = usage.completion_tokens
     return result

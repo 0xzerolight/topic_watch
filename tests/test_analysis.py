@@ -69,11 +69,36 @@ def _make_article(**overrides) -> Article:
     return Article(**defaults)
 
 
-def _mock_instructor_client(return_value):
-    """Create a mock instructor client that returns the given value from create()."""
+class _FakeUsage:
+    def __init__(self, prompt_tokens: int = 11, completion_tokens: int = 7) -> None:
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+
+
+class _FakeCompletion:
+    def __init__(self, usage: _FakeUsage | None = None) -> None:
+        self.usage = usage if usage is not None else _FakeUsage()
+
+
+def _mock_instructor_client(return_value, *, completion=None):
+    """Create a mock instructor client.
+
+    The returned ``mock_create`` is the single seam tests assert on. It backs
+    ``client.chat.completions.create`` directly (used by ``compress_knowledge_summary``)
+    AND ``create_with_completion`` (used by analyze/init/update), where its
+    return value is wrapped as ``(model, completion)``. So ``mock_create.call_args``
+    and ``mock_create.call_count`` work for either path.
+    """
+    fake_completion = completion if completion is not None else _FakeCompletion()
     mock_create = AsyncMock(return_value=return_value)
+
+    async def _cwc(*args, **kwargs):
+        model = await mock_create(*args, **kwargs)
+        return model, fake_completion
+
     mock_completions = MagicMock()
     mock_completions.create = mock_create
+    mock_completions.create_with_completion = AsyncMock(side_effect=_cwc)
     mock_chat = MagicMock()
     mock_chat.completions = mock_completions
     mock_client = MagicMock()
@@ -760,12 +785,14 @@ class TestInitializeKnowledge:
             new_callable=AsyncMock,
             return_value=llm_result,
         ):
-            state = await initialize_knowledge(topic, articles, db_conn, settings)
+            result = await initialize_knowledge(topic, articles, db_conn, settings)
 
+        state = result.state
         assert state.id is not None
         assert state.topic_id == topic.id
         assert state.summary_text == "Initial summary."
         assert state.token_count == 30
+        assert result.sufficient_data is True
 
         # Verify persisted in DB
         stored = get_knowledge_state(db_conn, topic.id)
@@ -784,8 +811,9 @@ class TestInitializeKnowledge:
             new_callable=AsyncMock,
             return_value=llm_result,
         ):
-            state = await initialize_knowledge(topic, [], db_conn, settings)
+            result = await initialize_knowledge(topic, [], db_conn, settings)
 
+        state = result.state
         assert isinstance(state.id, int)
         assert state.id > 0
 
@@ -826,10 +854,13 @@ class TestInitializeKnowledge:
             new_callable=AsyncMock,
             return_value=llm_result,
         ):
-            state = await initialize_knowledge(topic, [], db_conn, settings)
+            result = await initialize_knowledge(topic, [], db_conn, settings)
 
+        state = result.state
         assert state.id is not None
         assert "did not contain" in state.summary_text
+        # Task 3: insufficient-data signal is programmatic, not string-parsed.
+        assert result.sufficient_data is False
 
         stored = get_knowledge_state(db_conn, topic.id)
         assert stored is not None
@@ -870,10 +901,12 @@ class TestUpdateKnowledge:
             new_callable=AsyncMock,
             return_value=llm_result,
         ):
-            state = await update_knowledge(topic, novelty, db_conn, settings)
+            result = await update_knowledge(topic, novelty, db_conn, settings)
 
+        state = result.state
         assert state.summary_text == "Updated summary with Fact 1."
         assert state.token_count == 35
+        assert result.sufficient_data is True
 
         # Verify persisted
         stored = get_knowledge_state(db_conn, topic.id)
@@ -939,11 +972,265 @@ class TestUpdateKnowledge:
             new_callable=AsyncMock,
             return_value=llm_result,
         ):
-            state = await update_knowledge(topic, novelty, db_conn, settings)
+            result = await update_knowledge(topic, novelty, db_conn, settings)
 
         # Should return the original state unchanged
+        state = result.state
         assert state.summary_text == "Existing knowledge."
         assert state.token_count == 15
+        assert result.sufficient_data is False
 
         stored = get_knowledge_state(db_conn, topic.id)
         assert stored.summary_text == "Existing knowledge."
+
+
+# ============================================================
+# TestTokenUsage (Task 1 — usage extraction + population)
+# ============================================================
+
+
+class TestExtractUsage:
+    def test_extracts_attribute_style_usage(self) -> None:
+        from app.analysis.llm import _extract_usage
+
+        usage = _extract_usage(_FakeCompletion(_FakeUsage(prompt_tokens=42, completion_tokens=17)))
+        assert usage.prompt_tokens == 42
+        assert usage.completion_tokens == 17
+
+    def test_missing_usage_returns_zeros(self) -> None:
+        from app.analysis.llm import _extract_usage
+
+        class _NoUsage:
+            usage = None
+
+        usage = _extract_usage(_NoUsage())
+        assert usage.prompt_tokens == 0
+        assert usage.completion_tokens == 0
+
+    def test_dict_style_usage(self) -> None:
+        from app.analysis.llm import _extract_usage
+
+        class _DictComp:
+            usage = {"prompt_tokens": 5, "completion_tokens": 9}
+
+        usage = _extract_usage(_DictComp())
+        assert usage.prompt_tokens == 5
+        assert usage.completion_tokens == 9
+
+    def test_non_integer_usage_coerces_to_zero(self) -> None:
+        from app.analysis.llm import _extract_usage
+
+        usage = _extract_usage(_FakeCompletion(_FakeUsage(prompt_tokens=None, completion_tokens="bad")))  # type: ignore[arg-type]
+        assert usage.prompt_tokens == 0
+        assert usage.completion_tokens == 0
+
+
+class TestAnalyzeArticlesTokenUsage:
+    async def test_populates_token_usage_from_completion(self) -> None:
+        expected = NoveltyResult(has_new_info=True, summary="New thing", confidence=0.9)
+        completion = _FakeCompletion(_FakeUsage(prompt_tokens=123, completion_tokens=45))
+        mock_client, _ = _mock_instructor_client(expected, completion=completion)
+        settings = _make_settings()
+
+        with patch("app.analysis.llm._get_client", return_value=mock_client):
+            result = await analyze_articles([_make_article()], "Known facts.", _make_topic(), settings)
+
+        assert result.prompt_tokens == 123
+        assert result.completion_tokens == 45
+
+    async def test_error_path_token_usage_is_zero(self) -> None:
+        mock_client, mock_create = _mock_instructor_client(None)
+        mock_create.side_effect = Exception("LLM API error")
+        settings = _make_settings()
+
+        with patch("app.analysis.llm._get_client", return_value=mock_client):
+            result = await analyze_articles([_make_article()], "Known facts.", _make_topic(), settings)
+
+        assert result.has_new_info is False
+        assert result.prompt_tokens == 0
+        assert result.completion_tokens == 0
+
+
+class TestGenerateKnowledgeTokenUsage:
+    async def test_initial_knowledge_exposes_usage(self) -> None:
+        expected = KnowledgeStateUpdate(sufficient_data=True, confidence=0.9, updated_summary="Init.", token_count=0)
+        completion = _FakeCompletion(_FakeUsage(prompt_tokens=200, completion_tokens=60))
+        mock_client, _ = _mock_instructor_client(expected, completion=completion)
+        settings = _make_settings()
+
+        with (
+            patch("app.analysis.llm._get_client", return_value=mock_client),
+            patch("app.analysis.llm.count_tokens", return_value=10),
+        ):
+            result = await generate_initial_knowledge([_make_article()], _make_topic(), settings)
+
+        assert result.prompt_tokens == 200
+        assert result.completion_tokens == 60
+
+    async def test_knowledge_update_exposes_usage(self) -> None:
+        expected = KnowledgeStateUpdate(sufficient_data=True, confidence=0.9, updated_summary="Upd.", token_count=0)
+        completion = _FakeCompletion(_FakeUsage(prompt_tokens=80, completion_tokens=30))
+        mock_client, _ = _mock_instructor_client(expected, completion=completion)
+        novelty = NoveltyResult(has_new_info=True, summary="X", confidence=0.8)
+        settings = _make_settings()
+
+        with (
+            patch("app.analysis.llm._get_client", return_value=mock_client),
+            patch("app.analysis.llm.count_tokens", return_value=10),
+        ):
+            result = await generate_knowledge_update("Old.", novelty, _make_topic(), settings)
+
+        assert result.prompt_tokens == 80
+        assert result.completion_tokens == 30
+
+
+class TestKnowledgeWriteResultUsage:
+    """initialize_knowledge / update_knowledge expose usage via KnowledgeWriteResult."""
+
+    async def test_initialize_exposes_usage(self, db_conn: sqlite3.Connection) -> None:
+        topic = Topic(name="UsageInit", description="D", feed_urls=[])
+        topic = create_topic(db_conn, topic)
+        db_conn.commit()
+        settings = _make_settings()
+
+        llm_result = KnowledgeStateUpdate(
+            sufficient_data=True,
+            confidence=0.9,
+            updated_summary="Initial.",
+            token_count=10,
+            prompt_tokens=150,
+            completion_tokens=40,
+        )
+        with patch(
+            "app.analysis.knowledge.generate_initial_knowledge",
+            new_callable=AsyncMock,
+            return_value=llm_result,
+        ):
+            result = await initialize_knowledge(topic, [], db_conn, settings)
+
+        assert result.usage.prompt_tokens == 150
+        assert result.usage.completion_tokens == 40
+
+    async def test_update_exposes_usage(self, db_conn: sqlite3.Connection) -> None:
+        topic = Topic(name="UsageUpd", description="D", feed_urls=[])
+        topic = create_topic(db_conn, topic)
+        db_conn.commit()
+        initial = KnowledgeState(topic_id=topic.id, summary_text="Old.", token_count=10)
+        create_knowledge_state(db_conn, initial)
+        db_conn.commit()
+        settings = _make_settings()
+
+        novelty = NoveltyResult(has_new_info=True, summary="X", confidence=0.8)
+        llm_result = KnowledgeStateUpdate(
+            sufficient_data=True,
+            confidence=0.9,
+            updated_summary="Updated.",
+            token_count=12,
+            prompt_tokens=90,
+            completion_tokens=25,
+        )
+        with patch(
+            "app.analysis.knowledge.generate_knowledge_update",
+            new_callable=AsyncMock,
+            return_value=llm_result,
+        ):
+            result = await update_knowledge(topic, novelty, db_conn, settings)
+
+        assert result.usage.prompt_tokens == 90
+        assert result.usage.completion_tokens == 25
+
+    async def test_update_insufficient_still_exposes_usage(self, db_conn: sqlite3.Connection) -> None:
+        topic = Topic(name="UsageUpdIns", description="D", feed_urls=[])
+        topic = create_topic(db_conn, topic)
+        db_conn.commit()
+        initial = KnowledgeState(topic_id=topic.id, summary_text="Old.", token_count=10)
+        create_knowledge_state(db_conn, initial)
+        db_conn.commit()
+        settings = _make_settings()
+
+        novelty = NoveltyResult(has_new_info=True, summary="X", confidence=0.5)
+        llm_result = KnowledgeStateUpdate(
+            sufficient_data=False,
+            confidence=0.2,
+            updated_summary="Too vague.",
+            token_count=5,
+            prompt_tokens=33,
+            completion_tokens=11,
+        )
+        with patch(
+            "app.analysis.knowledge.generate_knowledge_update",
+            new_callable=AsyncMock,
+            return_value=llm_result,
+        ):
+            result = await update_knowledge(topic, novelty, db_conn, settings)
+
+        assert result.sufficient_data is False
+        assert result.usage.prompt_tokens == 33
+        assert result.usage.completion_tokens == 11
+
+
+# ============================================================
+# TestKeyFactsRestatementFilter (Task 2)
+# ============================================================
+
+
+class TestRestatementFilter:
+    def test_verbatim_restatement_is_filtered(self) -> None:
+        from app.analysis.llm import _filter_restated_key_facts
+
+        summary = "Confirmed Facts: Release date is March 2026. Price is $59.99."
+        facts = ["Release date is March 2026", "A brand new collector's edition was announced"]
+        kept = _filter_restated_key_facts(facts, summary)
+        assert "Release date is March 2026" not in kept
+        assert "A brand new collector's edition was announced" in kept
+
+    def test_genuinely_new_fact_is_kept(self) -> None:
+        from app.analysis.llm import _filter_restated_key_facts
+
+        summary = "Confirmed Facts: The game was announced in 2024."
+        facts = ["The studio confirmed a Q3 2026 release window with cross-play support"]
+        kept = _filter_restated_key_facts(facts, summary)
+        assert kept == facts
+
+    def test_empty_summary_keeps_all(self) -> None:
+        from app.analysis.llm import _filter_restated_key_facts
+
+        facts = ["Fact A", "Fact B"]
+        assert _filter_restated_key_facts(facts, "") == facts
+
+    async def test_analyze_articles_filters_restated_key_facts(self) -> None:
+        knowledge = "Confirmed Facts: The release date is March 2026."
+        expected = NoveltyResult(
+            has_new_info=True,
+            summary="A delay was announced",
+            key_facts=[
+                "The release date is March 2026",  # restatement -> dropped
+                "The release was delayed to September 2026 due to a recall",  # new -> kept
+            ],
+            confidence=0.9,
+        )
+        mock_client, _ = _mock_instructor_client(expected)
+        settings = _make_settings()
+
+        with patch("app.analysis.llm._get_client", return_value=mock_client):
+            result = await analyze_articles([_make_article()], knowledge, _make_topic(), settings)
+
+        assert "The release date is March 2026" not in result.key_facts
+        assert any("delayed to September 2026" in f for f in result.key_facts)
+
+    async def test_all_facts_filtered_keeps_has_new_info(self) -> None:
+        knowledge = "Confirmed Facts: The release date is March 2026 and the price is fifty nine dollars."
+        expected = NoveltyResult(
+            has_new_info=True,
+            summary="Still novel via summary",
+            key_facts=["The release date is March 2026"],
+            confidence=0.9,
+        )
+        mock_client, _ = _mock_instructor_client(expected)
+        settings = _make_settings()
+
+        with patch("app.analysis.llm._get_client", return_value=mock_client):
+            result = await analyze_articles([_make_article()], knowledge, _make_topic(), settings)
+
+        assert result.has_new_info is True
+        assert result.key_facts == []

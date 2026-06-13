@@ -61,11 +61,33 @@ def _make_rate_limit_error() -> litellm.RateLimitError:
     )
 
 
+class _FakeUsage:
+    def __init__(self, prompt_tokens: int = 11, completion_tokens: int = 7) -> None:
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+
+
+class _FakeCompletion:
+    def __init__(self, usage: _FakeUsage | None = None) -> None:
+        self.usage = usage if usage is not None else _FakeUsage()
+
+
 def _mock_instructor_client(return_value):
-    """Create a mock instructor client."""
-    mock_create = AsyncMock(return_value=return_value)
+    """Create a mock instructor client.
+
+    ``create_with_completion`` is the primary seam (analyze/init/update use it);
+    the returned mock wraps the model in a ``(model, completion)`` tuple unless a
+    ``side_effect`` is set by the test (e.g. to raise RateLimitError).
+    """
+    fake_completion = _FakeCompletion()
+
+    async def _cwc(*_args, **_kwargs):
+        return return_value, fake_completion
+
+    mock_create = AsyncMock(side_effect=_cwc)
     mock_completions = MagicMock()
-    mock_completions.create = mock_create
+    mock_completions.create_with_completion = mock_create
+    mock_completions.create = AsyncMock(return_value=return_value)
     mock_chat = MagicMock()
     mock_chat.completions = mock_completions
     mock_client = MagicMock()
@@ -162,7 +184,7 @@ class TestAnalyzeArticlesRateLimit:
         rate_error = _make_rate_limit_error()
         expected = NoveltyResult(has_new_info=True, confidence=0.9)
         mock_client, mock_create = _mock_instructor_client(expected)
-        mock_create.side_effect = [rate_error, expected]
+        mock_create.side_effect = [rate_error, (expected, _FakeCompletion())]
         settings = _make_settings()
 
         with (
@@ -222,7 +244,7 @@ class TestGenerateInitialKnowledgeRateLimit:
         rate_error = _make_rate_limit_error()
         expected = KnowledgeStateUpdate(sufficient_data=True, confidence=0.9, updated_summary="Summary.", token_count=0)
         mock_client, mock_create = _mock_instructor_client(expected)
-        mock_create.side_effect = [rate_error, expected]
+        mock_create.side_effect = [rate_error, (expected, _FakeCompletion())]
         settings = _make_settings()
 
         with (
@@ -278,7 +300,7 @@ class TestGenerateKnowledgeUpdateRateLimit:
         rate_error = _make_rate_limit_error()
         expected = KnowledgeStateUpdate(sufficient_data=True, confidence=0.9, updated_summary="Updated.", token_count=0)
         mock_client, mock_create = _mock_instructor_client(expected)
-        mock_create.side_effect = [rate_error, expected]
+        mock_create.side_effect = [rate_error, (expected, _FakeCompletion())]
         novelty = NoveltyResult(has_new_info=True, summary="New fact.", confidence=0.85)
         settings = _make_settings()
 
