@@ -514,6 +514,13 @@ class TestMigrations:
         ).fetchall()
         assert len(tables) == 1
 
+    def test_pending_webhooks_table_exists(self, db_conn: sqlite3.Connection) -> None:
+        """Migration m010 creates the pending_webhooks table."""
+        tables = db_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='pending_webhooks'"
+        ).fetchall()
+        assert len(tables) == 1
+
 
 class TestRecoverStuckTopics:
     """Tests for recover_stuck_topics."""
