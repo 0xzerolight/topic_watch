@@ -153,7 +153,78 @@
                            value="{{ form.min_confidence_threshold if form else settings.min_confidence_threshold }}">
                     <small>Below this confidence, new info is logged but not notified (0.0-1.0)</small>
                 </label>
+
+                <label for="min_relevance_threshold">
+                    Min Relevance Threshold
+                    <input type="number" id="min_relevance_threshold" name="min_relevance_threshold"
+                           min="0" max="1" step="0.05"
+                           value="{{ form.min_relevance_threshold if form else settings.min_relevance_threshold }}">
+                    <small>Below this relevance to the topic, new info is logged but not notified (0.0-1.0)</small>
+                </label>
+
+                <label for="apprise_timeout_seconds">
+                    Apprise Timeout (seconds)
+                    <input type="number" id="apprise_timeout_seconds" name="apprise_timeout_seconds"
+                           min="1"
+                           value="{{ form.apprise_timeout_seconds if form else settings.apprise_timeout_seconds }}">
+                    <small>Max time to wait for a single notification send before giving up.</small>
+                </label>
+
+                <label for="feed_max_retries">
+                    Feed Max Retries
+                    <input type="number" id="feed_max_retries" name="feed_max_retries"
+                           min="1" max="10"
+                           value="{{ form.feed_max_retries if form else settings.feed_max_retries }}">
+                </label>
+
+                <label for="content_fetch_concurrency">
+                    Content Fetch Concurrency
+                    <input type="number" id="content_fetch_concurrency" name="content_fetch_concurrency"
+                           min="1" max="20"
+                           value="{{ form.content_fetch_concurrency if form else settings.content_fetch_concurrency }}">
+                </label>
+
+                <label for="scheduler_misfire_grace_time">
+                    Scheduler Misfire Grace Time (seconds)
+                    <input type="number" id="scheduler_misfire_grace_time" name="scheduler_misfire_grace_time"
+                           min="30" max="3600"
+                           value="{{ form.scheduler_misfire_grace_time if form else settings.scheduler_misfire_grace_time }}">
+                </label>
+
+                <label for="scheduler_jitter_seconds">
+                    Scheduler Jitter (seconds)
+                    <input type="number" id="scheduler_jitter_seconds" name="scheduler_jitter_seconds"
+                           min="0" max="120"
+                           value="{{ form.scheduler_jitter_seconds if form else settings.scheduler_jitter_seconds }}">
+                </label>
+
+                <label for="llm_max_retries">
+                    LLM Max Retries
+                    <input type="number" id="llm_max_retries" name="llm_max_retries"
+                           min="0" max="10"
+                           value="{{ form.llm_max_retries if form else settings.llm_max_retries }}">
+                </label>
+
+                <label for="llm_temperature">
+                    LLM Temperature
+                    <input type="number" id="llm_temperature" name="llm_temperature"
+                           min="0" max="2" step="0.05"
+                           value="{{ form.llm_temperature if form else settings.llm_temperature }}">
+                    <small>Lower is more factual (0.0-2.0)</small>
+                </label>
             </div>
+
+            <label style="margin-top: 1rem;">
+                <input type="checkbox" name="secure_cookies" value="true" role="switch"
+                       {% if (form.secure_cookies if form is defined and form else settings.secure_cookies) %}checked{% endif %}>
+                Secure Cookies
+                <small>Set the Secure flag on cookies. Enable when TLS is terminated at your reverse proxy.</small>
+            </label>
+
+            <label style="margin-top: 1rem;">
+                Database Path <small>(read-only — set via config/env)</small>
+                <input type="text" value="{{ settings.db_path }}" disabled>
+            </label>
 
         </div>
     </details>

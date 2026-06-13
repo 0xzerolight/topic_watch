@@ -193,6 +193,16 @@ class TestSettingsPost:
             "llm_analysis_timeout": "60",
             "llm_knowledge_timeout": "120",
             "web_page_size": "20",
+            "min_confidence_threshold": "0.7",
+            "min_relevance_threshold": "0.5",
+            "secure_cookies": "true",
+            "feed_max_retries": "2",
+            "content_fetch_concurrency": "3",
+            "scheduler_misfire_grace_time": "300",
+            "scheduler_jitter_seconds": "30",
+            "llm_max_retries": "2",
+            "llm_temperature": "0.2",
+            "apprise_timeout_seconds": "30",
         }
         data.update(overrides)
         return data
@@ -385,6 +395,68 @@ class TestSettingsPost:
                 assert "1d" in response.text
         finally:
             app.dependency_overrides.clear()
+
+    async def test_min_relevance_threshold_persisted(self, client: httpx.AsyncClient) -> None:
+        """min_relevance_threshold from the form is saved, not reset to default."""
+        with patch("app.web.routes.save_settings_to_yaml"):
+            await client.post(
+                "/settings",
+                data=self._valid_form_data(min_relevance_threshold="0.85"),
+                follow_redirects=False,
+            )
+        assert app.state.settings.min_relevance_threshold == 0.85
+
+    async def test_secure_cookies_persisted(self, client: httpx.AsyncClient) -> None:
+        """secure_cookies checkbox from the form is saved, not silently reset to False."""
+        with patch("app.web.routes.save_settings_to_yaml"):
+            await client.post(
+                "/settings",
+                data=self._valid_form_data(secure_cookies="true"),
+                follow_redirects=False,
+            )
+        assert app.state.settings.secure_cookies is True
+
+    async def test_unchecked_secure_cookies_is_false(self, client: httpx.AsyncClient) -> None:
+        """An absent secure_cookies checkbox results in False."""
+        data = self._valid_form_data()
+        data.pop("secure_cookies")
+        with patch("app.web.routes.save_settings_to_yaml"):
+            await client.post("/settings", data=data, follow_redirects=False)
+        assert app.state.settings.secure_cookies is False
+
+    async def test_advanced_fields_round_trip(self, client: httpx.AsyncClient) -> None:
+        """Advanced fields editable in the full UI persist their submitted values."""
+        with patch("app.web.routes.save_settings_to_yaml"):
+            await client.post(
+                "/settings",
+                data=self._valid_form_data(
+                    feed_max_retries="5",
+                    content_fetch_concurrency="7",
+                    scheduler_misfire_grace_time="600",
+                    scheduler_jitter_seconds="10",
+                    llm_max_retries="4",
+                    llm_temperature="0.9",
+                    apprise_timeout_seconds="45",
+                ),
+                follow_redirects=False,
+            )
+        s = app.state.settings
+        assert s.feed_max_retries == 5
+        assert s.content_fetch_concurrency == 7
+        assert s.scheduler_misfire_grace_time == 600
+        assert s.scheduler_jitter_seconds == 10
+        assert s.llm_max_retries == 4
+        assert s.llm_temperature == 0.9
+        assert s.apprise_timeout_seconds == 45
+
+    async def test_unspecified_field_not_silently_changed(self, client: httpx.AsyncClient) -> None:
+        """Saving a form preserves current values for fields the form leaves at defaults."""
+        app.state.settings = _make_settings(min_relevance_threshold=0.42, secure_cookies=True)
+        data = self._valid_form_data(min_relevance_threshold="0.42", secure_cookies="true")
+        with patch("app.web.routes.save_settings_to_yaml"):
+            await client.post("/settings", data=data, follow_redirects=False)
+        assert app.state.settings.min_relevance_threshold == 0.42
+        assert app.state.settings.secure_cookies is True
 
     async def test_cloud_provider_base_url_stripped(self, client: httpx.AsyncClient) -> None:
         """POST /settings with a cloud provider model strips any stale base_url."""
