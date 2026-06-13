@@ -29,7 +29,14 @@ def _make_response(text: str, status_code: int = 200) -> MagicMock:
 
 def _make_client(side_effects) -> AsyncMock:
     client = AsyncMock(spec=httpx.AsyncClient)
-    client.get = AsyncMock(side_effect=side_effects)
+    # fetch_feed now routes through url_validation.safe_get, which builds a
+    # request and calls client.send(). build_request stays synchronous; send
+    # carries the per-attempt side effects. ``get`` is aliased to the same mock
+    # so existing call_count assertions remain meaningful.
+    transport = AsyncMock(side_effect=side_effects)
+    client.send = transport
+    client.get = transport
+    client.build_request = MagicMock(side_effect=lambda method, url, **kw: httpx.Request(method, url, **kw))
     return client
 
 

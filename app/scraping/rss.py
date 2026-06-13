@@ -22,7 +22,7 @@ import httpx
 from pydantic import BaseModel
 
 from app.models import FeedMode, Topic
-from app.url_validation import is_private_url
+from app.url_validation import is_private_url, safe_get
 
 if TYPE_CHECKING:
     from app.scraping.routing import ProviderRouter
@@ -142,13 +142,13 @@ async def fetch_feed(
         client = httpx.AsyncClient(
             headers={"User-Agent": _USER_AGENT},
             timeout=timeout,
-            follow_redirects=True,
+            follow_redirects=False,
         )
     assert client is not None
     try:
         for attempt in range(max_attempts):
             try:
-                response = await client.get(feed_url)
+                response = await safe_get(client, feed_url)
                 response.raise_for_status()
                 parsed = feedparser.parse(response.text)
                 entries = []
@@ -245,7 +245,7 @@ async def _fetch_auto(
     async with httpx.AsyncClient(
         headers={"User-Agent": _USER_AGENT},
         timeout=timeout,
-        follow_redirects=True,
+        follow_redirects=False,
     ) as client:
         feed_url = provider.build_feed_url(topic)
         entries = await fetch_feed(
@@ -297,7 +297,7 @@ async def _fetch_manual(
     async with httpx.AsyncClient(
         headers={"User-Agent": _USER_AGENT},
         timeout=timeout,
-        follow_redirects=True,
+        follow_redirects=False,
     ) as client:
         tasks = [
             fetch_feed(url, client, timeout=timeout, max_attempts=max_attempts, health_callback=health_callback)
