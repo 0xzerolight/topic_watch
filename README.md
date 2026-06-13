@@ -95,6 +95,28 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 </details>
 
+#### File permissions (PUID / PGID)
+
+Topic Watch stores its database and config in the bind-mounted `./data`
+directory. Docker keeps your host's file ownership on bind mounts, so the
+container has to write `./data` as *your* user. The image defaults to UID/GID
+`1000` (the first user on most Linux hosts), and the container entrypoint
+chowns `./data` to match `PUID`/`PGID` on startup.
+
+If your host user is not `1000`, set `PUID`/`PGID` so the container writes as
+you. Check with `id -u` / `id -g`:
+
+```bash
+# In the directory containing docker-compose.yml
+echo "PUID=$(id -u)" >> .env
+echo "PGID=$(id -g)" >> .env
+docker compose up -d
+```
+
+The one-line installer does this automatically. macOS and Windows (Docker
+Desktop) handle ownership transparently, so `PUID`/`PGID` are only relevant on
+native Linux hosts.
+
 Then visit [http://localhost:8000](http://localhost:8000) to configure.
 
 ### Running with Ollama (no API key needed)
@@ -367,7 +389,7 @@ See [SECURITY.md](docs/SECURITY.md) for vulnerability reporting.
 
 **Topic stuck in "Researching"** - Auto-recovers after 15 minutes (set to Error). Retry from the topic page. Usually an LLM connectivity issue.
 
-**Docker container exits** - `docker compose logs` for details. Check that `data/config.yml` exists and `data/` is writable.
+**Docker container exits** - `docker compose logs` for details. Check that `data/config.yml` exists and `data/` is writable. "Permission denied" writing `data/` on a native Linux host usually means your UID isn't 1000 — set `PUID`/`PGID` (see [File permissions](#file-permissions-puid--pgid)).
 
 **High memory** - Lower `max_articles_per_check` or `content_fetch_concurrency`. Increase check intervals.
 
