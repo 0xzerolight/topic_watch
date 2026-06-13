@@ -52,6 +52,23 @@ COMPOSE_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}/docker-compose.
 info "Downloading docker-compose.yml..."
 curl -fsSL "$COMPOSE_URL" -o "$INSTALL_DIR/docker-compose.yml"
 
+# --- Write PUID/PGID so bind-mounted ./data is writable by this host user ---
+# Docker bind mounts keep host ownership. If this user's UID/GID is not the
+# image default (1000), the container must chown ./data to match. The compose
+# files read PUID/PGID from this .env; the entrypoint applies them at startup.
+HOST_UID="$(id -u)"
+HOST_GID="$(id -g)"
+ENV_FILE="$INSTALL_DIR/.env"
+{
+    echo "PUID=${HOST_UID}"
+    echo "PGID=${HOST_GID}"
+} > "$ENV_FILE"
+if [ "$HOST_UID" != "1000" ] || [ "$HOST_GID" != "1000" ]; then
+    info "Host UID/GID is ${HOST_UID}:${HOST_GID} (not 1000); wrote PUID/PGID to .env"
+else
+    info "Wrote PUID/PGID (${HOST_UID}:${HOST_GID}) to .env"
+fi
+
 # --- Pull and start ---
 cd "$INSTALL_DIR"
 info "Pulling Docker image..."
