@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from app.web.routes import CheckingState
+from app.web.state import CheckingState
 
 
 @pytest.fixture
