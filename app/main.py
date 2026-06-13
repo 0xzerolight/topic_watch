@@ -24,7 +24,7 @@ from app.logging_config import setup_logging
 from app.scheduler import start_scheduler, stop_scheduler
 from app.web.api import router as api_router
 from app.web.csrf import CSRFMiddleware
-from app.web.routes import router
+from app.web.routers import router
 from app.web.setup_middleware import SetupRedirectMiddleware
 
 logger = logging.getLogger(__name__)

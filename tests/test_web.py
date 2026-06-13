@@ -68,7 +68,7 @@ async def client(
     app.dependency_overrides[get_settings] = override_settings
 
     # GET /settings calls load_settings() directly instead of using Depends
-    with patch("app.web.routes.load_settings", return_value=settings):
+    with patch("app.web.routers.settings.load_settings", return_value=settings):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app),
             base_url="http://test",
@@ -150,7 +150,7 @@ class TestAddTopic:
     async def test_create_topic_redirects_to_detail(self, client: httpx.AsyncClient) -> None:
         """POST /topics creates a topic and redirects to its detail page."""
         with patch(
-            "app.web.routes._run_init",
+            "app.web.routers.background._run_init",
             new_callable=AsyncMock,
         ):
             response = await client.post(
@@ -170,7 +170,7 @@ class TestAddTopic:
     async def test_create_topic_parses_feed_urls(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
         """Feed URLs textarea is parsed into a list (one URL per line)."""
         with patch(
-            "app.web.routes._run_init",
+            "app.web.routers.background._run_init",
             new_callable=AsyncMock,
         ):
             await client.post(
@@ -194,7 +194,7 @@ class TestAddTopic:
     async def test_create_topic_auto_mode_default(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
         """Topic created with auto mode has empty feed_urls."""
         with patch(
-            "app.web.routes._run_init",
+            "app.web.routers.background._run_init",
             new_callable=AsyncMock,
         ):
             await client.post(
@@ -220,7 +220,7 @@ class TestAddTopic:
     ) -> None:
         """Auto mode ignores any feed_urls provided in the form."""
         with patch(
-            "app.web.routes._run_init",
+            "app.web.routers.background._run_init",
             new_callable=AsyncMock,
         ):
             response = await client.post(
@@ -240,7 +240,7 @@ class TestAddTopic:
     async def test_create_topic_empty_feed_urls(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
         """Empty feed_urls textarea with auto mode results in empty list."""
         with patch(
-            "app.web.routes._run_init",
+            "app.web.routers.background._run_init",
             new_callable=AsyncMock,
         ):
             await client.post(
@@ -264,7 +264,7 @@ class TestAddTopic:
     ) -> None:
         """Newly created topic starts in RESEARCHING status."""
         with patch(
-            "app.web.routes._run_init",
+            "app.web.routers.background._run_init",
             new_callable=AsyncMock,
         ):
             await client.post(
@@ -281,7 +281,7 @@ class TestAddTopic:
     async def test_create_topic_kicks_off_init(self, client: httpx.AsyncClient) -> None:
         """POST /topics schedules the init background task."""
         with patch(
-            "app.web.routes._run_init",
+            "app.web.routers.background._run_init",
             new_callable=AsyncMock,
         ) as mock_init:
             await client.post(
@@ -313,7 +313,7 @@ class TestAddTopic:
     async def test_create_topic_accepts_valid_urls(self, client: httpx.AsyncClient) -> None:
         """Valid http/https URLs pass validation."""
         with patch(
-            "app.web.routes._run_init",
+            "app.web.routers.background._run_init",
             new_callable=AsyncMock,
         ):
             response = await client.post(
@@ -472,7 +472,7 @@ class TestReinitTopic:
             error_message="Previous failure",
         )
 
-        with patch("app.web.routes._run_init", new_callable=AsyncMock):
+        with patch("app.web.routers.background._run_init", new_callable=AsyncMock):
             response = await client.post(f"/topics/{topic.id}/init", follow_redirects=False)
 
         assert response.status_code == 303
@@ -489,7 +489,7 @@ class TestReinitTopic:
         """Re-init schedules the init background task."""
         topic = _make_topic(db_conn, status=TopicStatus.ERROR)
 
-        with patch("app.web.routes._run_init", new_callable=AsyncMock) as mock_init:
+        with patch("app.web.routers.background._run_init", new_callable=AsyncMock) as mock_init:
             await client.post(f"/topics/{topic.id}/init", follow_redirects=False)
 
         mock_init.assert_called_once()
@@ -511,7 +511,7 @@ class TestCheckNow:
         topic = _make_topic(db_conn)
 
         with patch(
-            "app.web.routes.check_topic",
+            "app.web.routers.topics.check_topic",
             new_callable=AsyncMock,
         ) as mock_check:
             mock_check.return_value = CheckResult(topic_id=topic.id)
@@ -683,7 +683,7 @@ class TestCSRFProtection:
                 base_url="http://test",
                 cookies={"csrf_token": CSRF_TEST_TOKEN},
             ) as ac:
-                with patch("app.web.routes._run_init", new_callable=AsyncMock):
+                with patch("app.web.routers.background._run_init", new_callable=AsyncMock):
                     response = await ac.post(
                         "/topics",
                         data={
@@ -728,7 +728,7 @@ class TestTimeagoFilter:
     """Tests for the timeago Jinja2 filter."""
 
     def test_just_now(self) -> None:
-        from app.web.routes import _timeago
+        from app.web.routers.templates import _timeago
 
         now = datetime.now(UTC)
         assert _timeago(now) == "just now"
@@ -736,7 +736,7 @@ class TestTimeagoFilter:
     def test_minutes_ago(self) -> None:
         from datetime import timedelta
 
-        from app.web.routes import _timeago
+        from app.web.routers.templates import _timeago
 
         dt = datetime.now(UTC) - timedelta(minutes=5)
         assert _timeago(dt) == "5m ago"
@@ -744,7 +744,7 @@ class TestTimeagoFilter:
     def test_hours_ago(self) -> None:
         from datetime import timedelta
 
-        from app.web.routes import _timeago
+        from app.web.routers.templates import _timeago
 
         dt = datetime.now(UTC) - timedelta(hours=3)
         assert _timeago(dt) == "3h ago"
@@ -752,7 +752,7 @@ class TestTimeagoFilter:
     def test_days_ago(self) -> None:
         from datetime import timedelta
 
-        from app.web.routes import _timeago
+        from app.web.routers.templates import _timeago
 
         dt = datetime.now(UTC) - timedelta(days=5)
         assert _timeago(dt) == "5d ago"
@@ -760,7 +760,7 @@ class TestTimeagoFilter:
     def test_over_30_days_shows_date(self) -> None:
         from datetime import timedelta
 
-        from app.web.routes import _timeago
+        from app.web.routers.templates import _timeago
 
         dt = datetime.now(UTC) - timedelta(days=45)
         result = _timeago(dt)
@@ -768,7 +768,7 @@ class TestTimeagoFilter:
         assert "ago" not in result
 
     def test_naive_datetime(self) -> None:
-        from app.web.routes import _timeago
+        from app.web.routers.templates import _timeago
 
         dt = datetime.now(UTC).replace(tzinfo=None)
         result = _timeago(dt)
@@ -935,7 +935,7 @@ class TestCheckAll:
 
     async def test_check_all_redirects(self, client: httpx.AsyncClient) -> None:
         """Check all returns redirect to dashboard."""
-        with patch("app.web.routes._run_check_all", new_callable=AsyncMock):
+        with patch("app.web.routers.background._run_check_all", new_callable=AsyncMock):
             response = await client.post("/check-all", follow_redirects=False)
         assert response.status_code == 303
         assert response.headers["location"] == "/"

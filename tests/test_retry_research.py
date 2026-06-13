@@ -79,7 +79,7 @@ class TestReinitTopic:
         """Posting to /init resets an ERROR topic's status to RESEARCHING."""
         topic = _make_topic(db_conn, status=TopicStatus.ERROR, error_message="timeout")
 
-        with patch("app.web.routes._run_init", new_callable=AsyncMock):
+        with patch("app.web.routers.background._run_init", new_callable=AsyncMock):
             response = await client.post(
                 f"/topics/{topic.id}/init",
                 follow_redirects=False,
@@ -99,7 +99,7 @@ class TestReinitTopic:
         """Posting to /init clears the error_message field."""
         topic = _make_topic(db_conn, status=TopicStatus.ERROR, error_message="some error")
 
-        with patch("app.web.routes._run_init", new_callable=AsyncMock):
+        with patch("app.web.routers.background._run_init", new_callable=AsyncMock):
             await client.post(f"/topics/{topic.id}/init", follow_redirects=False)
 
         updated = get_topic(db_conn, topic.id)
@@ -114,7 +114,7 @@ class TestReinitTopic:
         """Posting to /init redirects to the topic detail page."""
         topic = _make_topic(db_conn)
 
-        with patch("app.web.routes._run_init", new_callable=AsyncMock):
+        with patch("app.web.routers.background._run_init", new_callable=AsyncMock):
             response = await client.post(
                 f"/topics/{topic.id}/init",
                 follow_redirects=False,
@@ -128,7 +128,7 @@ class TestReinitTopic:
         client: httpx.AsyncClient,
     ) -> None:
         """Posting to /init for a non-existent topic returns 404."""
-        with patch("app.web.routes._run_init", new_callable=AsyncMock):
+        with patch("app.web.routers.background._run_init", new_callable=AsyncMock):
             response = await client.post(
                 "/topics/99999/init",
                 follow_redirects=False,
@@ -144,7 +144,7 @@ class TestReinitTopic:
         """Posting to /init for a READY topic also resets it to RESEARCHING."""
         topic = _make_topic(db_conn, status=TopicStatus.READY, error_message=None)
 
-        with patch("app.web.routes._run_init", new_callable=AsyncMock):
+        with patch("app.web.routers.background._run_init", new_callable=AsyncMock):
             response = await client.post(
                 f"/topics/{topic.id}/init",
                 follow_redirects=False,
@@ -164,7 +164,7 @@ class TestReinitTopic:
         """Posting to /init schedules the _run_init background task."""
         topic = _make_topic(db_conn, status=TopicStatus.ERROR)
 
-        with patch("app.web.routes._run_init", new_callable=AsyncMock) as mock_run_init:
+        with patch("app.web.routers.background._run_init", new_callable=AsyncMock) as mock_run_init:
             await client.post(f"/topics/{topic.id}/init", follow_redirects=False)
 
         # Background tasks are added but may run after the response; check mock was used
