@@ -169,9 +169,15 @@ class FeedHealth(BaseModel):
     def from_row(cls, row: sqlite3.Row) -> Self:
         data = dict(row)
         for field in ("last_success_at", "last_error_at"):
-            if data.get(field):
+            value = data.get(field)
+            # Treat empty/whitespace-only strings as missing (None); a falsy
+            # "" would otherwise skip parsing and reach Pydantic as a raw
+            # string, raising ValidationError on legacy/migrated rows.
+            if isinstance(value, str) and not value.strip():
+                data[field] = None
+            elif value:
                 try:
-                    data[field] = datetime.fromisoformat(data[field])
+                    data[field] = datetime.fromisoformat(value)
                 except (ValueError, TypeError):
                     data[field] = None
         return cls(**data)
