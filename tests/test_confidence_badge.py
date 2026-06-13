@@ -2,7 +2,7 @@
 
 import json
 
-from app.web.routes import _confidence_badge
+from app.web.routers.templates import _confidence_badge
 
 
 def test_high_confidence_green_badge():

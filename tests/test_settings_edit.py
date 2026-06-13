@@ -46,7 +46,7 @@ async def client(
     app.dependency_overrides[get_settings] = override_settings
 
     # GET /settings calls load_settings() directly instead of using Depends
-    with patch("app.web.routes.load_settings", return_value=settings):
+    with patch("app.web.routers.settings.load_settings", return_value=settings):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app),
             base_url="http://test",
@@ -209,7 +209,7 @@ class TestSettingsPost:
 
     async def test_valid_post_redirects(self, client: httpx.AsyncClient) -> None:
         """POST /settings with valid data redirects to /settings?saved=1."""
-        with patch("app.web.routes.save_settings_to_yaml"):
+        with patch("app.web.routers.settings.save_settings_to_yaml"):
             response = await client.post(
                 "/settings",
                 data=self._valid_form_data(),
@@ -221,7 +221,7 @@ class TestSettingsPost:
 
     async def test_valid_post_updates_app_state(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
         """POST /settings updates app.state.settings with the new values."""
-        with patch("app.web.routes.save_settings_to_yaml"):
+        with patch("app.web.routers.settings.save_settings_to_yaml"):
             await client.post(
                 "/settings",
                 data=self._valid_form_data(
@@ -236,7 +236,7 @@ class TestSettingsPost:
 
     async def test_valid_post_calls_save(self, client: httpx.AsyncClient) -> None:
         """POST /settings calls save_settings_to_yaml."""
-        with patch("app.web.routes.save_settings_to_yaml") as mock_save:
+        with patch("app.web.routers.settings.save_settings_to_yaml") as mock_save:
             await client.post(
                 "/settings",
                 data=self._valid_form_data(),
@@ -297,7 +297,7 @@ class TestSettingsPost:
 
     async def test_parses_notification_urls_from_textarea(self, client: httpx.AsyncClient) -> None:
         """Newline-separated notification URLs are parsed into a list."""
-        with patch("app.web.routes.save_settings_to_yaml"):
+        with patch("app.web.routers.settings.save_settings_to_yaml"):
             await client.post(
                 "/settings",
                 data=self._valid_form_data(
@@ -313,7 +313,7 @@ class TestSettingsPost:
 
     async def test_empty_notification_urls_results_in_empty_list(self, client: httpx.AsyncClient) -> None:
         """Empty notification_urls textarea results in an empty list."""
-        with patch("app.web.routes.save_settings_to_yaml"):
+        with patch("app.web.routers.settings.save_settings_to_yaml"):
             await client.post(
                 "/settings",
                 data=self._valid_form_data(notification_urls=""),
@@ -331,7 +331,7 @@ class TestSettingsPost:
 
             _real_save(settings, config_file)
 
-        with patch("app.web.routes.save_settings_to_yaml", side_effect=save_to_tmp):
+        with patch("app.web.routers.settings.save_settings_to_yaml", side_effect=save_to_tmp):
             await client.post(
                 "/settings",
                 data=self._valid_form_data(
@@ -351,7 +351,7 @@ class TestSettingsPost:
         import yaml as _yaml
 
         error = _yaml.scanner.ScannerError("while scanning", None, "could not find expected ':'", None)
-        with patch("app.web.routes.Settings", side_effect=error):
+        with patch("app.web.routers.settings.Settings", side_effect=error):
             response = await client.post(
                 "/settings",
                 data=self._valid_form_data(),
@@ -362,7 +362,10 @@ class TestSettingsPost:
 
     async def test_save_io_error_returns_422(self, client: httpx.AsyncClient) -> None:
         """I/O error during save_settings_to_yaml returns 422, not 500."""
-        with patch("app.web.routes.save_settings_to_yaml", side_effect=PermissionError("[Errno 13] Permission denied")):
+        with patch(
+            "app.web.routers.settings.save_settings_to_yaml",
+            side_effect=PermissionError("[Errno 13] Permission denied"),
+        ):
             response = await client.post(
                 "/settings",
                 data=self._valid_form_data(),
@@ -382,7 +385,7 @@ class TestSettingsPost:
         app.dependency_overrides[get_db_conn] = override_db
 
         try:
-            with patch("app.web.routes.load_settings", return_value=fresh_settings) as mock_load:
+            with patch("app.web.routers.settings.load_settings", return_value=fresh_settings) as mock_load:
                 async with httpx.AsyncClient(
                     transport=httpx.ASGITransport(app=app),
                     base_url="http://test",
@@ -398,7 +401,7 @@ class TestSettingsPost:
 
     async def test_min_relevance_threshold_persisted(self, client: httpx.AsyncClient) -> None:
         """min_relevance_threshold from the form is saved, not reset to default."""
-        with patch("app.web.routes.save_settings_to_yaml"):
+        with patch("app.web.routers.settings.save_settings_to_yaml"):
             await client.post(
                 "/settings",
                 data=self._valid_form_data(min_relevance_threshold="0.85"),
@@ -408,7 +411,7 @@ class TestSettingsPost:
 
     async def test_secure_cookies_persisted(self, client: httpx.AsyncClient) -> None:
         """secure_cookies checkbox from the form is saved, not silently reset to False."""
-        with patch("app.web.routes.save_settings_to_yaml"):
+        with patch("app.web.routers.settings.save_settings_to_yaml"):
             await client.post(
                 "/settings",
                 data=self._valid_form_data(secure_cookies="true"),
@@ -420,13 +423,13 @@ class TestSettingsPost:
         """An absent secure_cookies checkbox results in False."""
         data = self._valid_form_data()
         data.pop("secure_cookies")
-        with patch("app.web.routes.save_settings_to_yaml"):
+        with patch("app.web.routers.settings.save_settings_to_yaml"):
             await client.post("/settings", data=data, follow_redirects=False)
         assert app.state.settings.secure_cookies is False
 
     async def test_advanced_fields_round_trip(self, client: httpx.AsyncClient) -> None:
         """Advanced fields editable in the full UI persist their submitted values."""
-        with patch("app.web.routes.save_settings_to_yaml"):
+        with patch("app.web.routers.settings.save_settings_to_yaml"):
             await client.post(
                 "/settings",
                 data=self._valid_form_data(
@@ -453,14 +456,14 @@ class TestSettingsPost:
         """Saving a form preserves current values for fields the form leaves at defaults."""
         app.state.settings = _make_settings(min_relevance_threshold=0.42, secure_cookies=True)
         data = self._valid_form_data(min_relevance_threshold="0.42", secure_cookies="true")
-        with patch("app.web.routes.save_settings_to_yaml"):
+        with patch("app.web.routers.settings.save_settings_to_yaml"):
             await client.post("/settings", data=data, follow_redirects=False)
         assert app.state.settings.min_relevance_threshold == 0.42
         assert app.state.settings.secure_cookies is True
 
     async def test_cloud_provider_base_url_stripped(self, client: httpx.AsyncClient) -> None:
         """POST /settings with a cloud provider model strips any stale base_url."""
-        with patch("app.web.routes.save_settings_to_yaml"):
+        with patch("app.web.routers.settings.save_settings_to_yaml"):
             await client.post(
                 "/settings",
                 data=self._valid_form_data(

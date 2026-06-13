@@ -1,6 +1,6 @@
 """Tests for the _mask_url Jinja2 filter."""
 
-from app.web.routes import _mask_url
+from app.web.routers.templates import _mask_url
 
 
 def test_ntfy_url_masked():

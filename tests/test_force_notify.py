@@ -133,7 +133,7 @@ async def test_force_notify_success(
     check = _make_check_result(db_conn, topic.id, has_new_info=True)
     assert check.id is not None
 
-    with patch("app.web.routes.send_notification", new_callable=AsyncMock) as mock_send:
+    with patch("app.web.routers.topics.send_notification", new_callable=AsyncMock) as mock_send:
         mock_send.return_value = True
         response = await client.post(f"/topics/{topic.id}/checks/{check.id}/notify")
 
@@ -152,7 +152,7 @@ async def test_force_notify_calls_send_with_correct_args(
     check = _make_check_result(db_conn, topic.id, has_new_info=True)
     assert check.id is not None
 
-    with patch("app.web.routes.send_notification", new_callable=AsyncMock) as mock_send:
+    with patch("app.web.routers.topics.send_notification", new_callable=AsyncMock) as mock_send:
         mock_send.return_value = True
         await client.post(f"/topics/{topic.id}/checks/{check.id}/notify")
 
@@ -175,7 +175,7 @@ async def test_force_notify_delivery_failure(
     check = _make_check_result(db_conn, topic.id, has_new_info=True)
     assert check.id is not None
 
-    with patch("app.web.routes.send_notification", new_callable=AsyncMock) as mock_send:
+    with patch("app.web.routers.topics.send_notification", new_callable=AsyncMock) as mock_send:
         mock_send.return_value = False
         response = await client.post(f"/topics/{topic.id}/checks/{check.id}/notify")
 
@@ -197,7 +197,7 @@ async def test_force_notify_no_new_info_returns_400(
     check = _make_check_result(db_conn, topic.id, has_new_info=False, llm_response=None)
     assert check.id is not None
 
-    with patch("app.web.routes.send_notification", new_callable=AsyncMock) as mock_send:
+    with patch("app.web.routers.topics.send_notification", new_callable=AsyncMock) as mock_send:
         response = await client.post(f"/topics/{topic.id}/checks/{check.id}/notify")
 
     assert response.status_code == 400
@@ -270,7 +270,7 @@ async def test_force_notify_exception_returns_error_message(
     check = _make_check_result(db_conn, topic.id, has_new_info=True)
     assert check.id is not None
 
-    with patch("app.web.routes.send_notification", new_callable=AsyncMock) as mock_send:
+    with patch("app.web.routers.topics.send_notification", new_callable=AsyncMock) as mock_send:
         mock_send.side_effect = RuntimeError("SMTP connection refused")
         response = await client.post(f"/topics/{topic.id}/checks/{check.id}/notify")
 

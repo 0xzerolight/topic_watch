@@ -178,7 +178,7 @@ class TestBulkCheck:
     ) -> None:
         """Bulk check redirects to dashboard."""
         topic = _make_topic(db_conn, name="Check Me")
-        with patch("app.web.routes._run_single_check", new_callable=AsyncMock):
+        with patch("app.web.routers.background._run_single_check", new_callable=AsyncMock):
             response = await client.post(
                 "/topics/bulk-check",
                 data={"topic_ids": str(topic.id)},
@@ -193,7 +193,7 @@ class TestBulkCheck:
         researching_topic = _make_topic(db_conn, name="Busy Topic", status=TopicStatus.RESEARCHING)
 
         body = f"topic_ids={ready_topic.id}&topic_ids={researching_topic.id}"
-        with patch("app.web.routes._run_single_check", new_callable=AsyncMock) as mock_check:
+        with patch("app.web.routers.background._run_single_check", new_callable=AsyncMock) as mock_check:
             await client.post(
                 "/topics/bulk-check",
                 content=body.encode(),
