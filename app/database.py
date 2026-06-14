@@ -118,6 +118,41 @@ def get_db(db_path: Path | None = None) -> Generator[sqlite3.Connection, None, N
         conn.close()
 
 
+@contextmanager
+def short_conn(
+    conn: sqlite3.Connection | None = None,
+    db_path: Path | None = None,
+) -> Generator[sqlite3.Connection, None, None]:
+    """Yield a connection for a short DB interaction without auto-commit.
+
+    Used by the retry queues, which must apply results per item (committing
+    explicitly after each) rather than once at the end.
+
+    * If ``conn`` is given it is reused and NOT closed (the caller owns its
+      lifecycle); on error it is rolled back.
+    * Otherwise a fresh connection is opened and closed on exit.
+
+    Unlike ``get_db`` this does not commit on success — callers commit
+    explicitly so a failure mid-batch leaves prior commits intact.
+    """
+    if conn is not None:
+        try:
+            yield conn
+        except Exception:
+            conn.rollback()
+            raise
+        return
+
+    own = get_connection(db_path)
+    try:
+        yield own
+    except Exception:
+        own.rollback()
+        raise
+    finally:
+        own.close()
+
+
 def _backup_db(db_path: Path) -> Path | None:
     """Create a timestamped backup of the database before running migrations.
 

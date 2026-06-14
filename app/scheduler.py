@@ -95,14 +95,18 @@ async def _run_check_cycle(settings: Settings, db_path: Path | None = None) -> N
     busy_timeout would save them). Instead each phase uses its own short-lived
     connection that is committed and closed promptly:
 
-      * retry passes (notifications + webhooks) — one connection
+      * retry passes (notifications + webhooks) — each manages its own
+        short-lived connections internally (snapshot, send with none held,
+        commit per item)
       * the due-topics query — one connection
       * each topic check — a fresh connection per topic
     """
-    # Retry any failed deliveries from previous cycles (short-lived connection).
-    with get_db(db_path) as conn:
-        await retry_pending_notifications(conn, settings)
-        await retry_pending_webhooks(conn, settings)
+    # Retry any failed deliveries from previous cycles. Each retry function
+    # manages its own short-lived connections: it snapshots pending rows,
+    # sends with NO connection held, and commits per item. Holding one shared
+    # connection here would keep it open across every retry's HTTP POST.
+    await retry_pending_notifications(settings=settings, db_path=db_path)
+    await retry_pending_webhooks(settings=settings, db_path=db_path)
 
     # Snapshot the due topics, then release the connection before the long
     # per-topic HTTP/LLM work begins.
