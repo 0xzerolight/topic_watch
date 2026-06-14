@@ -56,13 +56,35 @@ curl -fsSL "$COMPOSE_URL" -o "$INSTALL_DIR/docker-compose.yml"
 # Docker bind mounts keep host ownership. If this user's UID/GID is not the
 # image default (1000), the container must chown ./data to match. The compose
 # files read PUID/PGID from this .env; the entrypoint applies them at startup.
+#
+# Upsert: replace existing PUID=/PGID= lines in-place so a re-run never
+# truncates user-added vars (e.g. TOPIC_WATCH_LLM__API_KEY). If the key is
+# absent it is appended; if the file doesn't exist it is created.
 HOST_UID="$(id -u)"
 HOST_GID="$(id -g)"
 ENV_FILE="$INSTALL_DIR/.env"
-{
-    echo "PUID=${HOST_UID}"
-    echo "PGID=${HOST_GID}"
-} > "$ENV_FILE"
+
+upsert_env() {
+    local key="$1"
+    local value="$2"
+    local file="$3"
+    if [ ! -f "$file" ]; then
+        echo "${key}=${value}" > "$file"
+    elif grep -q "^${key}=" "$file"; then
+        # Replace the existing line via a temp file (portable, no sed -i portability issues)
+        local tmp
+        tmp="$(mktemp "${file}.XXXXXX")"
+        grep -v "^${key}=" "$file" > "$tmp"
+        echo "${key}=${value}" >> "$tmp"
+        mv "$tmp" "$file"
+    else
+        echo "${key}=${value}" >> "$file"
+    fi
+}
+
+upsert_env "PUID" "${HOST_UID}" "${ENV_FILE}"
+upsert_env "PGID" "${HOST_GID}" "${ENV_FILE}"
+
 if [ "$HOST_UID" != "1000" ] || [ "$HOST_GID" != "1000" ]; then
     info "Host UID/GID is ${HOST_UID}:${HOST_GID} (not 1000); wrote PUID/PGID to .env"
 else
