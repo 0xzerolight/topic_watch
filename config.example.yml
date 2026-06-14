@@ -53,7 +53,8 @@ article_retention_days: 90
 
 # --- Advanced settings (optional, sensible defaults) ---
 # llm_temperature: 0.2
-# min_confidence_threshold: 0.6
+# min_confidence_threshold: 0.7
+# min_relevance_threshold: 0.5
 # web_page_size: 20
 # feed_max_retries: 2
 # content_fetch_concurrency: 3
