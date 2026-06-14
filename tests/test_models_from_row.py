@@ -15,6 +15,7 @@ from app.models import (
     CheckResult,
     KnowledgeState,
     PendingNotification,
+    PendingWebhook,
     Topic,
 )
 
@@ -221,6 +222,54 @@ class TestPendingNotificationFromRow:
         row["created_at"] = "???"
         notif = PendingNotification.from_row(row)
         assert isinstance(notif.created_at, datetime)
+
+
+class TestPendingWebhookFromRow:
+    """PendingWebhook.from_row / to_insert_dict defensive handling + round-trip."""
+
+    def _base_row(self) -> dict:
+        return {
+            "id": 1,
+            "topic_id": 1,
+            "check_result_id": None,
+            "url": "https://example.com/hook",
+            "payload": '{"topic": "Hooked", "count": 2}',
+            "created_at": "2026-06-13T12:00:00+00:00",
+            "retry_count": 0,
+            "max_retries": 3,
+        }
+
+    def test_valid_row_parses_identically(self) -> None:
+        hook = PendingWebhook.from_row(self._base_row())
+        assert hook.url == "https://example.com/hook"
+        assert hook.payload == {"topic": "Hooked", "count": 2}
+        assert hook.created_at.year == 2026
+
+    def test_malformed_payload_json_becomes_empty_dict(self) -> None:
+        row = self._base_row()
+        row["payload"] = "{not valid json"
+        hook = PendingWebhook.from_row(row)
+        assert hook.payload == {}
+
+    def test_empty_created_at_does_not_raise(self) -> None:
+        row = self._base_row()
+        row["created_at"] = ""
+        hook = PendingWebhook.from_row(row)
+        assert isinstance(hook.created_at, datetime)
+
+    def test_round_trip_from_row_to_insert_dict(self) -> None:
+        hook = PendingWebhook.from_row(self._base_row())
+        data = hook.to_insert_dict()
+        # id excluded; payload + created_at serialized back to TEXT.
+        assert "id" not in data
+        assert data["url"] == "https://example.com/hook"
+        assert data["created_at"] == "2026-06-13T12:00:00+00:00"
+        # Re-loading the insert dict reproduces the model (sans id).
+        reloaded = PendingWebhook.from_row({**data, "id": None})
+        assert reloaded.payload == hook.payload
+        assert reloaded.url == hook.url
+        assert reloaded.created_at == hook.created_at
+        assert reloaded.max_retries == hook.max_retries
 
 
 class TestRequiredDatetimeWarnings:
