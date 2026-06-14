@@ -38,7 +38,7 @@
         if (!isSupported() || !isEnabled()) return;
         if (Notification.permission !== "granted") return;
 
-        var opts = { body: body, icon: "/static/icon.png", tag: "topic-watch" };
+        var opts = { body: body, tag: "topic-watch" };
         var n = new Notification(title, opts);
 
         if (options && options.url) {
