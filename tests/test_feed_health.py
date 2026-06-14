@@ -4,7 +4,6 @@ import sqlite3
 from unittest.mock import MagicMock
 
 import httpx
-import pytest
 
 from app.crud import (
     get_feed_health,
@@ -255,7 +254,6 @@ def _mock_transport(responses: dict[str, tuple[int, str]]) -> httpx.MockTranspor
 class TestFetchFeedCallback:
     """Tests for callback integration with fetch_feed()."""
 
-    @pytest.mark.asyncio
     async def test_callback_called_on_success(self) -> None:
         """health_callback is called with success=True when feed is fetched."""
         from app.scraping.rss import fetch_feed
@@ -273,7 +271,6 @@ class TestFetchFeedCallback:
         assert len(entries) == 1
         callback.assert_called_once_with("https://example.com/feed.xml", True, None)
 
-    @pytest.mark.asyncio
     async def test_callback_called_on_http_error(self) -> None:
         """health_callback is called with success=False on HTTP error."""
         from app.scraping.rss import fetch_feed
@@ -296,7 +293,6 @@ class TestFetchFeedCallback:
         assert args[2] is not None
         assert "404" in args[2]
 
-    @pytest.mark.asyncio
     async def test_no_callback_does_not_error(self) -> None:
         """fetch_feed works fine without a callback."""
         from app.scraping.rss import fetch_feed
