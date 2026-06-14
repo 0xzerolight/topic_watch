@@ -82,6 +82,55 @@ class TestRunInitTimeout:
         assert refreshed.status == TopicStatus.ERROR
         assert refreshed.error_message == "Research timed out. Click Retry."
 
+    async def test_timeout_stamps_status_changed_at(self, db_path: Path) -> None:
+        """Timeout error transition re-stamps status_changed_at for stuck-recovery timing.
+
+        ``initialize_new_topic`` stamps status_changed_at when it moves the topic
+        to RESEARCHING, so the timeout path must re-stamp it on the ERROR transition
+        rather than leaving the stale RESEARCHING timestamp.
+        """
+        settings = _make_settings()
+
+        conn = get_connection(db_path)
+        try:
+            topic = _make_topic(conn, status_changed_at=None)
+            topic_id = topic.id
+        finally:
+            conn.close()
+
+        # Capture the RESEARCHING-transition stamp set by initialize_new_topic
+        # right before it hangs, so we can prove the ERROR path re-stamps it.
+        researching_stamp = {}
+
+        async def _hang(*args, **kwargs):
+            c = get_connection(db_path)
+            try:
+                researching_stamp["at"] = get_topic(c, topic_id).status_changed_at
+            finally:
+                c.close()
+            await asyncio.sleep(9999)
+
+        with (
+            patch("app.web.routers.background._INIT_TIMEOUT_SECONDS", 0.05),
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                side_effect=_hang,
+            ),
+        ):
+            await _run_init(topic_id, settings, db_path)
+
+        conn = get_connection(db_path)
+        try:
+            refreshed = get_topic(conn, topic_id)
+        finally:
+            conn.close()
+
+        assert refreshed is not None
+        assert refreshed.status == TopicStatus.ERROR
+        assert refreshed.status_changed_at is not None
+        # Stamp must reflect the ERROR transition, not the stale RESEARCHING stamp.
+        assert refreshed.status_changed_at > researching_stamp["at"]
+
     async def test_timeout_is_logged(self, db_path: Path, caplog) -> None:
         """Timeout event is logged at ERROR level."""
         import logging
