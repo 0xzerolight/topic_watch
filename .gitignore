@@ -4,6 +4,7 @@ data/*.db
 data/*.db-wal
 data/*.db-shm
 data/*.db-journal
+data/backups/
 
 # Environment variables (may contain API keys)
 .env
