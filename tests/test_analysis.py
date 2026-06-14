@@ -3,6 +3,7 @@
 import sqlite3
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import litellm
 import pytest
 from pydantic import ValidationError
 
@@ -1259,3 +1260,56 @@ class TestRestatementFilter:
 
         assert result.has_new_info is True
         assert result.key_facts == []
+
+
+class TestRateLimitRetry:
+    """The rate-limit backoff loop honors settings.llm_max_retries."""
+
+    async def test_retry_count_honors_max_retries(self) -> None:
+        from app.analysis import llm as llm_module
+
+        attempts = 0
+
+        async def _always_rate_limited() -> None:
+            nonlocal attempts
+            attempts += 1
+            raise litellm.RateLimitError.__new__(litellm.RateLimitError)
+
+        with (
+            patch("app.analysis.llm.asyncio.sleep", new=AsyncMock()),
+            pytest.raises(litellm.RateLimitError),
+        ):
+            await llm_module._call_with_rate_limit_retry(_always_rate_limited, max_retries=4)
+
+        assert attempts == 5  # initial attempt + 4 retries
+
+    async def test_succeeds_after_transient_rate_limit(self) -> None:
+        from app.analysis import llm as llm_module
+
+        attempts = 0
+
+        async def _flaky() -> str:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 2:
+                raise litellm.RateLimitError.__new__(litellm.RateLimitError)
+            return "ok"
+
+        with patch("app.analysis.llm.asyncio.sleep", new=AsyncMock()):
+            result = await llm_module._call_with_rate_limit_retry(_flaky, max_retries=3)
+
+        assert result == "ok"
+        assert attempts == 2
+
+
+class TestClientCaching:
+    """_get_client returns a single cached client instead of rebuilding per call."""
+
+    def test_client_is_cached(self) -> None:
+        from app.analysis import llm as llm_module
+
+        llm_module._client = None
+        settings = _make_settings()
+        first = llm_module._get_client(settings)
+        second = llm_module._get_client(settings)
+        assert first is second

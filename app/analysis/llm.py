@@ -129,9 +129,21 @@ class CompressedKnowledge(BaseModel):
 # --- Helpers ---
 
 
+_client: instructor.AsyncInstructor | None = None
+
+
 def _get_client(settings: Settings) -> instructor.AsyncInstructor:
-    """Create an async instructor-patched litellm client."""
-    return cast(instructor.AsyncInstructor, instructor.from_litellm(litellm.acompletion))
+    """Return a cached async instructor-patched litellm client.
+
+    The client wraps ``litellm.acompletion``, which is stateless — model, key,
+    base_url, etc. are passed per call — so a single instance is reused across
+    all calls instead of being rebuilt each time. ``settings`` is accepted for
+    call-site symmetry and to keep ``_get_client`` the patch seam used by tests.
+    """
+    global _client
+    if _client is None:
+        _client = cast(instructor.AsyncInstructor, instructor.from_litellm(litellm.acompletion))
+    return _client
 
 
 def _effective_base_url(settings: Settings) -> str | None:
@@ -308,7 +320,7 @@ async def analyze_articles(
         )
 
     try:
-        result, completion = await _call_with_rate_limit_retry(_do_call)
+        result, completion = await _call_with_rate_limit_retry(_do_call, max_retries=settings.llm_max_retries)
     except Exception:
         logger.warning("LLM analysis failed for topic '%s'", topic.name, exc_info=True)
         return NoveltyResult(has_new_info=False, confidence=0.0)
@@ -345,7 +357,7 @@ async def generate_initial_knowledge(
             temperature=settings.llm_temperature,
         )
 
-    raw_result, completion = await _call_with_rate_limit_retry(_do_call)
+    raw_result, completion = await _call_with_rate_limit_retry(_do_call, max_retries=settings.llm_max_retries)
     result: KnowledgeStateUpdate = raw_result
     result.token_count = count_tokens(result.updated_summary, settings.llm.model)
     usage = _extract_usage(completion)
@@ -383,7 +395,7 @@ async def compress_knowledge_summary(
             temperature=settings.llm_temperature,
         )
 
-    result: CompressedKnowledge = await _call_with_rate_limit_retry(_do_call)
+    result: CompressedKnowledge = await _call_with_rate_limit_retry(_do_call, max_retries=settings.llm_max_retries)
     result.token_count = count_tokens(result.compressed_summary, settings.llm.model)
     return result
 
@@ -419,7 +431,7 @@ async def generate_knowledge_update(
             temperature=settings.llm_temperature,
         )
 
-    raw_result, completion = await _call_with_rate_limit_retry(_do_call)
+    raw_result, completion = await _call_with_rate_limit_retry(_do_call, max_retries=settings.llm_max_retries)
     result: KnowledgeStateUpdate = raw_result
     result.token_count = count_tokens(result.updated_summary, settings.llm.model)
     usage = _extract_usage(completion)
