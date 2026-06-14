@@ -6,6 +6,7 @@ database connection. State is tracked via the shared ``_checking_state``.
 
 import asyncio
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 
 from app.checker import check_all_topics, check_topic
@@ -50,6 +51,7 @@ async def _run_init(topic_id: int, settings: Settings, db_path: Path | None = No
                     _INIT_TIMEOUT_SECONDS,
                 )
                 topic.status = TopicStatus.ERROR
+                topic.status_changed_at = datetime.now(UTC)
                 topic.error_message = "Research timed out. Click Retry."
                 update_topic(conn, topic)
     finally:
