@@ -24,7 +24,7 @@ Thanks for your interest in contributing! This guide covers everything you need 
    ```bash
    make dev
    ```
-   This installs pre-commit hooks (ruff + mypy on every commit) and pre-push hooks (pytest runs before every push). You can bypass the pre-push hook with `git push --no-verify` if needed.
+   This installs git hooks via pre-commit. The same checks (ruff, ruff-format, and mypy) run on every commit and again before every push. You can bypass them with `git commit --no-verify` or `git push --no-verify` if needed.
 
 ## Development Workflow
 

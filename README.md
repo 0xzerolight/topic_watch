@@ -185,6 +185,7 @@ Editable via the web UI Settings page or directly in the file.
 | `article_fetch_timeout` | float | `20.0` | Article content fetch timeout (seconds) |
 | `llm_analysis_timeout` | int | `60` | LLM novelty analysis timeout (seconds) |
 | `llm_knowledge_timeout` | int | `120` | LLM knowledge generation timeout (seconds) |
+| `apprise_timeout_seconds` | int | `30` | Timeout for a single Apprise notification send (seconds) |
 | `web_page_size` | int | `20` | Items per page in the web UI (5-200) |
 | `feed_max_retries` | int | `2` | RSS feed fetch retries (1-10) |
 | `content_fetch_concurrency` | int | `3` | Concurrent article content fetches (1-20) |
@@ -194,6 +195,7 @@ Editable via the web UI Settings page or directly in the file.
 | `llm_temperature` | float | `0.2` | LLM sampling temperature (0.0-2.0, lower = more factual) |
 | `min_confidence_threshold` | float | `0.7` | Minimum LLM confidence to send notifications (0.0-1.0) |
 | `min_relevance_threshold` | float | `0.5` | Minimum relevance to topic description to send notifications (0.0-1.0) |
+| `secure_cookies` | bool | `false` | Set the Secure flag on cookies (enable when TLS terminates at a reverse proxy) |
 
 </details>
 

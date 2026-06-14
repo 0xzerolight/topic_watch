@@ -50,52 +50,73 @@ All application code lives under `app/`.
 
 | Module | Responsibility |
 |--------|---------------|
-| `checker.py` | Orchestrates the full check pipeline: fetch → analyze → notify → record. `check_topic()` is the primary entry point. `check_all_topics()` iterates due topics. `retry_pending_notifications()` handles failed deliveries. |
-| `scheduler.py` | APScheduler 3.x `AsyncIOScheduler`. Four jobs: topic checks (every 1 min), stuck topic recovery (every 5 min), article cleanup (daily 4 AM), VACUUM (weekly Sunday 3 AM). All jobs coalesce, single instance, with jitter. |
+| `checker.py` | Orchestrates the full check pipeline: fetch → analyze → notify → record. `check_topic()` is the primary entry point. `check_all_topics()` iterates due topics. `retry_pending_notifications()` handles failed deliveries. `initialize_new_topic()` builds initial knowledge for NEW topics. |
+| `scheduler.py` | APScheduler 3.x `AsyncIOScheduler`. Four jobs: the every-minute tick (`_scheduled_check` — runs the check cycle then initializes one NEW topic per tick), stuck topic recovery (every 5 min, 15-min stuck timeout), weekly VACUUM (Sunday 3 AM), daily article cleanup (4 AM). The minute tick runs with jitter; all jobs coalesce and are single-instance. The check cycle itself (`_run_check_cycle`) also retries pending notifications and pending webhooks before querying due topics. |
 
 ### LLM Analysis
 
 | Module | Responsibility |
 |--------|---------------|
-| `analysis/llm.py` | LiteLLM + Instructor wrappers. Defines `NoveltyResult` and `KnowledgeStateUpdate` response models. Rate limit backoff with exponential delay. Returns safe default (`has_new_info=False`) on analysis failure. |
-| `analysis/prompts.py` | System and user prompt templates for novelty detection and knowledge management. Articles truncated to 1500 chars in prompts. |
-| `analysis/knowledge.py` | Knowledge state initialization and updates. Token budget enforcement via sentence-level truncation. |
+| `analysis/llm.py` | LiteLLM + Instructor wrappers. Defines `NoveltyResult` (with `confidence` and `relevance` scores), `KnowledgeStateUpdate`, and `TokenUsage`. Token counting, rate limit backoff with exponential delay. Returns safe default (`has_new_info=False`, `confidence=0.0`) on analysis failure. |
+| `analysis/prompts.py` | System and user prompt builders for novelty detection and knowledge init/update/compress. Articles truncated to 1500 chars in prompts. |
+| `analysis/knowledge.py` | Knowledge state initialization and updates with DB persistence. Token budget enforcement via summary compression. |
 
 ### Scraping
 
 | Module | Responsibility |
 |--------|---------------|
 | `scraping/__init__.py` | `fetch_new_articles_for_topic()` - orchestrates feed fetch, dedup against DB, cross-topic content reuse, concurrent content extraction (semaphore-limited), and article storage. |
-| `scraping/rss.py` | RSS/Atom feed fetching via httpx + feedparser. Google News RSS URL builder for auto feed mode. Retry on timeouts and 5xx. Feed health callbacks. |
+| `scraping/rss.py` | RSS/Atom feed fetching via httpx + feedparser. Converts entries to `FeedEntry` models. Retry on timeouts and 5xx. Feed health callbacks. |
 | `scraping/content.py` | Article HTML fetch + trafilatura content extraction. Falls back to RSS summary on failure. Content truncated to 5000 chars at word boundary. |
+| `scraping/providers.py` | News search provider definitions. `NewsProvider` Protocol plus `GoogleNewsProvider` / `BingNewsProvider` concrete classes that build keyword-search feed URLs from topic name + description (auto feed mode). |
+| `scraping/routing.py` | Health-based provider cascade. Tracks per-provider health in-memory and selects the first healthy provider per cycle (Bing first, Google second). Separate from the per-URL `feed_health` table. |
+| `scraping/google_news.py` | Resolves opaque Google News redirect URLs (`news.google.com/rss/articles/...`) to real article URLs via Google's `batchexecute` endpoint. |
+| `scraping/relevance.py` | Pre-LLM relevance scoring. `score_relevance()` rates an article 0.0–1.0 by keyword overlap between topic metadata and the entry's title/summary. |
 
 ### Data Layer
 
 | Module | Responsibility |
 |--------|---------------|
-| `models.py` | Pydantic models: `Topic`, `Article`, `KnowledgeState`, `CheckResult`, `FeedHealth`, `PendingNotification`. Enums: `TopicStatus`, `FeedMode`. Each model has `from_row()` and `to_insert_dict()` for SQLite interop. |
-| `crud.py` | All database operations grouped by model. Topic/Article/KnowledgeState/CheckResult CRUD, feed health upserts, pending notification queue, dashboard aggregation, article retention cleanup, stuck topic recovery. |
-| `database.py` | SQLite connection factory (WAL mode, foreign keys, busy timeout). Schema initialization. Migration runner. |
-| `migrations/` | 9 sequential migrations registered in `__init__.py` as `(version, description, up_function)` tuples. Tracked in `schema_version` table. |
+| `models.py` | Pydantic models: `Topic`, `Article`, `KnowledgeState`, `CheckResult`, `FeedHealth`, `DashboardStats`, `PendingNotification`. Enums: `TopicStatus` (new/researching/ready/error), `FeedMode` (auto/manual). Each model has `from_row()` and `to_insert_dict()` for SQLite interop; datetime cells are coerced defensively. |
+| `crud.py` | All database operations grouped by model. Topic/Article/KnowledgeState/CheckResult CRUD, feed health upserts, pending notification + pending webhook queues, dashboard aggregation, article retention cleanup, stuck topic recovery. |
+| `database.py` | SQLite connection factory (WAL mode, foreign keys, busy timeout). Schema initialization (`init_db`). Migration runner (`run_migrations`) — backs up the DB before applying pending migrations. |
+| `migrations/` | 13 sequential migrations registered in `__init__.py` as `(version, description, up_function)` tuples. Tracked in `schema_version` table. Migrations are append-only. |
+| `interval.py` | Human-readable interval parsing/formatting (`m`/`h`/`d`/`w`/`M`, combined syntax like `"1w 3d 2h"`). Enforces min/max interval bounds. |
+| `opml.py` | OPML import/export. Parses feeds from RSS readers (FreshRSS, Miniflux, TT-RSS), validates feed URLs, and exports topics as OPML. |
 
 ### Web
 
+The route handlers were split out of `routes.py` into the `web/routers/` package. The HTMX/HTML routes are mounted via an aggregate router; the JSON API lives separately in `web/api.py`.
+
 | Module | Responsibility |
 |--------|---------------|
-| `web/routes.py` | All FastAPI endpoints + HTMX partials. Dashboard, topic CRUD, manual check triggering, settings page, data export, feed health. `CheckingState` class for in-progress check tracking with stale lock detection. Rate limiter. Template filters (`timeago`, `sanitize_error`, `mask_url`, `confidence_badge`). |
-| `web/csrf.py` | Double-submit cookie CSRF middleware. Sets token cookie on responses, validates on POST/PUT/DELETE via `X-CSRF-Token` header (HTMX) or form field. |
+| `web/routes.py` | Backwards-compatible shim. Re-exports `router` from `web/routers/` so existing `from app.web.routes import router` imports still work. No handlers live here anymore. |
+| `web/routers/__init__.py` | Aggregate router. Includes the per-domain routers in include-order so static topic paths (`/topics/search`, `/topics/new`) register before the dynamic `/topics/{topic_id}` route. |
+| `web/routers/dashboard.py` | Dashboard page, `/health` check, and topic search. Reads the dashboard stats cache. |
+| `web/routers/topics.py` | Topic CRUD, detail/articles pages, manual check + init triggers, and per-topic CSV/JSON exports. |
+| `web/routers/settings.py` | Setup wizard, settings editor, and notification-test endpoint. Reads/writes config via `load_settings()` / `save_settings_to_yaml()`. |
+| `web/routers/feed_health.py` | Global feed-health dashboard and feed-URL validation endpoint (rate-limited). |
+| `web/routers/opml.py` | OPML import/export and bulk topic export (JSON). |
+| `web/routers/background.py` | Background-task helpers (`_run_init`, check-all) that run after the request connection closes, each opening its own DB connection. Coordinates via the shared `_checking_state`. |
+| `web/routers/templates.py` | Shared `Jinja2Templates` instance and template filters (`timeago`, `sanitize_error`, `mask_url`, `confidence_badge`). Filters are module-level for unit testing. |
+| `web/routers/_validation.py` | Shared topic-form validation (`validate_topic_form`) used by create and edit handlers. |
+| `web/api.py` | JSON API v1 (`/api/v1`). Read-only endpoints (list/get topics, checks, knowledge) plus one CSRF-protected mutation to trigger a check. Reuses CRUD and Pydantic models. |
+| `web/state.py` | Process-global web state: `CheckingState` (in-progress check tracking with stale-lock detection), dashboard stats cache, and the in-memory feed-validation rate limiter. |
+| `web/csrf.py` | Double-submit cookie CSRF middleware + `verify_csrf` dependency. Sets token cookie on responses, validates POST/PUT/DELETE via `X-CSRF-Token` header (HTMX) or `csrf_token` form field. |
 | `web/dependencies.py` | FastAPI dependency injection: `get_db_conn` (per-request connection with auto-commit/rollback), `get_settings` (from `app.state`). |
+| `web/setup_middleware.py` | ASGI middleware that redirects all routes to `/setup` while `app.state.setup_required` is set (exempts `/setup`, `/health`, `/static`). |
 
 ### Infrastructure
 
 | Module | Responsibility |
 |--------|---------------|
-| `config.py` | Pydantic `BaseSettings` with YAML source. Priority: env > YAML > defaults. `load_settings()` / `save_settings_to_yaml()`. |
+| `main.py` | FastAPI app + lifespan. Runs migrations, starts/stops the scheduler, mounts the web routers, JSON API, CSRF + setup-redirect middleware, and static files. |
+| `config.py` | Pydantic `BaseSettings` with YAML source. Priority: env > YAML > defaults. `load_settings()` / `save_settings_to_yaml()`; cloud/local provider helpers. |
 | `logging_config.py` | Plain text or JSON structured logging. Controlled by `TOPIC_WATCH_LOG_FORMAT` and `TOPIC_WATCH_LOG_LEVEL` env vars. |
 | `check_context.py` | Correlation IDs via `contextvars.ContextVar`. `CheckIdFilter` injects check ID into all log records. |
 | `url_validation.py` | SSRF protection. Blocks private/reserved IPs (localhost, 10.x, 172.16-31.x, 192.168.x, link-local, IPv6 ULA). |
 | `notifications.py` | Apprise wrapper. Formats `NoveltyResult` into title/body. Sync Apprise send wrapped in `asyncio.to_thread()`. |
-| `webhooks.py` | JSON POST to configured webhook endpoints. Concurrent delivery via `asyncio.gather()`. Fire-and-forget with logging. |
+| `webhooks.py` | JSON POST to configured webhook endpoints. Concurrent delivery via `asyncio.gather()`. Failed deliveries are queued in `pending_webhooks` and retried via `retry_pending_webhooks()` at the start of each check cycle. |
 | `cli.py` | Argparse CLI: `list`, `check`, `check-all`, `init`. |
 
 ### Frontend
@@ -134,38 +155,39 @@ All application code lives under `app/`.
 
 | Table | Purpose |
 |-------|---------|
-| `topics` | Core entity. Name, description, `feed_urls` (JSON array), `feed_mode` (auto/manual), `status`, `is_active`, `check_interval_minutes`, `tags` (JSON array). |
-| `articles` | Fetched articles linked to a topic. Deduped by `content_hash` (unique per topic). `processed` flag tracks analysis completion. |
+| `topics` | Core entity. Name, description, `feed_urls` (JSON array), `feed_mode` (auto/manual), `status`, `is_active`, `status_changed_at`, `check_interval_minutes`, `tags` (JSON array), per-topic `confidence_threshold` / `relevance_threshold` (m011, nullable overrides), `init_attempts` (m013). |
+| `articles` | Fetched articles linked to a topic. Deduped by `content_hash` (unique per topic). `source_provider` records the news provider (m009). `processed` flag tracks analysis completion. |
 | `knowledge_states` | One per topic. Rolling LLM-generated summary. `token_count` tracks budget usage. |
-| `check_results` | Audit log of every check cycle. Stores articles found/new, `has_new_info`, full LLM response JSON, notification outcome. |
+| `check_results` | Audit log of every check cycle. Stores articles found/new, `has_new_info`, full LLM response JSON, notification outcome, and `prompt_tokens` / `completion_tokens` (m012). |
 | `pending_notifications` | Failed notifications queued for retry. Retried at the start of each check cycle. Deleted after `max_retries`. |
+| `pending_webhooks` | Failed webhook deliveries queued for retry (m010). Stores `url`, `payload`, `retry_count`/`max_retries`. Retried at the start of each check cycle; expired entries pruned. |
 | `feed_health` | Per-feed-URL health. Consecutive failures, total fetches/failures, last success/error timestamps. |
 | `schema_version` | Migration tracking. Single `version` column. |
 
 ### Topic Lifecycle
 
 ```
-  ┌──────────────┐    success    ┌─────────┐
-  │ RESEARCHING  │──────────────>│  READY  │
-  │ (init phase) │               │ (active)│
-  └──────┬───────┘               └────┬────┘
-         │ failure                    │ LLM/knowledge error
-         v                           v
-  ┌──────────────┐           ┌──────────────┐
-  │    ERROR     │<──────────│    ERROR     │
-  │ (user retry) │           │ (user retry) │
-  └──────────────┘           └──────────────┘
+  ┌──────────────┐               ┌──────────────┐    success    ┌─────────┐
+  │     NEW      │──────────────>│ RESEARCHING  │──────────────>│  READY  │
+  │ (OPML queue) │  one per tick │ (init phase) │               │ (active)│
+  └──────────────┘               └──────┬───────┘               └────┬────┘
+                                        │ failure                    │ LLM/knowledge error
+                                        v                            v
+                                 ┌──────────────┐             ┌──────────────┐
+                                 │    ERROR     │             │    ERROR     │
+                                 │ (user retry) │             │ (user retry) │
+                                 └──────────────┘             └──────────────┘
 ```
 
-New topics start in **RESEARCHING**: articles are fetched and an initial knowledge state is built via the LLM. On success, the topic moves to **READY** and enters the normal check cycle. On failure, it moves to **ERROR** with a user-visible message. Users can retry from the dashboard.
+Topics created through the UI start in **RESEARCHING**: articles are fetched and an initial knowledge state is built via the LLM. OPML imports instead create topics in **NEW**; the every-minute scheduler tick promotes one NEW topic at a time through initialization (gradual processing to avoid hammering the LLM API). On success, the topic moves to **READY** and enters the normal check cycle. On failure, it moves to **ERROR** with a user-visible message. Users can retry from the dashboard.
 
 ## Request Lifecycle
 
 ### Scheduled Check Cycle
 
-1. APScheduler calls `_scheduled_check()` every 1 minute (with jitter).
-2. `retry_pending_notifications()` retries any failed deliveries from prior cycles.
-3. `get_topics_due_for_check()` finds active READY topics whose last check exceeds their interval.
+1. APScheduler calls `_scheduled_check()` every 1 minute (with jitter), which runs `_run_check_cycle()` then initializes one NEW topic.
+2. `retry_pending_notifications()` and `retry_pending_webhooks()` retry any failed deliveries from prior cycles (each manages its own short-lived connections).
+3. `get_topics_due_for_check()` finds active READY topics whose last check exceeds their interval. Each topic check uses a fresh, short-lived connection so none is held across the HTTP/LLM awaits.
 4. For each due topic, `check_topic()` runs with a unique correlation ID:
    - **Fetch** - `fetch_new_articles_for_topic()`: fetch feeds, dedup against DB, extract content.
    - **Analyze** - `analyze_articles()`: LLM compares articles against knowledge state.
@@ -216,7 +238,7 @@ On first run, `config.example.yml` is auto-copied to `data/config.yml`.
 
 **Feed resilience.** Timeouts and 5xx errors get configurable retries. Feed health is tracked per-URL. Empty feeds are not errors.
 
-**Stuck topic recovery.** Topics stuck in RESEARCHING are recovered to ERROR status both on startup (`recover_stuck_topics`) and by a periodic scheduler job (15-minute timeout).
+**Stuck topic recovery.** Topics stuck in RESEARCHING are recovered to ERROR status by `recover_stuck_researching`, run both on startup and by a periodic scheduler job (every 5 min, 15-minute stuck timeout).
 
 ## Security Model
 
