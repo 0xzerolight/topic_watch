@@ -52,8 +52,10 @@ fi
 mkdir -p "$DATA_DIR"
 # Skip the recursive chown when ownership already matches — it is expensive on
 # large bind-mounted volumes and unnecessary when the UID/GID haven't changed.
+# Check BOTH owner UID and group GID so a GID-only change is not missed.
 dir_uid="$(stat -c %u "$DATA_DIR")"
-if [ "$dir_uid" != "$PUID" ]; then
+dir_gid="$(stat -c %g "$DATA_DIR")"
+if [ "$dir_uid" != "$PUID" ] || [ "$dir_gid" != "$PGID" ]; then
     chown -R "$PUID:$PGID" "$DATA_DIR"
 fi
 
