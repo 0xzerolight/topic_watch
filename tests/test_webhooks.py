@@ -75,6 +75,16 @@ class TestBuildWebhookPayload:
         payload = _build_webhook_payload("T", novelty)
         assert payload["confidence"] == pytest.approx(0.72)
 
+    def test_payload_contains_relevance(self) -> None:
+        novelty = _make_novelty(relevance=0.61)
+        payload = _build_webhook_payload("T", novelty)
+        assert payload["relevance"] == pytest.approx(0.61)
+
+    def test_relevance_is_float_type(self) -> None:
+        novelty = _make_novelty(relevance=1.0)
+        payload = _build_webhook_payload("T", novelty)
+        assert isinstance(payload["relevance"], float)
+
     def test_payload_contains_timestamp(self) -> None:
         novelty = _make_novelty()
         payload = _build_webhook_payload("T", novelty)
@@ -87,7 +97,16 @@ class TestBuildWebhookPayload:
     def test_payload_has_all_expected_fields(self) -> None:
         novelty = _make_novelty()
         payload = _build_webhook_payload("T", novelty)
-        expected_keys = {"topic", "reasoning", "summary", "key_facts", "source_urls", "confidence", "timestamp"}
+        expected_keys = {
+            "topic",
+            "reasoning",
+            "summary",
+            "key_facts",
+            "source_urls",
+            "confidence",
+            "relevance",
+            "timestamp",
+        }
         assert set(payload.keys()) == expected_keys
 
     def test_key_facts_is_list_type(self) -> None:

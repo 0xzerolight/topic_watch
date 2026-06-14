@@ -38,6 +38,7 @@ def _build_webhook_payload(topic_name: str, novelty_result: NoveltyResult) -> di
         "key_facts": novelty_result.key_facts,
         "source_urls": novelty_result.source_urls,
         "confidence": novelty_result.confidence,
+        "relevance": novelty_result.relevance,
         "timestamp": datetime.now(UTC).isoformat(),
     }
 

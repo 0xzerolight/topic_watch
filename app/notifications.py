@@ -44,8 +44,10 @@ def format_notification(topic_name: str, novelty_result: NoveltyResult) -> tuple
             parts.append(f"  {url}")
 
     confidence_pct = int(novelty_result.confidence * 100)
+    relevance_pct = int(novelty_result.relevance * 100)
     parts.append("")
     parts.append(f"Confidence: {confidence_pct}%")
+    parts.append(f"Relevance: {relevance_pct}%")
 
     body = "\n".join(parts)
     return title, body
