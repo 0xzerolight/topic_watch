@@ -189,10 +189,18 @@ async def _call_with_rate_limit_retry(
 # --- key_facts restatement filtering ---
 
 # A key_fact is dropped only when it is a CLEAR restatement of the existing
-# knowledge summary: either its normalized text already appears verbatim inside
-# the normalized summary, or its content words overlap the summary above this
-# threshold. Conservative by design — a high bar avoids dropping genuinely new facts.
-_RESTATEMENT_OVERLAP_THRESHOLD = 0.9
+# knowledge summary: either its normalized text appears verbatim inside the
+# normalized summary, or a long *contiguous* word-sequence (n-gram) of the fact
+# appears verbatim in the summary. Phrase-level matching (not bag-of-words set
+# overlap) is required so a short genuinely-new fact whose words merely scatter
+# across a long summary is never silently dropped. Conservative by design.
+#
+# Restatement requires the longest fact word-sequence shared contiguously with
+# the summary to cover at least this fraction of the fact's content words...
+_RESTATEMENT_PHRASE_OVERLAP_THRESHOLD = 0.8
+# ...and the fact must have at least this many content words. Shorter facts are
+# never auto-dropped, since coincidental phrase matches are too easy on them.
+_RESTATEMENT_MIN_FACT_WORDS = 4
 _WORD_RE = re.compile(r"\w+")
 
 
@@ -201,19 +209,44 @@ def _normalize_for_match(text: str) -> str:
     return " ".join(text.lower().split())
 
 
-def _content_words(text: str) -> set[str]:
-    """Extract lowercased word tokens for overlap comparison."""
-    return {m.group(0) for m in _WORD_RE.finditer(text.lower())}
+def _content_words(text: str) -> list[str]:
+    """Extract ordered, lowercased word tokens (multiplicity preserved)."""
+    return [m.group(0) for m in _WORD_RE.finditer(text.lower())]
+
+
+def _longest_contiguous_run(fact_words: list[str], summary_words: list[str]) -> int:
+    """Length of the longest contiguous run of ``fact_words`` that appears, in
+    order and adjacent, anywhere within ``summary_words``.
+
+    Classic DP for longest common substring over token sequences.
+    """
+    if not fact_words or not summary_words:
+        return 0
+    prev = [0] * (len(summary_words) + 1)
+    best = 0
+    for fw in fact_words:
+        curr = [0] * (len(summary_words) + 1)
+        for j, sw in enumerate(summary_words, start=1):
+            if fw == sw:
+                curr[j] = prev[j - 1] + 1
+                if curr[j] > best:
+                    best = curr[j]
+        prev = curr
+    return best
 
 
 def _is_restatement(fact: str, knowledge_summary: str) -> bool:
-    """True if ``fact`` substantially restates content already in the summary.
+    """True if ``fact`` clearly restates content already in the summary.
 
-    Two conservative signals:
+    Two conservative, phrase-level signals:
     * normalized-substring: the fact's normalized text appears verbatim within
       the normalized knowledge summary; or
-    * token-overlap: ≥ ``_RESTATEMENT_OVERLAP_THRESHOLD`` of the fact's content
-      words are already present in the summary.
+    * contiguous-phrase: the fact has ≥ ``_RESTATEMENT_MIN_FACT_WORDS`` content
+      words AND its longest contiguous word-sequence shared with the summary
+      covers ≥ ``_RESTATEMENT_PHRASE_OVERLAP_THRESHOLD`` of the fact's words.
+
+    Set-overlap is deliberately NOT used: scattered, non-contiguous word matches
+    must never drop a short, genuinely-new fact.
 
     An empty summary or empty fact is never a restatement.
     """
@@ -226,11 +259,11 @@ def _is_restatement(fact: str, knowledge_summary: str) -> bool:
         return True
 
     fact_words = _content_words(fact)
-    if not fact_words:
+    if len(fact_words) < _RESTATEMENT_MIN_FACT_WORDS:
         return False
     summary_words = _content_words(knowledge_summary)
-    overlap = len(fact_words & summary_words) / len(fact_words)
-    return overlap >= _RESTATEMENT_OVERLAP_THRESHOLD
+    run = _longest_contiguous_run(fact_words, summary_words)
+    return run / len(fact_words) >= _RESTATEMENT_PHRASE_OVERLAP_THRESHOLD
 
 
 def _filter_restated_key_facts(key_facts: list[str], knowledge_summary: str) -> list[str]:
