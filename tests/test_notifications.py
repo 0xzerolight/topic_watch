@@ -1,6 +1,6 @@
 """Tests for the notification module: Apprise wrapper and formatting."""
 
-import time
+import threading
 from unittest.mock import MagicMock, patch
 
 from app.analysis.llm import NoveltyResult
@@ -152,8 +152,12 @@ class TestSendNotification:
         """A hung notify is abandoned after apprise_timeout_seconds, returning False."""
         mock_instance = MagicMock()
 
+        _blocker = threading.Event()
+
         def slow_notify(**_kwargs):
-            time.sleep(5)
+            # Block for 2s — longer than the 1s timeout so wait_for fires,
+            # but short enough that the abandoned thread exits quickly.
+            _blocker.wait(2)
             return True
 
         mock_instance.notify.side_effect = slow_notify
