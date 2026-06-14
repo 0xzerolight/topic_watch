@@ -104,18 +104,23 @@ container has to write `./data` as *your* user. The image defaults to UID/GID
 chowns `./data` to match `PUID`/`PGID` on startup.
 
 If your host user is not `1000`, set `PUID`/`PGID` so the container writes as
-you. Check with `id -u` / `id -g`:
+you. The one-line installer handles this automatically and is safe to re-run.
+
+For manual installs, use `grep -q` to avoid duplicating lines on re-run:
 
 ```bash
 # In the directory containing docker-compose.yml
-echo "PUID=$(id -u)" >> .env
-echo "PGID=$(id -g)" >> .env
+for kv in "PUID=$(id -u)" "PGID=$(id -g)"; do
+    key="${kv%%=*}"
+    grep -q "^${key}=" .env 2>/dev/null \
+        && sed -i "s|^${key}=.*|${kv}|" .env \
+        || echo "${kv}" >> .env
+done
 docker compose up -d
 ```
 
-The one-line installer does this automatically. macOS and Windows (Docker
-Desktop) handle ownership transparently, so `PUID`/`PGID` are only relevant on
-native Linux hosts.
+macOS and Windows (Docker Desktop) handle ownership transparently, so
+`PUID`/`PGID` are only relevant on native Linux hosts.
 
 Then visit [http://localhost:8000](http://localhost:8000) to configure.
 
