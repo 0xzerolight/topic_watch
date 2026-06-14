@@ -37,9 +37,13 @@ _PRIVATE_NETLOC_PATTERNS = [
     re.compile(r"^0\.0\.0\.0"),
     re.compile(r"^::1$"),  # IPv6 loopback
     re.compile(r"^::ffff:", re.IGNORECASE),  # IPv6-mapped IPv4
-    re.compile(r"^fd", re.IGNORECASE),  # IPv6 ULA
+    re.compile(r"^f[cd]", re.IGNORECASE),  # IPv6 ULA (fc00::/7)
     re.compile(r"^fe80:", re.IGNORECASE),  # IPv6 link-local
 ]
+
+# RFC 6598 carrier-grade NAT range. Not flagged by ipaddress.is_private/.is_reserved,
+# so it is checked explicitly — on CGNAT hosts it can reach carrier infrastructure.
+_CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 
 
 def _resolved_ip_is_private(hostname: str) -> bool:
@@ -58,7 +62,13 @@ def _resolved_ip_is_private(hostname: str) -> bool:
         infos = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
         for _family, _type, _proto, _canonname, sockaddr in infos:
             addr = ipaddress.ip_address(sockaddr[0])
-            if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
+            if (
+                addr.is_private
+                or addr.is_loopback
+                or addr.is_link_local
+                or addr.is_reserved
+                or (addr.version == 4 and addr in _CGNAT_NETWORK)
+            ):
                 return True
         return False
     except (socket.gaierror, ValueError, OSError):
