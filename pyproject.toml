@@ -40,6 +40,9 @@ dependencies = [
     "python-multipart>=0.0.9,<1.0",
 ]
 
+[project.scripts]
+topic-watch = "app.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/0xzerolight/topic_watch"
 Repository = "https://github.com/0xzerolight/topic_watch"
