@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Per-topic confidence and relevance thresholds (override global defaults; high-stakes topics can demand stricter novelty)
+- Per-check LLM token cost shown in topic check history
+- Multi-round topic initialization that retries thin first-pass knowledge across cycles instead of going READY too early
+- Setup wizard pre-flight LLM credential validation (pings the model on submit; bad key/model is caught before completing setup)
+- Persistent webhook retry queue that survives restarts and respects `max_retries`
+- Knowledge compression that condenses over-budget knowledge via the LLM instead of truncating, preventing dropped facts from being re-detected as new
+- Full settings UI that surfaces and persists all configurable fields (previously some were silently reset on save)
+- Friendly empty-states, clearer error copy, and accessibility labels across the UI
+- Docker PUID/PGID support for non-1000 host users (correct data-volume permissions)
+- Dropped-duplicate count surfaced instead of silently discarding duplicate articles
+- `apprise_timeout_seconds` to bound notification send time
+
+### Changed
+
+- Scheduler holds a database connection only per topic check (not across the whole tick); weekly VACUUM runs off the event loop
+- Apprise sends are time-bounded so a hung notification can no longer freeze the scheduler
+- Feed/LLM timeout config fields now reject zero or negative values
+- Dependency updates
+
+### Fixed
+
+- Settings POST handler no longer silently resets `min_relevance_threshold`, `secure_cookies`, and other fields on save
+- Stopped a re-analysis loop and corrected `status_changed_at` handling
+- Dashboard now surfaces `?error=` flash messages
+- RSS provider fallback: continue past single feed failures, fall back to a second provider when all are unhealthy, and don't mark a provider unhealthy on an empty-but-OK feed
+- OPML import merges feeds for same-named outlines
+- Config writer creates the parent directory before writing the YAML
+- Install script writes/updates PUID/PGID in `.env` without truncating existing contents
+- Hardened model parsing against malformed JSON and empty-string/corrupt datetimes
+- Docker entrypoint guards `chown`, validates PUID/PGID, and warns when run as root
+
+### Security
+
+- Reject non-http(s) redirect schemes during URL fetches
+- Re-validate redirect targets against SSRF on every hop
+- Bump python-multipart and pytest to patch known CVEs
+
 ## [1.1.2] - 2026-04-04
 
 ### Fixed
