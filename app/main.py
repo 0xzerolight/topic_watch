@@ -13,7 +13,6 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app import __version__ as _app_version
@@ -25,6 +24,7 @@ from app.scheduler import start_scheduler, stop_scheduler
 from app.web.api import router as api_router
 from app.web.csrf import CSRFMiddleware
 from app.web.routers import router
+from app.web.routers.templates import templates
 from app.web.setup_middleware import SetupRedirectMiddleware
 
 logger = logging.getLogger(__name__)
@@ -62,8 +62,6 @@ app.include_router(router)
 app.include_router(api_router)
 app.mount("/static", StaticFiles(directory=str(Path(__file__).resolve().parent / "static")), name="static")
 
-_error_templates = Jinja2Templates(directory=str(Path(__file__).resolve().parent / "templates"))
-
 
 def _wants_json(request: Request) -> bool:
     """Return True if the request is for the JSON API (not browser HTML)."""
@@ -79,7 +77,7 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException) 
 
     from app import __version__
 
-    return _error_templates.TemplateResponse(
+    return templates.TemplateResponse(
         request,
         "error.html",
         {"status_code": exc.status_code, "detail": exc.detail, "version": __version__},
@@ -95,7 +93,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
     from app import __version__
 
-    return _error_templates.TemplateResponse(
+    return templates.TemplateResponse(
         request,
         "error.html",
         {"status_code": 422, "detail": "Invalid request", "version": __version__},

@@ -452,9 +452,12 @@ class TestTopicDetail:
         assert "42" in response.text
 
     async def test_detail_404_for_nonexistent(self, client: httpx.AsyncClient) -> None:
-        """Requesting a nonexistent topic returns 404."""
-        response = await client.get("/topics/9999")
+        """Requesting a nonexistent topic renders the HTML error page with a 404."""
+        response = await client.get("/topics/9999", headers={"accept": "text/html"})
         assert response.status_code == 404
+        assert "text/html" in response.headers["content-type"]
+        assert "404" in response.text
+        assert "Back to Dashboard" in response.text
 
     async def test_detail_researching_shows_polling(
         self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
