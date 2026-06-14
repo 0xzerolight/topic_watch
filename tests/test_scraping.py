@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from unittest.mock import patch
 
 import httpx
+import pytest
 
 from app.crud import create_topic, list_articles_for_topic
 from app.models import Article, FeedMode, Topic
@@ -1066,3 +1067,84 @@ class TestSSRFRedirectProtection:
                 client=client,
             )
         assert "additional context" in content.lower() or len(content) > 20
+
+
+# ============================================================
+# TestSafeSendRedirectEdgeCases (hop cap, 303 downgrade, scheme)
+# ============================================================
+
+
+class TestSafeSendRedirectEdgeCases:
+    """Direct tests for safe_send redirect handling: hop cap, the 303 ->
+    GET method/body downgrade, and rejection of non-http(s) redirect schemes."""
+
+    async def test_exceeding_max_redirects_raises(self) -> None:
+        """A redirect chain longer than max_redirects raises PrivateRedirectError."""
+        from app.url_validation import PrivateRedirectError, safe_get
+
+        hops: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            hops.append(str(request.url))
+            # Always redirect to a fresh public URL, never terminating.
+            n = len(hops)
+            return httpx.Response(302, headers={"location": f"https://public.example.com/hop/{n}"})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=False) as client:
+            with pytest.raises(PrivateRedirectError, match="Exceeded maximum"):
+                await safe_get(client, "https://public.example.com/start", max_redirects=3)
+
+        # Initial request + exactly max_redirects (3) followed hops = 4 sends.
+        assert len(hops) == 4
+
+    async def test_303_redirect_downgrades_to_get_and_strips_body(self) -> None:
+        """A 303 on a POST must reissue as GET with no body and no content headers."""
+        from app.url_validation import safe_send
+
+        seen: list[tuple[str, str, bytes, str | None]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            seen.append((request.method, url, request.content, request.headers.get("content-type")))
+            if "final.example.org" in url:
+                return httpx.Response(200, text="done")
+            return httpx.Response(303, headers={"location": "https://final.example.org/result"})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=False) as client:
+            request = client.build_request(
+                "POST",
+                "https://public.example.com/submit",
+                content=b"payload=1",
+                headers={"content-type": "application/x-www-form-urlencoded"},
+            )
+            response = await safe_send(client, request)
+
+        assert response.status_code == 200
+        assert response.text == "done"
+        # First hop: original POST with body.
+        assert seen[0][0] == "POST"
+        assert seen[0][2] == b"payload=1"
+        # Second hop: downgraded to GET, body stripped, content-type removed.
+        method, url, body, content_type = seen[1]
+        assert method == "GET"
+        assert "final.example.org" in url
+        assert body == b""
+        assert content_type is None
+
+    async def test_redirect_to_non_http_scheme_is_rejected(self) -> None:
+        """A redirect to a file:// (or other non-http) scheme is blocked and the
+        target is never fetched, even though it has no netloc to flag as private."""
+        from app.url_validation import PrivateRedirectError, safe_get
+
+        fetched: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            fetched.append(str(request.url))
+            return httpx.Response(302, headers={"location": "file:///etc/passwd"})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=False) as client:
+            with pytest.raises(PrivateRedirectError, match="non-http"):
+                await safe_get(client, "https://public.example.com/feed.xml")
+
+        # Only the initial public URL was ever requested; file:// never fetched.
+        assert fetched == ["https://public.example.com/feed.xml"]
