@@ -281,3 +281,35 @@ class PendingNotification(BaseModel):
         d = self.model_dump(exclude={"id"})
         d["created_at"] = d["created_at"].isoformat()
         return d
+
+
+class PendingWebhook(BaseModel):
+    """A webhook delivery that failed to send and should be retried.
+
+    Mirrors ``PendingNotification`` for the webhook retry queue. The outbound
+    ``payload`` is stored as a JSON TEXT column.
+    """
+
+    id: int | None = None
+    topic_id: int
+    check_result_id: int | None = None
+    url: str
+    payload: dict = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    retry_count: int = 0
+    max_retries: int = 3
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> Self:
+        """Construct a PendingWebhook from a database row."""
+        data = dict(row)
+        data["payload"] = _safe_json(data.get("payload"), {})
+        data["created_at"] = _coerce_required_dt(data.get("created_at"))
+        return cls(**data)
+
+    def to_insert_dict(self) -> dict:
+        """Return a dict for SQL INSERT (excludes auto-generated id)."""
+        d = self.model_dump(exclude={"id"})
+        d["payload"] = json.dumps(d["payload"])
+        d["created_at"] = d["created_at"].isoformat()
+        return d
