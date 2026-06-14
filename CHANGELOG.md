@@ -20,12 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Docker PUID/PGID support for non-1000 host users (correct data-volume permissions)
 - Dropped-duplicate count surfaced instead of silently discarding duplicate articles
 - `apprise_timeout_seconds` to bound notification send time
+- Relevance score included in notifications and the webhook JSON payload (`relevance` field)
+- `topic-watch` console entry point (run the CLI as `topic-watch ...` after install)
 
 ### Changed
 
 - Scheduler holds a database connection only per topic check (not across the whole tick); weekly VACUUM runs off the event loop
 - Apprise sends are time-bounded so a hung notification can no longer freeze the scheduler
 - Feed/LLM timeout config fields now reject zero or negative values
+- `llm_max_retries` now governs rate-limit backoff on LLM calls (previously hardcoded)
 - Dependency updates
 
 ### Fixed
@@ -39,11 +42,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Install script writes/updates PUID/PGID in `.env` without truncating existing contents
 - Hardened model parsing against malformed JSON and empty-string/corrupt datetimes
 - Docker entrypoint guards `chown`, validates PUID/PGID, and warns when run as root
+- Docker entrypoint chowns `data/` when only the GID differs, not just the UID
+- Groq, DeepSeek, Mistral, xAI, and Perplexity now recognized as cloud providers, so a stale `base_url` is dropped on provider switch instead of misrouting the call
+- Init-timeout error transitions now stamp `status_changed_at`
+- Removed a broken notification icon reference in the web UI
 
 ### Security
 
 - Reject non-http(s) redirect schemes during URL fetches
 - Re-validate redirect targets against SSRF on every hop
+- SSRF check now fails closed on DNS resolution failure (unresolvable hosts are treated as private and blocked)
+- SSRF check now blocks CGNAT (`100.64.0.0/10`) and the full IPv6 ULA range (`fc00::/7`)
 - Bump python-multipart and pytest to patch known CVEs
 
 ## [1.1.2] - 2026-04-04
