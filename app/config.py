@@ -39,6 +39,11 @@ CLOUD_PROVIDERS: frozenset[str] = frozenset(
         "replicate",
         "huggingface",
         "together_ai",
+        "groq",
+        "deepseek",
+        "mistral",
+        "xai",
+        "perplexity",
     }
 )
 
