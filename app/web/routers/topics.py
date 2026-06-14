@@ -435,7 +435,7 @@ async def bulk_delete_handler(
     for tid in topic_ids:
         try:
             delete_topic(conn, int(str(tid)))
-        except (ValueError, Exception) as exc:
+        except Exception as exc:
             logger.warning("Failed to delete topic %s: %s", tid, exc)
     conn.commit()
     return RedirectResponse(url="/", status_code=303)
@@ -457,7 +457,7 @@ async def bulk_check_handler(
             topic = get_topic(conn, int(str(tid)))
             if topic and topic.id is not None and topic.status == TopicStatus.READY:
                 background_tasks.add_task(background._run_single_check, topic.id, settings, db_path)
-        except (ValueError, Exception) as exc:
+        except Exception as exc:
             logger.warning("Failed to queue check for topic %s: %s", tid, exc)
     return RedirectResponse(url="/", status_code=303)
 
