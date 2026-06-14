@@ -53,6 +53,9 @@ class TestIsPrivateUrl:
     def test_ipv6_ula_full(self) -> None:
         assert is_private_url("http://[fdab:cdef:1234::1]/path") is True
 
+    def test_ipv6_ula_fc(self) -> None:
+        assert is_private_url("http://[fc00::1]/path") is True
+
     def test_ipv6_link_local(self) -> None:
         assert is_private_url("http://[fe80::1]/path") is True
 
@@ -129,6 +132,16 @@ class TestIsPrivateUrl:
         monkeypatch.setattr(socket, "getaddrinfo", _public)
         assert _resolved_ip_is_private("example.com") is False
         assert is_private_url("https://example.com/feed.xml") is False
+
+    def test_resolved_cgnat_blocked(self, monkeypatch) -> None:
+        """A host resolving into the RFC 6598 CGNAT range (100.64.0.0/10) is blocked."""
+
+        def _cgnat(*_args, **_kwargs):
+            return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("100.64.0.1", 0))]
+
+        monkeypatch.setattr(socket, "getaddrinfo", _cgnat)
+        assert _resolved_ip_is_private("rebind.example.com") is True
+        assert is_private_url("https://rebind.example.com/feed.xml") is True
 
 
 class TestValidateFeedUrl:
