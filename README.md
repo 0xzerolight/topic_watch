@@ -93,6 +93,11 @@ mkdir -p data && cp config.example.yml data/config.yml
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
+> **Run a single worker.** The scheduler, the in-memory dashboard stats cache,
+> and the "already checking" guard all live in-process. Do not pass `--workers N`
+> (or run multiple replicas) — extra workers each start their own scheduler and
+> keep separate state. The default Docker image runs one worker.
+
 </details>
 
 #### File permissions (PUID / PGID)
@@ -298,19 +303,43 @@ Payload:
   "key_facts": ["...", "..."],
   "source_urls": ["https://..."],
   "confidence": 0.92,
+  "relevance": 0.88,
   "timestamp": "2026-04-01T12:00:00+00:00"
 }
 ```
 
 10-second timeout per endpoint, concurrent delivery, failures logged but non-blocking.
 
+## JSON API
+
+A read-only JSON API lives under `/api/v1`, plus one endpoint to trigger a check.
+Interactive docs are at `/docs` (OpenAPI/Swagger).
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/v1/topics` | List topics. Optional query params: `active` (bool), `tag` (string) |
+| `GET` | `/api/v1/topics/{id}` | One topic plus its knowledge state |
+| `GET` | `/api/v1/topics/{id}/checks` | Check history, paginated (`page`, `per_page`; `per_page` capped at 100) |
+| `GET` | `/api/v1/topics/{id}/knowledge` | Current knowledge state |
+| `POST` | `/api/v1/topics/{id}/check` | Trigger a check. Runs synchronously; requires `X-CSRF-Token`. Returns `409` unless the topic status is `ready` |
+
+The check endpoint returns `{"status": "checked", "has_new_info": <bool>, "check_result_id": <int>}`.
+
 ## Data Export
 
-| Endpoint | Description |
-|----------|-------------|
-| `GET /export/topics/json` | All topics |
-| `GET /topics/{id}/export/json` | Single topic with articles, checks, knowledge state |
-| `GET /topics/{id}/export/csv` | Check history as CSV |
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/export/topics/json` | All topics as JSON |
+| `GET` | `/export/opml` | All topics as OPML XML |
+| `GET` | `/topics/{id}/export/json` | Single topic with articles, checks, knowledge state |
+| `GET` | `/topics/{id}/export/csv` | Check history as CSV |
+
+### OPML import/export
+
+Move feeds in and out of RSS readers (FreshRSS, Miniflux, Tiny Tiny RSS) via OPML.
+
+- Export: `GET /export/opml` downloads all topics as an OPML file.
+- Import: `POST /import/opml` accepts an OPML upload (`opml_file` form field, 1 MB max, UTF-8). Imported topics start as `new` and initialize gradually (~1/min). Same-named topics are skipped.
 
 ## CLI
 
