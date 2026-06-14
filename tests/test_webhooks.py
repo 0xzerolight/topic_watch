@@ -419,3 +419,101 @@ class TestWebhookRetryQueue:
         assert list_pending_webhooks(db_conn) == []
         remaining = db_conn.execute("SELECT COUNT(*) FROM pending_webhooks").fetchone()[0]
         assert remaining == 0
+
+
+class TestWebhookRetryCrashSafety:
+    """Per-item commits must survive a mid-loop crash (no rollback of work)."""
+
+    async def test_crash_midloop_preserves_already_applied_results(self, db_conn: sqlite3.Connection) -> None:
+        """If applying item 2 crashes, item 1's delete must already be committed.
+
+        Old code committed once after the whole loop, so a crash rolled back
+        every delete/increment from that pass — letting a failing URL retry
+        unbounded. Per-item commits must keep already-applied work durable.
+        """
+        topic = _make_topic(db_conn)
+        settings = _make_settings(
+            notifications=NotificationSettings(
+                urls=[],
+                webhook_urls=["https://first.com/hook", "https://second.com/hook"],
+            )
+        )
+        novelty = _make_novelty()
+
+        # Enqueue two failed webhooks.
+        with patch("app.webhooks.send_webhook", return_value=False):
+            await send_webhooks("Hooked", novelty, settings, conn=db_conn, topic_id=topic.id)
+        pending = list_pending_webhooks(db_conn)
+        assert len(pending) == 2
+        first_id = pending[0]["id"]
+
+        # Retry: both sends "succeed", but applying the SECOND result crashes.
+        from app.crud import delete_pending_webhook as real_delete_pending_webhook
+
+        call_count = {"n": 0}
+
+        def crashing_delete(conn, webhook_id):  # noqa: ANN001
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                raise RuntimeError("simulated crash applying item 2")
+            real_delete_pending_webhook(conn, webhook_id)
+
+        with (
+            patch("app.webhooks.send_webhook", new_callable=AsyncMock, return_value=True),
+            patch("app.webhooks.delete_pending_webhook", side_effect=crashing_delete),
+            pytest.raises(RuntimeError, match="simulated crash"),
+        ):
+            await retry_pending_webhooks(db_conn, settings)
+
+        # Item 1's delete was committed before item 2 crashed: it is gone,
+        # item 2 remains. The pass did NOT roll back already-applied work.
+        remaining = db_conn.execute("SELECT id FROM pending_webhooks").fetchall()
+        remaining_ids = {r["id"] for r in remaining}
+        assert first_id not in remaining_ids
+        assert len(remaining_ids) == 1
+
+    async def test_no_connection_held_across_send(self, db_conn: sqlite3.Connection) -> None:
+        """The network send must run with no open transaction on the snapshot conn."""
+        topic = _make_topic(db_conn)
+        settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=["https://a.com/hook"]))
+        novelty = _make_novelty()
+
+        with patch("app.webhooks.send_webhook", return_value=False):
+            await send_webhooks("Hooked", novelty, settings, conn=db_conn, topic_id=topic.id)
+
+        in_transaction_during_send: list[bool] = []
+
+        async def observe(url: str, payload: dict, timeout: float = 10.0) -> bool:
+            # When a connection holds an uncommitted write, in_transaction is
+            # True. The snapshot must have been committed before the send.
+            in_transaction_during_send.append(db_conn.in_transaction)
+            return True
+
+        with patch("app.webhooks.send_webhook", side_effect=observe):
+            await retry_pending_webhooks(db_conn, settings)
+
+        assert in_transaction_during_send == [False]
+
+    async def test_db_path_mode_no_conn(self, tmp_path) -> None:  # noqa: ANN001
+        """Scheduler-style call (db_path, no conn) retries and clears on success."""
+        from app.database import get_connection, init_db
+
+        db_path = tmp_path / "test.db"
+        init_db(db_path)
+        conn = get_connection(db_path)
+        topic = _make_topic(conn)
+        settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=["https://a.com/hook"]))
+        novelty = _make_novelty()
+
+        with patch("app.webhooks.send_webhook", return_value=False):
+            await send_webhooks("Hooked", novelty, settings, conn=conn, topic_id=topic.id)
+        conn.close()
+
+        with patch("app.webhooks.send_webhook", new_callable=AsyncMock, return_value=True):
+            await retry_pending_webhooks(settings=settings, db_path=db_path)
+
+        verify = get_connection(db_path)
+        try:
+            assert list_pending_webhooks(verify) == []
+        finally:
+            verify.close()

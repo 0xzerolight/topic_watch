@@ -4,6 +4,8 @@ import json
 import sqlite3
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 from app.analysis.knowledge import KnowledgeWriteResult
 from app.analysis.llm import NoveltyResult, TokenUsage
 from app.checker import check_all_topics, check_topic, retry_pending_notifications
@@ -1025,3 +1027,61 @@ class TestRetryPendingNotifications:
             await retry_pending_notifications(db_conn, settings)
 
         mock_send.assert_not_called()
+
+    async def test_no_connection_held_across_send(self, db_conn: sqlite3.Connection) -> None:
+        """The send must run with the snapshot connection already committed."""
+        topic = _make_topic(db_conn)
+        create_pending_notification(
+            db_conn,
+            PendingNotification(topic_id=topic.id, title="T", body="B"),
+        )
+        db_conn.commit()
+        settings = _make_settings()
+
+        in_transaction: list[bool] = []
+
+        async def observe(title, body, s):  # noqa: ANN001
+            in_transaction.append(db_conn.in_transaction)
+            return True
+
+        with patch("app.checker.send_notification", side_effect=observe):
+            await retry_pending_notifications(db_conn, settings)
+
+        assert in_transaction == [False]
+
+    async def test_crash_midloop_preserves_applied_results(self, db_conn: sqlite3.Connection) -> None:
+        """A crash applying item 2 must not roll back item 1's committed delete."""
+        topic = _make_topic(db_conn)
+        for i in range(2):
+            create_pending_notification(
+                db_conn,
+                PendingNotification(topic_id=topic.id, title=f"T{i}", body="B"),
+            )
+        db_conn.commit()
+        settings = _make_settings()
+
+        pending = list_pending_notifications(db_conn)
+        assert len(pending) == 2
+        first_id = pending[0].id
+
+        from app.crud import delete_pending_notification as real_delete
+
+        call_count = {"n": 0}
+
+        def crashing_delete(conn, notification_id):  # noqa: ANN001
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                raise RuntimeError("simulated crash applying item 2")
+            real_delete(conn, notification_id)
+
+        with (
+            patch("app.checker.send_notification", new_callable=AsyncMock, return_value=True),
+            patch("app.checker.delete_pending_notification", side_effect=crashing_delete),
+            pytest.raises(RuntimeError, match="simulated crash"),
+        ):
+            await retry_pending_notifications(db_conn, settings)
+
+        remaining = db_conn.execute("SELECT id FROM pending_notifications").fetchall()
+        remaining_ids = {r["id"] for r in remaining}
+        assert first_id not in remaining_ids
+        assert len(remaining_ids) == 1
