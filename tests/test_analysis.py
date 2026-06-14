@@ -1198,6 +1198,31 @@ class TestRestatementFilter:
         facts = ["Fact A", "Fact B"]
         assert _filter_restated_key_facts(facts, "") == facts
 
+    def test_short_new_fact_with_scattered_words_is_kept(self) -> None:
+        """Regression: a short genuinely-new fact whose words merely appear
+        scattered (non-contiguously) across a long summary must NOT be dropped.
+
+        Old bag-of-words overlap scored 1.0 here and silently hid the fact.
+        """
+        from app.analysis.llm import _filter_restated_key_facts
+
+        summary = (
+            "Confirmed Facts: The price of the standard edition is significant. "
+            "Earlier reports said the value had dropped sharply. "
+            "Separately, a number close to 49 was mentioned regarding subscriber counts."
+        )
+        facts = ["Price dropped to $49"]
+        kept = _filter_restated_key_facts(facts, summary)
+        assert kept == facts
+
+    def test_contiguous_phrase_restatement_is_filtered(self) -> None:
+        from app.analysis.llm import _filter_restated_key_facts
+
+        summary = "Confirmed Facts: The official launch event is scheduled for next quarter in Berlin."
+        facts = ["the official launch event is scheduled for next quarter"]
+        kept = _filter_restated_key_facts(facts, summary)
+        assert kept == []
+
     async def test_analyze_articles_filters_restated_key_facts(self) -> None:
         knowledge = "Confirmed Facts: The release date is March 2026."
         expected = NoveltyResult(
