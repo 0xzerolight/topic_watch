@@ -60,8 +60,7 @@ async def _cmd_check_all() -> None:
     settings = load_settings()
     init_db()
 
-    with get_db() as conn:
-        results = await check_all_topics(conn, settings)
+    results = await check_all_topics(settings)
 
     print(f"Check cycle complete: {len(results)} topics checked")
     for r in results:

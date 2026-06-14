@@ -159,11 +159,11 @@ class TestScheduledCheck:
         from app.scheduler import _run_check_cycle
 
         with (
-            patch("app.scheduler.check_topic", side_effect=fake_check_topic),
-            patch("app.scheduler.retry_pending_notifications", new_callable=AsyncMock),
-            patch("app.scheduler.retry_pending_webhooks", new_callable=AsyncMock),
+            patch("app.checker.check_topic", side_effect=fake_check_topic),
+            patch("app.checker.retry_pending_notifications", new_callable=AsyncMock),
+            patch("app.checker.retry_pending_webhooks", new_callable=AsyncMock),
             patch(
-                "app.scheduler.get_topics_due_for_check",
+                "app.checker.get_topics_due_for_check",
                 return_value=topics,
             ),
         ):
