@@ -4,7 +4,22 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    # Batch all Python bumps into one weekly PR instead of one per package.
+    groups:
+      python:
+        patterns:
+          - "*"
+    ignore:
+      # pydantic-core is pinned transitively by pydantic. A standalone bump
+      # breaks the hash-locked requirements under `pip install --require-hashes`.
+      # Bump pydantic instead and relock with pip-compile.
+      - dependency-name: "pydantic-core"
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
+    # Batch all GitHub Actions bumps into one weekly PR.
+    groups:
+      github-actions:
+        patterns:
+          - "*"
