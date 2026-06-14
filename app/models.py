@@ -44,7 +44,11 @@ def _coerce_required_dt(value: object) -> datetime:
     """
     parsed = _coerce_dt(value)
     if parsed is None:
-        if value not in (None, ""):
+        if value is None:
+            logger.warning("Required datetime is NULL in DB row; defaulting to now(UTC)")
+        elif value == "":
+            logger.warning("Required datetime is empty string in DB row; defaulting to now(UTC)")
+        else:
             logger.warning("Corrupt required datetime %r in DB row; defaulting to now(UTC)", value)
         return datetime.now(UTC)
     return parsed
