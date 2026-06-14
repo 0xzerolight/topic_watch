@@ -1,6 +1,13 @@
 """Tests for SSRF protection in URL validation."""
 
-from app.url_validation import is_private_url, validate_feed_url, validate_feed_urls
+import socket
+
+from app.url_validation import (
+    _resolved_ip_is_private,
+    is_private_url,
+    validate_feed_url,
+    validate_feed_urls,
+)
 
 
 class TestIsPrivateUrl:
@@ -60,17 +67,31 @@ class TestIsPrivateUrl:
 
     # --- Alternative IP encodings (caught by DNS resolution layer) ---
 
-    def test_hex_ip_loopback(self) -> None:
+    def test_hex_ip_loopback(self, monkeypatch) -> None:
         """0x7f000001 = 127.0.0.1 in hex — caught by DNS resolution."""
+
+        def _loopback(*_args, **_kwargs):
+            return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", 0))]
+
+        monkeypatch.setattr(socket, "getaddrinfo", _loopback)
         assert is_private_url("http://0x7f000001/path") is True
 
-    def test_decimal_ip_loopback(self) -> None:
+    def test_decimal_ip_loopback(self, monkeypatch) -> None:
         """2130706433 = 127.0.0.1 in decimal — caught by DNS resolution."""
+
+        def _loopback(*_args, **_kwargs):
+            return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", 0))]
+
+        monkeypatch.setattr(socket, "getaddrinfo", _loopback)
         assert is_private_url("http://2130706433/path") is True
 
     # --- Public URLs should pass ---
 
-    def test_public_url(self) -> None:
+    def test_public_url(self, monkeypatch) -> None:
+        def _public(*_args, **_kwargs):
+            return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", 0))]
+
+        monkeypatch.setattr(socket, "getaddrinfo", _public)
         assert is_private_url("https://example.com/feed.xml") is False
 
     def test_public_ip(self) -> None:
@@ -79,11 +100,35 @@ class TestIsPrivateUrl:
     def test_empty_url(self) -> None:
         assert is_private_url("") is False
 
-    # --- DNS resolution failure = fail open ---
+    # --- DNS resolution failure = fail closed ---
 
-    def test_unresolvable_host_passes(self) -> None:
-        """Hosts that fail DNS resolution pass (fail-open). The HTTP client will error."""
-        assert is_private_url("http://this-definitely-does-not-resolve.invalid/feed") is False
+    def test_unresolvable_host_blocked(self, monkeypatch) -> None:
+        """Hosts that fail DNS resolution are blocked (fail-closed)."""
+
+        def _raise(*_args, **_kwargs):
+            raise socket.gaierror("name resolution failed")
+
+        monkeypatch.setattr(socket, "getaddrinfo", _raise)
+        assert is_private_url("http://this-definitely-does-not-resolve.invalid/feed") is True
+
+    def test_resolved_ip_is_private_fails_closed_on_gaierror(self, monkeypatch) -> None:
+        """_resolved_ip_is_private returns True when DNS resolution raises."""
+
+        def _raise(*_args, **_kwargs):
+            raise socket.gaierror("name resolution failed")
+
+        monkeypatch.setattr(socket, "getaddrinfo", _raise)
+        assert _resolved_ip_is_private("unresolvable.invalid") is True
+
+    def test_resolved_public_ip_allowed(self, monkeypatch) -> None:
+        """A host resolving to a public IP is still allowed (happy path)."""
+
+        def _public(*_args, **_kwargs):
+            return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", 0))]
+
+        monkeypatch.setattr(socket, "getaddrinfo", _public)
+        assert _resolved_ip_is_private("example.com") is False
+        assert is_private_url("https://example.com/feed.xml") is False
 
 
 class TestValidateFeedUrl:
@@ -103,7 +148,20 @@ class TestValidateFeedUrl:
         assert error is not None
         assert "private" in error.lower()
 
-    def test_accepts_valid_url(self) -> None:
+    def test_rejects_unresolvable_host(self, monkeypatch) -> None:
+        def _raise(*_args, **_kwargs):
+            raise socket.gaierror("name resolution failed")
+
+        monkeypatch.setattr(socket, "getaddrinfo", _raise)
+        error = validate_feed_url("https://nope.invalid/feed.xml")
+        assert error is not None
+        assert "could not be resolved" in error
+
+    def test_accepts_valid_url(self, monkeypatch) -> None:
+        def _public(*_args, **_kwargs):
+            return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", 0))]
+
+        monkeypatch.setattr(socket, "getaddrinfo", _public)
         error = validate_feed_url("https://example.com/rss.xml")
         assert error is None
 
@@ -111,11 +169,19 @@ class TestValidateFeedUrl:
 class TestValidateFeedUrls:
     """Tests for validate_feed_urls()."""
 
-    def test_all_valid(self) -> None:
+    def test_all_valid(self, monkeypatch) -> None:
+        def _public(*_args, **_kwargs):
+            return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", 0))]
+
+        monkeypatch.setattr(socket, "getaddrinfo", _public)
         errors = validate_feed_urls(["https://example.com/rss.xml", "https://other.com/feed"])
         assert errors == []
 
-    def test_mixed_valid_invalid(self) -> None:
+    def test_mixed_valid_invalid(self, monkeypatch) -> None:
+        def _public(*_args, **_kwargs):
+            return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", 0))]
+
+        monkeypatch.setattr(socket, "getaddrinfo", _public)
         errors = validate_feed_urls(["https://example.com/rss.xml", "http://localhost/feed.xml"])
         assert len(errors) == 1
         assert "private" in errors[0].lower()

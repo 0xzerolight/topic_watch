@@ -40,6 +40,10 @@ When deploying Topic Watch on a public network:
 - **Keep dependencies updated.** Dependabot is configured on the repository. For self-hosted installs, run `pip install --upgrade -r requirements.txt` periodically.
 - **Use the Docker image.** It runs as a non-root user with resource limits.
 
+## Known Limitations
+
+- **SSRF / DNS rebinding (TOCTOU).** Feed and webhook URLs are validated against private/reserved addresses, including a DNS-resolution layer that now fails closed (an unresolvable host is blocked). Redirects are re-validated per hop. However, validation resolves DNS at check time while httpx re-resolves at connect time, leaving a narrow rebinding window between validation and fetch. Eliminating it would require a pinned-IP connect transport that risks breaking HTTPS feed fetching (SNI / cert verification), so it is an accepted limitation for this single-user self-hosted tool.
+
 ## JSON API
 
 The `/api/v1/` JSON API endpoints are unauthenticated, the same as the web UI. GET endpoints provide read access to all topic data including knowledge states. The single mutation endpoint (`POST /api/v1/topics/{id}/check`) is protected by CSRF.

@@ -1,5 +1,6 @@
 """Shared test fixtures for Topic Watch tests."""
 
+import socket
 import sqlite3
 from collections.abc import Generator
 from pathlib import Path
@@ -8,6 +9,22 @@ import pytest
 
 from app.database import get_connection, init_db
 from app.main import app
+
+
+@pytest.fixture(autouse=True)
+def _stub_dns_resolution(monkeypatch: pytest.MonkeyPatch):
+    """Resolve any hostname to a public IP by default.
+
+    SSRF validation (app.url_validation) resolves DNS at check time and now
+    fails closed on resolution failure. The test sandbox has no network, so
+    without this stub every public test host would be blocked. Tests that need
+    a private IP or a resolution failure override socket.getaddrinfo themselves.
+    """
+
+    def _public(*_args, **_kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", _public)
 
 
 @pytest.fixture(autouse=True)
