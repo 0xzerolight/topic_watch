@@ -6,7 +6,7 @@ to trigger topic checks. Reuses existing CRUD functions and Pydantic models.
 
 import sqlite3
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException
 
 from app.checker import check_topic
 from app.config import Settings
@@ -93,12 +93,13 @@ async def api_get_knowledge(
 @router.post("/topics/{topic_id}/check", dependencies=[Depends(verify_csrf)])
 async def api_trigger_check(
     topic_id: int,
-    request: Request,
-    background_tasks: BackgroundTasks,
     conn: sqlite3.Connection = Depends(get_db_conn),
     settings: Settings = Depends(get_settings),
 ) -> dict:
-    """Trigger a check for a specific topic."""
+    """Trigger a check for a specific topic.
+
+    Runs synchronously and may take several seconds; returns the check result.
+    """
     topic = get_topic(conn, topic_id)
     if topic is None:
         raise HTTPException(status_code=404, detail="Topic not found")
