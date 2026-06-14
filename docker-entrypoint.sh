@@ -18,6 +18,19 @@ PUID="${PUID:-1000}"
 PGID="${PGID:-1000}"
 DATA_DIR="/app/data"
 
+# Validate that PUID and PGID are numeric.
+case "$PUID" in
+    *[!0-9]*) echo "ERROR: PUID must be a numeric user ID (got: '$PUID')" >&2; exit 1;;
+esac
+case "$PGID" in
+    *[!0-9]*) echo "ERROR: PGID must be a numeric group ID (got: '$PGID')" >&2; exit 1;;
+esac
+
+# Warn loudly when asked to run as root (privilege drop would be a no-op).
+if [ "$PUID" = "0" ]; then
+    echo "WARNING: PUID=0 — the app will run as root, which defeats privilege drop." >&2
+fi
+
 # If we are not root, we cannot chown or change identity; just exec the app.
 if [ "$(id -u)" != "0" ]; then
     exec "$@"
@@ -37,7 +50,12 @@ fi
 
 # Ensure the data volume is writable by the runtime user.
 mkdir -p "$DATA_DIR"
-chown -R "$PUID:$PGID" "$DATA_DIR"
+# Skip the recursive chown when ownership already matches — it is expensive on
+# large bind-mounted volumes and unnecessary when the UID/GID haven't changed.
+dir_uid="$(stat -c %u "$DATA_DIR")"
+if [ "$dir_uid" != "$PUID" ]; then
+    chown -R "$PUID:$PGID" "$DATA_DIR"
+fi
 
 # Drop privileges and run the app as the (now host-aligned) appuser.
 exec gosu "$PUID:$PGID" "$@"
