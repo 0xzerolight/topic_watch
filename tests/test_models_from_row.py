@@ -5,7 +5,10 @@ future code bug) must NOT crash the route that loads the row. Each ``from_row``
 must coerce bad JSON/datetime cells to a safe default instead of raising.
 """
 
+import logging
 from datetime import datetime
+
+import pytest
 
 from app.models import (
     Article,
@@ -218,3 +221,44 @@ class TestPendingNotificationFromRow:
         row["created_at"] = "???"
         notif = PendingNotification.from_row(row)
         assert isinstance(notif.created_at, datetime)
+
+
+class TestRequiredDatetimeWarnings:
+    """_coerce_required_dt must log a WARNING for every corrupt/empty/None value."""
+
+    def _topic_row(self, created_at_value: object) -> dict:
+        return {
+            "id": 1,
+            "name": "Topic",
+            "description": "desc",
+            "feed_urls": "[]",
+            "feed_mode": "auto",
+            "created_at": created_at_value,
+            "status_changed_at": None,
+            "is_active": 1,
+            "status": "ready",
+            "error_message": None,
+            "check_interval_minutes": 60,
+            "tags": "[]",
+        }
+
+    def test_empty_string_required_datetime_emits_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Empty-string in a required datetime column must log a WARNING."""
+        with caplog.at_level(logging.WARNING, logger="app.models"):
+            topic = Topic.from_row(self._topic_row(""))
+        assert isinstance(topic.created_at, datetime)
+        assert any("empty string" in r.message for r in caplog.records)
+
+    def test_none_required_datetime_emits_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        """None in a required datetime column must log a WARNING."""
+        with caplog.at_level(logging.WARNING, logger="app.models"):
+            topic = Topic.from_row(self._topic_row(None))
+        assert isinstance(topic.created_at, datetime)
+        assert any("NULL" in r.message for r in caplog.records)
+
+    def test_malformed_required_datetime_emits_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        """An unparseable string in a required datetime column must log a WARNING."""
+        with caplog.at_level(logging.WARNING, logger="app.models"):
+            topic = Topic.from_row(self._topic_row("not-a-date"))
+        assert isinstance(topic.created_at, datetime)
+        assert any("Corrupt required datetime" in r.message for r in caplog.records)
