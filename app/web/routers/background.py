@@ -73,14 +73,11 @@ async def _run_single_check(topic_id: int, settings: Settings, db_path: Path | N
 
 async def _run_check_all(settings: Settings, db_path: Path | None = None) -> None:
     """Background task: check all topics for new information."""
-    from app.database import get_db
-
     try:
-        with get_db(db_path) as conn:
-            try:
-                await asyncio.wait_for(check_all_topics(conn, settings), timeout=_CHECK_ALL_TIMEOUT_SECONDS)
-            except TimeoutError:
-                logger.error("Check all timed out after %d seconds", _CHECK_ALL_TIMEOUT_SECONDS)
+        try:
+            await asyncio.wait_for(check_all_topics(settings, db_path), timeout=_CHECK_ALL_TIMEOUT_SECONDS)
+        except TimeoutError:
+            logger.error("Check all timed out after %d seconds", _CHECK_ALL_TIMEOUT_SECONDS)
     except Exception:
         logger.error("Check all background task failed", exc_info=True)
     finally:

@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -823,7 +824,7 @@ class TestMultiRoundInitialization:
 class TestCheckAllTopics:
     """Tests for the multi-topic check loop."""
 
-    async def test_checks_all_ready_topics(self, db_conn: sqlite3.Connection) -> None:
+    async def test_checks_all_ready_topics(self, db_conn: sqlite3.Connection, tmp_path: Path) -> None:
         _make_topic(db_conn, name="Topic A")
         _make_topic(db_conn, name="Topic B")
         settings = _make_settings()
@@ -833,11 +834,11 @@ class TestCheckAllTopics:
             new_callable=AsyncMock,
             return_value=FetchResult(articles=[], total_feed_entries=0),
         ):
-            results = await check_all_topics(db_conn, settings)
+            results = await check_all_topics(settings, db_path=tmp_path / "test.db")
 
         assert len(results) == 2
 
-    async def test_skips_researching_topics(self, db_conn: sqlite3.Connection) -> None:
+    async def test_skips_researching_topics(self, db_conn: sqlite3.Connection, tmp_path: Path) -> None:
         _make_topic(db_conn, name="Ready", status=TopicStatus.READY)
         _make_topic(db_conn, name="Research", status=TopicStatus.RESEARCHING)
         settings = _make_settings()
@@ -847,11 +848,11 @@ class TestCheckAllTopics:
             new_callable=AsyncMock,
             return_value=FetchResult(articles=[], total_feed_entries=0),
         ):
-            results = await check_all_topics(db_conn, settings)
+            results = await check_all_topics(settings, db_path=tmp_path / "test.db")
 
         assert len(results) == 1
 
-    async def test_error_isolation(self, db_conn: sqlite3.Connection) -> None:
+    async def test_error_isolation(self, db_conn: sqlite3.Connection, tmp_path: Path) -> None:
         """One topic failing should not prevent others from being checked."""
         _make_topic(db_conn, name="Good Topic")
         _make_topic(db_conn, name="Bad Topic")
@@ -866,18 +867,18 @@ class TestCheckAllTopics:
             "app.checker.fetch_new_articles_for_topic",
             side_effect=mock_fetch,
         ):
-            results = await check_all_topics(db_conn, settings)
+            results = await check_all_topics(settings, db_path=tmp_path / "test.db")
 
         # Bad Topic's scraping error is caught inside check_topic,
         # so both topics produce a CheckResult.
         assert len(results) == 2
 
-    async def test_returns_empty_when_no_topics(self, db_conn: sqlite3.Connection) -> None:
+    async def test_returns_empty_when_no_topics(self, db_conn: sqlite3.Connection, tmp_path: Path) -> None:
         settings = _make_settings()
-        results = await check_all_topics(db_conn, settings)
+        results = await check_all_topics(settings, db_path=tmp_path / "test.db")
         assert results == []
 
-    async def test_skips_inactive_topics(self, db_conn: sqlite3.Connection) -> None:
+    async def test_skips_inactive_topics(self, db_conn: sqlite3.Connection, tmp_path: Path) -> None:
         _make_topic(db_conn, name="Active", status=TopicStatus.READY, is_active=True)
         _make_topic(db_conn, name="Inactive", status=TopicStatus.READY, is_active=False)
         settings = _make_settings()
@@ -887,11 +888,13 @@ class TestCheckAllTopics:
             new_callable=AsyncMock,
             return_value=FetchResult(articles=[], total_feed_entries=0),
         ):
-            results = await check_all_topics(db_conn, settings)
+            results = await check_all_topics(settings, db_path=tmp_path / "test.db")
 
         assert len(results) == 1
 
-    async def test_outer_error_boundary_isolates_check_topic_crash(self, db_conn: sqlite3.Connection) -> None:
+    async def test_outer_error_boundary_isolates_check_topic_crash(
+        self, db_conn: sqlite3.Connection, tmp_path: Path
+    ) -> None:
         """When check_topic itself raises, other topics still get checked."""
         _make_topic(db_conn, name="Good Topic")
         _make_topic(db_conn, name="Crash Topic")
@@ -912,7 +915,7 @@ class TestCheckAllTopics:
                 return_value=FetchResult(articles=[], total_feed_entries=0),
             ),
         ):
-            results = await check_all_topics(db_conn, settings)
+            results = await check_all_topics(settings, db_path=tmp_path / "test.db")
 
         # Only the good topic produces a result; crash topic is excluded
         assert len(results) == 1

@@ -26,11 +26,11 @@ from app.crud import (
     mark_articles_processed,
     update_topic,
 )
-from app.database import short_conn
+from app.database import get_db, short_conn
 from app.models import CheckResult, PendingNotification, Topic, TopicStatus
 from app.notifications import format_notification, send_notification
 from app.scraping import fetch_new_articles_for_topic
-from app.webhooks import send_webhooks
+from app.webhooks import retry_pending_webhooks, send_webhooks
 
 logger = logging.getLogger(__name__)
 
@@ -294,25 +294,42 @@ async def retry_pending_notifications(
 
 
 async def check_all_topics(
-    conn: sqlite3.Connection,
     settings: Settings,
+    db_path: Path | None = None,
 ) -> list[CheckResult]:
     """Check all active, ready topics for new information.
+
+    Uses per-topic connection granularity: a single connection held for the
+    whole cycle would stay open across every topic's HTTP + LLM awaits,
+    blocking concurrent web requests. Instead each phase uses its own
+    short-lived connection that is committed and closed promptly:
+
+      * retry passes (notifications + webhooks) — each manages its own
+        short-lived connections internally (snapshot, send with none held,
+        commit per item)
+      * the due-topics query — one connection
+      * each topic check — a fresh connection per topic
 
     Each topic is checked independently. Errors in one topic do not
     affect others.
 
     Args:
-        conn: Database connection.
         settings: Application settings.
+        db_path: Optional database path override for testing.
 
     Returns:
         List of CheckResults, one per topic checked.
     """
-    # Retry any failed notifications from previous cycles
-    await retry_pending_notifications(conn, settings)
+    # Retry any failed deliveries from previous cycles. Each retry function
+    # manages its own short-lived connections: it snapshots pending rows,
+    # sends with NO connection held, and commits per item.
+    await retry_pending_notifications(settings=settings, db_path=db_path)
+    await retry_pending_webhooks(settings=settings, db_path=db_path)
 
-    due_topics = get_topics_due_for_check(conn, settings.check_interval_minutes)
+    # Snapshot the due topics, then release the connection before the long
+    # per-topic HTTP/LLM work begins.
+    with get_db(db_path) as conn:
+        due_topics = get_topics_due_for_check(conn, settings.check_interval_minutes)
 
     if not due_topics:
         return []
@@ -321,8 +338,11 @@ async def check_all_topics(
 
     results: list[CheckResult] = []
     for topic in due_topics:
+        # Fresh, short-lived connection per topic so no connection is held
+        # across that topic's HTTP/LLM awaits.
         try:
-            result = await check_topic(topic, conn, settings)
+            with get_db(db_path) as conn:
+                result = await check_topic(topic, conn, settings)
             results.append(result)
         except Exception:
             logger.error(
