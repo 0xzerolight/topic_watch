@@ -128,6 +128,13 @@ async def safe_send(
         if not location:
             return response
         next_url = urljoin(str(request.url), location)
+        # Re-validate the scheme: is_private_url() returns False for URLs with no
+        # netloc (e.g. file:///etc/passwd, gopher://...), so a redirect to a
+        # non-http(s) scheme would otherwise slip past the private-host check.
+        if urlparse(next_url).scheme not in ("http", "https"):
+            await response.aclose()
+            logger.warning("Blocked redirect to non-http(s) URL: %s", next_url)
+            raise PrivateRedirectError(f"Redirect to non-http(s) scheme blocked: {next_url}")
         if is_private_url(next_url):
             await response.aclose()
             logger.warning("Blocked redirect to private/reserved URL: %s", next_url)
