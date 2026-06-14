@@ -77,10 +77,6 @@ _checking_state = CheckingState()
 
 _stats_cache: dict = {"data": None, "expires": 0.0}
 _STATS_CACHE_TTL = 60  # seconds
-# The cache is a plain dict read/written within a single request handler; the
-# guard below serializes the read-miss/refill so two concurrent requests don't
-# both run the (cheap) stats query on expiry.
-_stats_cache_lock = asyncio.Lock()
 
 
 # --- Feed-validation rate limiter ---
