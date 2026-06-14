@@ -8,6 +8,7 @@ import asyncio
 import logging
 import sqlite3
 from datetime import UTC, datetime
+from pathlib import Path
 
 import httpx
 
@@ -20,6 +21,7 @@ from app.crud import (
     increment_webhook_retry,
     list_pending_webhooks,
 )
+from app.database import short_conn
 from app.url_validation import is_private_url
 
 logger = logging.getLogger(__name__)
@@ -142,33 +144,65 @@ async def send_webhooks(
     return success_count
 
 
-async def retry_pending_webhooks(conn: sqlite3.Connection, settings: Settings) -> None:
+async def retry_pending_webhooks(
+    conn: sqlite3.Connection | None = None,
+    settings: Settings | None = None,
+    *,
+    db_path: Path | None = None,
+) -> None:
     """Retry any pending webhook deliveries from previous check cycles.
 
     Mirrors retry_pending_notifications: successful deliveries are deleted,
     failures get their retry count incremented, and deliveries exceeding
     max_retries are dropped.
-    """
-    expired = delete_expired_webhooks(conn)
-    if expired:
-        logger.warning("Deleted %d expired pending webhook(s)", expired)
 
-    pending = list_pending_webhooks(conn)
+    Connection handling: no sqlite connection is held across the network
+    sends. The pending rows are snapshotted under a short connection, the
+    POSTs run with no open connection, and results are applied with a commit
+    *per item* so a mid-loop crash never rolls back already-applied
+    delete/increment operations (which would let a permanently-failing URL be
+    retried unbounded across restarts).
+
+    Args:
+        conn: Optional existing connection (back-compat; callers that already
+            own a connection may pass it). When given, it is reused but still
+            committed per item and never held across a send.
+        settings: Application settings (required).
+        db_path: Database path used to open short-lived connections when no
+            ``conn`` is provided.
+    """
+    if settings is None:
+        raise ValueError("settings is required")
+
+    # --- Phase 1: snapshot pending rows under a short-lived connection. ---
+    with short_conn(conn, db_path) as snapshot:
+        expired = delete_expired_webhooks(snapshot)
+        if expired:
+            logger.warning("Deleted %d expired pending webhook(s)", expired)
+        snapshot.commit()
+        pending = list_pending_webhooks(snapshot)
+
     if not pending:
         return
 
     logger.info("Retrying %d pending webhook(s)", len(pending))
+
+    # --- Phase 2: send with NO connection held, then apply per item. ---
     for webhook in pending:
         webhook_id = webhook["id"]
         try:
             sent = await send_webhook(webhook["url"], webhook["payload"])
+        except Exception:
+            sent = False
+            logger.warning("Retry error for webhook id=%d", webhook_id, exc_info=True)
+
+        # Apply this single result and commit immediately so a later item's
+        # crash can't roll back what was already applied.
+        with short_conn(conn, db_path) as apply_conn:
             if sent:
-                delete_pending_webhook(conn, webhook_id)
+                delete_pending_webhook(apply_conn, webhook_id)
                 logger.info("Retry succeeded for webhook id=%d", webhook_id)
             else:
-                increment_webhook_retry(conn, webhook_id)
+                increment_webhook_retry(apply_conn, webhook_id)
                 logger.warning("Retry failed for webhook id=%d", webhook_id)
-        except Exception:
-            increment_webhook_retry(conn, webhook_id)
-            logger.warning("Retry error for webhook id=%d", webhook_id, exc_info=True)
-    conn.commit()
+            apply_conn.commit()

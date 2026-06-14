@@ -8,6 +8,7 @@ state, sends notifications for genuine updates, and records the outcome.
 import logging
 import sqlite3
 from datetime import UTC, datetime
+from pathlib import Path
 
 from app.analysis.knowledge import initialize_knowledge, update_knowledge
 from app.analysis.llm import analyze_articles
@@ -25,6 +26,7 @@ from app.crud import (
     mark_articles_processed,
     update_topic,
 )
+from app.database import short_conn
 from app.models import CheckResult, PendingNotification, Topic, TopicStatus
 from app.notifications import format_notification, send_notification
 from app.scraping import fetch_new_articles_for_topic
@@ -233,35 +235,62 @@ def _queue_notification(conn: sqlite3.Connection, topic_id: int, title: str, bod
         logger.warning("Failed to queue notification for retry", exc_info=True)
 
 
-async def retry_pending_notifications(conn: sqlite3.Connection, settings: Settings) -> None:
+async def retry_pending_notifications(
+    conn: sqlite3.Connection | None = None,
+    settings: Settings | None = None,
+    *,
+    db_path: Path | None = None,
+) -> None:
     """Retry any pending notifications from previous check cycles.
 
     Successful notifications are deleted. Failed ones get their retry
     count incremented. Notifications exceeding max_retries are deleted.
-    """
-    expired = delete_expired_notifications(conn)
-    if expired:
-        logger.warning("Deleted %d expired pending notification(s)", expired)
 
-    pending = list_pending_notifications(conn)
+    Connection handling mirrors retry_pending_webhooks: no sqlite connection
+    is held across the (potentially slow) notification sends. Pending rows are
+    snapshotted under a short connection, sends run with no open connection,
+    and each result is applied with a commit *per item* so a mid-loop crash
+    can't roll back already-applied delete/increment operations.
+
+    Args:
+        conn: Optional existing connection (back-compat). Reused if given but
+            committed per item and never held across a send.
+        settings: Application settings (required).
+        db_path: Path used to open short-lived connections when ``conn`` is None.
+    """
+    if settings is None:
+        raise ValueError("settings is required")
+
+    # --- Phase 1: snapshot pending rows under a short-lived connection. ---
+    with short_conn(conn, db_path) as snapshot:
+        expired = delete_expired_notifications(snapshot)
+        if expired:
+            logger.warning("Deleted %d expired pending notification(s)", expired)
+        snapshot.commit()
+        pending = list_pending_notifications(snapshot)
+
     if not pending:
         return
 
     logger.info("Retrying %d pending notification(s)", len(pending))
+
+    # --- Phase 2: send with NO connection held, then apply per item. ---
     for notification in pending:
         assert notification.id is not None
         try:
             sent = await send_notification(notification.title, notification.body, settings)
+        except Exception:
+            sent = False
+            logger.warning("Retry error for notification id=%d", notification.id, exc_info=True)
+
+        with short_conn(conn, db_path) as apply_conn:
             if sent:
-                delete_pending_notification(conn, notification.id)
+                delete_pending_notification(apply_conn, notification.id)
                 logger.info("Retry succeeded for notification id=%d", notification.id)
             else:
-                increment_notification_retry(conn, notification.id)
+                increment_notification_retry(apply_conn, notification.id)
                 logger.warning("Retry failed for notification id=%d", notification.id)
-        except Exception:
-            increment_notification_retry(conn, notification.id)
-            logger.warning("Retry error for notification id=%d", notification.id, exc_info=True)
-    conn.commit()
+            apply_conn.commit()
 
 
 async def check_all_topics(
