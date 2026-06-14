@@ -166,8 +166,14 @@ class TestProviderDetection:
     def test_is_cloud_provider_ollama(self) -> None:
         assert is_cloud_provider("ollama/llama3") is False
 
+    def test_is_cloud_provider_groq(self) -> None:
+        assert is_cloud_provider("groq/llama-3.3-70b-versatile") is True
+
+    def test_is_cloud_provider_deepseek(self) -> None:
+        assert is_cloud_provider("deepseek/deepseek-chat") is True
+
     def test_is_cloud_provider_unknown(self) -> None:
-        assert is_cloud_provider("groq/mixtral") is False
+        assert is_cloud_provider("madeupprovider/model") is False
 
     def test_is_cloud_provider_no_slash(self) -> None:
         assert is_cloud_provider("gpt-4") is False
