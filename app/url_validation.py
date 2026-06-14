@@ -1,4 +1,16 @@
-"""URL validation utilities shared across the application."""
+"""URL validation utilities shared across the application.
+
+SSRF defense and its residual risk: :func:`is_private_url` resolves DNS at
+*check time* and classifies the resulting IPs, while httpx re-resolves the
+hostname at *connect time*. A TOCTOU / DNS-rebinding window therefore remains
+between validation and the actual fetch -- an attacker controlling DNS could
+return a public IP during validation and a private one at connect. Per-hop
+redirect re-validation (:func:`safe_send`) and fail-closed resolution
+(:func:`_resolved_ip_is_private`) reduce but do not eliminate this window.
+Closing it fully would require a pinned-IP / custom-resolver transport, which
+risks breaking HTTPS feed fetching (SNI / cert verification); this is an
+accepted limitation for a single-user self-hosted tool.
+"""
 
 import ipaddress
 import logging
@@ -33,10 +45,14 @@ _PRIVATE_NETLOC_PATTERNS = [
 def _resolved_ip_is_private(hostname: str) -> bool:
     """Resolve a hostname and check if any resulting IP is private/reserved.
 
-    Returns False on DNS resolution failure (fail-open). The pattern-based
-    check already covers known private hostname formats. This layer adds
-    protection against encoding bypasses (hex IP, decimal IP, DNS rebinding)
-    that happen to resolve to private addresses.
+    Returns True on DNS resolution failure (fail-closed): a host we cannot
+    resolve cannot be verified as public, so we treat it as blocked rather
+    than silently allowing it. This also closes one DNS-rebinding variant
+    where resolution fails at check time but later succeeds (to a private
+    address) at connect time. The pattern-based check already covers known
+    private hostname formats; this layer adds protection against encoding
+    bypasses (hex IP, decimal IP, DNS rebinding) that resolve to private
+    addresses.
     """
     try:
         infos = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
@@ -46,7 +62,7 @@ def _resolved_ip_is_private(hostname: str) -> bool:
                 return True
         return False
     except (socket.gaierror, ValueError, OSError):
-        return False  # fail open: DNS failure is handled by the HTTP client
+        return True  # fail closed: an unresolvable host cannot be verified as public
 
 
 def is_private_url(url: str) -> bool:
@@ -75,7 +91,7 @@ def validate_feed_url(url: str) -> str | None:
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         return f"Invalid feed URL (must be http or https): {url}"
     if is_private_url(url):
-        return f"Feed URL points to a private/reserved address: {url}"
+        return f"Feed URL points to a private/reserved address or could not be resolved: {url}"
     return None
 
 
