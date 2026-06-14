@@ -150,98 +150,42 @@ def recover_stuck_researching(conn: sqlite3.Connection, timeout_minutes: int = 1
     return count
 
 
-def get_dashboard_data(conn: sqlite3.Connection) -> list[dict]:
-    """Get all topics with last check and article count in a single query."""
-    rows = conn.execute(
-        """
-        SELECT t.*,
-               cr.id AS cr_id,
-               cr.checked_at AS cr_checked_at,
-               cr.articles_found AS cr_articles_found,
-               cr.articles_new AS cr_articles_new,
-               cr.has_new_info AS cr_has_new_info,
-               cr.llm_response AS cr_llm_response,
-               cr.notification_sent AS cr_notification_sent,
-               cr.notification_error AS cr_notification_error,
-               (SELECT COUNT(*) FROM articles WHERE articles.topic_id = t.id) AS article_count
-        FROM topics t
-        LEFT JOIN check_results cr ON cr.id = (
-            SELECT id FROM check_results
-            WHERE topic_id = t.id
-            ORDER BY checked_at DESC LIMIT 1
-        )
-        ORDER BY t.name
-        """
-    ).fetchall()
-
-    result = []
-    for row in rows:
-        topic = Topic.from_row(row)
-        last_check = None
-        if row["cr_id"] is not None and topic.id is not None:
-            last_check = CheckResult(
-                id=row["cr_id"],
-                topic_id=topic.id,
-                checked_at=row["cr_checked_at"],
-                articles_found=row["cr_articles_found"],
-                articles_new=row["cr_articles_new"],
-                has_new_info=bool(row["cr_has_new_info"]),
-                llm_response=row["cr_llm_response"],
-                notification_sent=bool(row["cr_notification_sent"]),
-                notification_error=row["cr_notification_error"],
-            )
-        result.append(
-            {
-                "topic": topic,
-                "last_check": last_check,
-                "article_count": row["article_count"],
-            }
-        )
-    return result
+# Shared SELECT/JOIN for the dashboard listing: each topic joined to its most
+# recent check result plus an article-count subquery. Only the WHERE clause
+# varies between the unfiltered dashboard and the filtered search; values always
+# flow through ``?`` placeholders.
+_DASHBOARD_SELECT = """
+    SELECT t.*,
+           cr.id AS cr_id,
+           cr.checked_at AS cr_checked_at,
+           cr.articles_found AS cr_articles_found,
+           cr.articles_new AS cr_articles_new,
+           cr.has_new_info AS cr_has_new_info,
+           cr.llm_response AS cr_llm_response,
+           cr.notification_sent AS cr_notification_sent,
+           cr.notification_error AS cr_notification_error,
+           (SELECT COUNT(*) FROM articles WHERE articles.topic_id = t.id) AS article_count
+    FROM topics t
+    LEFT JOIN check_results cr ON cr.id = (
+        SELECT id FROM check_results
+        WHERE topic_id = t.id
+        ORDER BY checked_at DESC LIMIT 1
+    )
+"""
 
 
-def search_dashboard_data(
+def _query_dashboard_rows(
     conn: sqlite3.Connection,
-    query: str | None = None,
-    status: str | None = None,
+    where_sql: str,
+    params: list,
 ) -> list[dict]:
-    """Get topics with last check and article count, with optional name/status filters."""
-    where_clauses = []
-    params: list = []
+    """Run the shared dashboard SELECT with an optional WHERE clause.
 
-    if query:
-        where_clauses.append("t.name LIKE ?")
-        params.append(f"%{query}%")
-
-    if status:
-        where_clauses.append("t.status = ?")
-        params.append(status)
-
-    where_sql = ""
-    if where_clauses:
-        where_sql = "WHERE " + " AND ".join(where_clauses)
-
+    ``where_sql`` is built only from which filters are present (clause
+    *structure*); all filter *values* are bound via ``params`` placeholders.
+    """
     rows = conn.execute(
-        f"""
-        SELECT t.*,
-               cr.id AS cr_id,
-               cr.checked_at AS cr_checked_at,
-               cr.articles_found AS cr_articles_found,
-               cr.articles_new AS cr_articles_new,
-               cr.has_new_info AS cr_has_new_info,
-               cr.llm_response AS cr_llm_response,
-               cr.notification_sent AS cr_notification_sent,
-               cr.notification_error AS cr_notification_error,
-               (SELECT COUNT(*) FROM articles WHERE articles.topic_id = t.id) AS article_count
-        FROM topics t
-        LEFT JOIN check_results cr ON cr.id = (
-            SELECT id FROM check_results
-            WHERE topic_id = t.id
-            ORDER BY checked_at DESC LIMIT 1
-        )
-        {where_sql}
-        ORDER BY t.name
-        """,
+        f"{_DASHBOARD_SELECT}{where_sql} ORDER BY t.name",
         params,
     ).fetchall()
 
@@ -269,6 +213,35 @@ def search_dashboard_data(
             }
         )
     return result
+
+
+def get_dashboard_data(conn: sqlite3.Connection) -> list[dict]:
+    """Get all topics with last check and article count in a single query."""
+    return _query_dashboard_rows(conn, "", [])
+
+
+def search_dashboard_data(
+    conn: sqlite3.Connection,
+    query: str | None = None,
+    status: str | None = None,
+) -> list[dict]:
+    """Get topics with last check and article count, with optional name/status filters."""
+    where_clauses = []
+    params: list = []
+
+    if query:
+        where_clauses.append("t.name LIKE ?")
+        params.append(f"%{query}%")
+
+    if status:
+        where_clauses.append("t.status = ?")
+        params.append(status)
+
+    where_sql = ""
+    if where_clauses:
+        where_sql = " WHERE " + " AND ".join(where_clauses)
+
+    return _query_dashboard_rows(conn, where_sql, params)
 
 
 def delete_topic(conn: sqlite3.Connection, topic_id: int) -> bool:
