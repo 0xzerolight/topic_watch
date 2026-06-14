@@ -98,6 +98,26 @@ class TestFormatNotification:
         _, body = format_notification("Test", novelty)
         assert "Confidence: 85%" in body
 
+    def test_body_includes_relevance_percentage(self) -> None:
+        novelty = NoveltyResult(
+            has_new_info=True,
+            summary="Update",
+            confidence=0.9,
+            relevance=0.8,
+        )
+        _, body = format_notification("Test", novelty)
+        assert "Relevance: 80%" in body
+
+    def test_body_relevance_truncates_to_int(self) -> None:
+        novelty = NoveltyResult(
+            has_new_info=True,
+            summary="Update",
+            confidence=0.9,
+            relevance=0.736,
+        )
+        _, body = format_notification("Test", novelty)
+        assert "Relevance: 73%" in body
+
 
 # --- send_notification ---
 
