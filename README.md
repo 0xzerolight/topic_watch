@@ -8,7 +8,7 @@
 Self-hosted news monitoring with LLM-powered novelty detection. Watches topics via RSS feeds, notifies you only when genuinely new information appears. BYOK (bring your own key).
 
 <p align="center">
-  <img src="docs/themes-showcase.gif" alt="Topic Watch — theme showcase" width="720">
+  <img src="assets/themes-showcase.gif" alt="Topic Watch — theme showcase" width="720">
 </p>
 
 ## How It Works
@@ -348,7 +348,7 @@ pip install .
 # Restart your uvicorn process
 ```
 
-Check the [CHANGELOG](docs/CHANGELOG.md) before upgrading for breaking changes.
+Check the [CHANGELOG](CHANGELOG.md) before upgrading for breaking changes.
 
 ## Security
 
@@ -398,7 +398,7 @@ Create credentials: `htpasswd -c /etc/nginx/.htpasswd admin`
 
 API keys stored in `data/config.yml` (gitignored) or env vars. All data stays on your machine; outbound connections only go to RSS feeds, your LLM provider, and notification services.
 
-See [SECURITY.md](docs/SECURITY.md) for vulnerability reporting.
+See [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
 ## Troubleshooting
 
@@ -430,4 +430,4 @@ See [SECURITY.md](docs/SECURITY.md) for vulnerability reporting.
 
 ## Contributing
 
-See [CONTRIBUTING.md](docs/CONTRIBUTING.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md).

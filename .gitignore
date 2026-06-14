@@ -47,3 +47,6 @@ htmlcov/
 # extra
 personal-docs/
 .gstack/
+
+# Private development docs (public docs live in repo root)
+docs/
