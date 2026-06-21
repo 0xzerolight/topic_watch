@@ -539,6 +539,32 @@ class TestMigrations:
         columns = {row[1] for row in db_conn.execute("PRAGMA table_info(topics)").fetchall()}
         assert "init_attempts" in columns
 
+    def test_check_result_stage_error_column_exists(self, db_conn: sqlite3.Connection) -> None:
+        """Migration m015 adds nullable stage_error column to check_results."""
+        columns = {row[1]: row for row in db_conn.execute("PRAGMA table_info(check_results)").fetchall()}
+        assert "stage_error" in columns
+        # Column is nullable (notnull flag, index 3, is 0).
+        assert columns["stage_error"][3] == 0
+
+    def test_check_result_stage_error_roundtrip(self, db_conn: sqlite3.Connection) -> None:
+        """CheckResult.stage_error persists and loads back (None and a value)."""
+        topic = create_topic(db_conn, Topic(name="StageErr", description="d"))
+        db_conn.commit()
+
+        with_err = create_check_result(
+            db_conn,
+            CheckResult(topic_id=topic.id, stage_error="knowledge_update_failed: boom"),
+        )
+        without_err = create_check_result(db_conn, CheckResult(topic_id=topic.id))
+        db_conn.commit()
+
+        loaded_err = get_check_result(db_conn, with_err.id)
+        loaded_none = get_check_result(db_conn, without_err.id)
+        assert loaded_err is not None
+        assert loaded_err.stage_error == "knowledge_update_failed: boom"
+        assert loaded_none is not None
+        assert loaded_none.stage_error is None
+
     def test_topic_threshold_roundtrip(self, db_conn: sqlite3.Connection) -> None:
         """Per-topic thresholds and init_attempts persist and load back."""
         topic = create_topic(

@@ -62,6 +62,7 @@ def _make_check_result(
     conn: sqlite3.Connection,
     topic_id: int,
     has_new_info: bool = True,
+    stage_error: str | None = None,
 ) -> CheckResult:
     result = CheckResult(
         topic_id=topic_id,
@@ -72,6 +73,7 @@ def _make_check_result(
         llm_response=None,
         notification_sent=False,
         notification_error=None,
+        stage_error=stage_error,
     )
     created = create_check_result(conn, result)
     conn.commit()
@@ -246,6 +248,7 @@ async def test_export_topic_csv_has_correct_headers(
         "has_new_info",
         "notification_sent",
         "notification_error",
+        "stage_error",
     ]
     assert list(reader.fieldnames) == expected_headers
 
@@ -269,6 +272,43 @@ async def test_export_topic_csv_contains_check_data(
     # All rows should have the topic_id
     for row in rows:
         assert row["topic_id"] == str(topic.id)
+
+
+async def test_export_topic_csv_surfaces_stage_error(
+    client: httpx.AsyncClient,
+    db_conn: sqlite3.Connection,
+) -> None:
+    """CSV export carries the stage_error value (OVH-037 observability surface)."""
+    topic = _make_topic(db_conn)
+    assert topic.id is not None
+    _make_check_result(db_conn, topic.id, stage_error="knowledge_update_failed: boom")
+    _make_check_result(db_conn, topic.id, stage_error=None)
+
+    response = await client.get(f"/topics/{topic.id}/export/csv")
+
+    assert response.status_code == 200
+    rows = list(csv.DictReader(io.StringIO(response.text)))
+    stage_errors = {row["stage_error"] for row in rows}
+    assert "knowledge_update_failed: boom" in stage_errors
+    assert "" in stage_errors  # the None row renders as empty, not "None"
+
+
+async def test_export_topic_json_surfaces_stage_error(
+    client: httpx.AsyncClient,
+    db_conn: sqlite3.Connection,
+) -> None:
+    """JSON export carries the stage_error field on check results."""
+    topic = _make_topic(db_conn)
+    assert topic.id is not None
+    _make_check_result(db_conn, topic.id, stage_error="scrape_failed: timeout")
+
+    response = await client.get(f"/topics/{topic.id}/export/json")
+
+    assert response.status_code == 200
+    data = response.json()
+    checks = data["check_results"]
+    assert len(checks) == 1
+    assert checks[0]["stage_error"] == "scrape_failed: timeout"
 
 
 async def test_export_topic_csv_empty_checks(

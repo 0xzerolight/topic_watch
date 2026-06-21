@@ -367,23 +367,37 @@ class TestCheckTopic:
         assert knowledge_summary_arg == "Specific knowledge summary XYZ."
 
     async def test_knowledge_update_failure_still_notifies(self, db_conn: sqlite3.Connection) -> None:
-        """If update_knowledge fails, notification should still be sent."""
+        """If update_knowledge fails: notification still fires, but the row is now
+        distinguishable (stage_error set), the new-info article is NOT marked
+        processed (so the next cycle re-attempts), and the result is recorded.
+
+        Also pins token accounting on this branch (OVH-170): the swallowed
+        knowledge-update raise contributes no tokens; only analysis tokens count.
+        """
         topic = _make_topic(db_conn, name="KUFail")
         create_knowledge_state(
             db_conn,
             KnowledgeState(topic_id=topic.id, summary_text="Old.", token_count=5),
         )
+        # Persist a real article so we can assert its processed flag from the DB.
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
         db_conn.commit()
         settings = _make_settings()
 
-        articles = [_make_article(topic_id=topic.id)]
-        novelty = NoveltyResult(has_new_info=True, summary="New info", confidence=0.9, relevance=0.9)
+        novelty = NoveltyResult(
+            has_new_info=True,
+            summary="New info",
+            confidence=0.9,
+            relevance=0.9,
+            prompt_tokens=80,
+            completion_tokens=20,
+        )
 
         with (
             patch(
                 "app.checker.fetch_new_articles_for_topic",
                 new_callable=AsyncMock,
-                return_value=FetchResult(articles=articles, total_feed_entries=len(articles)),
+                return_value=FetchResult(articles=[article], total_feed_entries=1),
             ),
             patch(
                 "app.checker.analyze_articles",
@@ -406,6 +420,113 @@ class TestCheckTopic:
         mock_send.assert_called_once()
         assert result.notification_sent is True
         assert result.has_new_info is True
+
+        # The failure is now recorded distinctly (OVH-009/037).
+        assert result.id is not None
+        assert result.stage_error is not None
+        assert result.stage_error.startswith("knowledge_update_failed")
+        # The recorded row carries the stage_error too.
+        row = db_conn.execute("SELECT stage_error FROM check_results WHERE id = ?", (result.id,)).fetchone()
+        assert row["stage_error"] is not None
+        assert row["stage_error"].startswith("knowledge_update_failed")
+
+        # The new-info-bearing article must NOT be marked processed so the next
+        # cycle re-attempts the knowledge update (no silent drift).
+        assert article.id is not None
+        proc = db_conn.execute("SELECT processed FROM articles WHERE id = ?", (article.id,)).fetchone()
+        assert proc["processed"] == 0
+
+        # Token accounting on this branch: only analysis tokens (knowledge
+        # update raised before returning usage).
+        assert result.prompt_tokens == 80
+        assert result.completion_tokens == 20
+
+    async def test_scrape_failure_sets_stage_error(self, db_conn: sqlite3.Connection) -> None:
+        """A scrape failure records stage_error='scrape_failed' + summary (OVH-037)."""
+        topic = _make_topic(db_conn, name="ScrapeFail")
+        settings = _make_settings()
+
+        with patch(
+            "app.checker.fetch_new_articles_for_topic",
+            new_callable=AsyncMock,
+            side_effect=Exception("Network error"),
+        ):
+            result = await check_topic(topic, db_conn, settings)
+
+        assert result.id is not None
+        assert result.stage_error is not None
+        assert result.stage_error.startswith("scrape_failed")
+        row = db_conn.execute("SELECT stage_error FROM check_results WHERE id = ?", (result.id,)).fetchone()
+        assert row["stage_error"].startswith("scrape_failed")
+
+    async def test_analysis_failure_sets_stage_error(self, db_conn: sqlite3.Connection) -> None:
+        """An LLM analysis failure (safe-default) records stage_error='analysis_failed'.
+
+        analyze_articles stays fail-safe (returns has_new_info=False, does NOT
+        raise); the failure is surfaced via NoveltyResult.error and recorded on
+        the CheckResult so it is distinguishable from a clean 'nothing new' run.
+        """
+        topic = _make_topic(db_conn, name="AnalysisFail")
+        create_knowledge_state(
+            db_conn,
+            KnowledgeState(topic_id=topic.id, summary_text="Known.", token_count=10),
+        )
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
+        db_conn.commit()
+        settings = _make_settings()
+
+        # Mirror the analyze_articles safe-default error path.
+        failed = NoveltyResult(has_new_info=False, confidence=0.0, error="LLM analysis failed")
+
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[article], total_feed_entries=1),
+            ),
+            patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=failed),
+            patch("app.checker.send_notification") as mock_send,
+        ):
+            result = await check_topic(topic, db_conn, settings)
+
+        mock_send.assert_not_called()
+        assert result.has_new_info is False
+        assert result.id is not None
+        assert result.stage_error is not None
+        assert result.stage_error.startswith("analysis_failed")
+        row = db_conn.execute("SELECT stage_error FROM check_results WHERE id = ?", (result.id,)).fetchone()
+        assert row["stage_error"].startswith("analysis_failed")
+
+    async def test_clean_no_new_info_has_no_stage_error(self, db_conn: sqlite3.Connection) -> None:
+        """A clean 'nothing new' run leaves stage_error NULL (distinguishable from failures)."""
+        topic = _make_topic(db_conn, name="Quiet")
+        create_knowledge_state(
+            db_conn,
+            KnowledgeState(topic_id=topic.id, summary_text="Known.", token_count=10),
+        )
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
+        db_conn.commit()
+        settings = _make_settings()
+
+        novelty = NoveltyResult(has_new_info=False, confidence=0.9)
+
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[article], total_feed_entries=1),
+            ),
+            patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
+            patch("app.checker.send_notification") as mock_send,
+        ):
+            result = await check_topic(topic, db_conn, settings)
+
+        mock_send.assert_not_called()
+        assert result.stage_error is None
+        # And the article IS marked processed (we evaluated it, no failure).
+        assert article.id is not None
+        proc = db_conn.execute("SELECT processed FROM articles WHERE id = ?", (article.id,)).fetchone()
+        assert proc["processed"] == 1
 
     async def test_low_confidence_skips_notification_but_marks_processed(self, db_conn: sqlite3.Connection) -> None:
         """New info with confidence below threshold → no notification, no knowledge update,
