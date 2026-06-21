@@ -109,6 +109,58 @@ class TestMarkHealthy:
         router.mark_healthy("nonexistent")  # Should not raise
 
 
+class TestMonotonicHealthAccounting:
+    """OVH-127: a stale success must not wipe a fresh cooldown.
+
+    The read-fetch-mark sequence in ``_fetch_auto`` spans an ``await``: a check
+    that started earlier can succeed and call ``mark_healthy`` *after* a
+    concurrent check has just tripped the cooldown via ``mark_unhealthy``. The
+    accounting must be monotonic — capture the health epoch before the fetch,
+    then reset only if no failure was recorded in the interim.
+    """
+
+    def test_health_epoch_advances_on_failure(self) -> None:
+        router = _make_router()
+        e0 = router.health_epoch("bing_news")
+        router.mark_unhealthy("bing_news")
+        e1 = router.health_epoch("bing_news")
+        assert e1 > e0
+
+    def test_stale_mark_healthy_does_not_clear_fresh_cooldown(self) -> None:
+        router = _make_router()
+        # A check captures the epoch before its (slow) fetch.
+        observed = router.health_epoch("bing_news")
+        # Meanwhile, a concurrent check fails three times and trips cooldown.
+        for _ in range(_FAILURE_THRESHOLD):
+            router.mark_unhealthy("bing_news")
+        assert router.get_provider().name == "google_news"  # cooldown engaged
+        # The earlier (now stale) check finally returns success and marks healthy
+        # using its captured epoch — it must NOT clobber the fresh cooldown.
+        router.mark_healthy("bing_news", observed_epoch=observed)
+        assert router.get_provider().name == "google_news"
+        assert router._health["bing_news"].consecutive_failures >= _FAILURE_THRESHOLD
+
+    def test_fresh_mark_healthy_still_resets(self) -> None:
+        router = _make_router()
+        router.mark_unhealthy("bing_news")
+        router.mark_unhealthy("bing_news")
+        # Success observed after those failures (current epoch) resets normally.
+        observed = router.health_epoch("bing_news")
+        router.mark_healthy("bing_news", observed_epoch=observed)
+        assert "bing_news" not in router._health
+
+    def test_mark_healthy_without_epoch_resets_unconditionally(self) -> None:
+        """Back-compat: callers that don't pass an epoch keep the old reset."""
+        router = _make_router()
+        router.mark_unhealthy("bing_news")
+        router.mark_healthy("bing_news")
+        assert "bing_news" not in router._health
+
+    def test_epoch_unknown_provider_is_zero(self) -> None:
+        router = _make_router()
+        assert router.health_epoch("nonexistent") == 0
+
+
 class TestCooldownExpiry:
     def test_provider_reeligible_after_cooldown(self) -> None:
         router = _make_router()
