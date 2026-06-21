@@ -168,6 +168,42 @@ class TestSetupWizard:
         assert response.status_code == 303
         assert app.state.settings.llm.base_url is None
 
+    def test_post_setup_when_configured_is_guarded(self, configured_app: TestClient) -> None:
+        """OVH-059/082: re-POSTing /setup once configured redirects without re-running setup.
+
+        A double-submit / replay / stale bookmark must not clobber credentials or start a
+        second scheduler (which would orphan the running one).
+        """
+        # Seed the CSRF cookie (the GET redirects but still sets it via middleware).
+        configured_app.get("/setup", follow_redirects=False)
+        csrf_token = configured_app.cookies.get("csrf_token")
+        assert csrf_token
+
+        original_model = app.state.settings.llm.model
+        with (
+            patch("app.scheduler.start_scheduler") as mock_sched,
+            patch("app.web.routers.settings.save_settings_to_yaml") as mock_save,
+            patch("app.web.routers.settings.verify_llm_credentials", return_value=None),
+        ):
+            response = configured_app.post(
+                "/setup",
+                data={
+                    "llm_model": "openai/gpt-clobber",
+                    "llm_api_key": "sk-attacker-key",
+                    "llm_base_url": "",
+                    "csrf_token": csrf_token,
+                },
+                follow_redirects=False,
+            )
+
+        assert response.status_code == 303
+        assert response.headers["location"] == "/"
+        # Single-shot setup: no scheduler restart, no config rewrite.
+        mock_sched.assert_not_called()
+        mock_save.assert_not_called()
+        # Live credentials untouched.
+        assert app.state.settings.llm.model == original_model
+
     def test_post_setup_nav_hidden(self, unconfigured_app: TestClient) -> None:
         response = unconfigured_app.get("/setup")
         assert response.status_code == 200
