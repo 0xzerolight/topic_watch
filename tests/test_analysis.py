@@ -1241,6 +1241,43 @@ class TestRestatementFilter:
         kept = _filter_restated_key_facts(facts, summary)
         assert kept == []
 
+    # --- Boundary seam tests for the two tuned constants (OVH-078) ---
+    # _RESTATEMENT_MIN_FACT_WORDS = 4 ; _RESTATEMENT_PHRASE_OVERLAP_THRESHOLD = 0.8.
+    # These pin where retuning either constant (or a >= /< slip) silently changes
+    # which genuinely-new facts get hidden.
+
+    def test_three_word_fact_fully_contained_is_kept_below_min_words(self) -> None:
+        """A 3-word fact whose words all appear as a contiguous run is KEPT — it
+        is below the 4-word minimum, so it is never auto-dropped (commas keep it
+        off the verbatim-substring branch, so only the word-run branch could fire)."""
+        from app.analysis.llm import _filter_restated_key_facts
+
+        summary = "Confirmed: alpha, beta, gamma were noted."
+        facts = ["alpha beta gamma"]  # 3 content words, run == 3, but < min 4
+        assert _filter_restated_key_facts(facts, summary) == facts
+
+    def test_five_word_fact_with_four_word_run_at_080_is_dropped(self) -> None:
+        """A 5-word fact whose longest contiguous run is exactly 4 (4/5 == 0.80)
+        is DROPPED — at the threshold. Word order differs from the summary so the
+        full phrase is not a verbatim substring; only the word-run branch fires."""
+        from app.analysis.llm import _filter_restated_key_facts, _normalize_for_match
+
+        fact = "the quick brown fox today"  # 5 content words
+        summary = "Note: the quick brown fox jumped over things."  # contains the 4-word run
+        # Guard the test's own premise: the full phrase is NOT a verbatim substring,
+        # so a pass here proves the contiguous-run branch (not substring) did it.
+        assert _normalize_for_match(fact) not in _normalize_for_match(summary)
+        assert _filter_restated_key_facts([fact], summary) == []
+
+    def test_five_word_fact_with_three_word_run_at_060_is_kept(self) -> None:
+        """A 5-word fact whose longest contiguous run is 3 (3/5 == 0.60) is KEPT —
+        below the 0.80 overlap threshold."""
+        from app.analysis.llm import _filter_restated_key_facts
+
+        fact = "alpha beta gamma delta epsilon"  # 5 content words
+        summary = "Note: alpha beta gamma appeared but delta and epsilon were elsewhere entirely."
+        assert _filter_restated_key_facts([fact], summary) == [fact]
+
     async def test_analyze_articles_filters_restated_key_facts(self) -> None:
         knowledge = "Confirmed Facts: The release date is March 2026."
         expected = NoveltyResult(
@@ -1277,6 +1314,54 @@ class TestRestatementFilter:
 
         assert result.has_new_info is True
         assert result.key_facts == []
+
+
+class TestLongestContiguousRun:
+    """OVH-079: direct unit tests for the longest-common-substring DP that backs
+    restatement filtering. Exercised only end-to-end before, so an off-by-one
+    (len-1) or a repeated-adjacent-token bug was invisible."""
+
+    def test_empty_fact_returns_zero(self) -> None:
+        from app.analysis.llm import _longest_contiguous_run
+
+        assert _longest_contiguous_run([], ["a", "b"]) == 0
+
+    def test_empty_summary_returns_zero(self) -> None:
+        from app.analysis.llm import _longest_contiguous_run
+
+        assert _longest_contiguous_run(["a"], []) == 0
+
+    def test_both_empty_returns_zero(self) -> None:
+        from app.analysis.llm import _longest_contiguous_run
+
+        assert _longest_contiguous_run([], []) == 0
+
+    def test_full_match_returns_len(self) -> None:
+        from app.analysis.llm import _longest_contiguous_run
+
+        assert _longest_contiguous_run(["a", "b", "c"], ["a", "b", "c"]) == 3
+
+    def test_embedded_run_returns_run_length(self) -> None:
+        from app.analysis.llm import _longest_contiguous_run
+
+        assert _longest_contiguous_run(["a", "b", "c"], ["x", "a", "b", "c", "y"]) == 3
+
+    def test_repeated_tokens_returns_two(self) -> None:
+        """['a','a'] inside ['a','a','a'] is a contiguous run of length 2, not 1 or 3."""
+        from app.analysis.llm import _longest_contiguous_run
+
+        assert _longest_contiguous_run(["a", "a"], ["a", "a", "a"]) == 2
+
+    def test_no_overlap_returns_zero(self) -> None:
+        from app.analysis.llm import _longest_contiguous_run
+
+        assert _longest_contiguous_run(["a", "b"], ["x", "y", "z"]) == 0
+
+    def test_partial_then_restart_returns_two(self) -> None:
+        """A false start ('a' alone) must not block the later full run ('a','b')."""
+        from app.analysis.llm import _longest_contiguous_run
+
+        assert _longest_contiguous_run(["a", "b"], ["a", "x", "a", "b"]) == 2
 
 
 class TestRateLimitRetry:
