@@ -25,6 +25,9 @@ _FAILURE_THRESHOLD = 3
 class _ProviderHealth:
     consecutive_failures: int = 0
     last_failure: datetime | None = None
+    # Monotonic counter bumped on every failure. Lets a success that started
+    # before a concurrent failure detect it is stale and skip the reset.
+    epoch: int = 0
 
 
 @dataclass
@@ -71,10 +74,22 @@ class ProviderRouter:
                     return provider
         return None
 
+    def health_epoch(self, provider_name: str) -> int:
+        """Return the provider's current failure epoch (0 if never failed).
+
+        Callers capture this *before* a fetch await and pass it back to
+        :meth:`mark_healthy` so a success that raced with a concurrent failure
+        can be recognised as stale and not clobber a just-tripped cooldown
+        (OVH-127).
+        """
+        health = self._health.get(provider_name)
+        return health.epoch if health else 0
+
     def mark_unhealthy(self, provider_name: str) -> None:
         """Record a failure for a provider."""
         health = self._health.setdefault(provider_name, _ProviderHealth())
         health.consecutive_failures += 1
+        health.epoch += 1
         health.last_failure = datetime.now(UTC)
         logger.debug(
             "Provider %s: failure %d/%d",
@@ -83,10 +98,27 @@ class ProviderRouter:
             _FAILURE_THRESHOLD,
         )
 
-    def mark_healthy(self, provider_name: str) -> None:
-        """Reset failure count for a provider on success."""
-        if provider_name in self._health:
-            del self._health[provider_name]
+    def mark_healthy(self, provider_name: str, observed_epoch: int | None = None) -> None:
+        """Reset failure count for a provider on success.
+
+        Monotonic accounting (OVH-127): if ``observed_epoch`` is given and the
+        provider's epoch has advanced since (a concurrent check failed during
+        this fetch's await), the success is stale and the reset is skipped so a
+        freshly-tripped cooldown is not wiped. ``observed_epoch=None`` keeps the
+        unconditional legacy reset for non-overlapping callers.
+        """
+        health = self._health.get(provider_name)
+        if health is None:
+            return
+        if observed_epoch is not None and health.epoch != observed_epoch:
+            logger.debug(
+                "Provider %s: stale success (epoch %d != %d); cooldown kept",
+                provider_name,
+                observed_epoch,
+                health.epoch,
+            )
+            return
+        del self._health[provider_name]
 
     def _is_healthy(self, provider_name: str) -> bool:
         health = self._health.get(provider_name)

@@ -308,12 +308,15 @@ async def _fetch_auto(
         follow_redirects=False,
     ) as client:
         feed_url = provider.build_feed_url(topic)
+        # Capture the health epoch before the fetch await so a success that races
+        # with a concurrent failure is recognised as stale (OVH-127).
+        provider_epoch = router.health_epoch(provider.name)
         entries, fetch_ok = await fetch_feed_with_status(
             feed_url, client, timeout=timeout, max_attempts=max_attempts, health_callback=health_callback
         )
 
         if entries:
-            router.mark_healthy(provider.name)
+            router.mark_healthy(provider.name, observed_epoch=provider_epoch)
             return FeedResponse(
                 entries=entries,
                 provider_name=provider.name,
@@ -330,12 +333,13 @@ async def _fetch_auto(
 
         logger.info("Provider %s returned no entries, falling back to %s", provider.name, next_provider.name)
         feed_url = next_provider.build_feed_url(topic)
+        next_epoch = router.health_epoch(next_provider.name)
         entries, fetch_ok = await fetch_feed_with_status(
             feed_url, client, timeout=timeout, max_attempts=max_attempts, health_callback=health_callback
         )
 
         if entries:
-            router.mark_healthy(next_provider.name)
+            router.mark_healthy(next_provider.name, observed_epoch=next_epoch)
             return FeedResponse(
                 entries=entries,
                 provider_name=next_provider.name,
