@@ -134,6 +134,75 @@ class TestParseOPML:
         assert len(result.topics) == 1
 
 
+class TestParseOPMLStructuralWalk:
+    """OVH-071: structural parsing must be unit-testable without sockets/DNS.
+
+    The recursive walk extracts structure; SSRF validation is a separate pass.
+    Mocking ``validate_feed_url`` proves no DNS happens during structural parsing.
+    """
+
+    def test_parse_without_dns_when_validation_mocked(self):
+        with patch("app.opml.validate_feed_url", return_value=None) as mock_validate:
+            result = parse_opml(VALID_OPML, set())
+        assert len(result.topics) == 2
+        # Validation runs once per surviving (deduped) candidate URL.
+        assert mock_validate.call_count == 2
+
+    def test_url_dedup_runs_before_validation(self):
+        """Duplicate URLs are dropped structurally, so validation never sees them."""
+        existing = {"https://news.ycombinator.com/rss"}
+        with patch("app.opml.validate_feed_url", return_value=None) as mock_validate:
+            result = parse_opml(VALID_OPML, existing)
+        assert result.skipped_dupes == 1
+        assert len(result.topics) == 1
+        # Only the surviving (non-dupe) URL is validated.
+        assert mock_validate.call_count == 1
+        assert mock_validate.call_args.args == ("https://lobste.rs/rss",)
+
+    def test_nested_structure_walked_without_dns(self):
+        with patch("app.opml.validate_feed_url", return_value=None):
+            result = parse_opml(NESTED_OPML, set())
+        assert len(result.topics) == 3
+        hn = next(t for t in result.topics if t["name"] == "Hacker News")
+        assert hn["tags"] == ["Tech"]
+
+
+class TestParseOPMLNameCollision:
+    """OVH-072: name collisions with existing DB topics live in OPMLResult."""
+
+    def test_existing_topic_name_skipped_and_counted(self):
+        with patch("app.opml.validate_feed_url", return_value=None):
+            result = parse_opml(VALID_OPML, set(), existing_topic_names={"Hacker News"})
+        assert result.skipped_name_dupes == 1
+        names = {t["name"] for t in result.topics}
+        assert "Hacker News" not in names
+        assert "Lobsters" in names
+
+    def test_no_collision_when_name_absent(self):
+        with patch("app.opml.validate_feed_url", return_value=None):
+            result = parse_opml(VALID_OPML, set(), existing_topic_names={"Unrelated"})
+        assert result.skipped_name_dupes == 0
+        assert len(result.topics) == 2
+
+    def test_default_no_existing_names_keeps_all(self):
+        with patch("app.opml.validate_feed_url", return_value=None):
+            result = parse_opml(VALID_OPML, set())
+        assert result.skipped_name_dupes == 0
+        assert len(result.topics) == 2
+
+    def test_multi_feed_collision_counted_once(self):
+        """A multi-feed topic colliding with a DB name counts as one name-dupe."""
+        opml = """<?xml version="1.0"?>
+        <opml version="2.0"><body>
+            <outline text="Multi" xmlUrl="https://a.example.com/feed" />
+            <outline text="Multi" xmlUrl="https://b.example.com/feed" />
+        </body></opml>"""
+        with patch("app.opml.validate_feed_url", return_value=None):
+            result = parse_opml(opml, set(), existing_topic_names={"Multi"})
+        assert result.skipped_name_dupes == 1
+        assert result.topics == []
+
+
 class TestExportOPML:
     def test_export_basic(self):
         topics = [
