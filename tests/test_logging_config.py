@@ -270,6 +270,54 @@ class TestUvicornLoggersJSON:
         assert lg.propagate is False
 
 
+class TestNonRootLoggerHandling:
+    """OVH-172: setup_logging configures only the root logger, so non-root
+    application loggers (e.g. ``app.checker``) must inherit it via propagation —
+    flowing through the same handler, formatter, and CheckIdFilter. These tests
+    pin that scope (which the suite otherwise only assumed) for both modes.
+    """
+
+    def test_non_root_logger_propagates_to_json_handler_with_check_id(self, monkeypatch, set_check_id):
+        """A child logger's record reaches the root JSON handler and carries the id."""
+        monkeypatch.setenv("TOPIC_WATCH_LOG_FORMAT", "json")
+        setup_logging()
+
+        stream = io.StringIO()
+        logging.root.handlers[0].stream = stream
+
+        # A non-root logger with no handlers of its own (the production norm).
+        child = logging.getLogger("app.checker")
+        assert not child.handlers
+        assert child.propagate is True
+        child.info("child mode")
+
+        parsed = json.loads(stream.getvalue().strip())
+        assert parsed["logger"] == "app.checker"
+        assert parsed["message"] == "child mode"
+        # The CheckIdFilter on the root handler also applies to propagated records.
+        assert parsed["check_id"] == set_check_id
+
+    def test_non_root_logger_renders_through_text_handler_with_check_id(self, monkeypatch, set_check_id):
+        """In text mode the child logger's line carries the check_id placeholder."""
+        monkeypatch.setenv("TOPIC_WATCH_LOG_FORMAT", "text")
+        logging.root.handlers.clear()
+        setup_logging()
+
+        stream = io.StringIO()
+        text_handler = logging.root.handlers[0]
+        text_handler.stream = stream
+        logging.root.setLevel(logging.INFO)
+
+        child = logging.getLogger("app.scraping.rss")
+        child.info("scraper line")
+        text_handler.flush()
+
+        rendered = stream.getvalue()
+        assert "scraper line" in rendered, rendered
+        assert "abcd1234" in rendered, rendered
+        assert "app.scraping.rss" in rendered, rendered
+
+
 class TestJSONFormatterExtraFields:
     def test_extra_fields_included_in_json(self, monkeypatch):
         monkeypatch.setenv("TOPIC_WATCH_LOG_FORMAT", "json")
