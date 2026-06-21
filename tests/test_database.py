@@ -1070,6 +1070,24 @@ class TestGetAllFeedUrls:
         assert urls == set()
 
 
+class TestGetAllTopicNames:
+    """Tests for get_all_topic_names (OPML name-collision dedup)."""
+
+    def test_returns_all_topic_names(self, db_conn: sqlite3.Connection) -> None:
+        from app.crud import get_all_topic_names
+
+        create_topic(db_conn, Topic(name="Alpha", description="d", feed_urls=["https://a.com/feed"]))
+        create_topic(db_conn, Topic(name="Beta", description="d", feed_urls=["https://b.com/feed"]))
+        db_conn.commit()
+
+        assert get_all_topic_names(db_conn) == {"Alpha", "Beta"}
+
+    def test_empty_when_no_topics(self, db_conn: sqlite3.Connection) -> None:
+        from app.crud import get_all_topic_names
+
+        assert get_all_topic_names(db_conn) == set()
+
+
 class TestGetDashboardStats:
     """Tests for get_dashboard_stats."""
 
