@@ -61,17 +61,24 @@ async def _run_init(topic_id: int, settings: Settings, db_path: Path | None = No
 async def _run_single_check(topic_id: int, settings: Settings, db_path: Path | None = None) -> None:
     """Background task: check a single topic by ID.
 
-    Releases the per-topic ``_checking_state`` guard on completion. The guard
-    is acquired by the manual ``/check`` handler before enqueueing; for callers
-    that do not hold it (bulk-check) ``finish_check`` is an idempotent no-op.
+    Authoritatively owns the per-topic ``_checking_state`` guard for every caller
+    that enqueues it — the manual ``/check`` handler and bulk-check alike
+    (OVH-033). It acquires ``start_check`` at entry and skips (no fetch/LLM/notify)
+    when another check of the same topic is already in flight, then releases the
+    guard in ``finally``. ``check_topic`` is called with ``guard=False`` because
+    this task already holds the guard.
     """
     from app.database import get_db
+
+    if not await _checking_state.start_check(topic_id):
+        logger.info("Single check: topic %d already being checked; skipping", topic_id)
+        return
 
     try:
         with get_db(db_path) as conn:
             topic = get_topic(conn, topic_id)
             if topic:
-                await check_topic(topic, conn, settings)
+                await check_topic(topic, conn, settings, guard=False)
     except Exception:
         logger.error("Background check failed for topic %d", topic_id, exc_info=True)
     finally:
@@ -79,10 +86,15 @@ async def _run_single_check(topic_id: int, settings: Settings, db_path: Path | N
 
 
 async def _run_check_all(settings: Settings, db_path: Path | None = None) -> None:
-    """Background task: check all topics for new information."""
+    """Background task: check all topics for new information.
+
+    The web ``/check-all`` handler acquires the whole-cycle ``start_check_all``
+    gate synchronously to decide whether to enqueue, so this task runs the cycle
+    with ``guard=False`` and releases the gate in ``finally`` (OVH-034).
+    """
     try:
         try:
-            await asyncio.wait_for(check_all_topics(settings, db_path), timeout=_CHECK_ALL_TIMEOUT_SECONDS)
+            await asyncio.wait_for(check_all_topics(settings, db_path, guard=False), timeout=_CHECK_ALL_TIMEOUT_SECONDS)
         except TimeoutError:
             logger.error("Check all timed out after %d seconds", _CHECK_ALL_TIMEOUT_SECONDS)
     except Exception:

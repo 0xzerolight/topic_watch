@@ -20,6 +20,7 @@ from app.crud import (
 from app.models import KnowledgeState, Topic, TopicStatus
 from app.web.csrf import verify_csrf
 from app.web.dependencies import get_db_conn, get_settings
+from app.web.state import _checking_state
 
 router = APIRouter(prefix="/api/v1", tags=["api"])
 
@@ -103,6 +104,10 @@ async def api_trigger_check(
     """Trigger a check for a specific topic.
 
     Runs synchronously and may take several seconds; returns the check result.
+    Honors the same per-topic in-flight guard the web/UI path uses: a second
+    concurrent check of the same topic (two API POSTs, or an API call racing a
+    UI 'Check now') returns 409 instead of launching a duplicate pipeline that
+    would double-spend the LLM and double-notify (OVH-019).
     """
     topic = get_topic(conn, topic_id)
     if topic is None:
@@ -110,5 +115,13 @@ async def api_trigger_check(
     if topic.status != TopicStatus.READY:
         raise HTTPException(status_code=409, detail=f"Topic is not ready (status: {topic.status.value})")
 
-    result = await check_topic(topic, conn, settings)
+    # Clear entries from a crashed prior run (mirrors the UI handler) before
+    # claiming the guard, so a stale slot can never wedge the endpoint.
+    await _checking_state.clear_stale(600)
+    if not await _checking_state.start_check(topic_id):
+        raise HTTPException(status_code=409, detail="A check for this topic is already in progress")
+    try:
+        result = await check_topic(topic, conn, settings, guard=False)
+    finally:
+        await _checking_state.finish_check(topic_id)
     return {"status": "checked", "has_new_info": result.has_new_info, "check_result_id": result.id}
