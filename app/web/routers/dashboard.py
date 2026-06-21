@@ -1,7 +1,6 @@
 """Dashboard, health check, and topic search routes."""
 
 import sqlite3
-import time
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse
@@ -13,7 +12,7 @@ from app.crud import (
 )
 from app.web.dependencies import get_db_conn
 from app.web.routers.templates import templates
-from app.web.state import _STATS_CACHE_TTL, _stats_cache
+from app.web.state import _stats_cache
 
 router = APIRouter()
 
@@ -53,12 +52,8 @@ async def dashboard(
     for item in topic_data:
         status_counts[item["topic"].status.value] += 1
 
-    # Dashboard stats with caching
-    now = time.time()
-    if _stats_cache["data"] is None or now > _stats_cache["expires"]:
-        _stats_cache["data"] = get_dashboard_stats(conn)
-        _stats_cache["expires"] = now + _STATS_CACHE_TTL
-    stats = _stats_cache["data"]
+    # Dashboard stats with caching (guarded check-then-set; see DashboardStatsCache)
+    stats = await _stats_cache.get_or_populate(lambda: get_dashboard_stats(conn))
 
     return templates.TemplateResponse(
         request,
