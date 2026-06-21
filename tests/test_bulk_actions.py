@@ -1,5 +1,6 @@
 """Tests for bulk delete and bulk check routes."""
 
+import asyncio
 import sqlite3
 from collections.abc import AsyncGenerator
 from unittest.mock import AsyncMock, patch
@@ -237,3 +238,92 @@ class TestBulkCheck:
             follow_redirects=False,
         )
         assert response.status_code == 403
+
+
+# --- _run_single_check per-topic guard (bulk-check + manual share it, OVH-033/096) ---
+
+
+class TestSingleCheckGuard:
+    """The bulk-check / manual background task is the authoritative guard owner."""
+
+    async def test_run_single_check_skips_when_already_checking(self, tmp_path) -> None:
+        """A second _run_single_check on an in-flight topic skips the pipeline (OVH-033)."""
+        from app.database import get_db, init_db
+        from app.web.routers import background
+        from app.web.state import _checking_state
+
+        db_path = tmp_path / "bulk.db"
+        init_db(db_path)
+        with get_db(db_path) as seed:
+            topic = _make_topic(seed, name="Busy")
+        settings = _make_settings()
+
+        _checking_state._topics.clear()
+        _checking_state._start_times.clear()
+        try:
+            # Slot already taken (e.g. the manual /check is mid-flight).
+            assert await _checking_state.start_check(topic.id) is True
+            with patch("app.web.routers.background.check_topic", new_callable=AsyncMock) as mock_check:
+                await background._run_single_check(topic.id, settings, db_path)
+            mock_check.assert_not_awaited()
+        finally:
+            _checking_state._topics.clear()
+            _checking_state._start_times.clear()
+
+    async def test_run_single_check_acquires_and_releases(self, tmp_path) -> None:
+        """_run_single_check claims the guard, runs with guard=False, then releases (OVH-033)."""
+        from app.database import get_db, init_db
+        from app.web.routers import background
+        from app.web.state import _checking_state
+
+        db_path = tmp_path / "bulk2.db"
+        init_db(db_path)
+        with get_db(db_path) as seed:
+            topic = _make_topic(seed, name="Free")
+        settings = _make_settings()
+
+        _checking_state._topics.clear()
+        _checking_state._start_times.clear()
+        try:
+            with patch("app.web.routers.background.check_topic", new_callable=AsyncMock) as mock_check:
+                await background._run_single_check(topic.id, settings, db_path)
+            # check_topic invoked with guard=False (task owns the guard).
+            assert mock_check.await_count == 1
+            assert mock_check.await_args.kwargs.get("guard") is False
+            # Guard released after completion.
+            assert await _checking_state.is_checking(topic.id) is False
+        finally:
+            _checking_state._topics.clear()
+            _checking_state._start_times.clear()
+
+    async def test_concurrent_run_single_check_only_one_runs(self, tmp_path) -> None:
+        """Two concurrent _run_single_check of the same topic: only one runs the pipeline."""
+        from app.database import get_db, init_db
+        from app.web.routers import background
+        from app.web.state import _checking_state
+
+        db_path = tmp_path / "bulk3.db"
+        init_db(db_path)
+        with get_db(db_path) as seed:
+            topic = _make_topic(seed, name="Racer")
+        settings = _make_settings()
+
+        runs = 0
+
+        async def _slow_check(t, conn, settings, *, guard=True):
+            nonlocal runs
+            runs += 1
+            await asyncio.sleep(0.05)
+
+        _checking_state._topics.clear()
+        _checking_state._start_times.clear()
+        try:
+            with patch("app.web.routers.background.check_topic", side_effect=_slow_check):
+                await asyncio.gather(
+                    background._run_single_check(topic.id, settings, db_path),
+                    background._run_single_check(topic.id, settings, db_path),
+                )
+            assert runs == 1
+        finally:
+            _checking_state._topics.clear()
+            _checking_state._start_times.clear()
