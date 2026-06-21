@@ -1,12 +1,28 @@
 #!/usr/bin/env bash
 # Topic Watch installer
 # Usage: curl -fsSL https://raw.githubusercontent.com/0xzerolight/topic_watch/main/scripts/install.sh | bash
+#
+# SUPPLY-CHAIN NOTE (OVH-146): curl|bash runs whatever this URL returns, and by
+# default this script also fetches docker-compose.prod.yml (which selects the
+# container image) from the same ref. Both are pulled from the mutable "main"
+# branch with no commit pin, tag, signature, or checksum, so a repo/branch
+# compromise or a MITM proxy means arbitrary code runs as you. To reduce trust:
+#   1. Review this script before piping it to a shell, or download + run it.
+#   2. Pin a specific commit or release tag instead of "main":
+#        TOPIC_WATCH_REF=v1.1.2 curl -fsSL \
+#          https://raw.githubusercontent.com/0xzerolight/topic_watch/v1.1.2/scripts/install.sh | bash
+#      TOPIC_WATCH_REF also pins the docker-compose file this script downloads.
 set -euo pipefail
 
 REPO="0xzerolight/topic_watch"
-BRANCH="main"
+# Pin to a commit SHA or release tag for a verifiable install (OVH-146).
+# Defaults to "main" (mutable) — see the supply-chain note above.
+BRANCH="${TOPIC_WATCH_REF:-main}"
 INSTALL_DIR="${TOPIC_WATCH_DIR:-$HOME/topic-watch}"
 PORT="${TOPIC_WATCH_PORT:-8000}"
+# Autostart persistence is opt-in (OVH-147). Set TOPIC_WATCH_AUTOSTART=yes|no to
+# answer non-interactively; default in a non-interactive (piped) run is "no".
+AUTOSTART="${TOPIC_WATCH_AUTOSTART:-}"
 
 # --- Colors (degrade gracefully) ---
 if [ -t 1 ]; then
@@ -137,10 +153,30 @@ StartupNotify=false
 DESKTOP_EOF
     info "Desktop entry installed (find 'Topic Watch' in your app launcher)"
 
-    # Systemd user service
-    SYSTEMD_DIR="$HOME/.config/systemd/user"
-    mkdir -p "$SYSTEMD_DIR"
-    cat > "$SYSTEMD_DIR/topic-watch.service" << SERVICE_EOF
+    # --- Autostart at boot (opt-in, OVH-147) ---
+    # A systemd user service + enable-linger starts the container at boot even
+    # when you are not logged in. That is real persistence, so ask first instead
+    # of installing it silently. Non-interactive runs default to "no".
+    want_autostart="no"
+    case "${AUTOSTART}" in
+        yes|y|YES|Y) want_autostart="yes" ;;
+        no|n|NO|N)   want_autostart="no" ;;
+        "")
+            if [ -t 0 ]; then
+                printf "%b" "${YELLOW}[?]${RESET} Start Topic Watch automatically at boot (systemd user service + linger)? [y/N] "
+                read -r reply </dev/tty || reply=""
+                case "$reply" in y|Y|yes|YES) want_autostart="yes" ;; esac
+            else
+                warn "Skipping boot autostart (non-interactive). Set TOPIC_WATCH_AUTOSTART=yes to enable it."
+            fi
+            ;;
+    esac
+
+    if [ "$want_autostart" = "yes" ]; then
+        # Systemd user service
+        SYSTEMD_DIR="$HOME/.config/systemd/user"
+        mkdir -p "$SYSTEMD_DIR"
+        cat > "$SYSTEMD_DIR/topic-watch.service" << SERVICE_EOF
 [Unit]
 Description=Topic Watch - Self-hosted news monitoring
 After=network-online.target docker.service
@@ -158,14 +194,19 @@ RestartSec=10
 WantedBy=default.target
 SERVICE_EOF
 
-    systemctl --user daemon-reload
-    systemctl --user enable topic-watch 2>/dev/null || true
-    info "Systemd service installed and enabled"
+        systemctl --user daemon-reload
+        systemctl --user enable topic-watch 2>/dev/null || true
+        info "Systemd service installed and enabled"
 
-    # Enable lingering so service starts at boot (may require password)
-    if command -v loginctl &>/dev/null; then
-        loginctl enable-linger "$USER" 2>/dev/null || \
-            warn "Could not enable lingering. Run: sudo loginctl enable-linger $USER"
+        # Enable lingering so service starts at boot (may require password)
+        if command -v loginctl &>/dev/null; then
+            loginctl enable-linger "$USER" 2>/dev/null || \
+                warn "Could not enable lingering. Run: sudo loginctl enable-linger $USER"
+        fi
+        info "To remove autostart later: systemctl --user disable --now topic-watch &&"
+        info "  rm -f \"$HOME/.config/systemd/user/topic-watch.service\" && loginctl disable-linger \"$USER\""
+    else
+        info "Boot autostart not installed. Enable later by re-running with TOPIC_WATCH_AUTOSTART=yes."
     fi
 fi
 
@@ -180,6 +221,13 @@ echo "  Manage with:"
 echo "    cd ${INSTALL_DIR} && docker compose logs    # View logs"
 echo "    cd ${INSTALL_DIR} && docker compose restart  # Restart"
 echo "    cd ${INSTALL_DIR} && docker compose down     # Stop"
+echo ""
+echo "  Uninstall:"
+echo "    cd ${INSTALL_DIR} && docker compose down      # Stop the container"
+echo "    systemctl --user disable --now topic-watch    # Remove boot autostart (if enabled)"
+echo "    rm -f ~/.config/systemd/user/topic-watch.service ~/.local/share/applications/topic-watch.desktop"
+echo "    loginctl disable-linger \"\$USER\"               # Stop running at boot when logged out"
+echo "    rm -rf ${INSTALL_DIR}                          # Remove install dir + data (irreversible)"
 echo ""
 
 # Try to open browser
