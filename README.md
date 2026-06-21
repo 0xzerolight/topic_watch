@@ -144,6 +144,12 @@ docker compose up -d
 
 The override file sets `ollama/llama3.3` as the model and points to your local Ollama instance. No API key required.
 
+**Linux note:** On native Linux Docker Engine, `host.docker.internal` does not
+resolve on its own. The override file maps it via `extra_hosts:
+["host.docker.internal:host-gateway"]` so the container can reach Ollama on the
+host. macOS and Windows Docker Desktop resolve `host.docker.internal`
+automatically.
+
 **Model recommendations:** Models with 8B+ parameters and 8K+ context windows work best. Tested with `llama3.3` (8B), `mistral` (7B), and `qwen2.5` (7B). Smaller models may miss subtle novelty signals.
 
 ## Setup Wizard
