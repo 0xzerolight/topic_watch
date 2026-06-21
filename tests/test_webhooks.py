@@ -440,6 +440,49 @@ class TestWebhookRetryQueue:
         assert remaining == 0
 
 
+class TestAbandonedWebhookLogging:
+    """A permanently-dropped webhook must be observable (OVH-040)."""
+
+    async def test_abandoned_webhook_warns_with_ids_and_redacted_url(self, db_conn: sqlite3.Connection, caplog) -> None:  # noqa: ANN001
+        """Pruning an exhausted delivery emits a WARNING naming topic/check ids.
+
+        The secret-bearing full URL must NOT appear in the log; only the
+        redacted destination.
+        """
+        from app.crud import create_pending_webhook
+
+        topic = _make_topic(db_conn)
+        secret_url = "https://hooks.slack.com/services/T0/B0/SECRETWEBHOOKTOKEN123"
+        wid = create_pending_webhook(
+            db_conn,
+            topic_id=topic.id,
+            url=secret_url,
+            payload={"topic": "Hooked"},
+            check_result_id=4242,
+        )
+        # Drive it straight to exhaustion.
+        db_conn.execute("UPDATE pending_webhooks SET retry_count = max_retries WHERE id = ?", (wid,))
+        db_conn.commit()
+        settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=[]))
+
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="app.webhooks"):
+            await retry_pending_webhooks(db_conn, settings)
+
+        abandon_logs = [r.getMessage() for r in caplog.records if "Abandoning webhook" in r.getMessage()]
+        assert len(abandon_logs) == 1
+        msg = abandon_logs[0]
+        assert f"topic_id={topic.id}" in msg
+        assert "check_result_id=4242" in msg
+        # Redacted host present, secret token absent.
+        assert "hooks.slack.com" in msg
+        assert "SECRETWEBHOOKTOKEN123" not in msg
+        # The row is gone.
+        remaining = db_conn.execute("SELECT COUNT(*) FROM pending_webhooks").fetchone()[0]
+        assert remaining == 0
+
+
 class TestWebhookRetryCrashSafety:
     """Per-item commits must survive a mid-loop crash (no rollback of work)."""
 

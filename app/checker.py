@@ -356,9 +356,20 @@ async def _drain_pending_notifications(
         released = release_stale_notification_claims(snapshot, stale_cutoff)
         if released:
             logger.warning("Released %d stale notification claim(s)", released)
-        expired = delete_expired_notifications(snapshot)
-        if expired:
-            logger.warning("Deleted %d expired pending notification(s)", expired)
+        abandoned = delete_expired_notifications(snapshot)
+        for item in abandoned:
+            # One WARNING per permanently-dropped delivery so an abandoned
+            # notification is observable: identify it by topic/check ids (the
+            # body is not logged — it may carry the notified content) (OVH-040).
+            logger.warning(
+                "Abandoning notification after max retries (topic_id=%s check_result_id=%s title=%r created_at=%s)",
+                item.topic_id,
+                item.check_result_id,
+                item.title,
+                item.created_at.isoformat(),
+            )
+        if abandoned:
+            logger.warning("Deleted %d expired pending notification(s)", len(abandoned))
         snapshot.commit()
         pending = list_pending_notifications(snapshot)
 
