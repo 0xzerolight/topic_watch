@@ -196,6 +196,11 @@ class CheckResult(BaseModel):
     notification_error: str | None = None
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # Machine-distinguishable failure stage for an otherwise-recorded check:
+    # 'scrape_failed' / 'analysis_failed' / 'knowledge_update_failed' (+ a short
+    # exception summary). NULL on clean runs. Distinct from notification_error,
+    # which only covers delivery.
+    stage_error: str | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Self:

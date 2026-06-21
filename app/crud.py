@@ -431,10 +431,10 @@ def create_check_result(conn: sqlite3.Connection, result: CheckResult) -> CheckR
     cursor = conn.execute(
         """INSERT INTO check_results (topic_id, checked_at, articles_found,
            articles_new, has_new_info, llm_response, notification_sent,
-           notification_error, prompt_tokens, completion_tokens)
+           notification_error, prompt_tokens, completion_tokens, stage_error)
            VALUES (:topic_id, :checked_at, :articles_found, :articles_new,
            :has_new_info, :llm_response, :notification_sent,
-           :notification_error, :prompt_tokens, :completion_tokens)""",
+           :notification_error, :prompt_tokens, :completion_tokens, :stage_error)""",
         data,
     )
     result.id = cursor.lastrowid

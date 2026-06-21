@@ -153,6 +153,9 @@
                 {% else %}
                     -
                 {% endif %}
+                {% if check.stage_error %}
+                    <br><small class="stage-error" title="{{ check.stage_error }}">⚠ {{ check.stage_error }}</small>
+                {% endif %}
             </td>
             <td>
                 {% if check.has_new_info %}
