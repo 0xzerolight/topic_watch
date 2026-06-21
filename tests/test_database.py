@@ -695,6 +695,46 @@ class TestMigrations:
         assert "idx_articles_fetched_at" in index_names
         assert "idx_articles_topic_fetched_at" in index_names
 
+    def test_failing_migration_logs_version_and_backup_then_reraises(self, tmp_path, caplog, monkeypatch) -> None:
+        """OVH-047: a failing migration logs its version + backup path before re-raising."""
+        import app.migrations as migrations_mod
+        from app.database import get_connection, init_db
+
+        db_path = tmp_path / "fail.db"
+        init_db(db_path)  # establish an existing DB so a backup is created
+
+        def _boom(_conn: sqlite3.Connection) -> None:
+            raise ValueError("simulated migration failure")
+
+        # Inject a pending migration with a version above any real one.
+        # run_migrations imports MIGRATIONS from app.migrations at call time.
+        bad_version = 9999
+        monkeypatch.setattr(migrations_mod, "MIGRATIONS", [(bad_version, "intentionally broken", _boom)])
+
+        conn = get_connection(db_path)
+        try:
+            with caplog.at_level("ERROR"), pytest.raises(ValueError, match="simulated migration failure"):
+                run_migrations(conn, db_path=db_path)
+        finally:
+            conn.close()
+
+        records = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert records, "Expected an ERROR log for the failed migration"
+        msg = records[-1].getMessage()
+        assert str(bad_version) in msg
+        assert "intentionally broken" in msg
+        # The backup path must be referenced (backups live under data/backups dir).
+        assert "backup" in msg.lower()
+        # The migration version must NOT have been recorded as applied.
+        conn_after = get_connection(db_path)
+        try:
+            applied = conn_after.execute(
+                "SELECT version FROM schema_version WHERE version=?", (bad_version,)
+            ).fetchone()
+        finally:
+            conn_after.close()
+        assert applied is None
+
 
 class TestRecoverStuckTopics:
     """Tests for recover_stuck_topics."""
