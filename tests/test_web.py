@@ -628,14 +628,24 @@ class TestSettings:
         assert response.status_code == 200
         assert "openai/gpt-4o-mini" in response.text
 
-    async def test_settings_masks_api_key(self, client: httpx.AsyncClient) -> None:
-        """Settings page masks the API key."""
+    async def test_settings_masks_api_key(self, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Settings page masks the API key (editable, non-env-sourced path)."""
+        # Clear the env override so the editable (masked) API-key field renders (OVH-003).
+        monkeypatch.delenv("TOPIC_WATCH_LLM__API_KEY", raising=False)
         response = await client.get("/settings")
         assert response.status_code == 200
         # Full key should NOT be visible
         assert "test-key-12345678" not in response.text
         # The masked format should be shown (first 4 chars...last 4 chars)
         assert "test...5678" in response.text
+
+    async def test_settings_env_key_readonly(self, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When the key is env-sourced, the field is read-only and the full key is hidden."""
+        monkeypatch.setenv("TOPIC_WATCH_LLM__API_KEY", "test-key-12345678")
+        response = await client.get("/settings")
+        assert response.status_code == 200
+        assert "set via environment" in response.text.lower()
+        assert "test-key-12345678" not in response.text
 
 
 # --- CSRF Protection ---
