@@ -3,7 +3,7 @@
 import math
 import re
 import sqlite3
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.analysis.knowledge import _truncate_to_budget, compress_knowledge, initialize_knowledge, update_knowledge
 from app.analysis.llm import CompressedKnowledge, KnowledgeStateUpdate, NoveltyResult
@@ -140,8 +140,11 @@ class TestCompressKnowledge:
         """Over-budget text is compressed by the LLM — no trailing fact is dropped."""
         topic = _make_topic()
         long_summary = "Fact one here. Fact two here. Fact three here."
-        # LLM returns a denser summary that keeps ALL three facts.
-        compressed = CompressedKnowledge(compressed_summary="F1. F2. F3.", token_count=0)
+        # LLM returns a denser summary that keeps ALL three facts. token_count is
+        # what compress_knowledge_summary already computed via count_tokens
+        # (_word_count_tokens("F1. F2. F3.") == 3); compress_knowledge reuses it
+        # rather than recounting (OVH-135).
+        compressed = CompressedKnowledge(compressed_summary="F1. F2. F3.", token_count=3)
         settings = _make_settings(max_tokens=500)
 
         with (
@@ -152,11 +155,60 @@ class TestCompressKnowledge:
             ),
             patch("app.analysis.knowledge.count_tokens", side_effect=_word_count_tokens),
         ):
-            text, count = await compress_knowledge(long_summary, topic, settings)
+            text, count, usage = await compress_knowledge(long_summary, topic, settings)
 
         assert text == "F1. F2. F3."
         assert count <= 500
-        assert count == 3  # recomputed authoritatively, not the LLM's 0
+        assert count == 3  # reused from compress_knowledge_summary, not re-counted
+
+    async def test_reuses_summary_count_without_recount(self) -> None:
+        """OVH-135: the in-budget success path does NOT re-tokenize the compressed
+        summary — it reuses the count compress_knowledge_summary already set."""
+        topic = _make_topic()
+        long_summary = "Fact one here. Fact two here. Fact three here."
+        compressed = CompressedKnowledge(compressed_summary="F1. F2. F3.", token_count=3)
+        settings = _make_settings(max_tokens=500)
+
+        count_mock = MagicMock(side_effect=_word_count_tokens)
+        with (
+            patch(
+                "app.analysis.knowledge.compress_knowledge_summary",
+                new_callable=AsyncMock,
+                return_value=compressed,
+            ),
+            patch("app.analysis.knowledge.count_tokens", count_mock),
+        ):
+            _, count, _ = await compress_knowledge(long_summary, topic, settings)
+
+        # In-budget success path must not call count_tokens at all (reuse only).
+        count_mock.assert_not_called()
+        assert count == 3
+
+    async def test_propagates_compression_usage(self) -> None:
+        """OVH-129: the compression round-trip's token usage is returned so the
+        caller can fold it into the persisted per-check totals."""
+        topic = _make_topic()
+        long_summary = "Fact one here. Fact two here. Fact three here."
+        compressed = CompressedKnowledge(
+            compressed_summary="F1. F2. F3.",
+            token_count=3,
+            prompt_tokens=123,
+            completion_tokens=45,
+        )
+        settings = _make_settings(max_tokens=500)
+
+        with (
+            patch(
+                "app.analysis.knowledge.compress_knowledge_summary",
+                new_callable=AsyncMock,
+                return_value=compressed,
+            ),
+            patch("app.analysis.knowledge.count_tokens", side_effect=_word_count_tokens),
+        ):
+            _, _, usage = await compress_knowledge(long_summary, topic, settings)
+
+        assert usage.prompt_tokens == 123
+        assert usage.completion_tokens == 45
 
     async def test_falls_back_to_truncation_on_llm_error(self) -> None:
         """If compression raises, degrade to lossy truncation rather than crash."""
@@ -172,19 +224,24 @@ class TestCompressKnowledge:
             ),
             patch("app.analysis.knowledge.count_tokens", side_effect=_heavy_word_count),
         ):
-            text, count = await compress_knowledge(long_summary, topic, settings)
+            text, count, usage = await compress_knowledge(long_summary, topic, settings)
 
         # Fell back to truncation: fits the budget, trailing sentence dropped.
         assert count <= 500
         assert "Sentence three here." not in text
         assert "Sentence one here." in text
+        # No LLM round-trip succeeded, so no compression usage to report.
+        assert usage.prompt_tokens == 0
+        assert usage.completion_tokens == 0
 
     async def test_truncates_when_compression_still_over_budget(self) -> None:
         """If the LLM's compression is itself over budget, truncate its output."""
         topic = _make_topic()
         long_summary = "Old verbose summary text."
-        # LLM returns something still too long.
-        compressed = CompressedKnowledge(compressed_summary="Still one. Still two. Still three.", token_count=0)
+        # LLM returns something still too long. token_count reflects what
+        # compress_knowledge_summary computed (3 words * 100 = 300... but
+        # _heavy_word_count counts the whole string; set it to overflow).
+        compressed = CompressedKnowledge(compressed_summary="Still one. Still two. Still three.", token_count=9999)
         settings = _make_settings(max_tokens=500)
 
         with (
@@ -195,7 +252,7 @@ class TestCompressKnowledge:
             ),
             patch("app.analysis.knowledge.count_tokens", side_effect=_heavy_word_count),
         ):
-            text, count = await compress_knowledge(long_summary, topic, settings)
+            text, count, usage = await compress_knowledge(long_summary, topic, settings)
 
         assert count <= 500
         assert "Still three." not in text
@@ -213,9 +270,13 @@ class TestCompressKnowledge:
         topic = _make_topic()
         long_summary = "Old verbose summary text."
         # One sentence, no internal boundaries; _heavy_word_count makes it overflow.
+        # token_count mirrors what compress_knowledge_summary computed via
+        # count_tokens (11 words * 100 = 1100 under _heavy_word_count), which
+        # compress_knowledge reuses to decide it is over budget (OVH-135).
+        mega = "One huge unsplittable mega sentence with many words and no boundaries"
         compressed = CompressedKnowledge(
-            compressed_summary="One huge unsplittable mega sentence with many words and no boundaries",
-            token_count=0,
+            compressed_summary=mega,
+            token_count=_heavy_word_count(mega, "m"),
         )
         settings = _make_settings(max_tokens=500)
 
@@ -227,7 +288,7 @@ class TestCompressKnowledge:
             ),
             patch("app.analysis.knowledge.count_tokens", side_effect=_heavy_word_count),
         ):
-            text, count = await compress_knowledge(long_summary, topic, settings)
+            text, count, usage = await compress_knowledge(long_summary, topic, settings)
 
         # Facts preserved (never truncated to empty), but the budget is exceeded.
         assert text == compressed.compressed_summary
@@ -254,7 +315,11 @@ class TestInitializeKnowledgeBudget:
             token_count=9999,
         )
         # Compression keeps all three facts but shorter (3 words = 300 tokens).
-        compressed = CompressedKnowledge(compressed_summary="S1 S2 S3.", token_count=0)
+        # token_count mirrors what compress_knowledge_summary computed, which
+        # compress_knowledge reuses (OVH-135).
+        compressed = CompressedKnowledge(
+            compressed_summary="S1 S2 S3.", token_count=_heavy_word_count("S1 S2 S3.", "m")
+        )
         settings = _make_settings(max_tokens=500)
 
         with (
@@ -367,7 +432,10 @@ class TestUpdateKnowledgeBudget:
             token_count=9999,
         )
         # Compression keeps all three new facts — the one trailing-truncation would lose.
-        compressed = CompressedKnowledge(compressed_summary="N1 N2 N3.", token_count=0)
+        # token_count mirrors compress_knowledge_summary's count, reused (OVH-135).
+        compressed = CompressedKnowledge(
+            compressed_summary="N1 N2 N3.", token_count=_heavy_word_count("N1 N2 N3.", "m")
+        )
         novelty = NoveltyResult(has_new_info=True, summary="New findings", key_facts=["Fact"], confidence=0.9)
         settings = _make_settings(max_tokens=500)
 
@@ -642,7 +710,9 @@ class TestCompressionTriggerBoundary:
             updated_summary="Over budget summary needing compression.",
             token_count=self._BUDGET + 1,  # == budget + 1
         )
-        compressed = CompressedKnowledge(compressed_summary="Tight.", token_count=0)
+        compressed = CompressedKnowledge(
+            compressed_summary="Tight.", token_count=1
+        )  # _word_count_tokens("Tight.")==1, reused (OVH-135)
         compress_mock = AsyncMock(return_value=compressed)
         settings = _make_settings(max_tokens=self._BUDGET)
 
@@ -706,7 +776,9 @@ class TestCompressionTriggerBoundary:
             updated_summary="Update over budget needing compression.",
             token_count=self._BUDGET + 1,  # == budget + 1
         )
-        compressed = CompressedKnowledge(compressed_summary="Tight.", token_count=0)
+        compressed = CompressedKnowledge(
+            compressed_summary="Tight.", token_count=1
+        )  # _word_count_tokens("Tight.")==1, reused (OVH-135)
         compress_mock = AsyncMock(return_value=compressed)
         novelty = NoveltyResult(has_new_info=True, summary="X", confidence=0.8)
         settings = _make_settings(max_tokens=self._BUDGET)

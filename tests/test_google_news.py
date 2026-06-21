@@ -320,6 +320,50 @@ class TestResolveGoogleNewsUrls:
         assert google_url2 in resolved
         assert google_url3 in resolved
 
+    async def test_decoder_break_is_labelled_distinctly(self, caplog) -> None:
+        """OVH-134: a structural decode break (Google changed the batchexecute
+        shape) WARNs with a 'decoder broke' label, distinct from an unresolvable
+        URL — the partial-break case must not hide as a sporadic miss."""
+        import logging
+
+        from app.scraping.google_news import _DecoderBrokeError
+
+        google_url2 = "https://news.google.com/rss/articles/CBMiSecondArticle?oc=5"
+
+        async def mock_resolve(url, client):
+            if url == _GOOGLE_RSS_URL:
+                raise _DecoderBrokeError("shape changed")
+            return f"https://real.example.com/{_extract_article_id(url)}"
+
+        with (
+            patch("app.scraping.google_news._resolve_or_raise", side_effect=mock_resolve),
+            caplog.at_level(logging.WARNING, logger="app.scraping.google_news"),
+        ):
+            resolved = await resolve_google_news_urls([_GOOGLE_RSS_URL, google_url2], request_delay=0)
+
+        # The decoder-broke URL is excluded; the healthy one still resolves.
+        assert _GOOGLE_RSS_URL not in resolved
+        assert google_url2 in resolved
+        decoder_warns = [r.getMessage() for r in caplog.records if "decoder broke" in r.getMessage()]
+        assert len(decoder_warns) == 1
+        assert "1/2" in decoder_warns[0]
+
+    async def test_no_decoder_break_warning_on_ordinary_miss(self, caplog) -> None:
+        """OVH-134: an ordinary unresolvable URL (no structural break) must NOT
+        emit the decoder-broke WARNING."""
+        import logging
+
+        async def mock_resolve(url, client):
+            return url  # ordinary miss: returns original, no exception
+
+        with (
+            patch("app.scraping.google_news._resolve_or_raise", side_effect=mock_resolve),
+            caplog.at_level(logging.WARNING, logger="app.scraping.google_news"),
+        ):
+            await resolve_google_news_urls([_GOOGLE_RSS_URL], request_delay=0)
+
+        assert not [r for r in caplog.records if "decoder broke" in r.getMessage()]
+
     async def test_all_urls_attempted_despite_failures(self) -> None:
         """Every URL is attempted even when earlier ones fail (no early abort)."""
         call_count = 0
