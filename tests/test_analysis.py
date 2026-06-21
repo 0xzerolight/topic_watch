@@ -633,6 +633,23 @@ class TestAnalyzeArticles:
 
         assert mock_create.call_args.kwargs["temperature"] == 0.0
 
+    async def test_forces_error_none_on_success(self) -> None:
+        """A successful call must clear ``error`` even if the model populated it.
+
+        ``error`` is part of the structured-output schema, so a model could set
+        it on a clean run. Only the except-branch is allowed to set ``error``;
+        otherwise the checker mis-stamps a healthy run as ``analysis_failed``.
+        """
+        rogue = NoveltyResult(has_new_info=True, summary="X", confidence=0.9, error="model populated this on success")
+        mock_client, _ = _mock_instructor_client(rogue)
+        settings = _make_settings()
+
+        with patch("app.analysis.llm._get_client", return_value=mock_client):
+            result = await analyze_articles([_make_article()], "Known facts.", _make_topic(), settings)
+
+        assert result.has_new_info is True
+        assert result.error is None
+
 
 # ============================================================
 # TestGenerateInitialKnowledge (async, mocked LLM)
