@@ -12,7 +12,9 @@ from typing import Any, cast
 
 import instructor
 import litellm
+from instructor.core import InstructorRetryException
 from pydantic import BaseModel, Field
+from tenacity import AsyncRetrying, retry_if_not_exception_type, stop_after_attempt
 
 from app.analysis.prompts import (
     build_knowledge_compress_messages,
@@ -145,6 +147,45 @@ def _summarize_exc(exc: BaseException, *, limit: int = 200) -> str:
     return summary[:limit]
 
 
+def _instructor_retries(max_retries: int) -> AsyncRetrying:
+    """Build instructor's per-call retry policy.
+
+    Instructor's ``max_retries`` governs structured-output *validation* retries
+    (re-prompting when the LLM's response fails Pydantic validation). We keep
+    those, but explicitly exclude ``RateLimitError`` from instructor's retry set
+    so a 429 propagates *bare* to ``_call_with_rate_limit_retry``, which owns the
+    rate-limit backoff. Otherwise instructor would swallow the 429 inside an
+    ``InstructorRetryException`` and immediately re-fire it ``max_retries`` times
+    with zero delay — hammering the throttled provider and hiding the rate limit
+    from operators (OVH-008).
+    """
+    return AsyncRetrying(
+        stop=stop_after_attempt(max_retries + 1),
+        retry=retry_if_not_exception_type(litellm.RateLimitError),
+    )
+
+
+def _unwrap_rate_limit(exc: BaseException) -> litellm.RateLimitError | None:
+    """Return the underlying ``RateLimitError`` if ``exc`` represents a 429.
+
+    Belt-and-suspenders for the rate-limit backoff: a bare ``RateLimitError`` is
+    returned as-is, and an ``InstructorRetryException`` is inspected (its first
+    arg and its ``failed_attempts``) for an underlying ``RateLimitError`` in case
+    a provider/instructor path still wraps it despite ``_instructor_retries``.
+    """
+    if isinstance(exc, litellm.RateLimitError):
+        return exc
+    if isinstance(exc, InstructorRetryException):
+        for arg in exc.args:
+            if isinstance(arg, litellm.RateLimitError):
+                return arg
+        for attempt in exc.failed_attempts or []:
+            attempt_exc = getattr(attempt, "exception", None)
+            if isinstance(attempt_exc, litellm.RateLimitError):
+                return attempt_exc
+    return None
+
+
 _client: instructor.AsyncInstructor | None = None
 
 
@@ -189,14 +230,21 @@ async def _call_with_rate_limit_retry(
 ) -> Any:
     """Wrap an async LLM call with exponential backoff on rate limit errors.
 
-    On RateLimitError, waits base_delay * (backoff_multiplier ** attempt) seconds
-    and retries up to max_retries times. All other exceptions are re-raised immediately.
+    On a rate-limit error, waits ``base_delay * (backoff_multiplier ** attempt)``
+    seconds and retries up to ``max_retries`` times. Rate limits are detected via
+    ``_unwrap_rate_limit`` so this fires whether the call raises a bare
+    ``RateLimitError`` (the expected path now that instructor is told not to
+    retry 429s — see ``_instructor_retries``) or an ``InstructorRetryException``
+    that still wraps one. All other exceptions are re-raised immediately.
     """
     last_exc: BaseException | None = None
     for attempt in range(max_retries + 1):
         try:
             return await call_func()
-        except litellm.RateLimitError as exc:
+        except Exception as exc:
+            rate_limit = _unwrap_rate_limit(exc)
+            if rate_limit is None:
+                raise
             last_exc = exc
             if attempt >= max_retries:
                 break
@@ -208,8 +256,6 @@ async def _call_with_rate_limit_retry(
                 delay,
             )
             await asyncio.sleep(delay)
-        except Exception:
-            raise
     assert last_exc is not None
     raise last_exc
 
@@ -328,7 +374,7 @@ async def analyze_articles(
             model=settings.llm.model,
             response_model=NoveltyResult,
             messages=messages,  # type: ignore[arg-type]
-            max_retries=settings.llm_max_retries,
+            max_retries=_instructor_retries(settings.llm_max_retries),
             api_key=settings.llm.api_key,
             api_base=_effective_base_url(settings),
             timeout=settings.llm_analysis_timeout,
@@ -370,7 +416,7 @@ async def generate_initial_knowledge(
             model=settings.llm.model,
             response_model=KnowledgeStateUpdate,
             messages=messages,  # type: ignore[arg-type]
-            max_retries=settings.llm_max_retries,
+            max_retries=_instructor_retries(settings.llm_max_retries),
             api_key=settings.llm.api_key,
             api_base=_effective_base_url(settings),
             timeout=settings.llm_knowledge_timeout,
@@ -408,7 +454,7 @@ async def compress_knowledge_summary(
             model=settings.llm.model,
             response_model=CompressedKnowledge,
             messages=messages,  # type: ignore[arg-type]
-            max_retries=settings.llm_max_retries,
+            max_retries=_instructor_retries(settings.llm_max_retries),
             api_key=settings.llm.api_key,
             api_base=_effective_base_url(settings),
             timeout=settings.llm_knowledge_timeout,
@@ -444,7 +490,7 @@ async def generate_knowledge_update(
             model=settings.llm.model,
             response_model=KnowledgeStateUpdate,
             messages=messages,  # type: ignore[arg-type]
-            max_retries=settings.llm_max_retries,
+            max_retries=_instructor_retries(settings.llm_max_retries),
             api_key=settings.llm.api_key,
             api_base=_effective_base_url(settings),
             timeout=settings.llm_knowledge_timeout,
