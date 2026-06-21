@@ -20,7 +20,6 @@ from app.crud import (
 from app.models import Article, Topic
 from app.scraping.content import extract_article_content
 from app.scraping.google_news import resolve_google_news_urls
-from app.scraping.relevance import score_relevance
 from app.scraping.rss import FeedEntry, compute_article_hash, fetch_feeds_for_topic
 from app.scraping.rss import FeedResponse as FeedResponse
 
@@ -41,6 +40,31 @@ class FetchResult:
     Surfaces otherwise-silent article loss so callers/monitoring can detect it.
     Each increment corresponds to a WARNING-level log entry.
     """
+
+
+def _insert_or_count_dup(
+    conn: sqlite3.Connection,
+    article: Article,
+    topic_name: str,
+    stored: list[Article],
+) -> bool:
+    """Insert one article, handling the concurrent-insert UNIQUE race in one place.
+
+    On success the created row is appended to ``stored`` and ``True`` is returned.
+    If a concurrent insert already won the ``UNIQUE(topic_id, content_hash)`` race,
+    the loss is logged at WARNING and ``False`` is returned so the caller can count
+    it toward ``dropped_duplicates`` (the FetchResult observability signal).
+    """
+    try:
+        stored.append(create_article(conn, article))
+        return True
+    except sqlite3.IntegrityError:
+        logger.warning(
+            "Dropped duplicate article (concurrent insert race) for topic '%s': %s",
+            topic_name,
+            article.url,
+        )
+        return False
 
 
 async def fetch_new_articles_for_topic(
@@ -122,22 +146,14 @@ async def fetch_new_articles_for_topic(
     if not new_entries and not reuse_entries:
         return FetchResult(articles=[], total_feed_entries=len(entries))
 
-    # 3. Sort by published date (newest first, None dates last), apply limit
+    # 3. Combine reuse + fetch candidates, sort by published date (newest first,
+    # None dates last), and apply the limit. Selection is purely recency-first.
     datetime_min = datetime.min.replace(tzinfo=UTC)
-    new_entries.sort(
-        key=lambda pair: pair[0].published or datetime_min,
-        reverse=True,
-    )
-    reuse_entries.sort(
-        key=lambda triple: triple[0].published or datetime_min,
-        reverse=True,
-    )
-    # Combine and limit: reuse entries are cheap, prioritise by date across both
     all_candidates: list[tuple[FeedEntry, str, str | None]] = [(e, h, c) for e, h, c in reuse_entries] + [
         (e, h, None) for e, h in new_entries
     ]
     all_candidates.sort(
-        key=lambda t: (t[0].published or datetime_min, score_relevance(topic, t[0])),
+        key=lambda t: t[0].published or datetime_min,
         reverse=True,
     )
     all_candidates = all_candidates[:max_articles]
@@ -169,57 +185,32 @@ async def fetch_new_articles_for_topic(
     content_tasks = [_extract(entry) for entry, _ in fetch_batch]
     contents = await asyncio.gather(*content_tasks, return_exceptions=True)
 
-    # 5. Create and store articles
-    stored: list[Article] = []
-    dropped_duplicates = 0
-
-    # 5a. Articles with reused content
-    for entry, content_hash, reused_content in reuse_batch:
-        article = Article(
-            topic_id=topic.id,
-            title=entry.title,
-            url=entry.url,
-            content_hash=content_hash,
-            raw_content=reused_content,
-            source_feed=entry.source_feed,
-            source_provider=response.provider_name,
-        )
-        try:
-            created = create_article(conn, article)
-            stored.append(created)
-        except sqlite3.IntegrityError:
-            dropped_duplicates += 1
-            logger.warning(
-                "Dropped duplicate article (concurrent insert race) for topic '%s': %s",
-                topic.name,
-                entry.url,
-            )
-
-    # 5b. Articles with freshly fetched content
+    # 5. Normalize both batches into a uniform (entry, content_hash, content) list,
+    # then run a single insert loop. Reused content is already resolved; freshly
+    # fetched content needs the BaseException -> summary -> None coercion first.
+    pending: list[tuple[FeedEntry, str, str | None]] = list(reuse_batch)
     for (entry, content_hash), content in zip(fetch_batch, contents, strict=False):
         if isinstance(content, BaseException):
             logger.warning("Content extraction failed for %s: %s", entry.url, content)
             content = entry.summary
+        resolved_content = content if isinstance(content, str) and content else None
+        pending.append((entry, content_hash, resolved_content))
 
+    stored: list[Article] = []
+    dropped_duplicates = 0
+    for entry, content_hash, resolved_content in pending:
         article = Article(
             topic_id=topic.id,
             title=entry.title,
             url=entry.url,
             content_hash=content_hash,
-            raw_content=content if isinstance(content, str) and content else None,
+            raw_content=resolved_content,
             source_feed=entry.source_feed,
             source_provider=response.provider_name,
         )
-        try:
-            created = create_article(conn, article)
-            stored.append(created)
-        except sqlite3.IntegrityError:
-            dropped_duplicates += 1
-            logger.warning(
-                "Dropped duplicate article (concurrent insert race) for topic '%s': %s",
-                topic.name,
-                entry.url,
-            )
+        if _insert_or_count_dup(conn, article, topic.name, stored):
+            continue
+        dropped_duplicates += 1
 
     conn.commit()
     if dropped_duplicates:
