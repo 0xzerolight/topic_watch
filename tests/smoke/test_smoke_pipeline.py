@@ -331,10 +331,10 @@ async def test_check_topic_queues_webhook_through_held_conn_on_500(db_conn: sqli
     pending = list_pending_webhooks(db_conn)
     assert len(pending) == 1
     queued = pending[0]
-    assert queued["topic_id"] == topic.id
-    assert queued["url"] == _WEBHOOK_URL
+    assert queued.topic_id == topic.id
+    assert queued.url == _WEBHOOK_URL
     # check_result_id is populated (created before the send), not NULL (OVH-101).
-    assert queued["check_result_id"] == result.id
+    assert queued.check_result_id == result.id
 
 
 async def _init_ready_topic(db_conn: sqlite3.Connection, settings: Settings) -> Topic:

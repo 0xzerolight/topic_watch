@@ -11,6 +11,14 @@ from app.models import Article, Topic
 
 _PROMPT_ARTICLE_MAX_CHARS = 1500
 
+# Below this many characters, an article's extracted body is treated as a [STUB]
+# (minimal content, low reliability) so the LLM down-weights it and leans on the
+# title instead (OVH-158). It is a prompt-reliability heuristic, not a content
+# budget — it stays a named module constant here rather than a config knob so the
+# prompt's framing is self-contained; revisit promoting it to a config seam if it
+# ever needs per-deployment tuning.
+_STUB_CONTENT_MIN_CHARS = 200
+
 # --- Prompt-injection hardening (OVH-058) ---
 #
 # Article title/content/URL/source_feed are untrusted: an attacker who controls
@@ -292,7 +300,7 @@ def _content_quality_tag(content: str | None) -> str:
     """Classify article content quality for the LLM."""
     if not content:
         return "[NO CONTENT]"
-    if len(content) < 200:
+    if len(content) < _STUB_CONTENT_MIN_CHARS:
         return "[STUB — minimal content, low reliability]"
     return ""
 

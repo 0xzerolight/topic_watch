@@ -1669,3 +1669,61 @@ class TestSafeSendRedirectEdgeCases:
 
         # Only the initial public URL was ever requested; file:// never fetched.
         assert fetched == ["https://public.example.com/feed.xml"]
+
+
+class TestResolveRedirectUrls:
+    """OVH-157: redirect resolution is gated by the provider abstraction.
+
+    The orchestrator must not hardcode the Google News host: resolution only
+    fires when the provider's ``needs_url_resolution`` is set, and which URLs to
+    resolve is delegated to ``is_google_news_url`` / the resolver.
+    """
+
+    def _entry(self, url: str) -> FeedEntry:
+        return FeedEntry(title="t", url=url, source_feed="https://feed.example/rss")
+
+    async def test_skips_when_provider_does_not_need_resolution(self) -> None:
+        from app.scraping import _resolve_redirect_urls
+
+        gnews = "https://news.google.com/rss/articles/ABC123?oc=5"
+        fetch_batch = [(self._entry(gnews), "h1")]
+        response = FeedResponse(provider_name="bing_news", needs_url_resolution=False)
+
+        with patch("app.scraping.resolve_google_news_urls", new_callable=AsyncMock) as mock_resolve:
+            await _resolve_redirect_urls(fetch_batch, response, feed_fetch_timeout=5.0)
+        mock_resolve.assert_not_called()
+        # URL left untouched.
+        assert fetch_batch[0][0].url == gnews
+
+    async def test_resolves_only_google_article_urls_when_gated_on(self) -> None:
+        from app.scraping import _resolve_redirect_urls
+
+        gnews = "https://news.google.com/rss/articles/ABC123?oc=5"
+        plain = "https://example.com/story"
+        fetch_batch = [(self._entry(gnews), "h1"), (self._entry(plain), "h2")]
+        response = FeedResponse(provider_name="google_news", needs_url_resolution=True)
+
+        with patch(
+            "app.scraping.resolve_google_news_urls",
+            new_callable=AsyncMock,
+            return_value={gnews: "https://real.example/article"},
+        ) as mock_resolve:
+            await _resolve_redirect_urls(fetch_batch, response, feed_fetch_timeout=5.0)
+
+        # Only the Google article URL was offered for resolution (not the plain one).
+        mock_resolve.assert_awaited_once()
+        offered = mock_resolve.await_args.args[0]
+        assert offered == [gnews]
+        # Resolved URL applied in place; the plain URL is untouched.
+        assert fetch_batch[0][0].url == "https://real.example/article"
+        assert fetch_batch[1][0].url == plain
+
+    async def test_no_resolver_call_when_no_google_urls(self) -> None:
+        from app.scraping import _resolve_redirect_urls
+
+        fetch_batch = [(self._entry("https://example.com/a"), "h1")]
+        response = FeedResponse(provider_name="google_news", needs_url_resolution=True)
+
+        with patch("app.scraping.resolve_google_news_urls", new_callable=AsyncMock) as mock_resolve:
+            await _resolve_redirect_urls(fetch_batch, response, feed_fetch_timeout=5.0)
+        mock_resolve.assert_not_called()

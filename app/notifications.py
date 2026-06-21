@@ -6,37 +6,21 @@ come from the application settings (Apprise URL format).
 
 import asyncio
 import logging
-from urllib.parse import urlparse
 
 import apprise
 
 from app.analysis.llm import NoveltyResult
 from app.config import Settings
+
+# Single canonical URL-redaction helper (fold-in): notification logging uses the
+# most-complete app.log_redaction.redact_url, which strips userinfo/query and also
+# drops long (likely-secret) path segments — strictly stronger than the old
+# scheme+host form against secret leakage. Re-exported so existing
+# ``from app.notifications import redact_url`` call sites keep working.
+from app.log_redaction import redact_url as redact_url
 from app.models import NotificationDelivery
 
 logger = logging.getLogger(__name__)
-
-
-def redact_url(url: str) -> str:
-    """Mask a notification URL for logging, keeping only scheme://host.
-
-    Notification URLs routinely embed secrets (Telegram bot tokens, Slack
-    tokens, basic-auth credentials, ``?password=`` query params), so the raw
-    string must never reach the logs. Strips userinfo, port, path, and query;
-    keeps just the scheme and host so an operator can still tell which channel
-    is misbehaving. Never raises.
-    """
-    try:
-        parsed = urlparse(url)
-        scheme = parsed.scheme
-        host = parsed.hostname
-        if scheme and host:
-            return f"{scheme}://{host}"
-        if scheme:
-            return f"{scheme}://****"
-        return "****"
-    except Exception:
-        return "****"
 
 
 def format_notification(topic_name: str, novelty_result: NoveltyResult) -> tuple[str, str]:

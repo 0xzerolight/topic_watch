@@ -565,7 +565,7 @@ class TestWebhookCheckResultId:
         assert result.id is not None
         pending = list_pending_webhooks(db_conn)
         assert len(pending) == 1
-        assert pending[0]["check_result_id"] == result.id
+        assert pending[0].check_result_id == result.id
 
 
 class TestInitNoConnectionAcrossAwaits:
