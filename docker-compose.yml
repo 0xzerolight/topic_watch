@@ -8,7 +8,9 @@ services:
       - ./data:/app/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      # OVH-122: explicit urlopen timeout (< the 5s Docker timeout) so the probe
+      # is self-bounded if /health hangs, rather than relying on Docker's SIGKILL.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=4)"]
       interval: 30s
       timeout: 5s
       retries: 3

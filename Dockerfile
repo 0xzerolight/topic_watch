@@ -62,8 +62,10 @@ LABEL org.opencontainers.image.licenses="GPL-3.0-or-later"
 
 EXPOSE 8000
 
+# OVH-122: explicit urlopen timeout (< the 5s Docker --timeout) so the probe is
+# self-bounded if /health hangs, rather than relying on Docker's SIGKILL alone.
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=10s \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=4)"
 
 STOPSIGNAL SIGTERM
 
