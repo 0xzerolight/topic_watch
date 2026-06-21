@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +112,32 @@ class Topic(BaseModel):
     confidence_threshold: float | None = None
     relevance_threshold: float | None = None
     init_attempts: int = 0
+
+    @field_validator("confidence_threshold", "relevance_threshold", mode="before")
+    @classmethod
+    def _clamp_threshold(cls, value: object, info: object) -> object:
+        """Clamp per-topic thresholds into [0.0, 1.0] (OVH-107).
+
+        Validation otherwise lives only at the form boundary (``parse_threshold``).
+        A value outside [0.0, 1.0] reaching a topic row — via a manual DB edit,
+        restore, or a future write path that skips that helper — would make
+        ``novelty.confidence < confidence_threshold`` always true (or always
+        false), silently suppressing ALL notifications for the topic. Clamp (and
+        warn) rather than raise so loading a corrupt row degrades gracefully
+        instead of 500-ing the route, matching the defensive ``from_row`` layer.
+        """
+        if value is None:
+            return None
+        try:
+            parsed = float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return value  # let Pydantic raise its standard type error
+        if parsed < 0.0 or parsed > 1.0:
+            field_name = getattr(info, "field_name", "threshold")
+            clamped = min(max(parsed, 0.0), 1.0)
+            logger.warning("Out-of-range %s %r clamped to %s", field_name, parsed, clamped)
+            return clamped
+        return parsed
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Self:
@@ -376,6 +402,12 @@ class PendingWebhook(BaseModel):
     def from_row(cls, row: sqlite3.Row) -> Self:
         """Construct a PendingWebhook from a database row."""
         data = dict(row)
+        # ``_safe_json`` falls back to {} (with a warning) not only on malformed
+        # JSON but also on valid JSON of the wrong type — an array/scalar/string
+        # whose ``type(parsed) is not type(default)`` — so a payload that was ever
+        # a non-dict (manual edit, partial corruption, future path) degrades here
+        # instead of raising ValidationError and 500-ing the retry-queue view or
+        # crashing the retry worker (OVH-110).
         data["payload"] = _safe_json(data.get("payload"), {}, "payload")
         data["created_at"] = _coerce_required_dt(data.get("created_at"))
         return cls(**data)

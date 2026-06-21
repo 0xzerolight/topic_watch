@@ -859,6 +859,62 @@ class TestMigrations:
             conn_final.close()
         assert applied == {good_version, bad_version}
 
+    def test_applies_in_version_order_regardless_of_list_order(self, tmp_path, monkeypatch) -> None:
+        """OVH-109: an out-of-order MIGRATIONS list still applies in numeric order.
+
+        The runner must sort pending migrations by version, so a future
+        append-only migration inserted out of position cannot apply/record out of
+        order (which would then silently skip a lower version, since current=MAX).
+        """
+        import app.migrations as migrations_mod
+        from app.database import get_connection, init_db
+
+        db_path = tmp_path / "order.db"
+        init_db(db_path)  # establish an existing DB at the real head version
+
+        applied_order: list[int] = []
+
+        def _make(version: int):
+            def _up(_conn: sqlite3.Connection) -> None:
+                applied_order.append(version)
+
+            return _up
+
+        v_lo = 9101
+        v_hi = 9102
+        # Deliberately list the higher version FIRST.
+        monkeypatch.setattr(
+            migrations_mod,
+            "MIGRATIONS",
+            [
+                (v_hi, "higher version listed first", _make(v_hi)),
+                (v_lo, "lower version listed second", _make(v_lo)),
+            ],
+        )
+
+        conn = get_connection(db_path)
+        try:
+            run_migrations(conn, db_path=db_path)
+        finally:
+            conn.close()
+
+        # Despite list order, the lower version must apply first.
+        assert applied_order == [v_lo, v_hi]
+
+        # Both must be recorded (no silent skip of the lower version).
+        conn_check = get_connection(db_path)
+        try:
+            recorded = {
+                r[0]
+                for r in conn_check.execute(
+                    "SELECT version FROM schema_version WHERE version IN (?, ?)",
+                    (v_lo, v_hi),
+                ).fetchall()
+            }
+        finally:
+            conn_check.close()
+        assert recorded == {v_lo, v_hi}
+
 
 class TestRecoverStuckTopics:
     """Tests for recover_stuck_topics."""
@@ -1121,6 +1177,26 @@ class TestGetDashboardData:
         assert len(data) == 2
         assert data[0]["topic"].name == "Alpha"
         assert data[1]["topic"].name == "Zeta"
+
+    def test_corrupt_checked_at_degrades_not_500(self, db_conn: sqlite3.Connection) -> None:
+        """OVH-108: a corrupt checked_at cell must degrade to now(UTC), not raise.
+
+        The dashboard builds CheckResult directly from the row; it must route the
+        required datetime through the same defensive coercion the model uses, so a
+        legacy/corrupt cell degrades instead of 500-ing the dashboard.
+        """
+        topic = create_topic(db_conn, Topic(name="Corrupt", description="d"))
+        cr = create_check_result(db_conn, CheckResult(topic_id=topic.id, articles_found=4))
+        # Corrupt the stored datetime cell directly (simulates legacy/migrated data).
+        db_conn.execute("UPDATE check_results SET checked_at = ? WHERE id = ?", ("not-a-date", cr.id))
+        db_conn.commit()
+
+        data = get_dashboard_data(db_conn)
+        assert len(data) == 1
+        last_check = data[0]["last_check"]
+        assert last_check is not None
+        assert isinstance(last_check.checked_at, datetime)
+        assert last_check.articles_found == 4
 
 
 class TestGetNewTopics:
