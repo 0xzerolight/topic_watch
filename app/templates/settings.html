@@ -38,6 +38,13 @@
                placeholder="e.g., openai/gpt-5.4-nano">
     </label>
 
+    {% if api_key_env_sourced %}
+    <label for="llm_api_key">
+        API Key <small>(set via environment — read-only)</small>
+        <input type="text" id="llm_api_key" value="(set via environment variable TOPIC_WATCH_LLM__API_KEY)" disabled>
+        <small>The API key is supplied by an environment variable and cannot be changed here. Edits to this field are ignored and the key is never written to the config file.</small>
+    </label>
+    {% else %}
     <label for="llm_api_key">
         API Key <small>(leave blank to keep current key)</small>
         <div style="display: flex; gap: 0.5rem; align-items: center;">
@@ -48,6 +55,7 @@
             <button type="button" onclick="toggleApiKey()" style="white-space: nowrap; margin: 0;">Show</button>
         </div>
     </label>
+    {% endif %}
 
     <div id="base-url-group">
         <label for="llm_base_url">
