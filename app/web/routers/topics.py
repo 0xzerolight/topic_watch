@@ -531,6 +531,7 @@ async def export_topic_csv(
             "has_new_info",
             "notification_sent",
             "notification_error",
+            "stage_error",
         ]
     )
     for check in checks:
@@ -544,6 +545,7 @@ async def export_topic_csv(
                 check.has_new_info,
                 check.notification_sent,
                 check.notification_error or "",
+                check.stage_error or "",
             ]
         )
 

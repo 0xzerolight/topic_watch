@@ -39,6 +39,12 @@ logger = logging.getLogger(__name__)
 MAX_INIT_ATTEMPTS = 3
 
 
+def _summarize_exc(exc: BaseException, *, limit: int = 200) -> str:
+    """One-line, length-bounded exception summary for the stored stage_error."""
+    summary = f"{type(exc).__name__}: {exc}".replace("\n", " ").strip()
+    return summary[:limit]
+
+
 async def check_topic(
     topic: Topic,
     conn: sqlite3.Connection,
@@ -109,8 +115,9 @@ async def _check_topic_inner(
             feed_max_retries=settings.feed_max_retries,
             concurrency=settings.content_fetch_concurrency,
         )
-    except Exception:
+    except Exception as exc:
         logger.warning("Scraping failed for topic '%s'", topic.name, exc_info=True)
+        result.stage_error = f"scrape_failed: {_summarize_exc(exc)}"
         return _record_result(conn, result)
 
     new_articles = fetch_result.articles
@@ -132,6 +139,12 @@ async def _check_topic_inner(
     result.prompt_tokens += novelty.prompt_tokens
     result.completion_tokens += novelty.completion_tokens
 
+    # analyze_articles stays fail-safe (never raises), so an LLM failure surfaces
+    # as the safe default plus a populated ``error``. Record it distinctly so a
+    # broken analysis is not byte-identical to a clean "nothing new" run.
+    if novelty.error:
+        result.stage_error = f"analysis_failed: {novelty.error}"
+
     # Effective thresholds: per-topic override (NULL = inherit global).
     confidence_threshold = (
         topic.confidence_threshold if topic.confidence_threshold is not None else settings.min_confidence_threshold
@@ -141,6 +154,7 @@ async def _check_topic_inner(
     )
 
     # Step 4: If new info, update knowledge and notify
+    knowledge_update_failed = False
     if novelty.has_new_info:
         if novelty.confidence < confidence_threshold:
             logger.info(
@@ -161,12 +175,17 @@ async def _check_topic_inner(
                 write_result = await update_knowledge(topic, novelty, conn, settings)
                 result.prompt_tokens += write_result.usage.prompt_tokens
                 result.completion_tokens += write_result.usage.completion_tokens
-            except Exception:
+            except Exception as exc:
                 logger.warning(
                     "Knowledge update failed for topic '%s'",
                     topic.name,
                     exc_info=True,
                 )
+                # OVH-009: the alert still fires, but record the failure distinctly
+                # and do NOT mark these new-info-bearing articles processed, so the
+                # next cycle re-attempts the knowledge update (no silent drift).
+                knowledge_update_failed = True
+                result.stage_error = f"knowledge_update_failed: {_summarize_exc(exc)}"
 
             title, body = format_notification(topic.name, novelty)
             try:
@@ -201,9 +220,14 @@ async def _check_topic_inner(
     # not-new articles, so they are never re-analyzed. Leaving them unprocessed
     # would re-fetch + re-analyze them every cycle after retention deletion +
     # feed reappearance, wasting LLM quota.
-    article_ids = [a.id for a in new_articles if a.id is not None]
-    if article_ids:
-        mark_articles_processed(conn, article_ids)
+    #
+    # Exception (OVH-009): when the knowledge update failed, the recorded
+    # knowledge state is now stale. Leave these articles unprocessed so the next
+    # cycle re-fetches and re-attempts the update instead of silently diverging.
+    if not knowledge_update_failed:
+        article_ids = [a.id for a in new_articles if a.id is not None]
+        if article_ids:
+            mark_articles_processed(conn, article_ids)
 
     logger.info(
         "Topic '%s': %d articles, new_info=%s, notified=%s",
