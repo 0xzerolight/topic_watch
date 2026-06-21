@@ -18,6 +18,7 @@ from app.models import (
     PendingWebhook,
     Topic,
     TopicStatus,
+    _coerce_required_dt,
 )
 
 logger = logging.getLogger(__name__)
@@ -244,7 +245,12 @@ def _query_dashboard_rows(
             last_check = CheckResult(
                 id=row["cr_id"],
                 topic_id=topic.id,
-                checked_at=row["cr_checked_at"],
+                # Route the required datetime through the same defensive coercion
+                # CheckResult.from_row uses (OVH-108): a corrupt/legacy checked_at
+                # cell degrades to now(UTC) with a warning instead of 500-ing the
+                # dashboard. This path builds the model directly (no full blob), so
+                # it must apply the guard itself.
+                checked_at=_coerce_required_dt(row["cr_checked_at"]),
                 articles_found=row["cr_articles_found"],
                 articles_new=row["cr_articles_new"],
                 has_new_info=bool(row["cr_has_new_info"]),
