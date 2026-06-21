@@ -138,12 +138,20 @@ class KnowledgeStateUpdate(BaseModel):
 
 
 class CompressedKnowledge(BaseModel):
-    """LLM response for knowledge-state compression."""
+    """LLM response for knowledge-state compression.
+
+    ``prompt_tokens`` / ``completion_tokens`` are populated from the raw
+    completion's usage after the call (not filled by the LLM); they default to
+    0 when the provider omits usage. They let the compression round-trip's cost
+    flow into the per-check token totals instead of vanishing (OVH-129).
+    """
 
     compressed_summary: str = Field(
         description="The condensed knowledge summary: same facts, less verbosity, within the token budget."
     )
     token_count: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
 
 # --- Helpers ---
@@ -218,15 +226,36 @@ def _effective_base_url(settings: Settings) -> str | None:
     return None
 
 
+# Models whose tokenizer has already failed once. The char/4 fallback diverges
+# from a real model tokenizer (OVH-136), so budget decisions made on it run on a
+# wrong unit; surface that as a WARNING. Cached per model so a broken tokenizer
+# does not flood the log with one line per count_tokens call — the operator sees
+# the divergence once per model and can correct the model id / tokenizer asset.
+_token_fallback_warned: set[str] = set()
+
+
 def count_tokens(text: str, model: str) -> int:
     """Count tokens using litellm's model-aware tokenizer.
 
-    Falls back to len(text) // 4 if the tokenizer fails.
+    Falls back to ``len(text) // 4`` if the tokenizer fails. Because that
+    char-based estimate systematically diverges from the model tokenizer
+    (non-English/structured text especially), the first fallback for a given
+    model is logged at WARNING so budget enforcement running on the wrong unit is
+    observable (OVH-136); subsequent fallbacks for the same model stay quiet.
     """
     try:
         return litellm.token_counter(model=model, text=text)  # type: ignore[no-any-return]
     except Exception:
-        logger.debug("Token counting failed for model %s, using fallback", model)
+        if model not in _token_fallback_warned:
+            _token_fallback_warned.add(model)
+            logger.warning(
+                "Token counting failed for model %s; using char/4 fallback — token-budget "
+                "decisions for this model are approximate until the tokenizer is available",
+                model,
+                exc_info=True,
+            )
+        else:
+            logger.debug("Token counting failed for model %s, using fallback", model)
         return len(text) // 4
 
 
@@ -474,17 +503,19 @@ async def compress_knowledge_summary(
     """Compress an over-budget knowledge summary while preserving its facts.
 
     Raises on failure — the caller decides how to degrade (e.g. fall back to
-    lossy truncation). The returned ``token_count`` is recomputed authoritatively.
+    lossy truncation). The returned ``token_count`` is recomputed authoritatively,
+    and ``prompt_tokens`` / ``completion_tokens`` are populated from the raw
+    completion's usage so this round-trip's cost is not lost (OVH-129).
     """
 
-    async def _do_call() -> CompressedKnowledge:
+    async def _do_call() -> tuple[CompressedKnowledge, Any]:
         client = _get_client(settings)
         messages = build_knowledge_compress_messages(
             current_summary=current_summary,
             topic=topic,
             max_tokens=settings.knowledge_state_max_tokens,
         )
-        return await client.chat.completions.create(  # type: ignore[no-any-return]
+        return await client.chat.completions.create_with_completion(  # type: ignore[no-any-return]
             model=settings.llm.model,
             response_model=CompressedKnowledge,
             messages=messages,  # type: ignore[arg-type]
@@ -495,8 +526,12 @@ async def compress_knowledge_summary(
             temperature=settings.llm_temperature,
         )
 
-    result: CompressedKnowledge = await _call_with_rate_limit_retry(_do_call, max_retries=settings.llm_max_retries)
+    raw_result, completion = await _call_with_rate_limit_retry(_do_call, max_retries=settings.llm_max_retries)
+    result: CompressedKnowledge = raw_result
     result.token_count = count_tokens(result.compressed_summary, settings.llm.model)
+    usage = _extract_usage(completion)
+    result.prompt_tokens = usage.prompt_tokens
+    result.completion_tokens = usage.completion_tokens
     return result
 
 
