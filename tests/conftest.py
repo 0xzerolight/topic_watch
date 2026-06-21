@@ -1,5 +1,6 @@
 """Shared test fixtures for Topic Watch tests."""
 
+import os
 import socket
 import sqlite3
 from collections.abc import Generator
@@ -7,8 +8,49 @@ from pathlib import Path
 
 import pytest
 
+# Make the app self-configured for tests (mirrors the CI env). Without these the
+# lifespan marks the app setup-required and the SetupRedirectMiddleware 307s every
+# /api request to /setup, so tests relying on a configured app fail when run in
+# isolation or in an order that does not happen to leak a configured state.
+os.environ.setdefault("TOPIC_WATCH_LLM__MODEL", "openai/gpt-4o-mini")
+os.environ.setdefault("TOPIC_WATCH_LLM__API_KEY", "test-key-not-real")
+
 from app.database import get_connection, init_db
 from app.main import app
+
+
+@pytest.fixture(autouse=True)
+def _isolate_app_state():
+    """Snapshot/restore shared FastAPI app state between tests.
+
+    The app is a module-global imported across test files; a test that mutates
+    app.dependency_overrides or app.state and fails to clean up otherwise bleeds
+    into later tests, producing order-dependent failures. Reset around every test.
+    """
+    overrides = dict(app.dependency_overrides)
+    app_state = dict(app.state._state)
+    yield
+    app.dependency_overrides.clear()
+    app.dependency_overrides.update(overrides)
+    app.state._state.clear()
+    app.state._state.update(app_state)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_app_state():
+    """Snapshot/restore shared FastAPI app state between tests.
+
+    The app is a module-global imported across test files; a test that mutates
+    app.dependency_overrides or app.state and fails to clean up otherwise bleeds
+    into later tests, producing order-dependent failures. Reset around every test.
+    """
+    overrides = dict(app.dependency_overrides)
+    app_state = dict(app.state._state)
+    yield
+    app.dependency_overrides.clear()
+    app.dependency_overrides.update(overrides)
+    app.state._state.clear()
+    app.state._state.update(app_state)
 
 
 @pytest.fixture(autouse=True)
