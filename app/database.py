@@ -189,7 +189,12 @@ def run_migrations(conn: sqlite3.Connection, db_path: Path | None = None) -> Non
 
     from app.migrations import MIGRATIONS
 
-    pending = [(v, d, f) for v, d, f in MIGRATIONS if v > current]
+    # Sort by version, not list position (OVH-109): the registry order is
+    # hand-maintained, so an append-only migration inserted out of position would
+    # otherwise apply/record out of numeric order — after which a lower version is
+    # silently skipped (current = MAX(version)). Sorting makes numeric order the
+    # contract, independent of list order.
+    pending = sorted((m for m in MIGRATIONS if m[0] > current), key=lambda m: m[0])
     if not pending:
         return
 
