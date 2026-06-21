@@ -573,19 +573,117 @@ class TestReinitTopic:
 class TestCheckNow:
     """Tests for POST /topics/{id}/check."""
 
-    async def test_check_runs_pipeline(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
-        """Check Now runs check_topic and returns a response."""
+    async def test_check_defers_to_background_not_inline(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """OVH-013: /check enqueues the background task; the pipeline does not run inline."""
         topic = _make_topic(db_conn)
 
-        with patch(
-            "app.web.routers.topics.check_topic",
-            new_callable=AsyncMock,
-        ) as mock_check:
-            mock_check.return_value = CheckResult(topic_id=topic.id)
-            response = await client.post(f"/topics/{topic.id}/check")
+        with (
+            patch("app.checker.check_topic", new_callable=AsyncMock) as mock_inline,
+            patch("app.web.routers.background._run_single_check", new_callable=AsyncMock) as mock_bg,
+        ):
+            response = await client.post(
+                f"/topics/{topic.id}/check",
+                headers={"HX-Request": "true"},
+            )
 
         assert response.status_code == 200
-        mock_check.assert_called_once()
+        # Pipeline must be deferred to the background task, never run inline.
+        mock_inline.assert_not_called()
+        mock_bg.assert_called_once()
+        assert mock_bg.call_args[0][0] == topic.id
+
+    async def test_check_htmx_returns_row_partial(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        """OVH-005: HTMX /check returns the topic-row partial."""
+        topic = _make_topic(db_conn)
+
+        with patch("app.web.routers.background._run_single_check", new_callable=AsyncMock):
+            response = await client.post(
+                f"/topics/{topic.id}/check",
+                headers={"HX-Request": "true"},
+                follow_redirects=False,
+            )
+
+        assert response.status_code == 200
+        assert f'id="topic-{topic.id}"' in response.text
+
+    async def test_check_non_htmx_redirects(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        """OVH-005: a plain-form /check redirects to the topic detail page (no orphan <tr>)."""
+        topic = _make_topic(db_conn)
+
+        with patch("app.web.routers.background._run_single_check", new_callable=AsyncMock):
+            response = await client.post(
+                f"/topics/{topic.id}/check",
+                follow_redirects=False,
+            )
+
+        assert response.status_code == 303
+        assert response.headers["location"] == f"/topics/{topic.id}"
+        # Must not return a bare table row to a full-page navigation.
+        assert "<tr" not in response.text
+
+    async def test_check_already_checking_htmx_returns_partial(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """OVH-005: the already-checking early return honors HX-Request (partial)."""
+        topic = _make_topic(db_conn)
+        from app.web.state import _checking_state
+
+        await _checking_state.start_check(topic.id)
+        try:
+            with patch("app.web.routers.background._run_single_check", new_callable=AsyncMock) as mock_bg:
+                response = await client.post(
+                    f"/topics/{topic.id}/check",
+                    headers={"HX-Request": "true"},
+                    follow_redirects=False,
+                )
+            assert response.status_code == 200
+            assert f'id="topic-{topic.id}"' in response.text
+            # Already checking — do not enqueue a second pipeline run.
+            mock_bg.assert_not_called()
+        finally:
+            await _checking_state.finish_check(topic.id)
+
+    async def test_check_already_checking_non_htmx_redirects(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """OVH-005: the already-checking early return redirects for a plain form."""
+        topic = _make_topic(db_conn)
+        from app.web.state import _checking_state
+
+        await _checking_state.start_check(topic.id)
+        try:
+            response = await client.post(
+                f"/topics/{topic.id}/check",
+                follow_redirects=False,
+            )
+            assert response.status_code == 303
+            assert response.headers["location"] == f"/topics/{topic.id}"
+        finally:
+            await _checking_state.finish_check(topic.id)
+
+    async def test_check_counts_articles_with_count_query(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """OVH-138: the article count comes from COUNT(*), not by hydrating every row."""
+        topic = _make_topic(db_conn)
+
+        with (
+            patch("app.web.routers.background._run_single_check", new_callable=AsyncMock),
+            patch("app.web.routers.topics.count_articles_for_topic", return_value=7) as mock_count,
+            patch("app.web.routers.topics.list_articles_for_topic") as mock_list,
+        ):
+            response = await client.post(
+                f"/topics/{topic.id}/check",
+                headers={"HX-Request": "true"},
+                follow_redirects=False,
+            )
+
+        assert response.status_code == 200
+        mock_count.assert_called_once()
+        mock_list.assert_not_called()
+        assert ">7</td>" in response.text
 
     async def test_check_404(self, client: httpx.AsyncClient) -> None:
         """Check for nonexistent topic returns 404."""
