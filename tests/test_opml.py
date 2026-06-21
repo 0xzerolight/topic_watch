@@ -308,3 +308,44 @@ class TestExportOPML:
             "https://a.example.com/feed",
             "https://b.example.com/feed",
         }
+
+
+class TestParseOPMLResolverTimeout:
+    """OVH-148: OPML import DNS validation is bounded by a resolver timeout."""
+
+    def test_slow_host_does_not_block_import(self, monkeypatch):
+        """A crafted slow-resolving host can't occupy a worker for minutes.
+
+        Runs the REAL SSRF validation path (overriding the autouse mock) so the
+        bounded getaddrinfo in url_validation is exercised end-to-end: a host
+        whose resolution hangs is given up on after the resolver timeout and
+        skipped as invalid, rather than serializing into a multi-minute import.
+        """
+        import socket
+        import time
+
+        from app import url_validation
+
+        monkeypatch.setattr(url_validation, "_RESOLVE_TIMEOUT", 0.1)
+
+        def _slow(*_args, **_kwargs):
+            time.sleep(5)  # would stall the whole import if the resolver weren't bounded
+            return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", 0))]
+
+        monkeypatch.setattr(socket, "getaddrinfo", _slow)
+        # Undo the autouse validate_feed_url stub so real DNS validation runs.
+        monkeypatch.setattr("app.opml.validate_feed_url", url_validation.validate_feed_url)
+
+        opml = """<?xml version="1.0"?>
+        <opml version="2.0"><body>
+            <outline text="Slow" xmlUrl="https://slow.example.com/feed" />
+        </body></opml>"""
+
+        start = time.monotonic()
+        result = parse_opml(opml, set())
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 2.0  # bounded — did not wait for the 5s resolver
+        # Fail-closed: unverifiable host is skipped, never imported.
+        assert result.topics == []
+        assert result.skipped_invalid == 1
