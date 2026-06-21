@@ -24,6 +24,7 @@ from app.crud import (
     increment_notification_retry,
     list_pending_notifications,
     mark_articles_processed,
+    update_check_result_delivery,
     update_topic,
 )
 from app.database import get_db, short_conn
@@ -153,8 +154,13 @@ async def _check_topic_inner(
         topic.relevance_threshold if topic.relevance_threshold is not None else settings.min_relevance_threshold
     )
 
-    # Step 4: If new info, update knowledge and notify
+    # Step 4: If new info above thresholds, update knowledge. The notification
+    # /webhook SENDS are deferred to Step 6 — AFTER the durable state is
+    # committed — so an irreversible alert is never dispatched inside the same
+    # transaction window that could later roll back (OVH-066).
     knowledge_update_failed = False
+    should_notify = False
+    notification: tuple[str, str] | None = None
     if novelty.has_new_info:
         if novelty.confidence < confidence_threshold:
             logger.info(
@@ -171,6 +177,7 @@ async def _check_topic_inner(
                 relevance_threshold,
             )
         else:
+            should_notify = True
             try:
                 write_result = await update_knowledge(topic, novelty, conn, settings)
                 result.prompt_tokens += write_result.usage.prompt_tokens
@@ -186,34 +193,7 @@ async def _check_topic_inner(
                 # next cycle re-attempts the knowledge update (no silent drift).
                 knowledge_update_failed = True
                 result.stage_error = f"knowledge_update_failed: {_summarize_exc(exc)}"
-
-            title, body = format_notification(topic.name, novelty)
-            try:
-                sent = await send_notification(title, body, settings)
-                result.notification_sent = sent
-                if not sent:
-                    result.notification_error = "Delivery failed"
-                    _queue_notification(conn, topic_id, title, body)
-            except Exception as exc:
-                logger.warning(
-                    "Notification failed for topic '%s'",
-                    topic.name,
-                    exc_info=True,
-                )
-                result.notification_error = str(exc)
-                _queue_notification(conn, topic_id, title, body)
-
-            # Send webhooks (independent of Apprise success/failure). Pass the
-            # connection + topic_id so failed deliveries are enqueued to
-            # pending_webhooks for retry instead of being dropped.
-            try:
-                await send_webhooks(topic.name, novelty, settings, conn=conn, topic_id=topic_id)
-            except Exception:
-                logger.warning(
-                    "Webhook delivery failed for topic '%s'",
-                    topic.name,
-                    exc_info=True,
-                )
+            notification = format_notification(topic.name, novelty)
 
     # Step 5: Mark articles as processed. "processed" means "we've evaluated
     # this article" — set even for below-threshold (new-but-not-notified) and
@@ -229,6 +209,62 @@ async def _check_topic_inner(
         if article_ids:
             mark_articles_processed(conn, article_ids)
 
+    # Step 6: Durable-state commit boundary (OVH-066). Persist the knowledge
+    # update + processed flags + CheckResult in one explicit write transaction
+    # BEFORE any irreversible network send. If this commit fails, no alert has
+    # gone out and the next cycle re-runs cleanly. Creating the CheckResult here
+    # also gives the webhook queue a real check_result_id (OVH-101).
+    result = create_check_result(conn, result)
+    conn.commit()
+
+    # Step 7: Irreversible network sends, now that durable state is committed.
+    if should_notify and notification is not None:
+        title, body = notification
+        try:
+            sent = await send_notification(title, body, settings)
+            result.notification_sent = sent
+            if not sent:
+                result.notification_error = "Delivery failed"
+                _queue_notification(conn, topic_id, title, body)
+        except Exception as exc:
+            logger.warning(
+                "Notification failed for topic '%s'",
+                topic.name,
+                exc_info=True,
+            )
+            result.notification_error = str(exc)
+            _queue_notification(conn, topic_id, title, body)
+
+        # Send webhooks (independent of Apprise success/failure). Pass the
+        # connection + topic_id + check_result_id so failed deliveries are
+        # enqueued to pending_webhooks (correlated to this check) for retry
+        # instead of being dropped.
+        try:
+            await send_webhooks(
+                topic.name,
+                novelty,
+                settings,
+                conn=conn,
+                topic_id=topic_id,
+                check_result_id=result.id,
+            )
+        except Exception:
+            logger.warning(
+                "Webhook delivery failed for topic '%s'",
+                topic.name,
+                exc_info=True,
+            )
+
+        # Step 8: Record the post-send delivery outcome onto the committed row.
+        if result.id is not None:
+            update_check_result_delivery(
+                conn,
+                result.id,
+                notification_sent=result.notification_sent,
+                notification_error=result.notification_error,
+            )
+            conn.commit()
+
     logger.info(
         "Topic '%s': %d articles, new_info=%s, notified=%s",
         topic.name,
@@ -237,11 +273,11 @@ async def _check_topic_inner(
         result.notification_sent,
     )
 
-    return _record_result(conn, result)
+    return result
 
 
 def _record_result(conn: sqlite3.Connection, result: CheckResult) -> CheckResult:
-    """Persist a CheckResult and commit."""
+    """Persist a CheckResult and commit (used by the no-send early-return paths)."""
     created = create_check_result(conn, result)
     conn.commit()
     return created
@@ -392,6 +428,12 @@ async def initialize_new_topic(
 
     Transitions: NEW/RESEARCHING → RESEARCHING → READY (or ERROR on failure).
     Called by both the web layer (background task) and the scheduler (gradual init).
+
+    Connection invariant (OVH-099): every status write below commits eagerly, and
+    the fetch (OVH-007) + LLM (``initialize_knowledge`` writes only after its
+    await) phases hold no write transaction across their awaits. So while the
+    caller's connection is passed in, no write lock spans the fetch/LLM awaits —
+    a concurrent WAL writer is never starved during initialization.
     """
     if topic.id is None:
         raise ValueError("Topic must have an ID")

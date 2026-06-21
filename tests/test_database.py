@@ -397,6 +397,49 @@ class TestCheckResultCRUD:
         results = list_check_results(db_conn, topic.id)
         assert len(results) == 2
 
+    def test_update_delivery_outcome(self, db_conn: sqlite3.Connection) -> None:
+        """update_check_result_delivery records the post-send delivery outcome
+        onto an already-created CheckResult row (OVH-066)."""
+        from app.crud import update_check_result_delivery
+
+        topic = create_topic(db_conn, Topic(name="CRDelivery", description="desc"))
+        db_conn.commit()
+
+        created = create_check_result(
+            db_conn,
+            CheckResult(topic_id=topic.id, has_new_info=True),
+        )
+        db_conn.commit()
+        assert created.id is not None
+        # Created before the send: delivery fields default to "not sent".
+        assert get_check_result(db_conn, created.id).notification_sent is False
+
+        update_check_result_delivery(
+            db_conn,
+            created.id,
+            notification_sent=True,
+            notification_error=None,
+        )
+        db_conn.commit()
+
+        refreshed = get_check_result(db_conn, created.id)
+        assert refreshed is not None
+        assert refreshed.notification_sent is True
+        assert refreshed.notification_error is None
+
+        # And a failure outcome is recorded too.
+        update_check_result_delivery(
+            db_conn,
+            created.id,
+            notification_sent=False,
+            notification_error="Delivery failed",
+        )
+        db_conn.commit()
+        refreshed = get_check_result(db_conn, created.id)
+        assert refreshed is not None
+        assert refreshed.notification_sent is False
+        assert refreshed.notification_error == "Delivery failed"
+
     def test_ordered_newest_first(self, db_conn: sqlite3.Connection) -> None:
         topic = create_topic(db_conn, Topic(name="CROrder", description="desc"))
         db_conn.commit()
