@@ -74,6 +74,29 @@ def _reset_stats_cache():
     state._stats_cache["expires"] = 0.0
 
 
+@pytest.fixture(autouse=True)
+def _reset_checking_state():
+    """Reset the in-progress check tracker between tests to prevent bleed.
+
+    ``_checking_state`` is a process-global guard. A web test that enqueues a
+    check via BackgroundTasks can leave the per-topic or whole-cycle flag set if
+    the task hasn't drained by the time the test ends; that leaks into a later
+    test, where ``check_all_topics`` then short-circuits (returns ``[]``) and
+    ``check_topic`` dedupes. Clear it around every test (mirrors
+    ``_reset_stats_cache``).
+    """
+    from app.web.state import _checking_state
+
+    def _clear() -> None:
+        _checking_state._topics.clear()
+        _checking_state._start_times.clear()
+        _checking_state._checking_all = False
+
+    _clear()
+    yield
+    _clear()
+
+
 @pytest.fixture
 def db_conn(tmp_path: Path) -> Generator[sqlite3.Connection, None, None]:
     """Provide a fresh database with schema initialized."""

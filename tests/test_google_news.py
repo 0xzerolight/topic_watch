@@ -337,7 +337,14 @@ class TestResolveGoogleNewsUrls:
         assert call_count == 2  # Both URLs attempted, not just the first
 
     async def test_rate_limit_stops_remaining(self) -> None:
-        """A genuine 429 rate-limit DOES stop the batch (continuing would just be throttled)."""
+        """A genuine 429 aborts the batch: not-yet-started URLs are short-circuited.
+
+        With bounded concurrency (OVH-056) the abort can't guarantee exactly one
+        attempt — up to ``_RESOLVE_CONCURRENCY`` may already be in flight — but it
+        MUST stop the rest rather than attempting every URL.
+        """
+        from app.scraping.google_news import _RESOLVE_CONCURRENCY
+
         call_count = 0
 
         async def fake_get(client, url):
@@ -345,14 +352,16 @@ class TestResolveGoogleNewsUrls:
             call_count += 1
             return httpx.Response(429, request=httpx.Request("GET", url))
 
-        google_url2 = "https://news.google.com/rss/articles/CBMiSecondArticle?oc=5"
-        google_url3 = "https://news.google.com/rss/articles/CBMiThirdArticle?oc=5"
+        # A batch much larger than the concurrency cap so the abort is observable.
+        extra = [f"https://news.google.com/rss/articles/CBMiArticle{i}?oc=5" for i in range(20)]
         with patch("app.scraping.google_news.safe_get", side_effect=fake_get):
-            resolved = await resolve_google_news_urls([_GOOGLE_RSS_URL, google_url2, google_url3], request_delay=0)
+            resolved = await resolve_google_news_urls([_GOOGLE_RSS_URL, *extra], request_delay=0)
 
         assert resolved == {}
-        # Stopped after the first URL's rate-limit (one page-fetch attempt only).
-        assert call_count == 1
+        # Remaining tasks short-circuited: far fewer than the 21 URLs attempted,
+        # bounded by what could be in flight when the first 429 landed.
+        assert call_count < 21
+        assert call_count <= _RESOLVE_CONCURRENCY
 
 
 # ============================================================
