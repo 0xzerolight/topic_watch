@@ -9,6 +9,7 @@ import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 
@@ -68,6 +69,14 @@ async def send_webhook(url: str, payload: dict, timeout: float = _WEBHOOK_TIMEOU
     DNS-rebinding TOCTOU window between this check and the POST is a
     pre-existing, architectural limitation shared by all outbound fetches.
     """
+    # Scheme allowlist BEFORE the POST (OVH-141). is_private_url() returns False
+    # for schemes with no netloc (file://, gopher://, ftp://), so without this
+    # explicit check the first hop would rely solely on httpx raising
+    # UnsupportedProtocol — a weaker backstop than the per-hop redirect checks.
+    if urlparse(url).scheme not in ("http", "https"):
+        logger.warning("Blocked webhook to non-http(s) URL: %s", redact_url(url))
+        return False
+
     if await asyncio.to_thread(is_private_url, url):
         logger.warning("Blocked webhook to private/reserved URL: %s", redact_url(url))
         return False
