@@ -88,6 +88,23 @@ def _getaddrinfo_bounded(hostname: str, timeout: float) -> list:
     return result
 
 
+def _addr_is_private(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Classify a single resolved IP as private/reserved/CGNAT.
+
+    Applies the standard ipaddress predicates plus the explicit RFC 6598 CGNAT
+    range (not covered by is_private/.is_reserved). Used for both the resolved
+    address and any IPv4 unwrapped from an IPv4-mapped IPv6 address.
+    """
+    return bool(
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_reserved
+        or addr.is_unspecified
+        or (addr.version == 4 and addr in _CGNAT_NETWORK)
+    )
+
+
 def _resolved_ip_is_private(hostname: str) -> bool:
     """Resolve a hostname and check if any resulting IP is private/reserved.
 
@@ -107,13 +124,16 @@ def _resolved_ip_is_private(hostname: str) -> bool:
         infos = _getaddrinfo_bounded(hostname, _RESOLVE_TIMEOUT)
         for _family, _type, _proto, _canonname, sockaddr in infos:
             addr = ipaddress.ip_address(sockaddr[0])
-            if (
-                addr.is_private
-                or addr.is_loopback
-                or addr.is_link_local
-                or addr.is_reserved
-                or (addr.version == 4 and addr in _CGNAT_NETWORK)
-            ):
+            if _addr_is_private(addr):
+                return True
+            # An IPv4-mapped IPv6 address (e.g. ::ffff:100.64.0.1) keeps
+            # version == 6, so the IPv4-only CGNAT gate and most predicates
+            # never fire on the wrapper. Unwrap to the embedded IPv4 and
+            # re-classify so mapped CGNAT/private/etc. is blocked while a
+            # mapped PUBLIC address (::ffff:93.184.216.34) stays allowed
+            # (OVH-169 follow-up — do NOT reintroduce a blanket ::ffff: block).
+            mapped = getattr(addr, "ipv4_mapped", None)
+            if mapped is not None and _addr_is_private(mapped):
                 return True
         return False
     except (socket.gaierror, ValueError, OSError):
