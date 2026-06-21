@@ -96,8 +96,13 @@ class NoveltyResult(BaseModel):
     # Set ONLY on the fail-safe error path (LLM call failed). Lets the caller
     # distinguish a genuine analysis failure from a clean "nothing new" result
     # without making analyze_articles raise (settled decision #3). None on
-    # every successful call, including a legitimate has_new_info=False.
-    error: str | None = None
+    # every successful call, including a legitimate has_new_info=False. The
+    # description instructs the model not to populate it; analyze_articles also
+    # force-resets it on the success path (belt-and-suspenders).
+    error: str | None = Field(
+        default=None,
+        description="Internal error channel; the model must always leave this null.",
+    )
 
 
 class KnowledgeStateUpdate(BaseModel):
@@ -337,6 +342,10 @@ async def analyze_articles(
         return NoveltyResult(has_new_info=False, confidence=0.0, error=_summarize_exc(exc))
 
     novelty: NoveltyResult = result
+    # ``error`` is in the LLM's structured-output schema, so a model can populate
+    # it on a clean run. Force it None here so ONLY the except-branch above ever
+    # sets it; otherwise the checker mis-stamps a healthy run as analysis_failed.
+    novelty.error = None
     usage = _extract_usage(completion)
     novelty.prompt_tokens = usage.prompt_tokens
     novelty.completion_tokens = usage.completion_tokens
