@@ -938,6 +938,139 @@ class TestMultiRoundInitialization:
         assert updated.status == TopicStatus.READY
         assert updated.init_attempts == 0
 
+    async def test_attempts_two_insufficient_stays_new_and_increments(self, db_conn: sqlite3.Connection) -> None:
+        """OVH-076 boundary: init_attempts=2 + insufficient → stays NEW, becomes 3 (last retry)."""
+        topic = _make_topic(db_conn, status=TopicStatus.NEW, status_changed_at=None, init_attempts=2)
+        settings = _make_settings()
+
+        updated = await self._init(db_conn, topic, settings, sufficient=False)
+        assert updated.status == TopicStatus.NEW
+        assert updated.init_attempts == 3
+
+    async def _init_empty_fetch(self, db_conn, topic, settings):
+        """Drive init where the fetch returns no articles (e.g. all already stored)."""
+        from app.checker import initialize_new_topic
+
+        with patch(
+            "app.checker.fetch_new_articles_for_topic",
+            new_callable=AsyncMock,
+            return_value=FetchResult(articles=[], total_feed_entries=0),
+        ):
+            await initialize_new_topic(topic, db_conn, settings)
+        return get_topic(db_conn, topic.id)
+
+    async def test_empty_fetch_first_attempt_errors(self, db_conn: sqlite3.Connection) -> None:
+        """OVH-001: first attempt (init_attempts=0) with no articles → ERROR."""
+        topic = _make_topic(db_conn, status=TopicStatus.NEW, status_changed_at=None, init_attempts=0)
+        settings = _make_settings()
+
+        updated = await self._init_empty_fetch(db_conn, topic, settings)
+        assert updated.status == TopicStatus.ERROR
+        assert updated.error_message == "No articles found during initialization"
+
+    async def test_empty_fetch_during_reinit_stays_new(self, db_conn: sqlite3.Connection) -> None:
+        """OVH-001: empty fetch on a NEW-topic re-init (init_attempts>0) keeps waiting in NEW."""
+        topic = _make_topic(db_conn, status=TopicStatus.NEW, status_changed_at=None, init_attempts=1)
+        settings = _make_settings()
+
+        updated = await self._init_empty_fetch(db_conn, topic, settings)
+        assert updated.status == TopicStatus.NEW
+        # init_attempts unchanged: nothing was analyzed this pass.
+        assert updated.init_attempts == 1
+        assert updated.error_message is None
+
+    async def test_real_second_pass_empty_fetch_stays_new(self, db_conn: sqlite3.Connection) -> None:
+        """OVH-001 real path: pass 1 stores+marks articles (insufficient → NEW, attempts=1);
+        pass 2 fetch returns [] because every hash is already stored → stays NEW, not ERROR."""
+        from app.checker import initialize_new_topic
+
+        topic = _make_topic(db_conn, status=TopicStatus.NEW, status_changed_at=None, init_attempts=0)
+        settings = _make_settings()
+        stored_hashes: set[str] = set()
+
+        async def fake_fetch(t, conn, **kwargs):
+            # Mimic real dedup: only return articles whose hash isn't already stored.
+            article = _make_article(id=None, topic_id=t.id, content_hash="hash-1")
+            if article.content_hash in stored_hashes:
+                return FetchResult(articles=[], total_feed_entries=1)
+            created = create_article(conn, article)
+            conn.commit()
+            stored_hashes.add(article.content_hash)
+            return FetchResult(articles=[created], total_feed_entries=1)
+
+        with (
+            patch("app.checker.fetch_new_articles_for_topic", side_effect=fake_fetch),
+            patch(
+                "app.checker.initialize_knowledge",
+                new_callable=AsyncMock,
+                return_value=_make_write_result(sufficient_data=False),
+            ),
+        ):
+            # Pass 1: stores the article, insufficient → back to NEW, attempts=1.
+            await initialize_new_topic(topic, db_conn, settings)
+            after_pass1 = get_topic(db_conn, topic.id)
+            assert after_pass1.status == TopicStatus.NEW
+            assert after_pass1.init_attempts == 1
+
+            # Pass 2: fetch finds nothing new (already stored) → must NOT error.
+            await initialize_new_topic(after_pass1, db_conn, settings)
+
+        after_pass2 = get_topic(db_conn, topic.id)
+        assert after_pass2.status == TopicStatus.NEW
+        assert after_pass2.error_message is None
+
+
+class TestInitNoOverwriteConcurrentEdits:
+    """OVH-100: init's terminal status write must not clobber concurrent UI edits."""
+
+    async def _drive_terminal_write(self, db_conn, topic, settings, *, sufficient: bool):
+        """Run init through to its terminal status write, simulating a concurrent edit
+        to feeds/thresholds that lands while the LLM await is in flight."""
+        from app.checker import initialize_new_topic
+
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
+        db_conn.commit()
+
+        async def edit_during_llm(*args, **kwargs):
+            # Simulate the UI editing this topic's feeds/thresholds mid-init.
+            db_conn.execute(
+                "UPDATE topics SET feed_urls=?, confidence_threshold=? WHERE id=?",
+                ('["https://edited.example.com/feed.xml"]', 0.42, topic.id),
+            )
+            db_conn.commit()
+            return _make_write_result(sufficient_data=sufficient)
+
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[article], total_feed_entries=1),
+            ),
+            patch("app.checker.initialize_knowledge", side_effect=edit_during_llm),
+        ):
+            await initialize_new_topic(topic, db_conn, settings)
+        return get_topic(db_conn, topic.id)
+
+    async def test_ready_write_preserves_concurrent_feed_edit(self, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn, status=TopicStatus.NEW, status_changed_at=None)
+        settings = _make_settings()
+
+        updated = await self._drive_terminal_write(db_conn, topic, settings, sufficient=True)
+        assert updated.status == TopicStatus.READY
+        # The concurrent edit must survive the terminal status write.
+        assert updated.feed_urls == ["https://edited.example.com/feed.xml"]
+        assert updated.confidence_threshold == 0.42
+
+    async def test_insufficient_write_preserves_concurrent_feed_edit(self, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn, status=TopicStatus.NEW, status_changed_at=None)
+        settings = _make_settings()
+
+        updated = await self._drive_terminal_write(db_conn, topic, settings, sufficient=False)
+        assert updated.status == TopicStatus.NEW
+        assert updated.init_attempts == 1
+        assert updated.feed_urls == ["https://edited.example.com/feed.xml"]
+        assert updated.confidence_threshold == 0.42
+
 
 # --- check_all_topics ---
 

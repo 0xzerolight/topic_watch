@@ -25,7 +25,7 @@ from app.crud import (
     list_pending_notifications,
     mark_articles_processed,
     update_check_result_delivery,
-    update_topic,
+    update_topic_init_status,
 )
 from app.database import get_db, short_conn
 from app.models import CheckResult, PendingNotification, Topic, TopicStatus
@@ -437,15 +437,33 @@ async def initialize_new_topic(
     """
     if topic.id is None:
         raise ValueError("Topic must have an ID")
+    topic_id: int = topic.id
 
-    # Immediately mark as RESEARCHING (concurrency guard: UI shows spinner, prevents re-trigger)
-    topic.status = TopicStatus.RESEARCHING
-    topic.status_changed_at = datetime.now(UTC)
-    topic.error_message = None
-    update_topic(conn, topic)
-    conn.commit()
+    # Status transitions here use ``update_topic_init_status`` (a targeted UPDATE of
+    # only status/error/init_attempts) rather than ``update_topic`` so a concurrent
+    # UI edit to this topic's feeds/thresholds during the long fetch/LLM await is
+    # never clobbered by a stale in-memory snapshot (OVH-100).
 
-    logger.info("Initializing knowledge for topic '%s' (id=%d)", topic.name, topic.id)
+    def _set_init_status(status: TopicStatus, *, error_message: str | None, init_attempts: int) -> None:
+        now = datetime.now(UTC)
+        update_topic_init_status(
+            conn,
+            topic_id,
+            status=status,
+            status_changed_at=now,
+            error_message=error_message,
+            init_attempts=init_attempts,
+        )
+        conn.commit()
+        topic.status = status
+        topic.status_changed_at = now
+        topic.error_message = error_message
+        topic.init_attempts = init_attempts
+
+    # Immediately mark as RESEARCHING (concurrency guard: UI shows spinner, prevents re-trigger).
+    _set_init_status(TopicStatus.RESEARCHING, error_message=None, init_attempts=topic.init_attempts)
+
+    logger.info("Initializing knowledge for topic '%s' (id=%d)", topic.name, topic_id)
 
     try:
         fetch_result = await fetch_new_articles_for_topic(
@@ -460,11 +478,24 @@ async def initialize_new_topic(
         articles = fetch_result.articles
 
         if not articles:
-            topic.status = TopicStatus.ERROR
-            topic.status_changed_at = datetime.now(UTC)
-            topic.error_message = "No articles found during initialization"
-            update_topic(conn, topic)
-            conn.commit()
+            # OVH-001: during a NEW-topic re-init (init_attempts>0) every prior
+            # article is already stored, so a feed with no fresh entries yields an
+            # empty fetch. That is not a failure — keep waiting in NEW for a later
+            # cycle. Only the very first attempt (init_attempts==0) with no articles
+            # at all is a genuine initialization error.
+            if topic.init_attempts > 0:
+                _set_init_status(TopicStatus.NEW, error_message=None, init_attempts=topic.init_attempts)
+                logger.info(
+                    "Topic '%s': no new articles on re-init (attempt %d) — staying NEW",
+                    topic.name,
+                    topic.init_attempts,
+                )
+                return
+            _set_init_status(
+                TopicStatus.ERROR,
+                error_message="No articles found during initialization",
+                init_attempts=topic.init_attempts,
+            )
             return
 
         # create_knowledge_state uses INSERT OR REPLACE, so re-init works atomically
@@ -478,27 +509,18 @@ async def initialize_new_topic(
             # Thin data: retry on a later cycle. Bump attempts and send the topic
             # back to NEW so the scheduler's gradual init re-runs it. Do NOT mark
             # READY yet.
-            topic.init_attempts += 1
-            topic.status = TopicStatus.NEW
-            topic.status_changed_at = datetime.now(UTC)
-            topic.error_message = None
-            update_topic(conn, topic)
-            conn.commit()
+            next_attempts = topic.init_attempts + 1
+            _set_init_status(TopicStatus.NEW, error_message=None, init_attempts=next_attempts)
             logger.info(
                 "Knowledge for topic '%s' insufficient — retry %d/%d, back to NEW",
                 topic.name,
-                topic.init_attempts,
+                next_attempts,
                 MAX_INIT_ATTEMPTS,
             )
             return
 
         # Either knowledge is sufficient, or attempts are exhausted: go READY.
-        topic.status = TopicStatus.READY
-        topic.status_changed_at = datetime.now(UTC)
-        topic.error_message = None
-        topic.init_attempts = 0
-        update_topic(conn, topic)
-        conn.commit()
+        _set_init_status(TopicStatus.READY, error_message=None, init_attempts=0)
 
         if write_result.sufficient_data:
             logger.info("Knowledge initialized for topic '%s' — now READY", topic.name)
@@ -511,8 +533,4 @@ async def initialize_new_topic(
 
     except Exception as exc:
         logger.error("Knowledge init failed for topic '%s'", topic.name, exc_info=True)
-        topic.status = TopicStatus.ERROR
-        topic.status_changed_at = datetime.now(UTC)
-        topic.error_message = str(exc)
-        update_topic(conn, topic)
-        conn.commit()
+        _set_init_status(TopicStatus.ERROR, error_message=str(exc), init_attempts=topic.init_attempts)

@@ -104,6 +104,30 @@ def update_topic(conn: sqlite3.Connection, topic: Topic) -> Topic:
     return topic
 
 
+def update_topic_init_status(
+    conn: sqlite3.Connection,
+    topic_id: int,
+    *,
+    status: TopicStatus,
+    status_changed_at: datetime,
+    error_message: str | None,
+    init_attempts: int,
+) -> None:
+    """Targeted UPDATE of only the init-lifecycle columns a topic init owns.
+
+    Unlike ``update_topic`` (which rewrites the whole row from a possibly-stale
+    in-memory ``Topic``), this writes only status/error/init_attempts so a
+    concurrent UI edit to feeds/thresholds during the long init await is not
+    clobbered (OVH-100). Does not commit; the caller owns the transaction.
+    """
+    conn.execute(
+        """UPDATE topics
+           SET status = ?, status_changed_at = ?, error_message = ?, init_attempts = ?
+           WHERE id = ?""",
+        (status.value, status_changed_at.isoformat(), error_message, init_attempts, topic_id),
+    )
+
+
 def recover_stuck_topics(conn: sqlite3.Connection) -> int:
     """Mark all RESEARCHING topics as ERROR.
 

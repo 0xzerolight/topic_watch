@@ -156,6 +156,22 @@ class TestReinitTopic:
         assert updated is not None
         assert updated.status == TopicStatus.RESEARCHING
 
+    async def test_retry_resets_init_attempts(
+        self,
+        client: httpx.AsyncClient,
+        db_conn: sqlite3.Connection,
+    ) -> None:
+        """OVH-098: explicit Retry resets init_attempts to 0 (full thin-data budget)."""
+        topic = _make_topic(db_conn, status=TopicStatus.ERROR, init_attempts=2)
+
+        with patch("app.web.routers.background._run_init", new_callable=AsyncMock):
+            response = await client.post(f"/topics/{topic.id}/init", follow_redirects=False)
+
+        assert response.status_code == 303
+        updated = get_topic(db_conn, topic.id)
+        assert updated is not None
+        assert updated.init_attempts == 0
+
     async def test_background_task_is_triggered(
         self,
         client: httpx.AsyncClient,
