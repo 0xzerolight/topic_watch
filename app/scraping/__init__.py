@@ -81,13 +81,18 @@ async def fetch_new_articles_for_topic(
 
         return callback
 
-    # 1. Fetch all feed entries
+    # 1. Fetch all feed entries. The health callback writes feed_health rows on
+    # ``conn``; commit immediately afterwards so that write lock is NOT held
+    # across the later content-extraction await (OVH-007: WAL single-writer
+    # starvation). From here the connection performs only SELECTs until the
+    # final article-insert phase, so no write transaction spans the awaits.
     response = await fetch_feeds_for_topic(
         topic,
         timeout=feed_fetch_timeout,
         max_attempts=feed_max_retries,
         health_callback=_make_health_callback(conn),
     )
+    conn.commit()
     entries = response.entries
     if not entries:
         return FetchResult(articles=[], total_feed_entries=0)
