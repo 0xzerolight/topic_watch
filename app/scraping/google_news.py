@@ -63,6 +63,18 @@ class _RateLimitedError(Exception):
     """
 
 
+class _DecoderBrokeError(Exception):
+    """Raised internally when a 200 batchexecute body fails to parse structurally.
+
+    Google's internal batchexecute response shape changes from time to time. When
+    it does, the decode step throws on a *successful* HTTP response — a structural
+    decoder break, not an ordinary per-URL miss (where params/decoded are simply
+    absent). Distinguishing the two lets the batch resolver emit a semantic
+    'decoder broke vs URLs unresolvable' label so a whole-format change is not
+    masked as sporadic misses at INFO level (OVH-134).
+    """
+
+
 async def _get_decoding_params(
     article_id: str,
     client: httpx.AsyncClient,
@@ -148,14 +160,18 @@ async def _decode_url(
         # Response format: )]}'\n\n<json data>
         parts = response.text.split("\n\n", 1)
         if len(parts) < 2:
-            return None
+            # No JSON body at all — a structural break in the 200 response shape.
+            raise _DecoderBrokeError("batchexecute response had no JSON body")
         parsed = json.loads(parts[1])[:-2]
         decoded_url: str = json.loads(parsed[0][2])[1]
-        if decoded_url and isinstance(decoded_url, str) and decoded_url.startswith("http"):
-            return decoded_url
     except (json.JSONDecodeError, IndexError, TypeError, KeyError) as exc:
+        # A 200 body that no longer matches the expected shape: the decoder broke
+        # (Google changed the format), distinct from an unresolvable URL (OVH-134).
         logger.debug("Failed to parse batchexecute response: %s", exc)
+        raise _DecoderBrokeError(str(exc)) from exc
 
+    if decoded_url and isinstance(decoded_url, str) and decoded_url.startswith("http"):
+        return decoded_url
     return None
 
 
@@ -166,11 +182,11 @@ async def resolve_google_news_url(
     """Resolve a single Google News redirect URL to the actual article URL.
 
     Returns the resolved URL, or the original URL if resolution fails
-    (including when rate-limited).
+    (including when rate-limited or the decoder broke).
     """
     try:
         return await _resolve_or_raise(url, client)
-    except _RateLimitedError:
+    except (_RateLimitedError, _DecoderBrokeError):
         return url
 
 
@@ -178,11 +194,12 @@ async def _resolve_or_raise(
     url: str,
     client: httpx.AsyncClient,
 ) -> str:
-    """Resolve a single URL, propagating ``_RateLimitedError`` on HTTP 429.
+    """Resolve a single URL, propagating control signals to the batch resolver.
 
     Returns the resolved URL, or the original URL on ordinary (non-rate-limit)
-    failure. The batch resolver uses the raised ``_RateLimitedError`` to decide
-    whether to abort the remaining URLs.
+    failure. Propagates ``_RateLimitedError`` on HTTP 429 (the batch aborts) and
+    ``_DecoderBrokeError`` when a 200 response failed to parse structurally (the
+    batch labels it a decoder break, distinct from an unresolvable URL, OVH-134).
     """
     article_id = _extract_article_id(url)
     if not article_id:
@@ -233,6 +250,7 @@ async def resolve_google_news_urls(
 
     resolved: dict[str, str] = {}
     failures = 0
+    decoder_breaks = 0
     semaphore = asyncio.Semaphore(_RESOLVE_CONCURRENCY)
     # Shared 429 abort flag: once Google rate-limits, every not-yet-started task
     # short-circuits rather than piling on more throttled requests.
@@ -245,11 +263,16 @@ async def resolve_google_news_urls(
         follow_redirects=False,
     ) as client:
 
-        async def _resolve_one(url: str) -> tuple[str, str | None]:
-            """Return (url, resolved_url) or (url, None) on failure/abort/429."""
+        async def _resolve_one(url: str) -> tuple[str, str | None, bool]:
+            """Return (url, resolved_url, decoder_broke).
+
+            ``resolved_url`` is None on failure/abort/429; ``decoder_broke`` is
+            True only when a 200 batchexecute body failed to parse structurally
+            (OVH-134).
+            """
             async with semaphore:
                 if aborted.is_set():
-                    return url, None
+                    return url, None, False
                 # Jittered throttle: 0..request_delay before each request keeps the
                 # average rate near the old fixed delay without the strict stall.
                 if request_delay > 0:
@@ -258,12 +281,16 @@ async def resolve_google_news_urls(
                     result = await _resolve_or_raise(url, client)
                 except _RateLimitedError:
                     aborted.set()
-                    return url, None
-            return url, (None if result == url else result)
+                    return url, None, False
+                except _DecoderBrokeError:
+                    return url, None, True
+            return url, (None if result == url else result), False
 
         outcomes = await asyncio.gather(*(_resolve_one(u) for u in google_urls))
 
-    for url, result in outcomes:
+    for url, result, decoder_broke in outcomes:
+        if decoder_broke:
+            decoder_breaks += 1
         if result is None:
             failures += 1
             logger.debug("Could not resolve Google News URL: %s", url[:80])
@@ -272,6 +299,18 @@ async def resolve_google_news_urls(
 
     if aborted.is_set():
         logger.warning("Google News rate-limited (429); aborted remaining resolutions")
+
+    # A structural decoder break (Google changed the batchexecute response shape)
+    # is a different failure mode than an unresolvable URL: it tends to affect
+    # every URL and means stored articles keep their unfetchable redirect links.
+    # Surface the partial case at WARNING so it is not masked as sporadic misses
+    # (the total-break case already WARNs at 'Failed to resolve any', OVH-134).
+    if decoder_breaks:
+        logger.warning(
+            "Google News batchexecute decoder broke for %d/%d URL(s) — response format may have changed",
+            decoder_breaks,
+            len(google_urls),
+        )
 
     if failures:
         logger.info("Google News batch: %d URL(s) could not be resolved", failures)

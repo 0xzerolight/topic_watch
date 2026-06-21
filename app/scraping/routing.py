@@ -85,9 +85,15 @@ class ProviderRouter:
         health = self._health.get(provider_name)
         return health.epoch if health else 0
 
-    def mark_unhealthy(self, provider_name: str) -> None:
-        """Record a failure for a provider."""
+    def mark_unhealthy(self, provider_name: str) -> bool:
+        """Record a failure for a provider.
+
+        Returns ``True`` if this failure is the one that *crossed* the failure
+        threshold (the provider just became unhealthy / entered cooldown), so the
+        caller can log that transition at a louder level (OVH-133).
+        """
         health = self._health.setdefault(provider_name, _ProviderHealth())
+        was_below_threshold = health.consecutive_failures < _FAILURE_THRESHOLD
         health.consecutive_failures += 1
         health.epoch += 1
         health.last_failure = datetime.now(UTC)
@@ -97,8 +103,9 @@ class ProviderRouter:
             health.consecutive_failures,
             _FAILURE_THRESHOLD,
         )
+        return was_below_threshold and health.consecutive_failures >= _FAILURE_THRESHOLD
 
-    def mark_healthy(self, provider_name: str, observed_epoch: int | None = None) -> None:
+    def mark_healthy(self, provider_name: str, observed_epoch: int | None = None) -> bool:
         """Reset failure count for a provider on success.
 
         Monotonic accounting (OVH-127): if ``observed_epoch`` is given and the
@@ -106,10 +113,13 @@ class ProviderRouter:
         this fetch's await), the success is stale and the reset is skipped so a
         freshly-tripped cooldown is not wiped. ``observed_epoch=None`` keeps the
         unconditional legacy reset for non-overlapping callers.
+
+        Returns ``True`` if the provider had accumulated failures and was just
+        reset (a recovery), so the caller can log the recovery (OVH-133).
         """
         health = self._health.get(provider_name)
         if health is None:
-            return
+            return False
         if observed_epoch is not None and health.epoch != observed_epoch:
             logger.debug(
                 "Provider %s: stale success (epoch %d != %d); cooldown kept",
@@ -117,8 +127,10 @@ class ProviderRouter:
                 observed_epoch,
                 health.epoch,
             )
-            return
+            return False
+        recovered = health.consecutive_failures > 0
         del self._health[provider_name]
+        return recovered
 
     def _is_healthy(self, provider_name: str) -> bool:
         health = self._health.get(provider_name)
