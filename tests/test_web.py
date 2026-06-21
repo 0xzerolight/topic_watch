@@ -299,6 +299,34 @@ class TestAddTopic:
 
         mock_init.assert_called_once()
 
+    async def test_create_topic_duplicate_name_returns_422(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """Re-adding a topic with an existing name returns an inline 422, not a 500."""
+        _make_topic(db_conn, name="Dupe Topic")
+
+        with patch(
+            "app.web.routers.background._run_init",
+            new_callable=AsyncMock,
+        ):
+            response = await client.post(
+                "/topics",
+                data={
+                    "name": "Dupe Topic",
+                    "description": "Trying to re-add",
+                    "feed_mode": "manual",
+                    "feed_urls": "https://example.com/feed.xml",
+                },
+                follow_redirects=False,
+            )
+
+        assert response.status_code == 422
+        assert "A topic with that name already exists" in response.text
+        # Submitted form input is preserved (not discarded by a 500).
+        assert "Dupe Topic" in response.text
+        assert "Trying to re-add" in response.text
+        assert "https://example.com/feed.xml" in response.text
+
     async def test_create_topic_rejects_invalid_urls(self, client: httpx.AsyncClient) -> None:
         """Invalid feed URLs are rejected with 422 and error messages."""
         response = await client.post(
