@@ -78,6 +78,13 @@ def setup_logging() -> None:
         logging.root.handlers.clear()
         logging.root.addHandler(handler)
         logging.root.setLevel(getattr(logging, log_level, logging.INFO))
+        # Retarget uvicorn's loggers so their startup/error/access lines flow through
+        # the root JSON handler+filter instead of uvicorn's own text formatter. This
+        # makes stdout a single all-JSON stream and gives access logs a check_id field.
+        for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+            uvicorn_logger = logging.getLogger(name)
+            uvicorn_logger.handlers = []
+            uvicorn_logger.propagate = True
     else:
         logging.basicConfig(
             level=getattr(logging, log_level, logging.INFO),
