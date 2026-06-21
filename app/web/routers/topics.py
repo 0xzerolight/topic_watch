@@ -278,12 +278,15 @@ async def check_topic_handler(
     if topic is None:
         raise HTTPException(status_code=404, detail="Topic not found")
 
-    if not await _checking_state.start_check(topic_id):
-        # Already checking — return current state without re-checking.
+    if await _checking_state.is_checking(topic_id):
+        # Already checking — return current state without enqueueing a duplicate.
         return _topic_row_response(request, conn, topic, topic_id)
 
-    # Defer the pipeline to a background task with its own connection; the
-    # task releases the per-topic guard when it completes.
+    # Defer the pipeline to a background task with its own connection. The task
+    # is the authoritative owner of the per-topic guard: it acquires
+    # ``start_check`` at entry (so two near-simultaneous submissions still
+    # de-dupe even though both passed the read above) and releases it when done
+    # (OVH-033/OVH-096).
     db_path = getattr(request.app.state, "db_path", None)
     background_tasks.add_task(background._run_single_check, topic_id, settings, db_path)
 
