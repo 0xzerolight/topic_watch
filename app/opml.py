@@ -6,6 +6,7 @@ and exporting topics as OPML for backup/migration.
 
 import logging
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from urllib.parse import urlparse
@@ -16,6 +17,13 @@ logger = logging.getLogger(__name__)
 
 MAX_IMPORT_TOPICS = 500
 MAX_OUTLINE_DEPTH = 10
+
+# Bound on concurrent feed-URL validations (each does a blocking getaddrinfo).
+# Caps both wall-clock time and resolver fan-out for a large import so a handful
+# of slow/unresolvable hosts no longer serialize into a multi-minute import
+# (OVH-053). ``parse_opml`` runs inside ``asyncio.to_thread`` (worker thread, no
+# event loop), so a ThreadPoolExecutor — not asyncio — is the right primitive.
+_VALIDATION_CONCURRENCY = 16
 
 
 @dataclass
@@ -80,6 +88,26 @@ def _walk_outlines(
             _walk_outlines(outline, candidates, child_tags, depth + 1)
 
 
+def _validate_urls_concurrently(urls: list[str]) -> dict[str, str | None]:
+    """Validate a deduped URL list concurrently, returning ``{url: error|None}``.
+
+    Each URL is validated with :func:`validate_feed_url` (DNS resolution +
+    private-address check) in a bounded thread pool so a large import's blocking
+    ``getaddrinfo`` calls run in parallel rather than back-to-back (OVH-053).
+    The SSRF invariant is preserved: every URL still passes through
+    ``validate_feed_url``. A tiny/empty list skips the pool entirely.
+    """
+    if not urls:
+        return {}
+    if len(urls) == 1:
+        return {urls[0]: validate_feed_url(urls[0])}
+
+    workers = min(_VALIDATION_CONCURRENCY, len(urls))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(validate_feed_url, urls))
+    return dict(zip(urls, results, strict=True))
+
+
 def parse_opml(
     content: str,
     existing_feed_urls: set[str],
@@ -119,19 +147,30 @@ def parse_opml(
     candidates: list[_Candidate] = []
     _walk_outlines(body, candidates, parent_tags=[], depth=0)
 
-    # 2. Validation / dedup pass. ``seen_urls`` covers both DB URLs and URLs
-    # already accepted in this import; ``name_dupes_seen`` keeps the name-collision
-    # count per distinct topic (matching the old router's per-topic semantics).
+    # 2a. URL dedup pass (no network). Drop candidates whose URL already exists
+    # in the DB or appeared earlier in this import, so validation never resolves
+    # a URL twice. ``seen_urls`` is consumed in order to preserve intra-import
+    # dedup semantics (first occurrence wins).
     seen_urls = set(existing_feed_urls)
-    name_dupes_seen: set[str] = set()
+    survivors: list[_Candidate] = []
     for candidate in candidates:
-        # Dedup: skip if URL already exists in any topic or earlier in this import.
         if candidate.url in seen_urls:
             result.skipped_dupes += 1
             continue
+        survivors.append(candidate)
+        seen_urls.add(candidate.url)
 
-        # SSRF validation (DNS) — the only network step, isolated to this pass.
-        error = validate_feed_url(candidate.url)
+    # 2b. Concurrent SSRF validation of the deduped URL set — the only network
+    # step. Each URL still flows through ``validate_feed_url`` (DNS + private-IP
+    # check), but bounded concurrency caps wall-clock + resolver fan-out so slow
+    # hosts don't serialize (OVH-053). Resolve each unique URL exactly once.
+    errors_by_url = _validate_urls_concurrently([c.url for c in survivors])
+
+    # 2c. Apply pass (no network): consume validation results in document order,
+    # preserving the original merge / name-collision accounting.
+    name_dupes_seen: set[str] = set()
+    for candidate in survivors:
+        error = errors_by_url.get(candidate.url)
         if error:
             result.skipped_invalid += 1
             result.warnings.append(error)
@@ -142,7 +181,6 @@ def parse_opml(
         existing_topic = next((t for t in result.topics if t["name"] == candidate.name), None)
         if existing_topic is not None:
             existing_topic["feed_urls"].append(candidate.url)
-            seen_urls.add(candidate.url)
             continue
 
         # Name collision with an existing DB topic — skip (counted once per name).
@@ -159,7 +197,6 @@ def parse_opml(
                 "tags": list(candidate.tags),
             }
         )
-        seen_urls.add(candidate.url)
 
     if not result.topics:
         if result.skipped_dupes == 0 and result.skipped_invalid == 0 and result.skipped_name_dupes == 0:

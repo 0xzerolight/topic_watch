@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import re
+import secrets
 from urllib.parse import quote, urlparse
 
 import httpx
@@ -31,7 +32,11 @@ _SIG_RE = re.compile(r'data-n-a-sg="([^"]+)"')
 _TS_RE = re.compile(r'data-n-a-ts="([^"]+)"')
 
 _RESOLVE_TIMEOUT = 10.0
-_REQUEST_DELAY = 0.5  # seconds between resolution requests to avoid rate limiting
+_REQUEST_DELAY = 0.5  # max jittered delay before each request, to avoid rate limiting
+# Small bounded fan-out for resolution. Caps concurrent requests to stay under
+# Google's throttle threshold while removing the strict O(N) serialization
+# (OVH-056). A genuine 429 still aborts the remaining (unstarted) work.
+_RESOLVE_CONCURRENCY = 3
 _BATCHEXECUTE_URL = "https://news.google.com/_/DotsSplashUi/data/batchexecute"
 _USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
 
@@ -203,16 +208,20 @@ async def resolve_google_news_urls(
 ) -> dict[str, str]:
     """Batch-resolve Google News redirect URLs to actual article URLs.
 
-    Resolves URLs sequentially with a delay between requests to avoid
-    triggering Google's rate limiter. A single URL failing to resolve does NOT
-    abort the batch — the resolver continues and resolves as many as possible.
-    Only a genuine HTTP 429 rate-limit aborts the remaining URLs, since
-    continuing would just be throttled too.
+    Resolves under a small bounded ``Semaphore`` (``_RESOLVE_CONCURRENCY``) via
+    ``asyncio.gather`` instead of strict O(N) serialization, with a jittered
+    pre-request throttle (0..``request_delay``) replacing the fixed inter-request
+    sleep — the same average request rate at a fraction of the wall-clock latency
+    (OVH-056). A single URL failing to resolve does NOT abort the batch; the
+    resolver resolves as many as possible. A genuine HTTP 429 sets a shared abort
+    flag that short-circuits every task not yet started (preserving the previous
+    "stop on 429" semantics); tasks already in flight when the 429 lands may
+    finish, but at most ``_RESOLVE_CONCURRENCY`` are ever in flight at once.
 
     Args:
         urls: List of URLs (may include non-Google News URLs, which are skipped).
         timeout: HTTP timeout for resolution requests.
-        request_delay: Delay in seconds between resolution requests.
+        request_delay: Upper bound (seconds) on the jittered per-request throttle.
 
     Returns:
         Dict mapping original Google News URLs to resolved URLs.
@@ -224,6 +233,10 @@ async def resolve_google_news_urls(
 
     resolved: dict[str, str] = {}
     failures = 0
+    semaphore = asyncio.Semaphore(_RESOLVE_CONCURRENCY)
+    # Shared 429 abort flag: once Google rate-limits, every not-yet-started task
+    # short-circuits rather than piling on more throttled requests.
+    aborted = asyncio.Event()
 
     async with httpx.AsyncClient(
         cookies=_CONSENT_COOKIE,
@@ -231,26 +244,34 @@ async def resolve_google_news_urls(
         timeout=timeout,
         follow_redirects=False,
     ) as client:
-        for i, url in enumerate(google_urls):
-            if i > 0:
-                await asyncio.sleep(request_delay)
 
-            try:
-                result = await _resolve_or_raise(url, client)
-            except _RateLimitedError:
-                logger.warning(
-                    "Google News rate-limited (429); aborting remaining %d URL(s)",
-                    len(google_urls) - i - 1,
-                )
-                break
+        async def _resolve_one(url: str) -> tuple[str, str | None]:
+            """Return (url, resolved_url) or (url, None) on failure/abort/429."""
+            async with semaphore:
+                if aborted.is_set():
+                    return url, None
+                # Jittered throttle: 0..request_delay before each request keeps the
+                # average rate near the old fixed delay without the strict stall.
+                if request_delay > 0:
+                    await asyncio.sleep(secrets.SystemRandom().uniform(0, request_delay))
+                try:
+                    result = await _resolve_or_raise(url, client)
+                except _RateLimitedError:
+                    aborted.set()
+                    return url, None
+            return url, (None if result == url else result)
 
-            if result == url:
-                # Ordinary resolution failure for this URL — log and keep going
-                # so one bad URL doesn't drop the rest of the batch.
-                failures += 1
-                logger.debug("Could not resolve Google News URL, continuing: %s", url[:80])
-            else:
-                resolved[url] = result
+        outcomes = await asyncio.gather(*(_resolve_one(u) for u in google_urls))
+
+    for url, result in outcomes:
+        if result is None:
+            failures += 1
+            logger.debug("Could not resolve Google News URL: %s", url[:80])
+        else:
+            resolved[url] = result
+
+    if aborted.is_set():
+        logger.warning("Google News rate-limited (429); aborted remaining resolutions")
 
     if failures:
         logger.info("Google News batch: %d URL(s) could not be resolved", failures)
