@@ -6,7 +6,7 @@ for explicit dependency injection and testability.
 
 import logging
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from app.models import (
     Article,
@@ -405,12 +405,17 @@ def mark_articles_processed(conn: sqlite3.Connection, article_ids: list[int]) ->
     )
 
 
+# Bare-column compare so SQLite can use idx_articles_fetched_at (m014). Wrapping
+# fetched_at in datetime() would force a full table SCAN (OVH-022/050). The bound
+# is a precomputed tz-aware isoformat() string, matching how fetched_at is stored
+# (Article.to_insert_dict), so the lexicographic comparison is exact.
+_DELETE_OLD_ARTICLES_SQL = "DELETE FROM articles WHERE fetched_at < ?"
+
+
 def delete_old_articles(conn: sqlite3.Connection, retention_days: int) -> int:
     """Delete articles older than retention_days. Returns count of deleted rows."""
-    cursor = conn.execute(
-        "DELETE FROM articles WHERE datetime(fetched_at) < datetime('now', ? || ' days')",
-        (f"-{retention_days}",),
-    )
+    cutoff = datetime.now(UTC) - timedelta(days=retention_days)
+    cursor = conn.execute(_DELETE_OLD_ARTICLES_SQL, (cutoff.isoformat(),))
     return cursor.rowcount
 
 
