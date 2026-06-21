@@ -59,7 +59,12 @@ async def _run_init(topic_id: int, settings: Settings, db_path: Path | None = No
 
 
 async def _run_single_check(topic_id: int, settings: Settings, db_path: Path | None = None) -> None:
-    """Background task: check a single topic by ID."""
+    """Background task: check a single topic by ID.
+
+    Releases the per-topic ``_checking_state`` guard on completion. The guard
+    is acquired by the manual ``/check`` handler before enqueueing; for callers
+    that do not hold it (bulk-check) ``finish_check`` is an idempotent no-op.
+    """
     from app.database import get_db
 
     try:
@@ -69,6 +74,8 @@ async def _run_single_check(topic_id: int, settings: Settings, db_path: Path | N
                 await check_topic(topic, conn, settings)
     except Exception:
         logger.error("Background check failed for topic %d", topic_id, exc_info=True)
+    finally:
+        await _checking_state.finish_check(topic_id)
 
 
 async def _run_check_all(settings: Settings, db_path: Path | None = None) -> None:
