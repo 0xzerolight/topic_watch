@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
+import trafilatura
 
 from app.crud import create_topic, list_articles_for_topic
 from app.models import Article, FeedMode, Topic
@@ -940,6 +941,51 @@ class TestExtractArticleContent:
             "extracted nothing" in r.getMessage() and "example.com/article" in r.getMessage() for r in caplog.records
         )
 
+    async def test_parses_html_once_for_both_passes(self) -> None:
+        """OVH-115: the raw HTML DOM is parsed once via load_html, not re-parsed per pass.
+
+        Both the precision and recall extraction passes must run against the
+        same parsed tree, so load_html is called exactly once and trafilatura
+        never receives the raw HTML string for re-parsing.
+        """
+        raw_html = "<html><body><p>Some content</p></body></html>"
+        transport = _mock_transport({"example.com": (200, raw_html)})
+
+        sentinel_tree = object()
+        extract_inputs: list[object] = []
+
+        def mock_extract(parsed, **kwargs):
+            extract_inputs.append(parsed)
+            return None  # force both passes to run
+
+        with (
+            patch("app.scraping.content.trafilatura.load_html", return_value=sentinel_tree) as mock_load,
+            patch("app.scraping.content.trafilatura.extract", side_effect=mock_extract),
+        ):
+            async with httpx.AsyncClient(transport=transport) as client:
+                await extract_article_content(
+                    "https://example.com/article",
+                    fallback_summary="RSS",
+                    client=client,
+                )
+
+        # Parsed exactly once.
+        assert mock_load.call_count == 1
+        assert mock_load.call_args.args[0] == raw_html
+        # Both extraction passes ran against the single parsed tree, never the raw HTML.
+        assert extract_inputs == [sentinel_tree, sentinel_tree]
+
+    async def test_extraction_output_identical_with_single_parse(self) -> None:
+        """OVH-115: parse-once must yield byte-identical content to the raw-HTML path."""
+        transport = _mock_transport({"example.com": (200, _SAMPLE_HTML)})
+        async with httpx.AsyncClient(transport=transport) as client:
+            content = await extract_article_content("https://example.com/article", client=client)
+
+        # Reference: extract directly from the same raw HTML the old impl used.
+        reference = trafilatura.extract(_SAMPLE_HTML, favor_precision=True)
+        assert reference is not None
+        assert content == _truncate(reference, 5000)
+
 
 # ============================================================
 # TestTruncate
@@ -1163,6 +1209,102 @@ class TestFetchNewArticlesForTopic:
         warns = [r for r in caplog.records if "Failed to record feed health" in r.getMessage()]
         assert len(warns) == 1
         assert warns[0].levelno == logging.WARNING
+
+    async def test_extraction_batch_reuses_one_pooled_client(self, db_conn: sqlite3.Connection) -> None:
+        """OVH-128: the whole extraction batch shares ONE pooled httpx client.
+
+        Every per-article extraction must receive the same non-None client (so
+        connection pooling/keep-alive is preserved), and exactly one client is
+        constructed for the batch (not one per article).
+        """
+        topic = self._make_topic(db_conn)
+        entries = [
+            FeedEntry(
+                title=f"Article {i}",
+                url=f"https://example.com/{i}",
+                summary=f"Summary {i}",
+                source_feed="feed",
+                published=datetime(2025, 1, i + 1, tzinfo=UTC),
+            )
+            for i in range(3)
+        ]
+
+        clients_constructed = 0
+        original_init = httpx.AsyncClient.__init__
+
+        def counting_init(self, *args, **kwargs):
+            nonlocal clients_constructed
+            clients_constructed += 1
+            original_init(self, *args, **kwargs)
+
+        seen_clients: list[object] = []
+
+        async def fake_extract(url, fallback_summary="", client=None, **kwargs):
+            seen_clients.append(client)
+            return "Extracted"
+
+        with (
+            patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=entries)),
+            patch("app.scraping.extract_article_content", side_effect=fake_extract),
+            patch.object(httpx.AsyncClient, "__init__", counting_init),
+        ):
+            stored = (await fetch_new_articles_for_topic(topic, db_conn)).articles
+
+        assert len(stored) == 3
+        # Every extraction got a real (non-None) client...
+        assert all(c is not None for c in seen_clients)
+        # ...and they all shared the SAME client instance...
+        assert len({id(c) for c in seen_clients}) == 1
+        # ...constructed exactly once for the whole batch.
+        assert clients_constructed == 1
+
+    async def test_no_client_created_when_nothing_to_fetch(self, db_conn: sqlite3.Connection) -> None:
+        """OVH-128: a reuse-only batch (no network fetches) builds no extraction client."""
+        topic = self._make_topic(db_conn)
+
+        # Seed a stored article in another topic so the entry is reused cross-topic.
+        from app.crud import create_article
+
+        other = create_topic(db_conn, Topic(name="Other", description="d"))
+        db_conn.commit()
+        entry = FeedEntry(
+            title="Shared",
+            url="https://example.com/shared",
+            summary="s",
+            source_feed="feed",
+        )
+        content_hash = compute_article_hash(entry.url, entry.title)
+        create_article(
+            db_conn,
+            Article(
+                topic_id=other.id,
+                title="Shared",
+                url="https://example.com/shared",
+                content_hash=content_hash,
+                raw_content="Reused body",
+                source_feed="feed",
+            ),
+        )
+        db_conn.commit()
+
+        clients_constructed = 0
+        original_init = httpx.AsyncClient.__init__
+
+        def counting_init(self, *args, **kwargs):
+            nonlocal clients_constructed
+            clients_constructed += 1
+            original_init(self, *args, **kwargs)
+
+        with (
+            patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=[entry])),
+            patch.object(httpx.AsyncClient, "__init__", counting_init),
+        ):
+            stored = (await fetch_new_articles_for_topic(topic, db_conn)).articles
+
+        assert len(stored) == 1
+        assert stored[0].raw_content == "Reused body"
+        # Nothing to fetch → no extraction client constructed.
+        assert clients_constructed == 0
 
 
 # ============================================================

@@ -10,6 +10,8 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+import httpx
+
 from app.crud import (
     article_hash_exists,
     create_article,
@@ -214,19 +216,30 @@ async def fetch_new_articles_for_topic(
                 if entry.url in resolved:
                     entry.url = resolved[entry.url]
 
-    # 4. Extract content concurrently with semaphore (only for entries needing fetch)
+    # 4. Extract content concurrently with semaphore (only for entries needing fetch).
+    # OVH-128: share ONE pooled httpx client across the whole batch (keep-alive /
+    # connection reuse) instead of building+tearing down a client per article.
+    # The client is loop-confined and closed in finally. It must mirror the
+    # per-call client config (timeout + follow_redirects=False) so the SSRF
+    # per-hop redirect checks in safe_get stay intact. Skip it entirely when
+    # there is nothing to fetch (reuse-only batch).
     semaphore = asyncio.Semaphore(concurrency)
 
-    async def _extract(entry: FeedEntry) -> str:
-        async with semaphore:
-            return await extract_article_content(
-                entry.url,
-                fallback_summary=entry.summary,
-                timeout=article_fetch_timeout,
-            )
+    contents: list[str | BaseException] = []
+    if fetch_batch:
+        async with httpx.AsyncClient(timeout=article_fetch_timeout, follow_redirects=False) as fetch_client:
 
-    content_tasks = [_extract(entry) for entry, _ in fetch_batch]
-    contents = await asyncio.gather(*content_tasks, return_exceptions=True)
+            async def _extract(entry: FeedEntry) -> str:
+                async with semaphore:
+                    return await extract_article_content(
+                        entry.url,
+                        fallback_summary=entry.summary,
+                        client=fetch_client,
+                        timeout=article_fetch_timeout,
+                    )
+
+            content_tasks = [_extract(entry) for entry, _ in fetch_batch]
+            contents = list(await asyncio.gather(*content_tasks, return_exceptions=True))
 
     # 5. Normalize both batches into a uniform (entry, content_hash, content) list,
     # then run a single insert loop. Reused content is already resolved; freshly

@@ -713,3 +713,109 @@ class TestWebhookDrainSingleFlight:
             assert row["claimed_at"] == "2999-01-01T00:00:00+00:00"
         finally:
             verify.close()
+
+
+class TestWebhookDrainBoundedConcurrency:
+    """OVH-139: a single drain processes its queue with bounded concurrency.
+
+    A backlog of K failed deliveries must NOT serialize to K x timeout. The
+    drain mirrors the live path (bounded asyncio.gather), while still claiming
+    each row exactly once (the 1.6 single-flight/claim invariant must hold).
+    """
+
+    async def _enqueue(self, db_path, urls: list[str]) -> None:  # noqa: ANN001
+        from app.database import get_connection
+
+        conn = get_connection(db_path)
+        try:
+            topic = _make_topic(conn)
+            settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=urls))
+            novelty = _make_novelty()
+            with patch("app.webhooks.send_webhook", return_value=False):
+                await send_webhooks("Hooked", novelty, settings, conn=conn, topic_id=topic.id)
+        finally:
+            conn.close()
+
+    async def test_sends_overlap_within_one_drain(self, tmp_path) -> None:  # noqa: ANN001
+        """Multiple pending sends run concurrently, not strictly one-at-a-time."""
+        import asyncio
+
+        from app.database import get_connection, init_db
+
+        db_path = tmp_path / "test.db"
+        init_db(db_path)
+        urls = ["https://a.com/hook", "https://b.com/hook", "https://c.com/hook"]
+        await self._enqueue(db_path, urls)
+        settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=urls))
+
+        concurrent = 0
+        max_concurrent = 0
+        gate = asyncio.Event()
+        started = 0
+
+        async def overlapping_send(url: str, payload: dict, timeout: float = 10.0) -> bool:
+            nonlocal concurrent, max_concurrent, started
+            concurrent += 1
+            started += 1
+            max_concurrent = max(max_concurrent, concurrent)
+            # Release the gate once all three sends are in flight; if the drain
+            # were strictly sequential this would deadlock (only one ever starts).
+            if started >= len(urls):
+                gate.set()
+            try:
+                await asyncio.wait_for(gate.wait(), timeout=5.0)
+            finally:
+                concurrent -= 1
+            return True
+
+        with patch("app.webhooks.send_webhook", side_effect=overlapping_send):
+            await retry_pending_webhooks(settings=settings, db_path=db_path)
+
+        # Sequential code would peak at 1; bounded-concurrent overlaps them.
+        assert max_concurrent >= 2
+
+        verify = get_connection(db_path)
+        try:
+            assert list_pending_webhooks(verify) == []
+        finally:
+            verify.close()
+
+    async def test_each_item_claimed_exactly_once_no_double_send(self, tmp_path) -> None:  # noqa: ANN001
+        """Bounded concurrency must not break the per-item claim: one send each."""
+        import collections
+
+        from app.crud import claim_pending_webhook
+        from app.database import get_connection, init_db
+
+        db_path = tmp_path / "test.db"
+        init_db(db_path)
+        urls = [f"https://h{i}.com/hook" for i in range(5)]
+        await self._enqueue(db_path, urls)
+        settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=urls))
+
+        sent_counts: collections.Counter[str] = collections.Counter()
+        claim_calls = {"n": 0}
+
+        def counting_claim(conn, webhook_id, claimed_at):  # noqa: ANN001
+            claim_calls["n"] += 1
+            return claim_pending_webhook(conn, webhook_id, claimed_at)
+
+        async def record_send(url: str, payload: dict, timeout: float = 10.0) -> bool:
+            sent_counts[url] += 1
+            return True
+
+        with (
+            patch("app.webhooks.send_webhook", side_effect=record_send),
+            patch("app.webhooks.claim_pending_webhook", side_effect=counting_claim),
+        ):
+            await retry_pending_webhooks(settings=settings, db_path=db_path)
+
+        # Exactly one claim attempt per row and exactly one send per URL.
+        assert claim_calls["n"] == len(urls)
+        assert dict(sent_counts) == dict.fromkeys(urls, 1)
+
+        verify = get_connection(db_path)
+        try:
+            assert list_pending_webhooks(verify) == []
+        finally:
+            verify.close()
