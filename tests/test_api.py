@@ -1,6 +1,7 @@
 """Tests for the JSON API endpoints."""
 
 import sqlite3
+from unittest.mock import AsyncMock
 
 from fastapi.testclient import TestClient
 
@@ -251,8 +252,10 @@ class TestAPITriggerCheck:
 
         fake_result = CheckResult(id=42, topic_id=topic.id, has_new_info=True, articles_found=3, articles_new=1)
 
-        async def _fake_check_topic(t, conn, settings):
+        async def _fake_check_topic(t, conn, settings, *, guard=True):
             assert t.id == topic.id
+            # API path holds the in-flight guard itself, so it calls with guard=False.
+            assert guard is False
             return fake_result
 
         monkeypatch.setattr("app.web.api.check_topic", _fake_check_topic)
@@ -326,5 +329,73 @@ class TestAPITriggerCheck:
                     headers={"X-CSRF-Token": csrf_token},
                 )
                 assert resp.status_code == 409
+        finally:
+            app.dependency_overrides.pop(get_db_conn, None)
+
+    def test_trigger_returns_409_when_already_checking(self, db_conn: sqlite3.Connection, monkeypatch):
+        # OVH-019: a second concurrent same-topic check via the JSON API must be
+        # rejected (409), not launch a duplicate pipeline. Simulate contention by
+        # making the per-topic guard report the slot taken (avoids cross-event-loop
+        # lock interaction with the TestClient portal).
+        topic = _seed_topic(db_conn, status="ready")
+        db_conn.commit()
+
+        async def _slot_taken(topic_id: int) -> bool:
+            return False
+
+        async def _noop(topic_id: int) -> None:
+            return None
+
+        async def _should_not_run(t, conn, settings, *, guard=True):
+            raise AssertionError("check_topic must not run while topic is already in flight")
+
+        monkeypatch.setattr("app.web.api._checking_state.start_check", _slot_taken)
+        monkeypatch.setattr("app.web.api._checking_state.finish_check", _noop)
+        monkeypatch.setattr("app.web.api._checking_state.clear_stale", AsyncMock(return_value=[]))
+        monkeypatch.setattr("app.web.api.check_topic", _should_not_run)
+
+        from app.web.dependencies import get_db_conn
+
+        app.dependency_overrides[get_db_conn] = lambda: db_conn
+        try:
+            with TestClient(app) as client:
+                home = client.get("/")
+                csrf_token = home.cookies.get("csrf_token", "")
+                resp = client.post(
+                    f"/api/v1/topics/{topic.id}/check",
+                    headers={"X-CSRF-Token": csrf_token},
+                )
+                assert resp.status_code == 409
+                assert "in progress" in resp.json()["detail"].lower()
+        finally:
+            app.dependency_overrides.pop(get_db_conn, None)
+
+    def test_trigger_releases_guard_via_finally(self, db_conn: sqlite3.Connection, monkeypatch):
+        # OVH-019: even when check_topic raises, the per-topic guard is released
+        # (finally), so the slot never wedges.
+        topic = _seed_topic(db_conn, status="ready")
+        db_conn.commit()
+
+        start = AsyncMock(return_value=True)
+        finish = AsyncMock(return_value=None)
+        monkeypatch.setattr("app.web.api._checking_state.start_check", start)
+        monkeypatch.setattr("app.web.api._checking_state.finish_check", finish)
+        monkeypatch.setattr("app.web.api._checking_state.clear_stale", AsyncMock(return_value=[]))
+
+        async def _boom(t, conn, settings, *, guard=True):
+            raise RuntimeError("pipeline blew up")
+
+        monkeypatch.setattr("app.web.api.check_topic", _boom)
+
+        from app.web.dependencies import get_db_conn
+
+        app.dependency_overrides[get_db_conn] = lambda: db_conn
+        try:
+            with TestClient(app, raise_server_exceptions=False) as client:
+                home = client.get("/")
+                csrf_token = home.cookies.get("csrf_token", "")
+                client.post(f"/api/v1/topics/{topic.id}/check", headers={"X-CSRF-Token": csrf_token})
+                start.assert_awaited_once_with(topic.id)
+                finish.assert_awaited_once_with(topic.id)
         finally:
             app.dependency_overrides.pop(get_db_conn, None)

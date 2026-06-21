@@ -331,3 +331,97 @@ class TestVacuumDb:
         from app.scheduler import _vacuum_db_sync
 
         assert mock_to_thread.await_args.args[0] is _vacuum_db_sync
+
+
+class TestInitNewTopics:
+    """Tests for the scheduler's gradual NEW-topic init guard (OVH-032)."""
+
+    async def test_init_claims_new_topic_then_runs(self, tmp_path: Path) -> None:
+        """A NEW topic is atomically claimed (NEW -> RESEARCHING) before init runs."""
+        from unittest.mock import AsyncMock
+
+        from app.crud import create_topic, get_topic
+        from app.database import get_db, init_db
+        from app.models import Topic, TopicStatus
+        from app.scheduler import _init_new_topics
+        from app.web.state import _checking_state
+
+        db_path = tmp_path / "init.db"
+        init_db(db_path)
+        with get_db(db_path) as conn:
+            topic = create_topic(conn, Topic(name="Pending", description="d", status=TopicStatus.NEW))
+            conn.commit()
+
+        _checking_state._topics.clear()
+        captured: list[int] = []
+
+        async def _fake_init(t, conn, settings):
+            # The claim has already flipped the row to RESEARCHING.
+            captured.append(t.id)
+            assert t.status == TopicStatus.RESEARCHING
+
+        try:
+            with patch("app.scheduler.initialize_new_topic", new=AsyncMock(side_effect=_fake_init)):
+                await _init_new_topics(_make_settings(), db_path)
+        finally:
+            _checking_state._topics.clear()
+
+        assert captured == [topic.id]
+        with get_db(db_path) as conn:
+            assert get_topic(conn, topic.id).status == TopicStatus.RESEARCHING
+
+    async def test_init_skips_when_topic_no_longer_new(self, tmp_path: Path) -> None:
+        """If the topic was claimed elsewhere (no longer NEW), init does not run (OVH-032)."""
+        from unittest.mock import AsyncMock
+
+        from app.crud import create_topic
+        from app.database import get_db, init_db
+        from app.models import Topic, TopicStatus
+        from app.scheduler import _init_new_topics
+        from app.web.state import _checking_state
+
+        db_path = tmp_path / "init2.db"
+        init_db(db_path)
+        with get_db(db_path) as conn:
+            create_topic(conn, Topic(name="Pending", description="d", status=TopicStatus.NEW))
+            conn.commit()
+
+        _checking_state._topics.clear()
+        init_mock = AsyncMock()
+
+        # Simulate a concurrent winner: flip the row out of NEW just before the claim,
+        # by patching claim_new_topic_for_init to report a lost race.
+        with (
+            patch("app.scheduler.claim_new_topic_for_init", return_value=False),
+            patch("app.scheduler.initialize_new_topic", new=init_mock),
+        ):
+            await _init_new_topics(_make_settings(), db_path)
+
+        init_mock.assert_not_awaited()
+        _checking_state._topics.clear()
+
+    async def test_init_skips_when_in_process_guard_held(self, tmp_path: Path) -> None:
+        """If the in-process guard is already held (web init in flight), the tick skips."""
+        from unittest.mock import AsyncMock
+
+        from app.crud import create_topic
+        from app.database import get_db, init_db
+        from app.models import Topic, TopicStatus
+        from app.scheduler import _init_new_topics
+        from app.web.state import _checking_state
+
+        db_path = tmp_path / "init3.db"
+        init_db(db_path)
+        with get_db(db_path) as conn:
+            topic = create_topic(conn, Topic(name="Pending", description="d", status=TopicStatus.NEW))
+            conn.commit()
+
+        _checking_state._topics.clear()
+        init_mock = AsyncMock()
+        try:
+            await _checking_state.start_check(topic.id)
+            with patch("app.scheduler.initialize_new_topic", new=init_mock):
+                await _init_new_topics(_make_settings(), db_path)
+            init_mock.assert_not_awaited()
+        finally:
+            _checking_state._topics.clear()
