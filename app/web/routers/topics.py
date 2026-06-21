@@ -42,6 +42,12 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# Upper bound on rows pulled into memory for a single-topic export, so a large
+# article/check history can't materialise an unbounded result set (OVH-051).
+# Comfortably above any single-user volume; index-backed (m014) so the LIMIT is
+# index-ordered, not a full sort.
+_EXPORT_ROW_CAP = 10000
+
 
 @router.get("/topics/new", response_class=HTMLResponse)
 async def topic_add_form(request: Request, settings: Settings = Depends(get_settings)):
@@ -517,8 +523,8 @@ async def export_topic_json(
     if topic is None:
         raise HTTPException(status_code=404, detail="Topic not found")
 
-    articles = list_articles_for_topic(conn, topic_id)
-    checks = list_check_results(conn, topic_id, limit=10000, offset=0)
+    articles = list_articles_for_topic(conn, topic_id, limit=_EXPORT_ROW_CAP, offset=0)
+    checks = list_check_results(conn, topic_id, limit=_EXPORT_ROW_CAP, offset=0)
     knowledge = get_knowledge_state(conn, topic_id)
 
     data = {
@@ -549,7 +555,7 @@ async def export_topic_csv(
     if topic is None:
         raise HTTPException(status_code=404, detail="Topic not found")
 
-    checks = list_check_results(conn, topic_id, limit=10000, offset=0)
+    checks = list_check_results(conn, topic_id, limit=_EXPORT_ROW_CAP, offset=0)
 
     output = io.StringIO()
     writer = csv.writer(output)

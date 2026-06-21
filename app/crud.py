@@ -6,7 +6,7 @@ for explicit dependency injection and testability.
 
 import logging
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from app.models import (
     Article,
@@ -405,12 +405,17 @@ def mark_articles_processed(conn: sqlite3.Connection, article_ids: list[int]) ->
     )
 
 
+# Bare-column compare so SQLite can use idx_articles_fetched_at (m014). Wrapping
+# fetched_at in datetime() would force a full table SCAN (OVH-022/050). The bound
+# is a precomputed tz-aware isoformat() string, matching how fetched_at is stored
+# (Article.to_insert_dict), so the lexicographic comparison is exact.
+_DELETE_OLD_ARTICLES_SQL = "DELETE FROM articles WHERE fetched_at < ?"
+
+
 def delete_old_articles(conn: sqlite3.Connection, retention_days: int) -> int:
     """Delete articles older than retention_days. Returns count of deleted rows."""
-    cursor = conn.execute(
-        "DELETE FROM articles WHERE fetched_at < datetime('now', ? || ' days')",
-        (f"-{retention_days}",),
-    )
+    cutoff = datetime.now(UTC) - timedelta(days=retention_days)
+    cursor = conn.execute(_DELETE_OLD_ARTICLES_SQL, (cutoff.isoformat(),))
     return cursor.rowcount
 
 
@@ -841,9 +846,11 @@ def get_dashboard_stats(conn: sqlite3.Connection) -> DashboardStats:
         SELECT
             (SELECT COUNT(*) FROM topics) AS total_topics,
             (SELECT COUNT(*) FROM topics WHERE is_active = 1) AS active_topics,
-            (SELECT COUNT(*) FROM check_results WHERE checked_at >= datetime('now', '-1 day')) AS checks_24h,
+            (SELECT COUNT(*) FROM check_results
+             WHERE datetime(checked_at) >= datetime('now', '-1 day')) AS checks_24h,
             (SELECT COUNT(*) FROM check_results) AS checks_total,
-            (SELECT COUNT(*) FROM check_results WHERE has_new_info = 1 AND checked_at >= datetime('now', '-1 day')) AS new_info_24h,
+            (SELECT COUNT(*) FROM check_results
+             WHERE has_new_info = 1 AND datetime(checked_at) >= datetime('now', '-1 day')) AS new_info_24h,
             (SELECT COUNT(*) FROM check_results WHERE has_new_info = 1) AS new_info_total,
             (SELECT MAX(checked_at) FROM check_results WHERE notification_sent = 1) AS last_notification_at
         """
