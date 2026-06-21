@@ -39,7 +39,19 @@
         if (Notification.permission !== "granted") return;
 
         var opts = { body: body, tag: "topic-watch" };
-        var n = new Notification(title, opts);
+
+        // On some platforms (e.g. Android Chrome) the Notification constructor is
+        // present and permission can be "granted", yet `new Notification()` throws
+        // "Illegal constructor" — only ServiceWorkerRegistration.showNotification is
+        // allowed (Chromium issue 481856). Guard the construction so the throw does
+        // not propagate out of show() and abort callers (e.g. the afterSwap handler)
+        // or leave the UI in an inconsistent "enabled but nothing shown" state.
+        var n;
+        try {
+            n = new Notification(title, opts);
+        } catch (e) {
+            return;
+        }
 
         if (options && options.url) {
             n.onclick = function () {
