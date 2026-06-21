@@ -5,9 +5,10 @@ Each check cycle fetches articles, analyzes them against the knowledge
 state, sends notifications for genuine updates, and records the outcome.
 """
 
+import asyncio
 import logging
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from app.analysis.knowledge import initialize_knowledge, update_knowledge
@@ -15,6 +16,7 @@ from app.analysis.llm import analyze_articles
 from app.check_context import check_id_var, generate_check_id
 from app.config import Settings
 from app.crud import (
+    claim_pending_notification,
     create_check_result,
     create_pending_notification,
     delete_expired_notifications,
@@ -24,6 +26,7 @@ from app.crud import (
     increment_notification_retry,
     list_pending_notifications,
     mark_articles_processed,
+    release_stale_notification_claims,
     update_check_result_delivery,
     update_topic,
 )
@@ -38,6 +41,16 @@ logger = logging.getLogger(__name__)
 # Maximum number of initialization passes before a thin topic is forced READY
 # with whatever (insufficient) knowledge exists, to avoid looping forever.
 MAX_INIT_ATTEMPTS = 3
+
+# Single-flight guard: serializes notification drains within this process so
+# two overlapping drains (scheduler tick vs. a UI/CLI check-all) cannot both
+# walk the queue at once. The cross-process case is covered by the atomic
+# per-row claim (claimed_at) below. (OVH-017)
+_notification_retry_lock = asyncio.Lock()
+
+# Claims older than this are treated as stale (a drainer crashed mid-send) and
+# released so the row can be re-claimed.
+_CLAIM_STALE_AFTER = timedelta(minutes=10)
 
 
 def _summarize_exc(exc: BaseException, *, limit: int = 200) -> str:
@@ -321,8 +334,28 @@ async def retry_pending_notifications(
     if settings is None:
         raise ValueError("settings is required")
 
+    # Single-flight: only one drain runs at a time in this process. A second
+    # caller skips rather than walking the same queue concurrently (OVH-017).
+    if _notification_retry_lock.locked():
+        logger.debug("Notification retry already in progress; skipping overlapping drain")
+        return
+
+    async with _notification_retry_lock:
+        await _drain_pending_notifications(conn, settings, db_path)
+
+
+async def _drain_pending_notifications(
+    conn: sqlite3.Connection | None,
+    settings: Settings,
+    db_path: Path | None,
+) -> None:
+    """Drain the notification retry queue once (caller holds the retry lock)."""
     # --- Phase 1: snapshot pending rows under a short-lived connection. ---
+    stale_cutoff = (datetime.now(UTC) - _CLAIM_STALE_AFTER).isoformat()
     with short_conn(conn, db_path) as snapshot:
+        released = release_stale_notification_claims(snapshot, stale_cutoff)
+        if released:
+            logger.warning("Released %d stale notification claim(s)", released)
         expired = delete_expired_notifications(snapshot)
         if expired:
             logger.warning("Deleted %d expired pending notification(s)", expired)
@@ -334,15 +367,30 @@ async def retry_pending_notifications(
 
     logger.info("Retrying %d pending notification(s)", len(pending))
 
-    # --- Phase 2: send with NO connection held, then apply per item. ---
+    # --- Phase 2: claim, send with NO connection held, then apply per item. ---
     for notification in pending:
         assert notification.id is not None
+
+        # Atomically claim this row. A concurrent (cross-process) drainer that
+        # already claimed it returns rowcount 0 here, so we skip — only the
+        # winner sends, preventing double-delivery (OVH-017).
+        claimed_at = datetime.now(UTC).isoformat()
+        with short_conn(conn, db_path) as claim_conn:
+            won = claim_pending_notification(claim_conn, notification.id, claimed_at)
+            claim_conn.commit()
+        if not won:
+            logger.debug("Notification id=%d already claimed by another drain; skipping", notification.id)
+            continue
+
         try:
             sent = await send_notification(notification.title, notification.body, settings)
         except Exception:
             sent = False
             logger.warning("Retry error for notification id=%d", notification.id, exc_info=True)
 
+        # Apply this single result and commit immediately. On failure,
+        # increment_notification_retry also clears the claim so the next cycle
+        # can re-claim and retry.
         with short_conn(conn, db_path) as apply_conn:
             if sent:
                 delete_pending_notification(apply_conn, notification.id)
