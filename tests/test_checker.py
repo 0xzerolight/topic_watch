@@ -22,6 +22,7 @@ from app.crud import (
 from app.models import (
     Article,
     KnowledgeState,
+    NotificationDelivery,
     PendingNotification,
     Topic,
     TopicStatus,
@@ -36,6 +37,15 @@ def _make_settings(**overrides) -> Settings:
     }
     defaults.update(overrides)
     return Settings(**defaults)
+
+
+def _per_url_mock(*, ok: bool, error: str | None = None, url: str = "json://localhost") -> AsyncMock:
+    """AsyncMock for app.checker.send_notification_per_url returning one delivery.
+
+    check_topic delivers per-URL now (OVH-039); this mirrors the single-URL
+    default settings used across these tests.
+    """
+    return AsyncMock(return_value=[NotificationDelivery(url=url, ok=ok, error=error)])
 
 
 def _make_topic(conn: sqlite3.Connection, **overrides) -> Topic:
@@ -118,10 +128,7 @@ class TestCheckTopic:
                 new_callable=AsyncMock,
                 return_value=_make_write_result(),
             ) as mock_update,
-            patch(
-                "app.checker.send_notification",
-                return_value=True,
-            ) as mock_send,
+            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)) as mock_send,
         ):
             result = await check_topic(topic, db_conn, settings)
 
@@ -156,7 +163,7 @@ class TestCheckTopic:
                 new_callable=AsyncMock,
                 return_value=novelty,
             ),
-            patch("app.checker.send_notification") as mock_send,
+            patch("app.checker.send_notification_per_url") as mock_send,
         ):
             result = await check_topic(topic, db_conn, settings)
 
@@ -237,8 +244,8 @@ class TestCheckTopic:
             ),
             patch("app.checker.update_knowledge", new_callable=AsyncMock, return_value=_make_write_result()),
             patch(
-                "app.checker.send_notification",
-                side_effect=Exception("SMTP error"),
+                "app.checker.send_notification_per_url",
+                _per_url_mock(ok=False, error="SMTP error"),
             ),
         ):
             result = await check_topic(topic, db_conn, settings)
@@ -252,6 +259,7 @@ class TestCheckTopic:
         assert len(pending) == 1
         assert pending[0].topic_id == topic.id
         assert "Topic Watch:" in pending[0].title
+        assert pending[0].last_error == "SMTP error"
 
     async def test_notification_delivery_failure_queued(self, db_conn: sqlite3.Connection) -> None:
         """When send_notification returns False, notification is queued for retry."""
@@ -279,18 +287,20 @@ class TestCheckTopic:
             ),
             patch("app.checker.update_knowledge", new_callable=AsyncMock, return_value=_make_write_result()),
             patch(
-                "app.checker.send_notification",
-                return_value=False,
+                "app.checker.send_notification_per_url",
+                _per_url_mock(ok=False, error="delivery failed"),
             ),
         ):
             result = await check_topic(topic, db_conn, settings)
 
         assert result.notification_sent is False
-        assert result.notification_error == "Delivery failed"
+        # Per-URL failures are summarized redacted (scheme://host: reason) (OVH-039).
+        assert result.notification_error == "json://localhost: delivery failed"
 
-        # Verify queued for retry
+        # Verify the failed URL was queued for retry, scoped to that URL.
         pending = list_pending_notifications(db_conn)
         assert len(pending) == 1
+        assert pending[0].url == "json://localhost"
 
     async def test_llm_response_stored_as_json(self, db_conn: sqlite3.Connection) -> None:
         """The NoveltyResult should be serialized to llm_response."""
@@ -322,7 +332,7 @@ class TestCheckTopic:
                 return_value=novelty,
             ),
             patch("app.checker.update_knowledge", new_callable=AsyncMock, return_value=_make_write_result()),
-            patch("app.checker.send_notification", return_value=True),
+            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)),
         ):
             result = await check_topic(topic, db_conn, settings)
 
@@ -409,10 +419,7 @@ class TestCheckTopic:
                 new_callable=AsyncMock,
                 side_effect=Exception("Knowledge update crashed"),
             ),
-            patch(
-                "app.checker.send_notification",
-                return_value=True,
-            ) as mock_send,
+            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)) as mock_send,
         ):
             result = await check_topic(topic, db_conn, settings)
 
@@ -485,7 +492,7 @@ class TestCheckTopic:
                 return_value=FetchResult(articles=[article], total_feed_entries=1),
             ),
             patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=failed),
-            patch("app.checker.send_notification") as mock_send,
+            patch("app.checker.send_notification_per_url") as mock_send,
         ):
             result = await check_topic(topic, db_conn, settings)
 
@@ -517,7 +524,7 @@ class TestCheckTopic:
                 return_value=FetchResult(articles=[article], total_feed_entries=1),
             ),
             patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
-            patch("app.checker.send_notification") as mock_send,
+            patch("app.checker.send_notification_per_url") as mock_send,
         ):
             result = await check_topic(topic, db_conn, settings)
 
@@ -561,7 +568,7 @@ class TestCheckTopic:
             patch(
                 "app.checker.update_knowledge", new_callable=AsyncMock, return_value=_make_write_result()
             ) as mock_update,
-            patch("app.checker.send_notification") as mock_send,
+            patch("app.checker.send_notification_per_url") as mock_send,
         ):
             result = await check_topic(topic, db_conn, settings)
 
@@ -622,7 +629,7 @@ class TestCheckTopic:
             patch(
                 "app.checker.update_knowledge", new_callable=AsyncMock, return_value=_make_write_result()
             ) as mock_update,
-            patch("app.checker.send_notification", return_value=True) as mock_send,
+            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)) as mock_send,
         ):
             result = await check_topic(topic, db_conn, settings)
 
@@ -663,7 +670,7 @@ class TestCheckTopic:
             patch(
                 "app.checker.update_knowledge", new_callable=AsyncMock, return_value=_make_write_result()
             ) as mock_update,
-            patch("app.checker.send_notification") as mock_send,
+            patch("app.checker.send_notification_per_url") as mock_send,
         ):
             result = await check_topic(topic, db_conn, settings)
 
@@ -768,7 +775,7 @@ class TestPerTopicThresholds:
             ),
             patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
             patch("app.checker.update_knowledge", new_callable=AsyncMock, return_value=_make_write_result()),
-            patch("app.checker.send_notification", return_value=True) as mock_send,
+            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)) as mock_send,
         ):
             result = await check_topic(topic, db_conn, settings)
         return result, mock_send
@@ -832,7 +839,7 @@ class TestCheckResultTokens:
                 new_callable=AsyncMock,
                 return_value=_make_write_result(prompt_tokens=30, completion_tokens=10),
             ),
-            patch("app.checker.send_notification", return_value=True),
+            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)),
         ):
             result = await check_topic(topic, db_conn, settings)
 
@@ -1328,7 +1335,7 @@ class TestRetryPendingNotifications:
 
         in_transaction: list[bool] = []
 
-        async def observe(title, body, s):  # noqa: ANN001
+        async def observe(title, body, s, *, url=None):  # noqa: ANN001
             in_transaction.append(db_conn.in_transaction)
             return True
 

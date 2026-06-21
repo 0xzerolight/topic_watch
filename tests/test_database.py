@@ -616,6 +616,32 @@ class TestMigrations:
             # Column is nullable (notnull flag, index 3, is 0).
             assert columns["claimed_at"][3] == 0
 
+    def test_pending_notification_url_last_error_columns_exist(self, db_conn: sqlite3.Connection) -> None:
+        """Migration m017 adds nullable url + last_error to pending_notifications."""
+        columns = {row[1]: row for row in db_conn.execute("PRAGMA table_info(pending_notifications)").fetchall()}
+        for col in ("url", "last_error"):
+            assert col in columns, f"pending_notifications missing {col}"
+            # Column is nullable (notnull flag, index 3, is 0).
+            assert columns[col][3] == 0
+
+    def test_pending_notification_url_last_error_roundtrip(self, db_conn: sqlite3.Connection) -> None:
+        """url + last_error persist and load back (None and a value)."""
+        topic = create_topic(db_conn, Topic(name="NotifUrl", description="d"))
+        db_conn.commit()
+
+        scoped = create_pending_notification(
+            db_conn,
+            PendingNotification(topic_id=topic.id, title="T", body="B", url="json://b", last_error="HTTP 500"),
+        )
+        legacy = create_pending_notification(db_conn, PendingNotification(topic_id=topic.id, title="T2", body="B2"))
+        db_conn.commit()
+
+        rows = {r.id: r for r in list_pending_notifications(db_conn)}
+        assert rows[scoped.id].url == "json://b"
+        assert rows[scoped.id].last_error == "HTTP 500"
+        assert rows[legacy.id].url is None
+        assert rows[legacy.id].last_error is None
+
     def test_topic_threshold_roundtrip(self, db_conn: sqlite3.Connection) -> None:
         """Per-topic thresholds and init_attempts persist and load back."""
         topic = create_topic(
