@@ -12,6 +12,11 @@ venv/
 # Runtime data (mounted as volume)
 data/
 
+# Secrets — never ship the secret-bearing .env into the build context (OVH-145)
+.env
+.env.*
+!.env.example
+
 # CI/CD and automation
 .github/
 .claude-runner/
