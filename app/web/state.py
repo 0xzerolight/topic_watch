@@ -1,9 +1,9 @@
 """Process-global mutable state for the web layer.
 
 Centralizes the in-memory state that used to live as module globals in
-``app.web.routes``: the in-progress check tracker, the dashboard stats
-cache, and the feed-validation rate limiter. Mutations are guarded with
-``asyncio.Lock`` where concurrent access is possible.
+the original web routes module: the in-progress check tracker, the
+dashboard stats cache, and the feed-validation rate limiter. Mutations
+are guarded with ``asyncio.Lock`` where concurrent access is possible.
 """
 
 import asyncio
