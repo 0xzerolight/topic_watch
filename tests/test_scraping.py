@@ -267,6 +267,85 @@ class TestFetchFeed:
             entries = await fetch_feed("https://example.com/feed", client)
         assert entries == []
 
+    async def test_one_malformed_entry_keeps_other_entries(self, caplog: pytest.LogCaptureFixture) -> None:
+        """OVH-024: a single bad entry must not discard the whole feed."""
+        from app.scraping import rss
+
+        real_parse_entry = rss._parse_entry
+
+        def flaky_parse_entry(raw_entry: dict, source_feed: str) -> FeedEntry | None:
+            # Blow up only on the first entry; parse the rest normally.
+            if raw_entry.get("title") == "Article One":
+                raise ValueError("boom: malformed entry")
+            return real_parse_entry(raw_entry, source_feed)
+
+        transport = _mock_transport({"example.com/feed": (200, _SAMPLE_RSS)})
+        with (
+            patch("app.scraping.rss._parse_entry", side_effect=flaky_parse_entry),
+            caplog.at_level("WARNING"),
+        ):
+            async with httpx.AsyncClient(transport=transport) as client:
+                entries = await fetch_feed("https://example.com/feed.xml", client)
+
+        # The valid second entry survives; the malformed first one is skipped.
+        assert [e.title for e in entries] == ["Article Two"]
+        assert any("entry" in r.getMessage().lower() for r in caplog.records)
+
+
+# ============================================================
+# TestFeedBozoHandling (OVH-044)
+# ============================================================
+
+
+# A body feedparser flags bozo but from which it still recovers an entry.
+_BOZO_RECOVERED_RSS = (
+    '<?xml version="1.0"?><rss version="2.0"><channel><title>T</title>'
+    "<item><title>Recovered & Co</title><link>https://example.com/ok</link></item>"
+    "</channel></rss>"
+)
+
+
+class TestFeedBozoHandling:
+    """OVH-044: feedparser bozo + zero entries is a soft failure."""
+
+    async def test_bozo_empty_marks_unhealthy(self) -> None:
+        """Bozo + zero entries => fetch_ok=False and a failure health callback."""
+        from unittest.mock import MagicMock
+
+        from app.scraping.rss import fetch_feed_with_status
+
+        callback = MagicMock()
+        transport = _mock_transport({"example.com/feed": (200, "not xml at all {{{")})
+        async with httpx.AsyncClient(transport=transport) as client:
+            entries, fetch_ok = await fetch_feed_with_status(
+                "https://example.com/feed.xml", client, health_callback=callback
+            )
+
+        assert entries == []
+        assert fetch_ok is False
+        callback.assert_called_once()
+        args = callback.call_args[0]
+        assert args[0] == "https://example.com/feed.xml"
+        assert args[1] is False
+        assert args[2] is not None  # carries the bozo exception text
+
+    async def test_bozo_with_recovered_entries_succeeds(self) -> None:
+        """Bozo but entries recovered => proceed as success."""
+        from unittest.mock import MagicMock
+
+        from app.scraping.rss import fetch_feed_with_status
+
+        callback = MagicMock()
+        transport = _mock_transport({"example.com/feed": (200, _BOZO_RECOVERED_RSS)})
+        async with httpx.AsyncClient(transport=transport) as client:
+            entries, fetch_ok = await fetch_feed_with_status(
+                "https://example.com/feed.xml", client, health_callback=callback
+            )
+
+        assert fetch_ok is True
+        assert [e.title for e in entries] == ["Recovered & Co"]
+        callback.assert_called_once_with("https://example.com/feed.xml", True, None)
+
 
 # ============================================================
 # TestFetchFeedsForTopic (async, mocked)
@@ -714,6 +793,24 @@ class TestExtractArticleContent:
                     client=client,
                 )
         assert content == "RSS summary fallback"
+
+    async def test_extraction_nothing_logs_fallback(self, caplog: pytest.LogCaptureFixture) -> None:
+        """OVH-045: html present but extraction empty logs the RSS-summary fallback."""
+        transport = _mock_transport({"example.com": (200, "<html><body></body></html>")})
+
+        with patch("app.scraping.content.trafilatura.extract", return_value=None):
+            async with httpx.AsyncClient(transport=transport) as client:
+                with caplog.at_level("INFO", logger="app.scraping.content"):
+                    content = await extract_article_content(
+                        "https://example.com/article",
+                        fallback_summary="RSS summary",
+                        client=client,
+                    )
+
+        assert content == "RSS summary"
+        assert any(
+            "extracted nothing" in r.getMessage() and "example.com/article" in r.getMessage() for r in caplog.records
+        )
 
 
 # ============================================================
