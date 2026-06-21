@@ -7,7 +7,7 @@ new information is found, complementing the Apprise notifications.
 import asyncio
 import logging
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -15,11 +15,13 @@ import httpx
 from app.analysis.llm import NoveltyResult
 from app.config import Settings
 from app.crud import (
+    claim_pending_webhook,
     create_pending_webhook,
     delete_expired_webhooks,
     delete_pending_webhook,
     increment_webhook_retry,
     list_pending_webhooks,
+    release_stale_webhook_claims,
 )
 from app.database import short_conn
 from app.url_validation import is_private_url
@@ -27,6 +29,17 @@ from app.url_validation import is_private_url
 logger = logging.getLogger(__name__)
 
 _WEBHOOK_TIMEOUT = 10.0
+
+# Single-flight guard: serializes webhook drains within this process so two
+# overlapping drains (scheduler tick vs. a UI/CLI check-all) cannot both walk
+# the queue at once. The cross-process case is covered by the atomic per-row
+# claim (claimed_at) below. (OVH-017)
+_retry_lock = asyncio.Lock()
+
+# Claims older than this are treated as stale (a drainer crashed mid-send) and
+# released so the row can be re-claimed. Comfortably exceeds the per-item send
+# timeout so an in-flight send is never stolen.
+_CLAIM_STALE_AFTER = timedelta(minutes=10)
 
 
 def _build_webhook_payload(topic_name: str, novelty_result: NoveltyResult) -> dict:
@@ -175,8 +188,27 @@ async def retry_pending_webhooks(
     if settings is None:
         raise ValueError("settings is required")
 
+    # Single-flight: only one drain runs at a time in this process. A second
+    # caller skips rather than walking the same queue concurrently (OVH-017).
+    if _retry_lock.locked():
+        logger.debug("Webhook retry already in progress; skipping overlapping drain")
+        return
+
+    async with _retry_lock:
+        await _drain_pending_webhooks(conn, db_path)
+
+
+async def _drain_pending_webhooks(
+    conn: sqlite3.Connection | None,
+    db_path: Path | None,
+) -> None:
+    """Drain the webhook retry queue once (caller holds ``_retry_lock``)."""
     # --- Phase 1: snapshot pending rows under a short-lived connection. ---
+    stale_cutoff = (datetime.now(UTC) - _CLAIM_STALE_AFTER).isoformat()
     with short_conn(conn, db_path) as snapshot:
+        released = release_stale_webhook_claims(snapshot, stale_cutoff)
+        if released:
+            logger.warning("Released %d stale webhook claim(s)", released)
         expired = delete_expired_webhooks(snapshot)
         if expired:
             logger.warning("Deleted %d expired pending webhook(s)", expired)
@@ -188,9 +220,21 @@ async def retry_pending_webhooks(
 
     logger.info("Retrying %d pending webhook(s)", len(pending))
 
-    # --- Phase 2: send with NO connection held, then apply per item. ---
+    # --- Phase 2: claim, send with NO connection held, then apply per item. ---
     for webhook in pending:
         webhook_id = webhook["id"]
+
+        # Atomically claim this row. A concurrent (cross-process) drainer that
+        # already claimed it returns rowcount 0 here, so we skip — only the
+        # winner sends, preventing double-delivery (OVH-017).
+        claimed_at = datetime.now(UTC).isoformat()
+        with short_conn(conn, db_path) as claim_conn:
+            won = claim_pending_webhook(claim_conn, webhook_id, claimed_at)
+            claim_conn.commit()
+        if not won:
+            logger.debug("Webhook id=%d already claimed by another drain; skipping", webhook_id)
+            continue
+
         try:
             sent = await send_webhook(webhook["url"], webhook["payload"])
         except Exception:
@@ -198,7 +242,9 @@ async def retry_pending_webhooks(
             logger.warning("Retry error for webhook id=%d", webhook_id, exc_info=True)
 
         # Apply this single result and commit immediately so a later item's
-        # crash can't roll back what was already applied.
+        # crash can't roll back what was already applied. On failure,
+        # increment_webhook_retry also clears the claim so the next cycle can
+        # re-claim and retry.
         with short_conn(conn, db_path) as apply_conn:
             if sent:
                 delete_pending_webhook(apply_conn, webhook_id)

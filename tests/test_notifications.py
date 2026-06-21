@@ -1,10 +1,20 @@
-"""Tests for the notification module: Apprise wrapper and formatting."""
+"""Tests for the notification module: Apprise wrapper and formatting.
 
+Also covers the persistent notification retry-drain single-flight/claim
+behaviour (OVH-017), which lives in ``app.checker.retry_pending_notifications``.
+"""
+
+import asyncio
+import collections
 import threading
 from unittest.mock import MagicMock, patch
 
 from app.analysis.llm import NoveltyResult
+from app.checker import retry_pending_notifications
 from app.config import LLMSettings, NotificationSettings, Settings
+from app.crud import create_pending_notification, create_topic, list_pending_notifications
+from app.database import get_connection, init_db
+from app.models import PendingNotification, Topic, TopicStatus
 from app.notifications import format_notification, send_notification
 
 
@@ -198,3 +208,95 @@ class TestSendNotification:
         result = await send_notification("Title", "Body", settings)
 
         assert result is False
+
+
+# --- pending notification drain single-flight / claim (OVH-017) ---
+
+
+def _enqueue_notifications(db_path, count: int) -> list[int]:  # noqa: ANN001
+    """Insert ``count`` pending notifications, returning their ids."""
+    conn = get_connection(db_path)
+    try:
+        topic = create_topic(conn, Topic(name="Notif", description="d", status=TopicStatus.READY))
+        conn.commit()
+        ids: list[int] = []
+        for i in range(count):
+            n = create_pending_notification(
+                conn,
+                PendingNotification(topic_id=topic.id, title=f"T{i}", body=f"B{i}"),
+            )
+            ids.append(n.id)
+        conn.commit()
+        return ids
+    finally:
+        conn.close()
+
+
+class TestNotificationDrainSingleFlight:
+    """Overlapping drains deliver each pending notification exactly once."""
+
+    async def test_two_concurrent_drains_deliver_each_item_once(self, tmp_path) -> None:  # noqa: ANN001
+        """Two drains launched together send each pending notification once."""
+        db_path = tmp_path / "test.db"
+        init_db(db_path)
+        _enqueue_notifications(db_path, 3)
+        settings = _make_settings()
+
+        sent_counts: collections.Counter[str] = collections.Counter()
+        first_send_started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_send(title: str, body: str, _settings) -> bool:  # noqa: ANN001
+            first_send_started.set()
+            await release.wait()
+            sent_counts[title] += 1
+            return True
+
+        with patch("app.checker.send_notification", side_effect=slow_send):
+            drain1 = asyncio.create_task(retry_pending_notifications(settings=settings, db_path=db_path))
+            await first_send_started.wait()
+            drain2 = asyncio.create_task(retry_pending_notifications(settings=settings, db_path=db_path))
+            await asyncio.sleep(0)  # let drain2 observe the single-flight guard
+            release.set()
+            await asyncio.gather(drain1, drain2)
+
+        assert dict(sent_counts) == {"T0": 1, "T1": 1, "T2": 1}
+
+        verify = get_connection(db_path)
+        try:
+            assert list_pending_notifications(verify) == []
+        finally:
+            verify.close()
+
+    async def test_claimed_row_skipped_by_second_drainer(self, tmp_path) -> None:  # noqa: ANN001
+        """A row another process already claimed is skipped, not re-sent."""
+        from app.crud import claim_pending_notification
+
+        db_path = tmp_path / "test.db"
+        init_db(db_path)
+        ids = _enqueue_notifications(db_path, 1)
+
+        claimer = get_connection(db_path)
+        try:
+            assert claim_pending_notification(claimer, ids[0], "2999-01-01T00:00:00+00:00") is True
+            claimer.commit()
+        finally:
+            claimer.close()
+
+        send_calls: list[str] = []
+
+        async def record_send(title: str, body: str, _settings) -> bool:  # noqa: ANN001
+            send_calls.append(title)
+            return True
+
+        with patch("app.checker.send_notification", side_effect=record_send):
+            await retry_pending_notifications(settings=_make_settings(), db_path=db_path)
+
+        assert send_calls == []
+        verify = get_connection(db_path)
+        try:
+            row = verify.execute("SELECT claimed_at FROM pending_notifications").fetchone()
+            assert row is not None
+            assert row["claimed_at"] == "2999-01-01T00:00:00+00:00"
+        finally:
+            verify.close()
