@@ -1,9 +1,37 @@
-"""Shared form validation for topic create/edit handlers."""
+"""Shared form validation for topic and settings handlers."""
 
 import asyncio
 
+from pydantic import ValidationError
+
+from app.config import is_cloud_provider
 from app.models import FeedMode
 from app.url_validation import validate_feed_urls
+
+
+def strip_base_url(raw: str, model: str) -> str | None:
+    """Normalize a submitted LLM base URL (OVH-153).
+
+    Blank input becomes ``None``. A base URL set for a cloud provider is dropped
+    (cloud providers use their own endpoints; a stale Ollama URL left over when
+    switching to Anthropic would otherwise be sent). This mirrors the Settings
+    model's ``strip_base_url_for_cloud_provider`` validator (OVH-104) but applies
+    it eagerly so the setup pre-flight credential check sees the same value the
+    model will persist.
+    """
+    stripped = raw.strip() or None
+    if stripped and is_cloud_provider(model):
+        return None
+    return stripped
+
+
+def format_validation_errors(exc: ValidationError) -> list[str]:
+    """Render a Pydantic ``ValidationError`` into user-facing field messages.
+
+    Shared by the setup and settings handlers (OVH-153) so both surface the same
+    ``<field path>: <message>`` form on a 422 re-render.
+    """
+    return [f"{' → '.join(str(loc) for loc in e['loc'])}: {e['msg']}" for e in exc.errors()]
 
 
 async def validate_topic_form(
