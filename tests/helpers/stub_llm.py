@@ -19,7 +19,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.analysis.llm import KnowledgeStateUpdate, NoveltyResult
+from app.analysis.llm import CompressedKnowledge, KnowledgeStateUpdate, NoveltyResult
 
 
 class _StubUsage:
@@ -52,6 +52,13 @@ def make_knowledge_update(
     )
 
 
+def make_compressed_knowledge(
+    summary: str = "Canned compressed knowledge.",
+) -> CompressedKnowledge:
+    """Build a canned CompressedKnowledge (token_count is recomputed by prod code)."""
+    return CompressedKnowledge(compressed_summary=summary, token_count=0)
+
+
 def make_novelty_result(
     *,
     has_new_info: bool = True,
@@ -78,6 +85,7 @@ def stub_llm_boundary(
     novelty: NoveltyResult | None = None,
     knowledge_init: KnowledgeStateUpdate | None = None,
     knowledge_update: KnowledgeStateUpdate | None = None,
+    compressed: CompressedKnowledge | None = None,
 ) -> Iterator[AsyncMock]:
     """Patch ``app.analysis.llm._get_client`` so no live LLM call happens.
 
@@ -89,6 +97,10 @@ def stub_llm_boundary(
       ``KnowledgeStateUpdate`` call, and ``knowledge_update`` thereafter — so a
       single ``with`` block can serve both ``initialize_new_topic`` and a
       later ``check_topic`` knowledge-update without re-patching.
+    * ``compressed`` for ``response_model is CompressedKnowledge`` — so a smoke
+      case that drives the over-budget compression branch (small budget) stays
+      offline instead of AssertionError-ing (OVH-162). Defaults to a canned
+      ``CompressedKnowledge`` when not supplied.
 
     Yields:
         The ``AsyncMock`` standing in for ``client.chat.completions.create``,
@@ -97,6 +109,7 @@ def stub_llm_boundary(
     novelty_result = novelty if novelty is not None else make_novelty_result()
     init_result = knowledge_init if knowledge_init is not None else make_knowledge_update()
     update_result = knowledge_update if knowledge_update is not None else make_knowledge_update()
+    compressed_result = compressed if compressed is not None else make_compressed_knowledge()
 
     state = {"knowledge_calls": 0}
 
@@ -104,6 +117,8 @@ def stub_llm_boundary(
         response_model = kwargs.get("response_model")
         if response_model is NoveltyResult:
             return novelty_result
+        if response_model is CompressedKnowledge:
+            return compressed_result
         if response_model is KnowledgeStateUpdate:
             state["knowledge_calls"] += 1
             if state["knowledge_calls"] == 1:
