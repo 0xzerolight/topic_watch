@@ -25,7 +25,17 @@ class OPMLResult:
     topics: list[dict] = field(default_factory=list)
     skipped_dupes: int = 0
     skipped_invalid: int = 0
+    skipped_name_dupes: int = 0
     warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class _Candidate:
+    """A raw feed entry from the pure structural walk (pre-validation/dedup)."""
+
+    name: str
+    url: str
+    tags: list[str]
 
 
 def _derive_name_from_url(url: str) -> str:
@@ -39,12 +49,16 @@ def _derive_name_from_url(url: str) -> str:
 
 def _walk_outlines(
     element: ET.Element,
-    existing_feed_urls: set[str],
-    result: OPMLResult,
+    candidates: list[_Candidate],
     parent_tags: list[str],
     depth: int = 0,
 ) -> None:
-    """Recursively walk OPML outline elements, extracting feed entries."""
+    """Recursively walk OPML outline elements, collecting raw feed candidates.
+
+    Pure structural pass: no DNS / SSRF validation and no cross-import dedup, so
+    parse correctness is unit-testable without sockets. It only extracts
+    ``(name, url, tags)``. Validation, dedup, and capping happen in ``parse_opml``.
+    """
     if depth > MAX_OUTLINE_DEPTH:
         return
 
@@ -57,60 +71,38 @@ def _walk_outlines(
             xml_url = xml_url.strip()
             if not xml_url:
                 continue
-
-            # Dedup: skip if URL already exists in any topic
-            if xml_url in existing_feed_urls:
-                result.skipped_dupes += 1
-                continue
-
-            # Also dedup within the same import
-            if any(xml_url in t.get("feed_urls", []) for t in result.topics):
-                result.skipped_dupes += 1
-                continue
-
-            # SSRF validation
-            error = validate_feed_url(xml_url)
-            if error:
-                result.skipped_invalid += 1
-                result.warnings.append(error)
-                continue
-
             name = text.strip() if text.strip() else _derive_name_from_url(xml_url)
-
-            # Merge feeds that share a topic name so a multi-feed topic
-            # round-trips intact (export writes one <outline> per feed_url,
-            # all sharing the topic name).
-            existing_topic = next((t for t in result.topics if t["name"] == name), None)
-            if existing_topic is not None:
-                existing_topic["feed_urls"].append(xml_url)
-            else:
-                result.topics.append(
-                    {
-                        "name": name,
-                        "feed_urls": [xml_url],
-                        "tags": list(parent_tags),
-                    }
-                )
-            # Track this URL as existing for in-import dedup
-            existing_feed_urls.add(xml_url)
+            candidates.append(_Candidate(name=name, url=xml_url, tags=list(parent_tags)))
         else:
             # This is a folder — use its text as a tag for children
             folder_name = text.strip()
             child_tags = parent_tags + [folder_name] if folder_name else parent_tags
-            _walk_outlines(outline, existing_feed_urls, result, child_tags, depth + 1)
+            _walk_outlines(outline, candidates, child_tags, depth + 1)
 
 
-def parse_opml(content: str, existing_feed_urls: set[str]) -> OPMLResult:
+def parse_opml(
+    content: str,
+    existing_feed_urls: set[str],
+    existing_topic_names: set[str] | None = None,
+) -> OPMLResult:
     """Parse OPML content and return extracted feed entries.
+
+    Orchestrates a pure structural walk followed by a separate validation/dedup
+    pass: walk -> dedup (URL) -> validate (SSRF) -> dedup (name collision) -> cap.
+    Network I/O is confined to ``validate_feed_url`` in the second pass.
 
     Args:
         content: Raw XML string of the OPML file.
         existing_feed_urls: Set of feed URLs already in the database (for dedup).
+        existing_topic_names: Set of topic names already in the database. Feeds
+            whose name collides with one are skipped and counted in
+            ``skipped_name_dupes`` (replaces the router's raw SQL check).
 
     Returns:
         OPMLResult with parsed topics, skip counts, and warnings.
     """
     result = OPMLResult()
+    existing_names = existing_topic_names or set()
 
     try:
         root = ET.fromstring(content)  # noqa: S314 — entity expansion disabled by default in Python 3.11+ expat; 1MB size cap adds defense-in-depth
@@ -123,12 +115,54 @@ def parse_opml(content: str, existing_feed_urls: set[str]) -> OPMLResult:
         result.warnings.append("No <body> element found in OPML file.")
         return result
 
-    # Make a mutable copy so in-import dedup can track new URLs
-    working_urls = set(existing_feed_urls)
-    _walk_outlines(body, working_urls, result, parent_tags=[], depth=0)
+    # 1. Pure structural walk (no network, no dedup).
+    candidates: list[_Candidate] = []
+    _walk_outlines(body, candidates, parent_tags=[], depth=0)
+
+    # 2. Validation / dedup pass. ``seen_urls`` covers both DB URLs and URLs
+    # already accepted in this import; ``name_dupes_seen`` keeps the name-collision
+    # count per distinct topic (matching the old router's per-topic semantics).
+    seen_urls = set(existing_feed_urls)
+    name_dupes_seen: set[str] = set()
+    for candidate in candidates:
+        # Dedup: skip if URL already exists in any topic or earlier in this import.
+        if candidate.url in seen_urls:
+            result.skipped_dupes += 1
+            continue
+
+        # SSRF validation (DNS) — the only network step, isolated to this pass.
+        error = validate_feed_url(candidate.url)
+        if error:
+            result.skipped_invalid += 1
+            result.warnings.append(error)
+            continue
+
+        # Merge feeds that share a topic name so a multi-feed topic round-trips
+        # intact (export writes one <outline> per feed_url, all sharing the name).
+        existing_topic = next((t for t in result.topics if t["name"] == candidate.name), None)
+        if existing_topic is not None:
+            existing_topic["feed_urls"].append(candidate.url)
+            seen_urls.add(candidate.url)
+            continue
+
+        # Name collision with an existing DB topic — skip (counted once per name).
+        if candidate.name in existing_names:
+            if candidate.name not in name_dupes_seen:
+                name_dupes_seen.add(candidate.name)
+                result.skipped_name_dupes += 1
+            continue
+
+        result.topics.append(
+            {
+                "name": candidate.name,
+                "feed_urls": [candidate.url],
+                "tags": list(candidate.tags),
+            }
+        )
+        seen_urls.add(candidate.url)
 
     if not result.topics:
-        if result.skipped_dupes == 0 and result.skipped_invalid == 0:
+        if result.skipped_dupes == 0 and result.skipped_invalid == 0 and result.skipped_name_dupes == 0:
             result.warnings.append("No feeds found in OPML file.")
         return result
 
