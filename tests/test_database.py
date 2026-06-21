@@ -846,7 +846,11 @@ class TestPendingNotificationCRUD:
 
         deleted = delete_expired_notifications(db_conn)
         db_conn.commit()
-        assert deleted == 1
+        # Returns the abandoned rows (not just a count) so the prune site can
+        # log what was permanently dropped (OVH-040).
+        assert len(deleted) == 1
+        assert deleted[0].title == "Expired"
+        assert deleted[0].topic_id == topic.id
 
         # Only the active one remains
         remaining = list_pending_notifications(db_conn)
