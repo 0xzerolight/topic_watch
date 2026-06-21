@@ -652,8 +652,8 @@ def delete_expired_notifications(conn: sqlite3.Connection) -> list[PendingNotifi
 #
 # The webhook retry queue mirrors pending_notifications. Rows map to the
 # PendingWebhook model (see app/models.py); the payload is stored as a JSON TEXT
-# column. list_pending_webhooks returns plain dicts (payload pre-decoded) for
-# the existing subscript-style consumers in app/webhooks.py.
+# column. list_pending_webhooks returns PendingWebhook models, symmetric with
+# list_pending_notifications (OVH-152).
 
 
 def create_pending_webhook(
@@ -683,18 +683,19 @@ def create_pending_webhook(
     return int(cursor.lastrowid or 0)
 
 
-def list_pending_webhooks(conn: sqlite3.Connection) -> list[dict]:
+def list_pending_webhooks(conn: sqlite3.Connection) -> list[PendingWebhook]:
     """Get pending webhooks that haven't exceeded max retries.
 
-    Each row is returned as a dict with the payload already decoded from JSON
-    (via the PendingWebhook model). Already-claimed rows (``claimed_at`` set)
-    are excluded so a concurrent drainer never re-snapshots an item another
-    drainer is sending (see :func:`claim_pending_webhook` / OVH-017).
+    Returns ``PendingWebhook`` models (payload decoded from JSON), symmetric with
+    :func:`list_pending_notifications` (OVH-152). Already-claimed rows
+    (``claimed_at`` set) are excluded so a concurrent drainer never re-snapshots
+    an item another drainer is sending (see :func:`claim_pending_webhook` /
+    OVH-017).
     """
     rows = conn.execute(
         "SELECT * FROM pending_webhooks WHERE retry_count < max_retries AND claimed_at IS NULL ORDER BY created_at ASC"
     ).fetchall()
-    return [PendingWebhook.from_row(row).model_dump() for row in rows]
+    return [PendingWebhook.from_row(row) for row in rows]
 
 
 def claim_pending_webhook(conn: sqlite3.Connection, webhook_id: int, claimed_at: str) -> bool:

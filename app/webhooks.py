@@ -26,6 +26,7 @@ from app.crud import (
 )
 from app.database import short_conn
 from app.log_redaction import redact_url
+from app.models import PendingWebhook
 from app.url_validation import is_private_url
 
 logger = logging.getLogger(__name__)
@@ -269,8 +270,9 @@ async def _drain_pending_webhooks(
     # interleave mid-transaction.
     semaphore = asyncio.Semaphore(_RETRY_DRAIN_CONCURRENCY)
 
-    async def _process(webhook: dict) -> None:
-        webhook_id = webhook["id"]
+    async def _process(webhook: PendingWebhook) -> None:
+        webhook_id = webhook.id
+        assert webhook_id is not None
         async with semaphore:
             # Atomically claim this row. A concurrent (cross-process) drainer
             # that already claimed it returns rowcount 0 here, so we skip — only
@@ -284,7 +286,7 @@ async def _drain_pending_webhooks(
                 return
 
             try:
-                sent = await send_webhook(webhook["url"], webhook["payload"])
+                sent = await send_webhook(webhook.url, webhook.payload)
             except Exception:
                 sent = False
                 logger.warning("Retry error for webhook id=%d", webhook_id, exc_info=True)
