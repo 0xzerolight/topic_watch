@@ -136,6 +136,14 @@ async def send_notification_per_url(
     Returns:
         One NotificationDelivery per attempted URL (empty if none configured).
         Never raises — a timeout yields a single failed delivery per target.
+
+    Timeout semantics (OVH-116): ``wait_for`` bounds only the *awaiting coroutine*,
+    so on timeout the scheduler is freed and never blocked on a hung send. It does
+    NOT cancel the underlying ``to_thread`` worker — a thread cannot be cancelled —
+    so ``_deliver_per_url_sync`` keeps running until Apprise's socket I/O returns,
+    and that executor slot is reclaimed only then, not at the timeout. At
+    single-user scale (default ~32-slot pool) slot pressure is implausible, but a
+    hung send does occupy a worker past its deadline.
     """
     urls = [url] if url is not None else list(settings.notifications.urls)
     if not urls:
