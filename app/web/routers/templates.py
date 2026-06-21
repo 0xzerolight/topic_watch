@@ -15,6 +15,7 @@ from fastapi.templating import Jinja2Templates
 from markupsafe import Markup, escape
 
 from app import __version__
+from app.log_redaction import redact_url
 
 _TEMPLATE_DIR = Path(__file__).resolve().parent.parent.parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATE_DIR))
@@ -75,15 +76,20 @@ def _sanitize_error(error_message: str | None) -> Markup:
 
 
 def _mask_url(url: str) -> str:
-    """Mask a notification URL, showing only the scheme."""
-    try:
-        parsed = urlparse(url)
-        scheme = parsed.scheme
-        if scheme:
-            return f"{scheme}://****"
-        return "****"
-    except Exception:
-        return "****"
+    """Mask a notification URL for the UI, showing only the scheme.
+
+    Built on the single canonical ``app.log_redaction.redact_url`` (fold-in): that
+    helper already strips userinfo/query/secret path segments and never raises.
+    For the UI this filter is deliberately *stronger* — it also hides the host —
+    so it collapses everything after the scheme to ``****``. ``redact_url``
+    returns ``"****"`` (no ``://``) for schemeless/garbage input, which maps to the
+    same masked placeholder here.
+    """
+    redacted = redact_url(url)
+    scheme, sep, _rest = redacted.partition("://")
+    if sep and scheme:
+        return f"{scheme}://****"
+    return "****"
 
 
 def _safe_href(url: str | None) -> str:

@@ -21,7 +21,7 @@ from app.crud import (
 )
 from app.models import Article, Topic
 from app.scraping.content import extract_article_content
-from app.scraping.google_news import resolve_google_news_urls
+from app.scraping.google_news import is_google_news_url, resolve_google_news_urls
 from app.scraping.rss import FeedEntry, compute_article_hash, fetch_feeds_for_topic
 from app.scraping.rss import FeedResponse as FeedResponse
 
@@ -77,6 +77,209 @@ def _insert_or_count_dup(
         return False
 
 
+def _make_health_callback(conn: sqlite3.Connection):
+    """Build the per-feed health-recording callback used during feed fetch.
+
+    The callback writes feed_health rows on ``conn``; a swallowed write is
+    surfaced at WARNING because feed_health is the ONLY persisted record of
+    per-feed failures, so silently losing it would leave the dashboard showing
+    stale health while feeds break (OVH-132).
+    """
+
+    def callback(feed_url: str, success: bool, error_msg: str | None) -> None:
+        try:
+            if success:
+                upsert_feed_health_success(conn, feed_url)
+            else:
+                upsert_feed_health_failure(conn, feed_url, error_msg or "Unknown error")
+        except Exception:
+            logger.warning("Failed to record feed health for %s", feed_url, exc_info=True)
+
+    return callback
+
+
+def _log_feed_coverage(topic: Topic, feeds_total: int, feeds_failed: int) -> None:
+    """Log a degraded/total feed-fetch failure so partial coverage is visible.
+
+    ``0 < feeds_failed < feeds_total`` is a *degraded* check — total_feed_entries
+    only reflects the survivors, so it would otherwise look like a healthy partial
+    yield (OVH-130). A full failure is logged distinctly.
+    """
+    if 0 < feeds_failed < feeds_total:
+        logger.warning(
+            "Topic '%s': partial feed-fetch failure — %d of %d feed fetch(es) failed",
+            topic.name,
+            feeds_failed,
+            feeds_total,
+        )
+    elif feeds_total and feeds_failed >= feeds_total:
+        logger.warning("Topic '%s': all %d feed fetch(es) failed", topic.name, feeds_total)
+
+
+def _split_dedup_candidates(
+    entries: list[FeedEntry],
+    conn: sqlite3.Connection,
+    topic_id: int,
+) -> tuple[list[tuple[FeedEntry, str]], list[tuple[FeedEntry, str, str, str | None]]]:
+    """Filter feed entries to those not already stored; split reuse vs. fetch-needed.
+
+    Returns ``(new_entries, reuse_entries)``. ``new_entries`` are ``(entry, hash)``
+    pairs whose content must be fetched. ``reuse_entries`` are
+    ``(entry, hash, content, provider)`` for entries whose content already exists
+    cross-topic (OVH-025/OVH-114): the reused row's RESOLVED url and ORIGINATING
+    provider are adopted so attribution stays correct and the (already-computed)
+    hash keeps dedup intact.
+    """
+    new_entries: list[tuple[FeedEntry, str]] = []
+    reuse_entries: list[tuple[FeedEntry, str, str, str | None]] = []
+    for entry in entries:
+        content_hash = compute_article_hash(entry.url, entry.title)
+        if article_hash_exists(conn, topic_id, content_hash):
+            continue
+        existing = find_article_by_hash(conn, content_hash)
+        if existing and existing.raw_content:
+            logger.info(
+                "Cross-topic dedup: reusing content for '%s' (from topic_id=%d)",
+                entry.title,
+                existing.topic_id,
+            )
+            # OVH-025: adopt the originating article's RESOLVED url instead of this
+            # entry's (possibly unresolved redirect). The hash was already computed
+            # above from entry.url, so dedup stays intact.
+            entry.url = existing.url
+            reuse_entries.append((entry, content_hash, existing.raw_content, existing.source_provider))
+        else:
+            new_entries.append((entry, content_hash))
+    return new_entries, reuse_entries
+
+
+def _select_candidates(
+    new_entries: list[tuple[FeedEntry, str]],
+    reuse_entries: list[tuple[FeedEntry, str, str, str | None]],
+    max_articles: int,
+) -> tuple[list[tuple[FeedEntry, str, str | None, str | None]], list[tuple[FeedEntry, str]]]:
+    """Combine reuse + fetch candidates, sort recency-first, apply the limit.
+
+    Each candidate carries ``(entry, hash, reused_content, provider)``; provider is
+    the originating one for reused rows and ``None`` for fresh fetches (stamped with
+    this topic's provider later). Returns ``(reuse_batch, fetch_batch)`` after the
+    limit, where ``fetch_batch`` is the ``(entry, hash)`` subset still needing a fetch.
+    """
+    datetime_min = datetime.min.replace(tzinfo=UTC)
+    all_candidates: list[tuple[FeedEntry, str, str | None, str | None]] = [
+        (e, h, c, p) for e, h, c, p in reuse_entries
+    ] + [(e, h, None, None) for e, h in new_entries]
+    all_candidates.sort(key=lambda t: t[0].published or datetime_min, reverse=True)
+    all_candidates = all_candidates[:max_articles]
+
+    reuse_batch: list[tuple[FeedEntry, str, str | None, str | None]] = [
+        (e, h, c, p) for e, h, c, p in all_candidates if c is not None
+    ]
+    fetch_batch = [(e, h) for e, h, c, _ in all_candidates if c is None]
+    return reuse_batch, fetch_batch
+
+
+async def _resolve_redirect_urls(
+    fetch_batch: list[tuple[FeedEntry, str]],
+    response: FeedResponse,
+    feed_fetch_timeout: float,
+) -> None:
+    """Resolve provider redirect URLs in-place for entries needing content fetch.
+
+    Gated by the provider's ``needs_url_resolution`` (carried on the FeedResponse)
+    rather than a hardcoded host substring (OVH-157): only providers that emit
+    opaque redirects (Google News) opt in. The which-URLs-need-resolving decision
+    is delegated to ``is_google_news_url``/``resolve_google_news_urls`` instead of
+    leaking the ``news.google.com`` detail into the orchestrator. Done after
+    dedup+limiting to minimize requests (typically ~10 URLs, not 100).
+    """
+    if not response.needs_url_resolution:
+        return
+    to_resolve = [e.url for e, _ in fetch_batch if is_google_news_url(e.url)]
+    if not to_resolve:
+        return
+    resolved = await resolve_google_news_urls(to_resolve, timeout=feed_fetch_timeout)
+    for entry, _ in fetch_batch:
+        if entry.url in resolved:
+            entry.url = resolved[entry.url]
+
+
+async def _extract_contents(
+    fetch_batch: list[tuple[FeedEntry, str]],
+    article_fetch_timeout: float,
+    concurrency: int,
+) -> list[str | BaseException]:
+    """Extract article content concurrently for the fetch batch.
+
+    OVH-128: shares ONE pooled httpx client across the batch (keep-alive /
+    connection reuse) instead of one client per article. The client is
+    loop-confined and closed in finally, and mirrors the per-call config
+    (timeout + follow_redirects=False) so the SSRF per-hop redirect checks in
+    safe_get stay intact. Returns ``[]`` for an empty (reuse-only) batch so no
+    client is built.
+    """
+    if not fetch_batch:
+        return []
+    semaphore = asyncio.Semaphore(concurrency)
+    async with httpx.AsyncClient(timeout=article_fetch_timeout, follow_redirects=False) as fetch_client:
+
+        async def _extract(entry: FeedEntry) -> str:
+            async with semaphore:
+                return await extract_article_content(
+                    entry.url,
+                    fallback_summary=entry.summary,
+                    client=fetch_client,
+                    timeout=article_fetch_timeout,
+                )
+
+        content_tasks = [_extract(entry) for entry, _ in fetch_batch]
+        return list(await asyncio.gather(*content_tasks, return_exceptions=True))
+
+
+def _store_articles(
+    reuse_batch: list[tuple[FeedEntry, str, str | None, str | None]],
+    fetch_batch: list[tuple[FeedEntry, str]],
+    contents: list[str | BaseException],
+    topic: Topic,
+    provider_name: str | None,
+    conn: sqlite3.Connection,
+) -> tuple[list[Article], int]:
+    """Normalize both batches and run a single insert loop.
+
+    Reused content is already resolved and carries its originating provider;
+    freshly fetched rows carry provider=None ("this topic's provider") and need
+    the BaseException -> summary -> None coercion. Returns
+    ``(stored, dropped_duplicates)`` where dropped_duplicates counts rows lost to a
+    concurrent UNIQUE(topic_id, content_hash) race (OVH-114 attribution preserved).
+    """
+    assert topic.id is not None
+    pending: list[tuple[FeedEntry, str, str | None, str | None]] = list(reuse_batch)
+    for (entry, content_hash), content in zip(fetch_batch, contents, strict=False):
+        if isinstance(content, BaseException):
+            logger.warning("Content extraction failed for %s: %s", entry.url, content)
+            content = entry.summary
+        resolved_content = content if isinstance(content, str) and content else None
+        pending.append((entry, content_hash, resolved_content, None))
+
+    stored: list[Article] = []
+    dropped_duplicates = 0
+    for entry, content_hash, resolved_content, origin_provider in pending:
+        article = Article(
+            topic_id=topic.id,
+            title=entry.title,
+            url=entry.url,
+            content_hash=content_hash,
+            raw_content=resolved_content,
+            source_feed=entry.source_feed,
+            # OVH-114: reused rows keep the originating provider; fresh rows (None)
+            # are attributed to the provider that produced this topic's feed.
+            source_provider=origin_provider if origin_provider is not None else provider_name,
+        )
+        if not _insert_or_count_dup(conn, article, topic.name, stored):
+            dropped_duplicates += 1
+    return stored, dropped_duplicates
+
+
 async def fetch_new_articles_for_topic(
     topic: Topic,
     conn: sqlite3.Connection,
@@ -103,23 +306,6 @@ async def fetch_new_articles_for_topic(
     if topic.id is None:
         raise ValueError("Topic must have an ID")
 
-    def _make_health_callback(conn):
-        def callback(feed_url, success, error_msg):
-            try:
-                if success:
-                    upsert_feed_health_success(conn, feed_url)
-                else:
-                    upsert_feed_health_failure(conn, feed_url, error_msg or "Unknown error")
-            except Exception:
-                # feed_health is the ONLY persisted record of per-feed failures, so
-                # a swallowed write (locked DB under WAL contention, schema drift,
-                # disk error) leaves the dashboard showing stale health while feeds
-                # silently break. Surface it at WARNING — matching the dropped-
-                # duplicates loss convention — not DEBUG (OVH-132).
-                logger.warning("Failed to record feed health for %s", feed_url, exc_info=True)
-
-        return callback
-
     # 1. Fetch all feed entries. The health callback writes feed_health rows on
     # ``conn``; commit immediately afterwards so that write lock is NOT held
     # across the later content-extraction await (OVH-007: WAL single-writer
@@ -136,22 +322,7 @@ async def fetch_new_articles_for_topic(
 
     feeds_total = response.feeds_total
     feeds_failed = response.feeds_failed
-    # Surface a degraded check: when SOME but not all feeds failed, total_feed_entries
-    # only reflects the survivors, so the check looks like a healthy partial yield.
-    # Log a WARNING so degraded coverage is distinguishable from healthy (OVH-130).
-    if 0 < feeds_failed < feeds_total:
-        logger.warning(
-            "Topic '%s': partial feed-fetch failure — %d of %d feed fetch(es) failed",
-            topic.name,
-            feeds_failed,
-            feeds_total,
-        )
-    elif feeds_total and feeds_failed >= feeds_total:
-        logger.warning(
-            "Topic '%s': all %d feed fetch(es) failed",
-            topic.name,
-            feeds_total,
-        )
+    _log_feed_coverage(topic, feeds_total, feeds_failed)
 
     if not entries:
         return FetchResult(
@@ -161,30 +332,8 @@ async def fetch_new_articles_for_topic(
             feeds_failed=feeds_failed,
         )
 
-    # 2. Filter to entries not already in DB; split into reuse vs. fetch-needed.
-    # Reuse tuples also carry the ORIGINATING provider (OVH-114) so the reused row
-    # is attributed to whoever actually fetched the bytes, not this topic's provider.
-    new_entries: list[tuple[FeedEntry, str]] = []
-    reuse_entries: list[tuple[FeedEntry, str, str, str | None]] = []  # (entry, hash, content, provider)
-    for entry in entries:
-        content_hash = compute_article_hash(entry.url, entry.title)
-        if article_hash_exists(conn, topic.id, content_hash):
-            continue
-        existing = find_article_by_hash(conn, content_hash)
-        if existing and existing.raw_content:
-            logger.info(
-                "Cross-topic dedup: reusing content for '%s' (from topic_id=%d)",
-                entry.title,
-                existing.topic_id,
-            )
-            # OVH-025: adopt the originating article's RESOLVED url instead of this
-            # entry's (possibly unresolved news.google.com redirect). The hash was
-            # already computed above from entry.url, so dedup stays intact.
-            entry.url = existing.url
-            reuse_entries.append((entry, content_hash, existing.raw_content, existing.source_provider))
-        else:
-            new_entries.append((entry, content_hash))
-
+    # 2. Dedup against the DB and split into reuse vs. fetch-needed.
+    new_entries, reuse_entries = _split_dedup_candidates(entries, conn, topic.id)
     if not new_entries and not reuse_entries:
         return FetchResult(
             articles=[],
@@ -193,88 +342,19 @@ async def fetch_new_articles_for_topic(
             feeds_failed=feeds_failed,
         )
 
-    # 3. Combine reuse + fetch candidates, sort by published date (newest first,
-    # None dates last), and apply the limit. Selection is purely recency-first.
-    # Each candidate carries (entry, hash, reused_content, provider); provider is
-    # the originating one for reused rows and None for fresh fetches (stamped with
-    # this topic's provider later).
-    datetime_min = datetime.min.replace(tzinfo=UTC)
-    all_candidates: list[tuple[FeedEntry, str, str | None, str | None]] = [
-        (e, h, c, p) for e, h, c, p in reuse_entries
-    ] + [(e, h, None, None) for e, h in new_entries]
-    all_candidates.sort(
-        key=lambda t: t[0].published or datetime_min,
-        reverse=True,
+    # 3. Combine, sort recency-first, and apply the limit.
+    reuse_batch, fetch_batch = _select_candidates(new_entries, reuse_entries, max_articles)
+
+    # 3b. Resolve provider redirect URLs for entries needing a content fetch.
+    await _resolve_redirect_urls(fetch_batch, response, feed_fetch_timeout)
+
+    # 4. Extract content concurrently (only for entries needing fetch).
+    contents = await _extract_contents(fetch_batch, article_fetch_timeout, concurrency)
+
+    # 5. Normalize both batches and run a single insert loop.
+    stored, dropped_duplicates = _store_articles(
+        reuse_batch, fetch_batch, contents, topic, response.provider_name, conn
     )
-    all_candidates = all_candidates[:max_articles]
-
-    reuse_batch = [(e, h, c, p) for e, h, c, p in all_candidates if c is not None]
-    fetch_batch = [(e, h) for e, h, c, _ in all_candidates if c is None]
-
-    # 3b. Resolve Google News redirect URLs for entries that need content fetching.
-    # Done after dedup+limiting to minimize requests (typically ~10 URLs, not 100).
-    if response.needs_url_resolution:
-        google_urls = [e.url for e, _ in fetch_batch if "news.google.com/" in e.url]
-        if google_urls:
-            resolved = await resolve_google_news_urls(google_urls, timeout=feed_fetch_timeout)
-            for entry, _ in fetch_batch:
-                if entry.url in resolved:
-                    entry.url = resolved[entry.url]
-
-    # 4. Extract content concurrently with semaphore (only for entries needing fetch).
-    # OVH-128: share ONE pooled httpx client across the whole batch (keep-alive /
-    # connection reuse) instead of building+tearing down a client per article.
-    # The client is loop-confined and closed in finally. It must mirror the
-    # per-call client config (timeout + follow_redirects=False) so the SSRF
-    # per-hop redirect checks in safe_get stay intact. Skip it entirely when
-    # there is nothing to fetch (reuse-only batch).
-    semaphore = asyncio.Semaphore(concurrency)
-
-    contents: list[str | BaseException] = []
-    if fetch_batch:
-        async with httpx.AsyncClient(timeout=article_fetch_timeout, follow_redirects=False) as fetch_client:
-
-            async def _extract(entry: FeedEntry) -> str:
-                async with semaphore:
-                    return await extract_article_content(
-                        entry.url,
-                        fallback_summary=entry.summary,
-                        client=fetch_client,
-                        timeout=article_fetch_timeout,
-                    )
-
-            content_tasks = [_extract(entry) for entry, _ in fetch_batch]
-            contents = list(await asyncio.gather(*content_tasks, return_exceptions=True))
-
-    # 5. Normalize both batches into a uniform (entry, hash, content, provider) list,
-    # then run a single insert loop. Reused content is already resolved and carries
-    # its originating provider; freshly fetched rows carry provider=None (meaning
-    # "this topic's provider") and need the BaseException -> summary -> None coercion.
-    pending: list[tuple[FeedEntry, str, str | None, str | None]] = list(reuse_batch)
-    for (entry, content_hash), content in zip(fetch_batch, contents, strict=False):
-        if isinstance(content, BaseException):
-            logger.warning("Content extraction failed for %s: %s", entry.url, content)
-            content = entry.summary
-        resolved_content = content if isinstance(content, str) and content else None
-        pending.append((entry, content_hash, resolved_content, None))
-
-    stored: list[Article] = []
-    dropped_duplicates = 0
-    for entry, content_hash, resolved_content, origin_provider in pending:
-        article = Article(
-            topic_id=topic.id,
-            title=entry.title,
-            url=entry.url,
-            content_hash=content_hash,
-            raw_content=resolved_content,
-            source_feed=entry.source_feed,
-            # OVH-114: reused rows keep the originating provider; fresh rows (None)
-            # are attributed to the provider that produced this topic's feed.
-            source_provider=origin_provider if origin_provider is not None else response.provider_name,
-        )
-        if _insert_or_count_dup(conn, article, topic.name, stored):
-            continue
-        dropped_duplicates += 1
 
     conn.commit()
     if dropped_duplicates:

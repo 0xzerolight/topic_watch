@@ -9,7 +9,7 @@ import logging
 import sqlite3
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Self
+from typing import ClassVar, Self
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -78,6 +78,87 @@ def _safe_json(value: object, default: object, field: str) -> object:
     return parsed
 
 
+class SQLiteModel(BaseModel):
+    """Base for models persisted to SQLite, factoring out the row<->model interop.
+
+    SQLite stores booleans as INTEGER (0/1), datetimes as ISO-8601 TEXT, and JSON
+    arrays/objects as TEXT. Every persisted model otherwise re-implemented the
+    same coercion boilerplate in its own ``from_row`` / ``to_insert_dict`` (OVH-150).
+    Subclasses declare the columns needing each coercion; the shared
+    ``_coerce_row`` / ``_dump_for_insert`` helpers apply them, with custom per-model
+    logic (e.g. Topic's check-interval backcompat, CheckResult's derived
+    confidence) layered on top.
+
+    Class-level declarations (override per subclass as needed):
+
+    * ``_bool_fields``: columns stored as 0/1 INTEGER <-> ``bool``.
+    * ``_required_dt_fields``: NOT NULL datetime columns (corrupt/empty -> now(UTC),
+      via ``_coerce_required_dt``).
+    * ``_optional_dt_fields``: nullable datetime columns (corrupt/empty -> None,
+      via ``_coerce_dt``).
+    * ``_json_fields``: mapping of column name -> empty default (list/dict) for
+      JSON TEXT columns coerced via ``_safe_json``.
+    * ``_insert_exclude``: extra field names dropped from ``to_insert_dict`` beyond
+      the always-excluded ``id``.
+    """
+
+    _bool_fields: ClassVar[tuple[str, ...]] = ()
+    _required_dt_fields: ClassVar[tuple[str, ...]] = ()
+    _optional_dt_fields: ClassVar[tuple[str, ...]] = ()
+    _json_fields: ClassVar[dict[str, object]] = {}
+    _insert_exclude: ClassVar[frozenset[str]] = frozenset()
+
+    @classmethod
+    def _coerce_row(cls, row: sqlite3.Row) -> dict:
+        """Return a model-ready dict from a DB row, applying the declared coercions.
+
+        Operates on a copy of the row (never the row itself). Subclasses needing
+        extra handling call this first, then adjust the dict before constructing.
+        """
+        data = dict(row)
+        for field in cls._json_fields:
+            data[field] = _safe_json(data.get(field), cls._json_fields[field], field)
+        for field in cls._bool_fields:
+            if field in data:
+                data[field] = bool(data[field])
+        for field in cls._required_dt_fields:
+            data[field] = _coerce_required_dt(data.get(field))
+        for field in cls._optional_dt_fields:
+            data[field] = _coerce_dt(data.get(field))
+        return data
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> Self:
+        """Construct the model from a database row using the declared coercions."""
+        return cls(**cls._coerce_row(row))
+
+    def _dump_for_insert(self) -> dict:
+        """Return a model_dump dict ready for SQL INSERT (shared serialization).
+
+        Excludes ``id`` plus any ``_insert_exclude`` fields, then serializes the
+        declared bool/datetime/JSON columns back to their SQLite storage forms.
+        StrEnum values are emitted as their ``.value`` string.
+        """
+        d = self.model_dump(exclude={"id", *self._insert_exclude})
+        for field in self._json_fields:
+            if field in d:
+                d[field] = json.dumps(d[field])
+        for field in self._bool_fields:
+            if field in d:
+                d[field] = int(d[field])
+        for field in (*self._required_dt_fields, *self._optional_dt_fields):
+            if d.get(field) is not None:
+                d[field] = d[field].isoformat()
+        for field, value in list(d.items()):
+            if isinstance(value, StrEnum):
+                d[field] = value.value
+        return d
+
+    def to_insert_dict(self) -> dict:
+        """Return a dict for SQL INSERT (excludes auto-generated id)."""
+        return self._dump_for_insert()
+
+
 class TopicStatus(StrEnum):
     """Status of a topic's lifecycle."""
 
@@ -94,8 +175,13 @@ class FeedMode(StrEnum):
     MANUAL = "manual"
 
 
-class Topic(BaseModel):
+class Topic(SQLiteModel):
     """A monitored topic with associated feed URLs."""
+
+    _bool_fields = ("is_active",)
+    _required_dt_fields = ("created_at",)
+    _optional_dt_fields = ("status_changed_at",)
+    _json_fields = {"feed_urls": [], "tags": []}  # noqa: RUF012 - declarative
 
     id: int | None = None
     name: str
@@ -142,12 +228,7 @@ class Topic(BaseModel):
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Self:
         """Construct a Topic from a database row."""
-        data = dict(row)
-        data["feed_urls"] = _safe_json(data.get("feed_urls"), [], "feed_urls")
-        data["is_active"] = bool(data["is_active"])
-        data["tags"] = _safe_json(data.get("tags"), [], "tags")
-        data["created_at"] = _coerce_required_dt(data.get("created_at"))
-        data["status_changed_at"] = _coerce_dt(data.get("status_changed_at"))
+        data = cls._coerce_row(row)
         # Backwards compatibility: if check_interval_minutes is absent but
         # check_interval_hours is present, convert hours to minutes.
         if data.get("check_interval_minutes") is None and data.get("check_interval_hours") is not None:
@@ -155,22 +236,12 @@ class Topic(BaseModel):
         data.pop("check_interval_hours", None)
         return cls(**data)
 
-    def to_insert_dict(self) -> dict:
-        """Return a dict for SQL INSERT (excludes auto-generated id)."""
-        d = self.model_dump(exclude={"id"})
-        d["feed_urls"] = json.dumps(d["feed_urls"])
-        d["tags"] = json.dumps(d["tags"])
-        d["feed_mode"] = d["feed_mode"].value
-        d["created_at"] = d["created_at"].isoformat()
-        d["status"] = d["status"].value
-        d["is_active"] = int(d["is_active"])
-        if d["status_changed_at"] is not None:
-            d["status_changed_at"] = d["status_changed_at"].isoformat()
-        return d
 
-
-class Article(BaseModel):
+class Article(SQLiteModel):
     """A fetched article associated with a topic."""
+
+    _bool_fields = ("processed",)
+    _required_dt_fields = ("fetched_at",)
 
     id: int | None = None
     topic_id: int
@@ -183,24 +254,11 @@ class Article(BaseModel):
     fetched_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     processed: bool = False
 
-    @classmethod
-    def from_row(cls, row: sqlite3.Row) -> Self:
-        """Construct an Article from a database row."""
-        data = dict(row)
-        data["processed"] = bool(data["processed"])
-        data["fetched_at"] = _coerce_required_dt(data.get("fetched_at"))
-        return cls(**data)
 
-    def to_insert_dict(self) -> dict:
-        """Return a dict for SQL INSERT (excludes auto-generated id)."""
-        d = self.model_dump(exclude={"id"})
-        d["fetched_at"] = d["fetched_at"].isoformat()
-        d["processed"] = int(d["processed"])
-        return d
-
-
-class KnowledgeState(BaseModel):
+class KnowledgeState(SQLiteModel):
     """Rolling summary of everything known about a topic."""
+
+    _required_dt_fields = ("updated_at",)
 
     id: int | None = None
     topic_id: int
@@ -208,22 +266,14 @@ class KnowledgeState(BaseModel):
     token_count: int = 0
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
-    @classmethod
-    def from_row(cls, row: sqlite3.Row) -> Self:
-        """Construct a KnowledgeState from a database row."""
-        data = dict(row)
-        data["updated_at"] = _coerce_required_dt(data.get("updated_at"))
-        return cls(**data)
 
-    def to_insert_dict(self) -> dict:
-        """Return a dict for SQL INSERT (excludes auto-generated id)."""
-        d = self.model_dump(exclude={"id"})
-        d["updated_at"] = d["updated_at"].isoformat()
-        return d
-
-
-class CheckResult(BaseModel):
+class CheckResult(SQLiteModel):
     """Record of a single check cycle for a topic."""
+
+    _bool_fields = ("has_new_info", "notification_sent")
+    _required_dt_fields = ("checked_at",)
+    # ``confidence`` is derived from llm_response, not a real column — never persist it (OVH-052).
+    _insert_exclude = frozenset({"confidence"})
 
     id: int | None = None
     topic_id: int
@@ -250,13 +300,10 @@ class CheckResult(BaseModel):
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Self:
         """Construct a CheckResult from a database row."""
-        data = dict(row)
+        data = cls._coerce_row(row)
         # ``confidence`` is a derived, non-column field; drop any stray DB key so
         # it is only ever set explicitly here from the loaded blob.
         data.pop("confidence", None)
-        data["has_new_info"] = bool(data["has_new_info"])
-        data["notification_sent"] = bool(data["notification_sent"])
-        data["checked_at"] = _coerce_required_dt(data.get("checked_at"))
         # Derive confidence from the already-loaded blob on the single-row paths
         # (detail/history) so the badge renders without a second parse. The
         # dashboard path skips the blob entirely and sets ``confidence`` via SQL
@@ -280,19 +327,41 @@ class CheckResult(BaseModel):
         except (ValueError, TypeError):
             return None
 
-    def to_insert_dict(self) -> dict:
-        """Return a dict for SQL INSERT (excludes auto-generated id)."""
-        # ``confidence`` is derived from llm_response, not a real column — never
-        # persist it (OVH-052).
-        d = self.model_dump(exclude={"id", "confidence"})
-        d["checked_at"] = d["checked_at"].isoformat()
-        d["has_new_info"] = int(d["has_new_info"])
-        d["notification_sent"] = int(d["notification_sent"])
-        return d
+    @classmethod
+    def from_dashboard_row(cls, row: sqlite3.Row, topic_id: int) -> Self:
+        """Build the partial CheckResult the dashboard listing carries (OVH-151).
+
+        The dashboard SELECT joins each topic to its latest check via ``cr_``-
+        prefixed aliases and pre-extracts ``confidence`` with SQL ``json_extract``,
+        so the full ``llm_response`` blob is never shipped/parsed per topic
+        (OVH-052). This maps those aliases to the model, routing the required
+        ``checked_at`` through the same defensive coercion ``from_row`` uses
+        (OVH-108) so a corrupt/legacy cell degrades to now(UTC) instead of 500-ing
+        the dashboard. ``llm_response`` is intentionally left ``None`` on this path.
+        """
+        return cls(
+            id=row["cr_id"],
+            topic_id=topic_id,
+            checked_at=_coerce_required_dt(row["cr_checked_at"]),
+            articles_found=row["cr_articles_found"],
+            articles_new=row["cr_articles_new"],
+            has_new_info=bool(row["cr_has_new_info"]),
+            llm_response=None,
+            confidence=row["cr_confidence"],
+            notification_sent=bool(row["cr_notification_sent"]),
+            notification_error=row["cr_notification_error"],
+        )
 
 
-class FeedHealth(BaseModel):
-    """Health tracking for a single feed URL."""
+class FeedHealth(SQLiteModel):
+    """Health tracking for a single feed URL.
+
+    OVH-150: the nullable datetime cells (``last_success_at`` / ``last_error_at``)
+    are coerced through the shared ``_coerce_dt`` path like every other model
+    instead of an inlined copy that had drifted from it.
+    """
+
+    _optional_dt_fields = ("last_success_at", "last_error_at")
 
     id: int | None = None
     feed_url: str
@@ -302,23 +371,6 @@ class FeedHealth(BaseModel):
     consecutive_failures: int = 0
     total_fetches: int = 0
     total_failures: int = 0
-
-    @classmethod
-    def from_row(cls, row: sqlite3.Row) -> Self:
-        data = dict(row)
-        for field in ("last_success_at", "last_error_at"):
-            value = data.get(field)
-            # Treat empty/whitespace-only strings as missing (None); a falsy
-            # "" would otherwise skip parsing and reach Pydantic as a raw
-            # string, raising ValidationError on legacy/migrated rows.
-            if isinstance(value, str) and not value.strip():
-                data[field] = None
-            elif value:
-                try:
-                    data[field] = datetime.fromisoformat(value)
-                except (ValueError, TypeError):
-                    data[field] = None
-        return cls(**data)
 
 
 class DashboardStats(BaseModel):
@@ -333,7 +385,7 @@ class DashboardStats(BaseModel):
     last_notification_at: datetime | None = None
 
 
-class PendingNotification(BaseModel):
+class PendingNotification(SQLiteModel):
     """A notification that failed to send and should be retried.
 
     Scoped to a single ``url`` when that target failed (OVH-039): a partial
@@ -342,6 +394,9 @@ class PendingNotification(BaseModel):
     in which case the drain falls back to every configured URL. ``last_error``
     records the most recent failure reason for operator diagnostics.
     """
+
+    _required_dt_fields = ("created_at",)
+    _insert_exclude = frozenset({"claimed_at"})
 
     id: int | None = None
     topic_id: int
@@ -354,19 +409,6 @@ class PendingNotification(BaseModel):
     retry_count: int = 0
     max_retries: int = 3
     claimed_at: str | None = None
-
-    @classmethod
-    def from_row(cls, row: sqlite3.Row) -> Self:
-        """Construct a PendingNotification from a database row."""
-        data = dict(row)
-        data["created_at"] = _coerce_required_dt(data.get("created_at"))
-        return cls(**data)
-
-    def to_insert_dict(self) -> dict:
-        """Return a dict for SQL INSERT (excludes auto-generated id)."""
-        d = self.model_dump(exclude={"id", "claimed_at"})
-        d["created_at"] = d["created_at"].isoformat()
-        return d
 
 
 class NotificationDelivery(BaseModel):
@@ -381,12 +423,23 @@ class NotificationDelivery(BaseModel):
     error: str | None = None
 
 
-class PendingWebhook(BaseModel):
+class PendingWebhook(SQLiteModel):
     """A webhook delivery that failed to send and should be retried.
 
     Mirrors ``PendingNotification`` for the webhook retry queue. The outbound
     ``payload`` is stored as a JSON TEXT column.
+
+    OVH-110: ``payload`` is coerced via the shared ``_safe_json`` path, which
+    falls back to ``{}`` (with a warning) not only on malformed JSON but also on
+    valid JSON of the wrong type — an array/scalar/string whose ``type(parsed) is
+    not type(default)``. So a payload that was ever a non-dict (manual edit,
+    partial corruption, future path) degrades here instead of raising
+    ValidationError and 500-ing the retry-queue view or crashing the retry worker.
     """
+
+    _required_dt_fields = ("created_at",)
+    _json_fields = {"payload": {}}  # noqa: RUF012 - declarative
+    _insert_exclude = frozenset({"claimed_at"})
 
     id: int | None = None
     topic_id: int
@@ -397,24 +450,3 @@ class PendingWebhook(BaseModel):
     retry_count: int = 0
     max_retries: int = 3
     claimed_at: str | None = None
-
-    @classmethod
-    def from_row(cls, row: sqlite3.Row) -> Self:
-        """Construct a PendingWebhook from a database row."""
-        data = dict(row)
-        # ``_safe_json`` falls back to {} (with a warning) not only on malformed
-        # JSON but also on valid JSON of the wrong type — an array/scalar/string
-        # whose ``type(parsed) is not type(default)`` — so a payload that was ever
-        # a non-dict (manual edit, partial corruption, future path) degrades here
-        # instead of raising ValidationError and 500-ing the retry-queue view or
-        # crashing the retry worker (OVH-110).
-        data["payload"] = _safe_json(data.get("payload"), {}, "payload")
-        data["created_at"] = _coerce_required_dt(data.get("created_at"))
-        return cls(**data)
-
-    def to_insert_dict(self) -> dict:
-        """Return a dict for SQL INSERT (excludes auto-generated id)."""
-        d = self.model_dump(exclude={"id", "claimed_at"})
-        d["payload"] = json.dumps(d["payload"])
-        d["created_at"] = d["created_at"].isoformat()
-        return d
