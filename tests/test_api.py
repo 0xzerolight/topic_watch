@@ -19,8 +19,20 @@ def _make_settings(**overrides) -> Settings:
     return Settings(**defaults)
 
 
-def _seed_topic(conn: sqlite3.Connection, name: str = "Test Topic", status: str = "ready") -> Topic:
-    topic = Topic(name=name, description=f"About {name}", status=TopicStatus(status))
+def _seed_topic(
+    conn: sqlite3.Connection,
+    name: str = "Test Topic",
+    status: str = "ready",
+    is_active: bool = True,
+    tags: list[str] | None = None,
+) -> Topic:
+    topic = Topic(
+        name=name,
+        description=f"About {name}",
+        status=TopicStatus(status),
+        is_active=is_active,
+        tags=tags or [],
+    )
     return create_topic(conn, topic)
 
 
@@ -37,7 +49,7 @@ def _seed_knowledge(conn: sqlite3.Connection, topic_id: int) -> KnowledgeState:
 class TestAPIListTopics:
     def test_list_all_topics(self, db_conn: sqlite3.Connection):
         _seed_topic(db_conn, "Topic A")
-        _seed_topic(db_conn, "Topic B")
+        _seed_topic(db_conn, "Topic B", is_active=False)
         db_conn.commit()
 
         app.state.db_path = None
@@ -50,17 +62,16 @@ class TestAPIListTopics:
                 resp = client.get("/api/v1/topics")
                 assert resp.status_code == 200
                 data = resp.json()
+                # No active filter -> both active and inactive topics returned.
                 assert len(data) == 2
+                names = {t["name"] for t in data}
+                assert names == {"Topic A", "Topic B"}
             finally:
                 app.dependency_overrides.pop(get_db_conn, None)
 
     def test_filter_active_only(self, db_conn: sqlite3.Connection):
         _seed_topic(db_conn, "Active")
-        inactive = _seed_topic(db_conn, "Inactive")
-        inactive.is_active = False
-        from app.crud import update_topic
-
-        update_topic(db_conn, inactive)
+        _seed_topic(db_conn, "Inactive", is_active=False)
         db_conn.commit()
 
         from app.web.dependencies import get_db_conn
@@ -73,6 +84,64 @@ class TestAPIListTopics:
                 data = resp.json()
                 assert len(data) == 1
                 assert data[0]["name"] == "Active"
+        finally:
+            app.dependency_overrides.pop(get_db_conn, None)
+
+    def test_filter_active_false_returns_only_inactive(self, db_conn: sqlite3.Connection):
+        # OVH-028 / OVH-159: ?active=false must return inactive-only, not all.
+        _seed_topic(db_conn, "Active")
+        _seed_topic(db_conn, "Inactive", is_active=False)
+        db_conn.commit()
+
+        from app.web.dependencies import get_db_conn
+
+        app.dependency_overrides[get_db_conn] = lambda: db_conn
+        try:
+            with TestClient(app) as client:
+                resp = client.get("/api/v1/topics?active=false")
+                assert resp.status_code == 200
+                data = resp.json()
+                assert len(data) == 1
+                assert data[0]["name"] == "Inactive"
+                assert data[0]["is_active"] is False
+        finally:
+            app.dependency_overrides.pop(get_db_conn, None)
+
+    def test_filter_by_tag(self, db_conn: sqlite3.Connection):
+        # OVH-080: ?tag=X returns only topics carrying that tag.
+        _seed_topic(db_conn, "Tagged", tags=["alpha"])
+        _seed_topic(db_conn, "Other", tags=["beta"])
+        db_conn.commit()
+
+        from app.web.dependencies import get_db_conn
+
+        app.dependency_overrides[get_db_conn] = lambda: db_conn
+        try:
+            with TestClient(app) as client:
+                resp = client.get("/api/v1/topics?tag=alpha")
+                assert resp.status_code == 200
+                data = resp.json()
+                assert len(data) == 1
+                assert data[0]["name"] == "Tagged"
+        finally:
+            app.dependency_overrides.pop(get_db_conn, None)
+
+
+class TestAPIChecksClamp:
+    def test_per_page_upper_clamp(self, db_conn: sqlite3.Connection):
+        # OVH-080: per_page is clamped to 100 (DoS guard) in the response.
+        topic = _seed_topic(db_conn)
+        db_conn.commit()
+
+        from app.web.dependencies import get_db_conn
+
+        app.dependency_overrides[get_db_conn] = lambda: db_conn
+        try:
+            with TestClient(app) as client:
+                resp = client.get(f"/api/v1/topics/{topic.id}/checks?per_page=500")
+                assert resp.status_code == 200
+                data = resp.json()
+                assert data["per_page"] == 100
         finally:
             app.dependency_overrides.pop(get_db_conn, None)
 
@@ -175,6 +244,40 @@ class TestAPIKnowledge:
 
 
 class TestAPITriggerCheck:
+    def test_trigger_check_happy_path(self, db_conn: sqlite3.Connection, monkeypatch):
+        # OVH-016: the only mutation endpoint's success-path response contract.
+        topic = _seed_topic(db_conn, status="ready")
+        db_conn.commit()
+
+        fake_result = CheckResult(id=42, topic_id=topic.id, has_new_info=True, articles_found=3, articles_new=1)
+
+        async def _fake_check_topic(t, conn, settings):
+            assert t.id == topic.id
+            return fake_result
+
+        monkeypatch.setattr("app.web.api.check_topic", _fake_check_topic)
+
+        from app.web.dependencies import get_db_conn
+
+        app.dependency_overrides[get_db_conn] = lambda: db_conn
+        try:
+            with TestClient(app) as client:
+                home = client.get("/")
+                csrf_token = home.cookies.get("csrf_token", "")
+                resp = client.post(
+                    f"/api/v1/topics/{topic.id}/check",
+                    headers={"X-CSRF-Token": csrf_token},
+                )
+                assert resp.status_code == 200
+                data = resp.json()
+                assert data == {
+                    "status": "checked",
+                    "has_new_info": True,
+                    "check_result_id": 42,
+                }
+        finally:
+            app.dependency_overrides.pop(get_db_conn, None)
+
     def test_trigger_requires_csrf(self, db_conn: sqlite3.Connection):
         topic = _seed_topic(db_conn)
         db_conn.commit()
