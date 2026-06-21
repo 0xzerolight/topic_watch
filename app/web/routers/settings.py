@@ -142,6 +142,12 @@ async def complete_setup(
     from app.config import LLMSettings, NotificationSettings
     from app.scheduler import start_scheduler
 
+    # Single-shot setup (OVH-059): once configured, a replay/double-submit/stale-bookmark
+    # POST must not re-run setup — that would clobber live credentials and start a second
+    # scheduler (orphaning the running one). Ongoing changes go through /settings.
+    if not getattr(request.app.state, "setup_required", False):
+        return RedirectResponse(url="/", status_code=303)
+
     # Strip base_url for cloud providers (e.g. stale Ollama URL when switching to Anthropic)
     effective_base_url = llm_base_url.strip() or None
     if effective_base_url and is_cloud_provider(llm_model):
@@ -168,7 +174,8 @@ async def complete_setup(
         save_settings_to_yaml(new_settings, request.app.state.config_path)
         request.app.state.settings = new_settings
         request.app.state.setup_required = False
-        start_scheduler(new_settings, db_path=request.app.state.db_path)
+        # Wire the app so scheduler jobs read live settings from app.state (OVH-015/036).
+        start_scheduler(new_settings, db_path=request.app.state.db_path, app=request.app)
     except LLMValidationError as exc:
         return templates.TemplateResponse(
             request,
