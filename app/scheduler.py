@@ -8,6 +8,7 @@ loop in Session 5.
 import asyncio
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -20,9 +21,40 @@ from app.crud import (
 )
 from app.database import get_db
 
+if TYPE_CHECKING:
+    from fastapi import FastAPI
+
 logger = logging.getLogger(__name__)
 
 _scheduler: AsyncIOScheduler | None = None
+
+# Cron maintenance (VACUUM, article cleanup) tolerates running hours late so a
+# slept/woken host still catches up missed runs instead of skipping them (OVH-029).
+_MAINTENANCE_MISFIRE_GRACE_SECONDS = 6 * 60 * 60
+
+
+def _resolve_settings(app: "FastAPI | None", fallback: Settings) -> Settings:
+    """Return the live settings for this tick.
+
+    When the scheduler is wired to the running app, read ``app.state.settings`` so
+    in-place ``/settings`` edits take effect on the next tick without a restart
+    (OVH-015/036). When no app is wired (e.g. unit tests calling ``start_scheduler``
+    with settings directly), fall back to the settings bound at start.
+    """
+    if app is not None:
+        live = getattr(app.state, "settings", None)
+        if isinstance(live, Settings):
+            return live
+    return fallback
+
+
+def _resolve_db_path(app: "FastAPI | None", fallback: Path | None) -> Path | None:
+    """Return the live db_path for this tick (mirrors ``_resolve_settings``)."""
+    if app is not None:
+        live = getattr(app.state, "db_path", None)
+        if isinstance(live, Path):
+            return live
+    return fallback
 
 
 async def _cleanup_old_articles(settings: Settings, db_path: Path | None = None) -> None:
@@ -111,29 +143,61 @@ async def _scheduled_check(settings: Settings, db_path: Path | None = None) -> N
     await _init_new_topics(settings, db_path)
 
 
+async def _tick_check(settings: Settings, db_path: Path | None, app: "FastAPI | None") -> None:
+    """Minute-tick job: run a check cycle using settings live from app.state (OVH-015/036)."""
+    await _scheduled_check(_resolve_settings(app, settings), _resolve_db_path(app, db_path))
+
+
+async def _tick_recover(timeout_minutes: int, db_path: Path | None, app: "FastAPI | None") -> None:
+    """Recovery job: read the live db_path from app.state at tick time."""
+    await _recover_stuck(timeout_minutes=timeout_minutes, db_path=_resolve_db_path(app, db_path))
+
+
+async def _tick_vacuum(db_path: Path | None, app: "FastAPI | None") -> None:
+    """VACUUM job: read the live db_path from app.state at tick time."""
+    await _vacuum_db(_resolve_db_path(app, db_path))
+
+
+async def _tick_cleanup(settings: Settings, db_path: Path | None, app: "FastAPI | None") -> None:
+    """Cleanup job: read live settings (retention) and db_path from app.state at tick time."""
+    await _cleanup_old_articles(_resolve_settings(app, settings), _resolve_db_path(app, db_path))
+
+
 def start_scheduler(
     settings: Settings,
     db_path: Path | None = None,
+    app: "FastAPI | None" = None,
 ) -> AsyncIOScheduler:
-    """Create and start the background scheduler.
+    """Create and start the background scheduler (idempotent, single owner).
 
-    Schedules check_all_topics to run at the configured interval.
+    Schedules check_all_topics to run every minute. If a scheduler is already
+    running it is shut down first, so a second call (lifespan, setup, or a future
+    reschedule) never orphans a live scheduler (OVH-067/125). All start/stop goes
+    through this guarded entry point and ``stop_scheduler``.
 
     Args:
-        settings: Application settings (provides check_interval).
+        settings: Application settings, used as the fallback when no app is wired.
         db_path: Optional database path override for testing.
+        app: Optional FastAPI app; when given, jobs read settings/db_path from
+            ``app.state`` at tick time so ``/settings`` edits take effect without a
+            restart (OVH-015/036).
 
     Returns:
         The running AsyncIOScheduler instance.
     """
     global _scheduler
 
+    # Idempotent: never overwrite a live scheduler — shut it down first (OVH-067/125).
+    if _scheduler is not None and _scheduler.running:
+        logger.warning("start_scheduler called while a scheduler is running; restarting cleanly")
+        stop_scheduler()
+
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
-        _scheduled_check,
+        _tick_check,
         "interval",
         minutes=1,
-        args=[settings, db_path],
+        args=[settings, db_path, app],
         id="check_all_topics",
         name="Check due topics for updates",
         replace_existing=True,
@@ -143,10 +207,10 @@ def start_scheduler(
         jitter=settings.scheduler_jitter_seconds,
     )
     scheduler.add_job(
-        _recover_stuck,
+        _tick_recover,
         "interval",
         minutes=5,
-        kwargs={"timeout_minutes": 15, "db_path": db_path},
+        kwargs={"timeout_minutes": 15, "db_path": db_path, "app": app},
         id="recover_stuck_researching",
         name="Recover stuck researching topics",
         replace_existing=True,
@@ -155,25 +219,27 @@ def start_scheduler(
         misfire_grace_time=settings.scheduler_misfire_grace_time,
     )
     scheduler.add_job(
-        _vacuum_db,
+        _tick_vacuum,
         "cron",
         day_of_week="sun",
         hour=3,
-        args=[db_path],
+        args=[db_path, app],
         id="vacuum_db",
         name="Weekly database VACUUM",
         coalesce=True,
         max_instances=1,
+        misfire_grace_time=_MAINTENANCE_MISFIRE_GRACE_SECONDS,
     )
     scheduler.add_job(
-        _cleanup_old_articles,
+        _tick_cleanup,
         "cron",
         hour=4,
-        args=[settings, db_path],
+        args=[settings, db_path, app],
         id="cleanup_old_articles",
         name="Daily article cleanup",
         coalesce=True,
         max_instances=1,
+        misfire_grace_time=_MAINTENANCE_MISFIRE_GRACE_SECONDS,
     )
     scheduler.start()
     _scheduler = scheduler
@@ -187,7 +253,15 @@ def start_scheduler(
 
 
 def stop_scheduler() -> None:
-    """Stop the background scheduler, waiting for running jobs to finish."""
+    """Stop the background scheduler; in-flight coroutine jobs are CANCELLED, not drained.
+
+    AsyncIOScheduler's executor cancels any running coroutine job mid-await on shutdown
+    (``wait=True`` waits for the executor's threadpool, not for cancelled coroutines to
+    finish naturally). A topic mid-initialization has already committed status=RESEARCHING
+    before its first long await, so cancellation can leave it stuck in RESEARCHING. The
+    stuck-RESEARCHING recovery — at startup (main.py) and via the periodic recover job — is
+    the safety net for that, not a graceful drain here.
+    """
     global _scheduler
     if _scheduler and _scheduler.running:
         _scheduler.shutdown(wait=True)
