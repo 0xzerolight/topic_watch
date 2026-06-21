@@ -1058,3 +1058,34 @@ class TestGetDashboardStats:
         assert stats.checks_total == 2
         assert stats.new_info_total == 1
         assert stats.last_notification_at is not None
+
+    def test_24h_window_excludes_25h_old_check(self, db_conn: sqlite3.Connection) -> None:
+        """OVH-021: a 25h-old check must be excluded from the 24h window.
+
+        ``checked_at`` is stored as timezone-aware ISO (``T``/``+00:00``); a raw
+        string compare against SQLite's space-separated ``datetime('now', ...)``
+        over-counts rows beyond the intended window. Wrapping the column in
+        ``datetime()`` makes the boundary correct.
+        """
+        from app.crud import get_dashboard_stats
+
+        t1 = create_topic(db_conn, Topic(name="T", description="d", status=TopicStatus.READY))
+        now = datetime.now(UTC)
+
+        # Inside the window: 1h old, with new info.
+        create_check_result(
+            db_conn,
+            CheckResult(topic_id=t1.id, checked_at=now - timedelta(hours=1), has_new_info=True),
+        )
+        # Outside the window: 25h old, with new info — must NOT be counted.
+        create_check_result(
+            db_conn,
+            CheckResult(topic_id=t1.id, checked_at=now - timedelta(hours=25), has_new_info=True),
+        )
+        db_conn.commit()
+
+        stats = get_dashboard_stats(db_conn)
+        assert stats.checks_total == 2
+        assert stats.new_info_total == 2
+        assert stats.checks_24h == 1
+        assert stats.new_info_24h == 1

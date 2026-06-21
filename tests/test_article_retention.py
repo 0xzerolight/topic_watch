@@ -137,6 +137,29 @@ class TestDeleteOldArticles:
         assert len(remaining) == 1
         assert remaining[0].content_hash == "hash_boundary_new"
 
+    def test_boundary_offset_iso_timestamps(self, db_conn: sqlite3.Connection) -> None:
+        """OVH-022: timezone-aware ISO timestamps must compare via datetime().
+
+        A 90d+2h-old row (just past a 90-day cutoff) is deleted, while an
+        89-day-old row is kept. Without wrapping the stored column in
+        ``datetime()`` the ``T``/``+00:00`` ISO format string-compares wrong
+        against SQLite's space-separated ``datetime('now', ...)`` output,
+        leaving the old row over-retained by up to a day.
+        """
+        topic = self._make_topic(db_conn)
+        now = datetime.now(UTC)
+
+        _insert_article(db_conn, topic.id, "past_cutoff", now - timedelta(days=90, hours=2))
+        _insert_article(db_conn, topic.id, "within_window", now - timedelta(days=89))
+
+        deleted = delete_old_articles(db_conn, retention_days=90)
+        db_conn.commit()
+
+        assert deleted == 1
+        remaining = list_articles_for_topic(db_conn, topic.id)
+        assert len(remaining) == 1
+        assert remaining[0].content_hash == "hash_within_window"
+
     def test_short_retention_period(self, db_conn: sqlite3.Connection) -> None:
         """A retention period of 1 day removes articles older than 1 day."""
         topic = self._make_topic(db_conn)

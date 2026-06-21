@@ -408,7 +408,7 @@ def mark_articles_processed(conn: sqlite3.Connection, article_ids: list[int]) ->
 def delete_old_articles(conn: sqlite3.Connection, retention_days: int) -> int:
     """Delete articles older than retention_days. Returns count of deleted rows."""
     cursor = conn.execute(
-        "DELETE FROM articles WHERE fetched_at < datetime('now', ? || ' days')",
+        "DELETE FROM articles WHERE datetime(fetched_at) < datetime('now', ? || ' days')",
         (f"-{retention_days}",),
     )
     return cursor.rowcount
@@ -793,9 +793,11 @@ def get_dashboard_stats(conn: sqlite3.Connection) -> DashboardStats:
         SELECT
             (SELECT COUNT(*) FROM topics) AS total_topics,
             (SELECT COUNT(*) FROM topics WHERE is_active = 1) AS active_topics,
-            (SELECT COUNT(*) FROM check_results WHERE checked_at >= datetime('now', '-1 day')) AS checks_24h,
+            (SELECT COUNT(*) FROM check_results
+             WHERE datetime(checked_at) >= datetime('now', '-1 day')) AS checks_24h,
             (SELECT COUNT(*) FROM check_results) AS checks_total,
-            (SELECT COUNT(*) FROM check_results WHERE has_new_info = 1 AND checked_at >= datetime('now', '-1 day')) AS new_info_24h,
+            (SELECT COUNT(*) FROM check_results
+             WHERE has_new_info = 1 AND datetime(checked_at) >= datetime('now', '-1 day')) AS new_info_24h,
             (SELECT COUNT(*) FROM check_results WHERE has_new_info = 1) AS new_info_total,
             (SELECT MAX(checked_at) FROM check_results WHERE notification_sent = 1) AS last_notification_at
         """
