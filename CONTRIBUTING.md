@@ -68,6 +68,20 @@ Run with coverage:
 pytest --cov=app --cov-report=term-missing
 ```
 
+Run the hermetic end-to-end smoke tests:
+
+```bash
+make smoke
+```
+
+`make smoke` runs `tests/smoke`, which drives the real check pipeline (scraping,
+dedup, content extraction, knowledge persistence, novelty thresholding,
+notification queueing) with only the outermost boundaries stubbed — HTTP, LLM,
+and delivery. It is the integration mitigation for the "no live API calls"
+policy: because the unit suite mocks heavily, the smoke layer exercises the code
+paths between those mocks end to end. Run it before opening a PR that touches the
+pipeline.
+
 **Rules for tests:**
 
 - New features and bug fixes should include tests.
