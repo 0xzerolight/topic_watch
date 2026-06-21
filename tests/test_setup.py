@@ -78,6 +78,29 @@ class TestSetupRedirect:
         response = unconfigured_app.get("/setup")
         assert response.status_code == 200
 
+    def test_setupx_is_redirected(self, unconfigured_app: TestClient) -> None:
+        """OVH-144: a path that merely starts with /setup (no segment boundary) is NOT exempt."""
+        response = unconfigured_app.get("/setupx", follow_redirects=False)
+        assert response.status_code == 307
+        assert response.headers["location"] == "/setup"
+
+    def test_healthz_is_redirected(self, unconfigured_app: TestClient) -> None:
+        """OVH-144: /healthz is not the /health segment and must not be exempt."""
+        response = unconfigured_app.get("/healthz", follow_redirects=False)
+        assert response.status_code == 307
+        assert response.headers["location"] == "/setup"
+
+    def test_static_leak_is_redirected(self, unconfigured_app: TestClient) -> None:
+        """OVH-144: /static-leak is not the /static segment and must not be exempt."""
+        response = unconfigured_app.get("/static-leak", follow_redirects=False)
+        assert response.status_code == 307
+        assert response.headers["location"] == "/setup"
+
+    def test_setup_subpath_not_redirected(self, unconfigured_app: TestClient) -> None:
+        """OVH-144: a true /setup/* subpath stays exempt (prefix + boundary)."""
+        response = unconfigured_app.get("/setup/anything", follow_redirects=False)
+        assert response.status_code != 307
+
 
 class TestSetupWizard:
     """Test the setup wizard GET and POST routes."""
