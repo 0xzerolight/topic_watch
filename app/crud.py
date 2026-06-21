@@ -836,6 +836,12 @@ def get_all_feed_urls(conn: sqlite3.Connection) -> set[str]:
     return {row[0] for row in rows}
 
 
+def get_all_topic_names(conn: sqlite3.Connection) -> set[str]:
+    """Get all topic names for OPML name-collision dedup."""
+    rows = conn.execute("SELECT name FROM topics").fetchall()
+    return {row[0] for row in rows}
+
+
 # --- Dashboard Stats ---
 
 

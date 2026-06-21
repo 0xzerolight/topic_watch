@@ -66,7 +66,7 @@ async def import_opml_handler(
 
     from fastapi import UploadFile
 
-    from app.crud import create_topic, get_all_feed_urls
+    from app.crud import create_topic, get_all_feed_urls, get_all_topic_names
     from app.opml import parse_opml
 
     form = await request.form()
@@ -85,24 +85,19 @@ async def import_opml_handler(
         return RedirectResponse(url="/?error=Invalid+file+encoding+(must+be+UTF-8)", status_code=303)
 
     existing_urls = get_all_feed_urls(conn)
+    existing_names = get_all_topic_names(conn)
 
-    # Run OPML parsing (includes SSRF validation with DNS lookups) in a thread
-    result = await asyncio.to_thread(parse_opml, content, existing_urls)
+    # Run OPML parsing (includes SSRF validation with DNS lookups) in a thread.
+    # All dedup (URL + name collision) is resolved inside parse_opml.
+    result = await asyncio.to_thread(parse_opml, content, existing_urls, existing_names)
 
     if result.warnings and not result.topics:
         warning_msg = result.warnings[0][:200]
         return RedirectResponse(url=f"/?error={warning_msg}", status_code=303)
 
-    # Create topics with NEW status
+    # Create topics with NEW status (collisions already filtered by parse_opml).
     created = 0
-    skipped_name_dupes = 0
     for topic_data in result.topics:
-        # Check for name collision
-        existing = conn.execute("SELECT 1 FROM topics WHERE name = ?", (topic_data["name"],)).fetchone()
-        if existing:
-            skipped_name_dupes += 1
-            continue
-
         default_interval = settings.check_interval_minutes
         topic = Topic(
             name=topic_data["name"],
@@ -120,7 +115,7 @@ async def import_opml_handler(
 
     # Build summary message
     parts = [f"Imported {created} topic(s)"]
-    total_skipped = result.skipped_dupes + skipped_name_dupes
+    total_skipped = result.skipped_dupes + result.skipped_name_dupes
     if total_skipped:
         parts.append(f"skipped {total_skipped} duplicate(s)")
     if result.skipped_invalid:
