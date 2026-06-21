@@ -267,6 +267,35 @@ class TestFetchFeed:
             entries = await fetch_feed("https://example.com/feed", client)
         assert entries == []
 
+    async def test_malformed_xml_is_detected_as_bozo_failure(self) -> None:
+        """OVH-165: empty result alone is ambiguous — pin that a malformed feed is
+        detected via feedparser's bozo flag (not just coincidentally zero entries).
+
+        ``fetch_feed`` collapses to ``[]`` for both a healthy-empty feed and a
+        malformed one. Reaching through ``fetch_feed_with_status`` asserts the
+        malformed body is a *soft failure* (``fetch_ok=False`` + a health-failure
+        callback carrying the bozo exception), so a persistently malformed feed is
+        no longer silently counted as a healthy empty fetch.
+        """
+        from unittest.mock import MagicMock
+
+        from app.scraping.rss import fetch_feed_with_status
+
+        callback = MagicMock()
+        transport = _mock_transport({"example.com": (200, "not xml at all {{{")})
+        async with httpx.AsyncClient(transport=transport) as client:
+            entries, fetch_ok = await fetch_feed_with_status(
+                "https://example.com/feed", client, health_callback=callback
+            )
+
+        assert entries == []
+        assert fetch_ok is False
+        callback.assert_called_once()
+        url_arg, ok_arg, reason_arg = callback.call_args[0]
+        assert url_arg == "https://example.com/feed"
+        assert ok_arg is False
+        assert reason_arg is not None  # carries the bozo exception text
+
     async def test_one_malformed_entry_keeps_other_entries(self, caplog: pytest.LogCaptureFixture) -> None:
         """OVH-024: a single bad entry must not discard the whole feed."""
         from app.scraping import rss
