@@ -33,7 +33,7 @@ from app.analysis.llm import NoveltyResult
 from app.checker import check_topic, initialize_new_topic
 from app.config import LLMSettings, Settings
 from app.crud import create_topic, get_knowledge_state, list_articles_for_topic, list_check_results
-from app.models import CheckResult, FeedMode, Topic, TopicStatus
+from app.models import CheckResult, FeedMode, NotificationDelivery, Topic, TopicStatus
 from tests.helpers import RssEntry, build_rss_transport, stub_llm_boundary
 
 _FEED_URL = "https://example.com/feed.xml"
@@ -178,7 +178,10 @@ async def test_initialize_then_check_pipeline(db_conn: sqlite3.Connection) -> No
     with (
         _inject_transport(_build_transport(check_entries)),
         stub_llm_boundary(novelty=novelty),
-        patch("app.checker.send_notification", new=AsyncMock(return_value=True)) as mock_notify,
+        patch(
+            "app.checker.send_notification_per_url",
+            new=AsyncMock(return_value=[NotificationDelivery(url="json://localhost", ok=True)]),
+        ) as mock_notify,
         patch("app.checker.send_webhooks", new=AsyncMock(return_value=0)),
     ):
         result = await check_topic(topic, db_conn, settings)
