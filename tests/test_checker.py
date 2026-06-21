@@ -1273,6 +1273,37 @@ class TestRetryPendingNotifications:
         row = db_conn.execute("SELECT COUNT(*) FROM pending_notifications").fetchone()
         assert row[0] == 0
 
+    async def test_abandoned_notification_warns_with_ids(self, db_conn: sqlite3.Connection, caplog) -> None:  # noqa: ANN001
+        """Pruning an exhausted notification emits a WARNING naming topic/check ids (OVH-040)."""
+        import logging
+
+        topic = _make_topic(db_conn)
+        create_pending_notification(
+            db_conn,
+            PendingNotification(
+                topic_id=topic.id,
+                check_result_id=777,
+                title="Expired",
+                body="B",
+                retry_count=3,
+                max_retries=3,
+            ),
+        )
+        db_conn.commit()
+        settings = _make_settings()
+
+        with (
+            caplog.at_level(logging.WARNING, logger="app.checker"),
+            patch("app.checker.send_notification", new_callable=AsyncMock),
+        ):
+            await retry_pending_notifications(db_conn, settings)
+
+        abandon_logs = [r.getMessage() for r in caplog.records if "Abandoning notification" in r.getMessage()]
+        assert len(abandon_logs) == 1
+        msg = abandon_logs[0]
+        assert f"topic_id={topic.id}" in msg
+        assert "check_result_id=777" in msg
+
     async def test_empty_pending_is_noop(self, db_conn: sqlite3.Connection) -> None:
         """No pending notifications means no send attempts."""
         settings = _make_settings()

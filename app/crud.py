@@ -614,10 +614,17 @@ def release_stale_notification_claims(conn: sqlite3.Connection, cutoff: str) -> 
     return cursor.rowcount
 
 
-def delete_expired_notifications(conn: sqlite3.Connection) -> int:
-    """Delete notifications that have exceeded their max retries."""
-    cursor = conn.execute("DELETE FROM pending_notifications WHERE retry_count >= max_retries")
-    return cursor.rowcount
+def delete_expired_notifications(conn: sqlite3.Connection) -> list[PendingNotification]:
+    """Delete notifications that have exceeded their max retries.
+
+    Returns the rows that were permanently abandoned (selected before the
+    DELETE) so the caller can log exactly what was dropped instead of only a
+    count — a silently-pruned notification is otherwise unobservable (OVH-040).
+    """
+    rows = conn.execute("SELECT * FROM pending_notifications WHERE retry_count >= max_retries").fetchall()
+    abandoned = [PendingNotification.from_row(row) for row in rows]
+    conn.execute("DELETE FROM pending_notifications WHERE retry_count >= max_retries")
+    return abandoned
 
 
 # --- PendingWebhook CRUD ---
@@ -713,10 +720,18 @@ def release_stale_webhook_claims(conn: sqlite3.Connection, cutoff: str) -> int:
     return cursor.rowcount
 
 
-def delete_expired_webhooks(conn: sqlite3.Connection) -> int:
-    """Delete webhooks that have exceeded their max retries."""
-    cursor = conn.execute("DELETE FROM pending_webhooks WHERE retry_count >= max_retries")
-    return cursor.rowcount
+def delete_expired_webhooks(conn: sqlite3.Connection) -> list[PendingWebhook]:
+    """Delete webhooks that have exceeded their max retries.
+
+    Returns the rows that were permanently abandoned (selected before the
+    DELETE) so the caller can log exactly what was dropped — including the
+    topic_id/check_result_id for traceability — instead of only a count
+    (OVH-040). The URL is redacted by the caller before it reaches a log.
+    """
+    rows = conn.execute("SELECT * FROM pending_webhooks WHERE retry_count >= max_retries").fetchall()
+    abandoned = [PendingWebhook.from_row(row) for row in rows]
+    conn.execute("DELETE FROM pending_webhooks WHERE retry_count >= max_retries")
+    return abandoned
 
 
 # --- FeedHealth CRUD ---
