@@ -49,6 +49,44 @@ router = APIRouter()
 _EXPORT_ROW_CAP = 10000
 
 
+def _slug_for_filename(name: str) -> str:
+    """ASCII-only slug for a download filename, never empty/degenerate (OVH-167).
+
+    Lowercases, maps spaces to underscores, drops anything outside ``[a-z0-9_-]``,
+    then collapses/strips underscores. A fully non-ASCII name (e.g. CJK/Cyrillic)
+    would otherwise slug to "" or a bare "_", yielding a degenerate filename like
+    ``checks_5_.csv``; in that case fall back to ``"topic"`` so the Content-
+    Disposition hint stays sensible. This affects only the suggested download
+    filename, not any filesystem path.
+    """
+    slug = re.sub(r"[^a-z0-9_-]", "", name.replace(" ", "_").lower())
+    slug = re.sub(r"_+", "_", slug).strip("_-")
+    return slug or "topic"
+
+
+# Leading characters a spreadsheet (Excel/Sheets/LibreOffice) may interpret as
+# the start of a formula when a CSV cell is opened, enabling CSV/formula
+# injection (CWE-1236, OVH-168).
+_CSV_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(value: object) -> object:
+    """Neutralize a CSV cell against spreadsheet formula injection (OVH-168).
+
+    If the stringified cell begins with a formula-trigger character, prefix it
+    with a single quote so a spreadsheet treats it as literal text instead of a
+    formula. Non-string values (ints/bools/None) are returned unchanged — only a
+    string that actually starts with a trigger is rewritten, so well-formed data
+    is untouched. Under the single-user threat model the realistic vector is a
+    malicious upstream provider error string echoed into ``notification_error``.
+    """
+    if not isinstance(value, str):
+        return value
+    if value and value[0] in _CSV_FORMULA_TRIGGERS:
+        return "'" + value
+    return value
+
+
 @router.get("/topics/new", response_class=HTMLResponse)
 async def topic_add_form(request: Request, settings: Settings = Depends(get_settings)):
     """Render the add topic form."""
@@ -490,11 +528,25 @@ async def bulk_check_handler(
     form = await request.form()
     topic_ids = form.getlist("topic_ids")
     db_path = getattr(request.app.state, "db_path", None)
+    # Dedup so a duplicated checkbox id (crafted form or double-submit) cannot
+    # queue the same topic's check twice in one request (OVH-166). Preserve the
+    # first-seen order; the per-topic guard in _run_single_check would skip a
+    # same-process duplicate anyway, but dropping it here avoids the redundant
+    # sequential background task entirely.
+    queued: set[int] = set()
     for tid in topic_ids:
         try:
-            topic = get_topic(conn, int(str(tid)))
+            topic_id = int(str(tid))
+        except (TypeError, ValueError) as exc:
+            logger.warning("Failed to queue check for topic %s: %s", tid, exc)
+            continue
+        if topic_id in queued:
+            continue
+        try:
+            topic = get_topic(conn, topic_id)
             if topic and topic.id is not None and topic.status == TopicStatus.READY:
                 background_tasks.add_task(background._run_single_check, topic.id, settings, db_path)
+                queued.add(topic_id)
         except Exception as exc:
             logger.warning("Failed to queue check for topic %s: %s", tid, exc)
     return RedirectResponse(url="/", status_code=303)
@@ -535,7 +587,7 @@ async def export_topic_json(
     }
 
     content = json.dumps(data, indent=2, default=str)
-    safe_name = re.sub(r"[^a-z0-9_-]", "", topic.name.replace(" ", "_").lower())
+    safe_name = _slug_for_filename(topic.name)
     filename = f"topic_{topic_id}_{safe_name}.json"
 
     return StreamingResponse(
@@ -573,22 +625,25 @@ async def export_topic_csv(
         ]
     )
     for check in checks:
+        # Neutralize every cell against spreadsheet formula injection (OVH-168);
+        # only the free-text fields can carry attacker-influenced content, but
+        # the guard is a cheap no-op on the numeric/boolean cells.
         writer.writerow(
             [
-                check.id,
-                check.topic_id,
-                check.checked_at.isoformat(),
-                check.articles_found,
-                check.articles_new,
-                check.has_new_info,
-                check.notification_sent,
-                check.notification_error or "",
-                check.stage_error or "",
+                _csv_safe(check.id),
+                _csv_safe(check.topic_id),
+                _csv_safe(check.checked_at.isoformat()),
+                _csv_safe(check.articles_found),
+                _csv_safe(check.articles_new),
+                _csv_safe(check.has_new_info),
+                _csv_safe(check.notification_sent),
+                _csv_safe(check.notification_error or ""),
+                _csv_safe(check.stage_error or ""),
             ]
         )
 
     content = output.getvalue()
-    safe_name = re.sub(r"[^a-z0-9_-]", "", topic.name.replace(" ", "_").lower())
+    safe_name = _slug_for_filename(topic.name)
     filename = f"checks_{topic_id}_{safe_name}.csv"
 
     return StreamingResponse(

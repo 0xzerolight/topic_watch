@@ -227,6 +227,30 @@ class TestBulkCheck:
         )
         assert response.status_code == 303
 
+    async def test_bulk_check_dedups_duplicate_topic_ids(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """OVH-166: a duplicated topic_id queues exactly one background check.
+
+        A crafted form (or a double-submit) can repeat the same checkbox id; the
+        route must not launch a redundant second re-check of the same topic.
+        """
+        topic = _make_topic(db_conn, name="Dup Topic", status=TopicStatus.READY)
+
+        body = f"topic_ids={topic.id}&topic_ids={topic.id}&topic_ids={topic.id}"
+        with patch("app.web.routers.background._run_single_check", new_callable=AsyncMock) as mock_check:
+            response = await client.post(
+                "/topics/bulk-check",
+                content=body.encode(),
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                follow_redirects=False,
+            )
+
+        assert response.status_code == 303
+        # Three identical ids → exactly one queued check.
+        assert mock_check.call_count == 1
+        assert mock_check.call_args[0][0] == topic.id
+
     async def test_bulk_check_requires_csrf(
         self, client_no_csrf: httpx.AsyncClient, db_conn: sqlite3.Connection
     ) -> None:
