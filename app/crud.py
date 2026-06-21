@@ -168,6 +168,10 @@ def recover_stuck_researching(conn: sqlite3.Connection, timeout_minutes: int = 1
     Uses status_changed_at to determine how long a topic has been in
     RESEARCHING status. Topics that entered RESEARCHING more than
     timeout_minutes ago without completing are considered stuck.
+
+    Does not commit; the caller owns the transaction (invariant #12), matching
+    ``recover_stuck_topics``. The scheduler's ``_recover_stuck`` runs this inside
+    a ``get_db`` block, which commits on success (OVH-087).
     """
     cursor = conn.execute(
         """UPDATE topics SET status = ?, error_message = ?
@@ -183,7 +187,6 @@ def recover_stuck_researching(conn: sqlite3.Connection, timeout_minutes: int = 1
     )
     count = cursor.rowcount
     if count:
-        conn.commit()
         logger.warning("Recovered %d stuck researching topic(s)", count)
     return count
 
