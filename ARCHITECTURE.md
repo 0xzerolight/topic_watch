@@ -114,7 +114,7 @@ The route handlers were split out of `routes.py` into the `web/routers/` package
 | `config.py` | Pydantic `BaseSettings` with YAML source. Priority: env > YAML > defaults. `load_settings()` / `save_settings_to_yaml()`; cloud/local provider helpers. |
 | `logging_config.py` | Plain text or JSON structured logging. Controlled by `TOPIC_WATCH_LOG_FORMAT` and `TOPIC_WATCH_LOG_LEVEL` env vars. |
 | `check_context.py` | Correlation IDs via `contextvars.ContextVar`. `CheckIdFilter` injects check ID into all log records. |
-| `url_validation.py` | SSRF protection. Blocks private/reserved IPs (localhost, 10.x, 172.16-31.x, 192.168.x, link-local, IPv6 ULA). |
+| `url_validation.py` | SSRF protection. Blocks private/reserved IPs (localhost, 10.x, 172.16-31.x, 192.168.x, link-local, CGNAT 100.64.0.0/10, IPv6 ULA). |
 | `notifications.py` | Apprise wrapper. Formats `NoveltyResult` into title/body. Sync Apprise send wrapped in `asyncio.to_thread()`. |
 | `webhooks.py` | JSON POST to configured webhook endpoints. Concurrent delivery via `asyncio.gather()`. Failed deliveries are queued in `pending_webhooks` and retried via `retry_pending_webhooks()` at the start of each check cycle. |
 | `cli.py` | Argparse CLI: `list`, `check`, `check-all`, `init`. |
@@ -246,7 +246,7 @@ On first run, `config.example.yml` is auto-copied to `data/config.yml`.
 
 **CSRF.** Double-submit cookie on all POST/PUT/DELETE endpoints. HTMX sends the token via `X-CSRF-Token` header. Regular forms use a hidden field. Timing-safe HMAC comparison.
 
-**SSRF protection.** `url_validation.py` blocks requests to private/reserved IP ranges (127.x, 10.x, 172.16-31.x, 192.168.x, 169.254.x, localhost, IPv6 ULA/link-local).
+**SSRF protection.** `url_validation.py` blocks requests to private/reserved IP ranges (127.x, 10.x, 172.16-31.x, 192.168.x, 169.254.x, CGNAT 100.64.0.0/10, localhost, IPv6 ULA/link-local).
 
 **XSS.** Jinja2 auto-escaping enabled. Error messages sanitized via `sanitize_error` template filter. Notification URLs masked in UI.
 
