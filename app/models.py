@@ -54,14 +54,28 @@ def _coerce_required_dt(value: object) -> datetime:
     return parsed
 
 
-def _safe_json(value: object, default: object) -> object:
-    """Parse a JSON TEXT cell, returning ``default`` on malformed/empty input."""
-    if not isinstance(value, str) or not value.strip():
+def _safe_json(value: object, default: object, field: str) -> object:
+    """Parse a JSON TEXT cell, returning ``default`` on malformed/empty input.
+
+    Corruption is logged (mirroring ``_coerce_required_dt``) so a column that
+    silently coerces to its empty default — e.g. ``feed_urls`` becoming ``[]``
+    and quietly halting a topic's monitoring — leaves a diagnosable trace.
+    Empty/NULL cells are treated as a benign default and are not logged.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return default
+    if not isinstance(value, str):
+        logger.warning("Non-string JSON cell for %s (%r); using default", field, type(value).__name__)
         return default
     try:
-        return json.loads(value)
+        parsed = json.loads(value)
     except (ValueError, TypeError):
+        logger.warning("Corrupt JSON in %s cell (%r); using default", field, value)
         return default
+    if type(parsed) is not type(default):
+        logger.warning("Unexpected JSON type %s for %s; using default", type(parsed).__name__, field)
+        return default
+    return parsed
 
 
 class TopicStatus(StrEnum):
@@ -103,9 +117,9 @@ class Topic(BaseModel):
     def from_row(cls, row: sqlite3.Row) -> Self:
         """Construct a Topic from a database row."""
         data = dict(row)
-        data["feed_urls"] = _safe_json(data.get("feed_urls"), [])
+        data["feed_urls"] = _safe_json(data.get("feed_urls"), [], "feed_urls")
         data["is_active"] = bool(data["is_active"])
-        data["tags"] = _safe_json(data.get("tags"), [])
+        data["tags"] = _safe_json(data.get("tags"), [], "tags")
         data["created_at"] = _coerce_required_dt(data.get("created_at"))
         data["status_changed_at"] = _coerce_dt(data.get("status_changed_at"))
         # Backwards compatibility: if check_interval_minutes is absent but
@@ -331,7 +345,7 @@ class PendingWebhook(BaseModel):
     def from_row(cls, row: sqlite3.Row) -> Self:
         """Construct a PendingWebhook from a database row."""
         data = dict(row)
-        data["payload"] = _safe_json(data.get("payload"), {})
+        data["payload"] = _safe_json(data.get("payload"), {}, "payload")
         data["created_at"] = _coerce_required_dt(data.get("created_at"))
         return cls(**data)
 

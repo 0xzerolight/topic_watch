@@ -3,7 +3,13 @@
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
-from app.crud import create_article, create_topic, delete_old_articles, list_articles_for_topic
+from app.crud import (
+    _DELETE_OLD_ARTICLES_SQL,
+    create_article,
+    create_topic,
+    delete_old_articles,
+    list_articles_for_topic,
+)
 from app.models import Article, Topic
 
 
@@ -136,6 +142,49 @@ class TestDeleteOldArticles:
         remaining = list_articles_for_topic(db_conn, topic.id)
         assert len(remaining) == 1
         assert remaining[0].content_hash == "hash_boundary_new"
+
+    def test_boundary_offset_iso_timestamps(self, db_conn: sqlite3.Connection) -> None:
+        """OVH-022/050: tz-aware ISO timestamps compare correctly at sub-day grain.
+
+        A 90d+2h-old row (just past a 90-day cutoff) is deleted, while an
+        89-day-old row is kept. Both the stored column and the cutoff bound are
+        fixed-width tz-aware ``isoformat()`` strings (``T``/``+00:00``), so the
+        bare-column ``fetched_at < ?`` comparison is lexicographically exact —
+        no ``datetime()`` wrapper needed (and none allowed, since it would
+        defeat ``idx_articles_fetched_at``; see ``test_query_uses_fetched_at_index``).
+        """
+        topic = self._make_topic(db_conn)
+        now = datetime.now(UTC)
+
+        _insert_article(db_conn, topic.id, "past_cutoff", now - timedelta(days=90, hours=2))
+        _insert_article(db_conn, topic.id, "within_window", now - timedelta(days=89))
+
+        deleted = delete_old_articles(db_conn, retention_days=90)
+        db_conn.commit()
+
+        assert deleted == 1
+        remaining = list_articles_for_topic(db_conn, topic.id)
+        assert len(remaining) == 1
+        assert remaining[0].content_hash == "hash_within_window"
+
+    def test_query_uses_fetched_at_index(self, db_conn: sqlite3.Connection) -> None:
+        """The retention DELETE must use idx_articles_fetched_at (SEARCH, not SCAN).
+
+        Regression guard for OVH-022/050: wrapping the column in ``datetime()``
+        defeats ``idx_articles_fetched_at`` (added by m014 for exactly this
+        sweep) and degrades the query to a full table SCAN. The bound must stay
+        a bare-column comparison against a precomputed parameter.
+        """
+        topic = self._make_topic(db_conn)
+        _insert_article(db_conn, topic.id, "row", datetime.now(UTC) - timedelta(days=100))
+
+        cutoff = (datetime.now(UTC) - timedelta(days=90)).isoformat()
+        plan = db_conn.execute(f"EXPLAIN QUERY PLAN {_DELETE_OLD_ARTICLES_SQL}", (cutoff,)).fetchall()
+        details = " ".join(row["detail"] for row in plan)
+
+        assert "idx_articles_fetched_at" in details, details
+        assert "SEARCH" in details, details
+        assert "SCAN articles" not in details, details
 
     def test_short_retention_period(self, db_conn: sqlite3.Connection) -> None:
         """A retention period of 1 day removes articles older than 1 day."""
