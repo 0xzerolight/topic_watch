@@ -4,9 +4,18 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
-    # Batch all Python bumps into one weekly PR instead of one per package.
     groups:
+      # Security (CVE) patches land as their own PR so their urgency is not
+      # masked by routine churn (OVH-062). applies-to limits this group to
+      # Dependabot security updates.
+      security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+      # Routine version bumps are batched into one weekly PR, separate from the
+      # security group above.
       python:
+        applies-to: version-updates
         patterns:
           - "*"
     ignore:
@@ -21,5 +30,15 @@ updates:
     # Batch all GitHub Actions bumps into one weekly PR.
     groups:
       github-actions:
+        patterns:
+          - "*"
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+    # Bump the digest-pinned base image (Dockerfile) on a schedule so the OS /
+    # Python base stays current, matching the pin-everything posture (OVH-061).
+    groups:
+      docker:
         patterns:
           - "*"
