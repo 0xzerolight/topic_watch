@@ -13,14 +13,14 @@ Self-hosted news monitoring with LLM-powered novelty detection. Watches topics v
 
 ## How It Works
 
-1. Define topics with RSS feed URLs, or let it auto-generate a Google News feed
+1. Define topics with RSS feed URLs, or let it auto-generate a news-search feed (Bing News first, Google News as fallback)
 2. On a schedule, articles are fetched and compared against a **knowledge state** (a rolling summary of what's already known)
 3. An LLM decides if anything is actually new
 4. New info: notification with summary + sources. Nothing new: silence.
 
 ## Features
 
-- Auto feeds (Google News) or manual RSS/Atom URLs
+- Auto feeds (Bing News, falling back to Google News) or manual RSS/Atom URLs
 - Per-topic check intervals (10 min to 6 months, human-readable: `6h`, `1w 3d`, `2h 30m`)
 - Topic tags
 - 100+ notification services via [Apprise](https://github.com/caronc/apprise/wiki) (Discord, Slack, Telegram, email, ntfy, etc.)
@@ -463,7 +463,7 @@ See [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
 **No API key?** Use Ollama or any local LLM. Set `llm.base_url` and put any string for `llm.api_key`.
 
-**No RSS feeds?** Pick "Automatic" when adding a topic. Uses Google News RSS.
+**No RSS feeds?** Pick "Automatic" when adding a topic. Builds a news-search RSS feed, using Bing News first and falling back to Google News if Bing is unhealthy.
 
 ## Contributing
 
