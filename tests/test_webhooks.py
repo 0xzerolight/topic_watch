@@ -396,9 +396,9 @@ class TestWebhookRetryQueue:
         assert count == 0
         pending = list_pending_webhooks(db_conn)
         assert len(pending) == 1
-        assert pending[0]["url"] == "https://a.com/hook"
-        assert pending[0]["topic_id"] == topic.id
-        assert pending[0]["payload"]["topic"] == "Hooked"
+        assert pending[0].url == "https://a.com/hook"
+        assert pending[0].topic_id == topic.id
+        assert pending[0].payload["topic"] == "Hooked"
 
     async def test_successful_webhook_not_enqueued(self, db_conn: sqlite3.Connection) -> None:
         topic = _make_topic(db_conn)
@@ -542,7 +542,7 @@ class TestWebhookRetryCrashSafety:
             await send_webhooks("Hooked", novelty, settings, conn=db_conn, topic_id=topic.id)
         pending = list_pending_webhooks(db_conn)
         assert len(pending) == 2
-        first_id = pending[0]["id"]
+        first_id = pending[0].id
 
         # Retry: both sends "succeed", but applying the SECOND result crashes.
         from app.crud import delete_pending_webhook as real_delete_pending_webhook
