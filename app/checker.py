@@ -124,12 +124,15 @@ async def _check_topic_guarded(
         raise ValueError("Topic must have an ID")
 
     cid = generate_check_id()
-    check_id_var.set(cid)
+    # Token idiom (OVH-103): restore whatever id the caller had set, rather than
+    # clobbering it to None. A future outer flow that sets its own check_id and
+    # then calls check_topic keeps that id intact after this nested run returns.
+    token = check_id_var.set(cid)
 
     try:
         return await _check_topic_inner(topic, conn, settings, cid)
     finally:
-        check_id_var.set(None)
+        check_id_var.reset(token)
 
 
 async def _check_topic_inner(
@@ -408,8 +411,16 @@ async def retry_pending_notifications(
         logger.debug("Notification retry already in progress; skipping overlapping drain")
         return
 
+    # OVH-102: run the drain under a generated correlation id so a single drain's
+    # snapshot/claim/send/apply log lines are traceable across interleaved ticks
+    # (otherwise they all logged '-'). Token idiom (OVH-103): restore the caller's
+    # prior id afterwards rather than clobbering it to None.
     async with _notification_retry_lock:
-        await _drain_pending_notifications(conn, settings, db_path)
+        token = check_id_var.set(generate_check_id())
+        try:
+            await _drain_pending_notifications(conn, settings, db_path)
+        finally:
+            check_id_var.reset(token)
 
 
 async def _drain_pending_notifications(
@@ -612,6 +623,13 @@ async def initialize_new_topic(
         raise ValueError("Topic must have an ID")
     topic_id: int = topic.id
 
+    # OVH-102: run the whole multi-round init under a generated correlation id so a
+    # single topic's NEW->RESEARCHING->READY/ERROR flow is traceable across
+    # interleaved scheduler ticks (otherwise every init log line was '-'). Token
+    # idiom (OVH-103): restore the caller's prior id afterwards rather than clobber.
+    cid = generate_check_id()
+    token = check_id_var.set(cid)
+
     # Status transitions here use ``update_topic_init_status`` (a targeted UPDATE of
     # only status/error/init_attempts) rather than ``update_topic`` so a concurrent
     # UI edit to this topic's feeds/thresholds during the long fetch/LLM await is
@@ -636,7 +654,7 @@ async def initialize_new_topic(
     # Immediately mark as RESEARCHING (concurrency guard: UI shows spinner, prevents re-trigger).
     _set_init_status(TopicStatus.RESEARCHING, error_message=None, init_attempts=topic.init_attempts)
 
-    logger.info("Initializing knowledge for topic '%s' (id=%d)", topic.name, topic_id)
+    logger.info("Initializing knowledge for topic '%s' (id=%d) [check_id=%s]", topic.name, topic_id, cid)
 
     try:
         fetch_result = await fetch_new_articles_for_topic(
@@ -707,3 +725,6 @@ async def initialize_new_topic(
     except Exception as exc:
         logger.error("Knowledge init failed for topic '%s'", topic.name, exc_info=True)
         _set_init_status(TopicStatus.ERROR, error_message=str(exc), init_attempts=topic.init_attempts)
+    finally:
+        # Restore the caller's prior correlation id (OVH-103 token idiom).
+        check_id_var.reset(token)
