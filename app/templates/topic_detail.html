@@ -37,7 +37,7 @@
         {% else %}
             <span class="status-unknown" title="No health data">&#9679; Unknown</span>
         {% endif %}
-        <a href="{{ url }}" target="_blank">{{ url|truncate(80) }}</a>
+        <a href="{{ url|safe_href }}" target="_blank">{{ url|truncate(80) }}</a>
     </li>
     {% endfor %}
 </ul>
@@ -60,7 +60,7 @@
         {% else %}
             <span class="status-unknown" title="No health data">&#9679; Unknown</span>
         {% endif %}
-        <a href="{{ url }}" target="_blank">{{ url }}</a>
+        <a href="{{ url|safe_href }}" target="_blank">{{ url }}</a>
     </li>
     {% endfor %}
 </ul>
@@ -93,7 +93,7 @@
         <tbody>
             {% for article in articles %}
             <tr>
-                <td><a href="{{ article.url }}" target="_blank">{{ article.title }}</a></td>
+                <td><a href="{{ article.url|safe_href }}" target="_blank">{{ article.title }}</a></td>
                 <td><small>{{ article.source_feed|feed_source_name }}</small></td>
                 <td>{{ article.fetched_at.strftime("%Y-%m-%d %H:%M") }}</td>
             </tr>
