@@ -91,6 +91,69 @@ class TestTopicFromRow:
         assert topic.status_changed_at is None
 
 
+class TestTopicThresholdValidation:
+    """OVH-107: per-topic thresholds must stay within [0.0, 1.0].
+
+    A value >1.0 reaching a topic row (manual DB edit, restore, or a future write
+    path that skips ``parse_threshold``) would make ``novelty.confidence <
+    confidence_threshold`` always true, silently suppressing ALL notifications for
+    that topic. The model clamps out-of-range values to the valid range (and
+    warns) rather than either raising — which would 500 a route loading a corrupt
+    row, violating the defensive-load contract — or letting the bad value through.
+    """
+
+    def _base_row(self) -> dict:
+        return {
+            "id": 1,
+            "name": "Topic",
+            "description": "desc",
+            "feed_urls": '["https://example.com/feed.xml"]',
+            "feed_mode": "auto",
+            "created_at": "2026-06-13T12:00:00+00:00",
+            "status_changed_at": None,
+            "is_active": 1,
+            "status": "ready",
+            "error_message": None,
+            "check_interval_minutes": 60,
+            "tags": "[]",
+            "confidence_threshold": None,
+            "relevance_threshold": None,
+        }
+
+    def test_in_range_values_pass_through(self) -> None:
+        topic = Topic(name="T", description="d", confidence_threshold=0.7, relevance_threshold=0.0)
+        assert topic.confidence_threshold == 0.7
+        assert topic.relevance_threshold == 0.0
+        boundary = Topic(name="T", description="d", confidence_threshold=1.0, relevance_threshold=1.0)
+        assert boundary.confidence_threshold == 1.0
+        assert boundary.relevance_threshold == 1.0
+
+    def test_none_thresholds_pass_through(self) -> None:
+        topic = Topic(name="T", description="d")
+        assert topic.confidence_threshold is None
+        assert topic.relevance_threshold is None
+
+    def test_above_one_is_clamped_to_one(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING, logger="app.models"):
+            topic = Topic(name="T", description="d", confidence_threshold=1.5)
+        assert topic.confidence_threshold == 1.0
+        assert any("confidence_threshold" in r.message for r in caplog.records)
+
+    def test_below_zero_is_clamped_to_zero(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING, logger="app.models"):
+            topic = Topic(name="T", description="d", relevance_threshold=-0.5)
+        assert topic.relevance_threshold == 0.0
+        assert any("relevance_threshold" in r.message for r in caplog.records)
+
+    def test_from_row_clamps_out_of_range_db_value(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A corrupt >1.0 value in the DB must not survive to suppress all alerts."""
+        row = self._base_row()
+        row["confidence_threshold"] = 9.0
+        with caplog.at_level(logging.WARNING, logger="app.models"):
+            topic = Topic.from_row(row)
+        assert topic.confidence_threshold == 1.0
+
+
 class TestArticleFromRow:
     """Article.from_row defensive handling of fetched_at."""
 
@@ -250,6 +313,36 @@ class TestPendingWebhookFromRow:
         row["payload"] = "{not valid json"
         hook = PendingWebhook.from_row(row)
         assert hook.payload == {}
+
+    def test_valid_json_array_payload_becomes_empty_dict(self) -> None:
+        """OVH-110: valid JSON of the wrong type (array) must not raise."""
+        row = self._base_row()
+        row["payload"] = "[1, 2, 3]"
+        hook = PendingWebhook.from_row(row)
+        assert hook.payload == {}
+
+    def test_valid_json_scalar_payload_becomes_empty_dict(self) -> None:
+        """OVH-110: valid JSON of the wrong type (scalar) must not raise."""
+        row = self._base_row()
+        row["payload"] = "5"
+        hook = PendingWebhook.from_row(row)
+        assert hook.payload == {}
+
+    def test_valid_json_string_payload_becomes_empty_dict(self) -> None:
+        """OVH-110: valid JSON of the wrong type (string) must not raise."""
+        row = self._base_row()
+        row["payload"] = '"just a string"'
+        hook = PendingWebhook.from_row(row)
+        assert hook.payload == {}
+
+    def test_wrong_type_payload_logs_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        """OVH-110: a type-mismatched (but valid JSON) payload warns naming the field."""
+        row = self._base_row()
+        row["payload"] = "[1, 2]"
+        with caplog.at_level(logging.WARNING, logger="app.models"):
+            hook = PendingWebhook.from_row(row)
+        assert hook.payload == {}
+        assert any("payload" in r.message for r in caplog.records)
 
     def test_empty_created_at_does_not_raise(self) -> None:
         row = self._base_row()
