@@ -18,7 +18,12 @@ from tests.helpers.rss_fixtures import (
     build_rss_transport,
     build_rss_xml,
 )
-from tests.helpers.stub_llm import stub_llm_boundary
+from tests.helpers.stub_llm import (
+    make_compressed_knowledge,
+    make_knowledge_update,
+    make_novelty_result,
+    stub_llm_boundary,
+)
 
 __all__ = [
     "RssEntry",
@@ -26,5 +31,8 @@ __all__ = [
     "build_redirect_transport",
     "build_rss_transport",
     "build_rss_xml",
+    "make_compressed_knowledge",
+    "make_knowledge_update",
+    "make_novelty_result",
     "stub_llm_boundary",
 ]
