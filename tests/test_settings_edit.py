@@ -95,6 +95,38 @@ async def client(
 # ---------------------------------------------------------------------------
 
 
+class TestValidationHelpers:
+    """OVH-153: the _validation seam shared by setup and settings handlers."""
+
+    def test_strip_base_url_blank_is_none(self) -> None:
+        from app.web.routers._validation import strip_base_url
+
+        assert strip_base_url("   ", "ollama/llama3") is None
+
+    def test_strip_base_url_kept_for_local_provider(self) -> None:
+        from app.web.routers._validation import strip_base_url
+
+        assert strip_base_url("http://localhost:11434", "ollama/llama3") == "http://localhost:11434"
+
+    def test_strip_base_url_dropped_for_cloud_provider(self) -> None:
+        from app.web.routers._validation import strip_base_url
+
+        # A stale base URL for a cloud provider is dropped (OVH-104/OVH-153).
+        assert strip_base_url("http://stale", "openai/gpt-4o-mini") is None
+
+    def test_format_validation_errors_renders_field_path(self) -> None:
+        from pydantic import ValidationError
+
+        from app.web.routers._validation import format_validation_errors
+
+        with pytest.raises(ValidationError) as excinfo:
+            _make_settings(max_articles_per_check=0)  # ge=1 constraint trips
+        messages = format_validation_errors(excinfo.value)
+        assert messages
+        assert all(": " in m for m in messages)
+        assert any("max_articles_per_check" in m for m in messages)
+
+
 class TestSaveSettingsToYaml:
     """Direct unit tests for the save_settings_to_yaml function."""
 
