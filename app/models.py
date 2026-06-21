@@ -273,6 +273,7 @@ class PendingNotification(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     retry_count: int = 0
     max_retries: int = 3
+    claimed_at: str | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Self:
@@ -283,7 +284,7 @@ class PendingNotification(BaseModel):
 
     def to_insert_dict(self) -> dict:
         """Return a dict for SQL INSERT (excludes auto-generated id)."""
-        d = self.model_dump(exclude={"id"})
+        d = self.model_dump(exclude={"id", "claimed_at"})
         d["created_at"] = d["created_at"].isoformat()
         return d
 
@@ -303,6 +304,7 @@ class PendingWebhook(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     retry_count: int = 0
     max_retries: int = 3
+    claimed_at: str | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Self:
@@ -314,7 +316,7 @@ class PendingWebhook(BaseModel):
 
     def to_insert_dict(self) -> dict:
         """Return a dict for SQL INSERT (excludes auto-generated id)."""
-        d = self.model_dump(exclude={"id"})
+        d = self.model_dump(exclude={"id", "claimed_at"})
         d["payload"] = json.dumps(d["payload"])
         d["created_at"] = d["created_at"].isoformat()
         return d

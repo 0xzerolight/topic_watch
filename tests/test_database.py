@@ -608,6 +608,14 @@ class TestMigrations:
         assert loaded_none is not None
         assert loaded_none.stage_error is None
 
+    def test_pending_claimed_at_columns_exist(self, db_conn: sqlite3.Connection) -> None:
+        """Migration m016 adds nullable claimed_at to both retry queues."""
+        for table in ("pending_notifications", "pending_webhooks"):
+            columns = {row[1]: row for row in db_conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            assert "claimed_at" in columns, f"{table} missing claimed_at"
+            # Column is nullable (notnull flag, index 3, is 0).
+            assert columns["claimed_at"][3] == 0
+
     def test_topic_threshold_roundtrip(self, db_conn: sqlite3.Connection) -> None:
         """Per-topic thresholds and init_attempts persist and load back."""
         topic = create_topic(
