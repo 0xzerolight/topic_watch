@@ -6,13 +6,37 @@ come from the application settings (Apprise URL format).
 
 import asyncio
 import logging
+from urllib.parse import urlparse
 
 import apprise
 
 from app.analysis.llm import NoveltyResult
 from app.config import Settings
+from app.models import NotificationDelivery
 
 logger = logging.getLogger(__name__)
+
+
+def redact_url(url: str) -> str:
+    """Mask a notification URL for logging, keeping only scheme://host.
+
+    Notification URLs routinely embed secrets (Telegram bot tokens, Slack
+    tokens, basic-auth credentials, ``?password=`` query params), so the raw
+    string must never reach the logs. Strips userinfo, port, path, and query;
+    keeps just the scheme and host so an operator can still tell which channel
+    is misbehaving. Never raises.
+    """
+    try:
+        parsed = urlparse(url)
+        scheme = parsed.scheme
+        host = parsed.hostname
+        if scheme and host:
+            return f"{scheme}://{host}"
+        if scheme:
+            return f"{scheme}://****"
+        return "****"
+    except Exception:
+        return "****"
 
 
 def format_notification(topic_name: str, novelty_result: NoveltyResult) -> tuple[str, str]:
@@ -53,43 +77,74 @@ def format_notification(topic_name: str, novelty_result: NoveltyResult) -> tuple
     return title, body
 
 
-def _send_notification_sync(title: str, body: str, settings: Settings) -> bool:
-    """Send a notification synchronously (blocks on I/O).
+def _deliver_one(title: str, body: str, url: str) -> NotificationDelivery:
+    """Deliver to a single notification URL with its own Apprise instance.
 
-    Use send_notification() for the async wrapper.
+    One instance per URL means a failure (down channel, invalid URL) is
+    attributable to that URL alone and can be re-queued individually, instead
+    of collapsing the whole batch to one bool (OVH-027/OVH-039). Never raises.
     """
-    urls = settings.notifications.urls
+    ap = apprise.Apprise()
+    if not ap.add(url):
+        # OVH-027: a typo'd/unsupported URL is dropped by Apprise at add() time.
+        # Surface it instead of silently succeeding on the other channels.
+        logger.warning("Skipping invalid notification URL: %s", redact_url(url))
+        return NotificationDelivery(url=url, ok=False, error="invalid notification URL")
+
+    try:
+        ok = bool(ap.notify(title=title, body=body))
+        if ok:
+            logger.info("Notification sent to %s: %s", redact_url(url), title)
+            return NotificationDelivery(url=url, ok=True)
+        logger.warning("Notification delivery failed for %s: %s", redact_url(url), title)
+        return NotificationDelivery(url=url, ok=False, error="delivery failed")
+    except Exception as exc:
+        logger.warning("Notification error for %s: %s", redact_url(url), title, exc_info=True)
+        return NotificationDelivery(url=url, ok=False, error=str(exc))
+
+
+def _deliver_per_url_sync(title: str, body: str, urls: list[str]) -> list[NotificationDelivery]:
+    """Deliver to each URL independently (blocks on I/O).
+
+    Use send_notification_per_url() for the async wrapper.
+    """
+    return [_deliver_one(title, body, url) for url in urls]
+
+
+async def send_notification_per_url(
+    title: str,
+    body: str,
+    settings: Settings,
+    *,
+    url: str | None = None,
+) -> list[NotificationDelivery]:
+    """Deliver a notification per-URL, returning one result per target.
+
+    Each URL gets its own Apprise instance and a per-URL outcome, so a partial
+    failure (one channel down) is attributable and re-queueable on its own
+    rather than re-sending the whole batch (OVH-039). Invalid URLs are reported
+    as failed deliveries rather than silently dropped (OVH-027).
+
+    Args:
+        title: Notification title.
+        body: Notification body.
+        settings: Application settings (provides the configured URLs).
+        url: When given, deliver to only this single URL (the retry-drain path,
+            where each pending row carries one already-failed target). When
+            None, deliver to every configured URL.
+
+    Returns:
+        One NotificationDelivery per attempted URL (empty if none configured).
+        Never raises — a timeout yields a single failed delivery per target.
+    """
+    urls = [url] if url is not None else list(settings.notifications.urls)
     if not urls:
         logger.debug("No notification URLs configured, skipping notification")
-        return False
+        return []
 
-    ap = apprise.Apprise()
-    for url in urls:
-        ap.add(url)
-
-    try:
-        result = ap.notify(title=title, body=body)
-        if result:
-            logger.info("Notification sent: %s", title)
-        else:
-            logger.warning("Notification delivery failed for: %s", title)
-        return bool(result)
-    except Exception:
-        logger.warning("Notification error for: %s", title, exc_info=True)
-        return False
-
-
-async def send_notification(title: str, body: str, settings: Settings) -> bool:
-    """Send a notification without blocking the async event loop.
-
-    Wraps the synchronous Apprise call in a thread executor, bounded by
-    apprise_timeout_seconds so a hung send can't exhaust the to_thread
-    executor and stall the scheduler. On timeout, logs a warning and returns
-    failure so the existing retry-queue path can handle it.
-    """
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(_send_notification_sync, title, body, settings),
+            asyncio.to_thread(_deliver_per_url_sync, title, body, urls),
             timeout=settings.apprise_timeout_seconds,
         )
     except TimeoutError:
@@ -98,4 +153,22 @@ async def send_notification(title: str, body: str, settings: Settings) -> bool:
             settings.apprise_timeout_seconds,
             title,
         )
+        return [NotificationDelivery(url=u, ok=False, error="timed out") for u in urls]
+
+
+async def send_notification(title: str, body: str, settings: Settings, *, url: str | None = None) -> bool:
+    """Send a notification without blocking the async event loop.
+
+    Delivers per-URL (see send_notification_per_url) and collapses to a single
+    bool for the boolean callers/tests: True only if every attempted target
+    delivered. A partial failure returns False so the caller can re-queue, but
+    callers needing per-URL granularity (to re-queue only the failed targets)
+    should use send_notification_per_url directly. Never raises.
+
+    Args:
+        url: When given, send to only this single URL (retry-drain per-row path).
+    """
+    results = await send_notification_per_url(title, body, settings, url=url)
+    if not results:
         return False
+    return all(r.ok for r in results)
