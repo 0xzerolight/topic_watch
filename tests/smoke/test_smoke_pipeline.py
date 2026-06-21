@@ -29,7 +29,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from app.analysis.llm import NoveltyResult
+from app.analysis.llm import CompressedKnowledge, KnowledgeStateUpdate, NoveltyResult
 from app.checker import check_topic, initialize_new_topic
 from app.config import LLMSettings, NotificationSettings, Settings
 from app.crud import (
@@ -37,6 +37,7 @@ from app.crud import (
     get_knowledge_state,
     list_articles_for_topic,
     list_check_results,
+    list_pending_notifications,
     list_pending_webhooks,
 )
 from app.models import CheckResult, FeedMode, NotificationDelivery, Topic, TopicStatus
@@ -200,6 +201,16 @@ async def test_initialize_then_check_pipeline(db_conn: sqlite3.Connection) -> No
     assert result.articles_new == 1
     assert result.notification_sent is True
 
+    # OVH-163: token usage propagates from the raw completions into CheckResult.
+    # The stub supplies 12 prompt / 8 completion tokens per call; the novelty
+    # path runs analyze (12/8) then the knowledge update (12/8), so the result
+    # accumulates a deterministic 24 prompt / 16 completion across the two calls.
+    assert result.prompt_tokens == 24
+    assert result.completion_tokens == 16
+    persisted = list_check_results(db_conn, topic.id)[0]
+    assert persisted.prompt_tokens == 24
+    assert persisted.completion_tokens == 16
+
     # The notification path was genuinely exercised (real format_notification ran).
     mock_notify.assert_awaited_once()
 
@@ -324,3 +335,186 @@ async def test_check_topic_queues_webhook_through_held_conn_on_500(db_conn: sqli
     assert queued["url"] == _WEBHOOK_URL
     # check_result_id is populated (created before the send), not NULL (OVH-101).
     assert queued["check_result_id"] == result.id
+
+
+async def _init_ready_topic(db_conn: sqlite3.Connection, settings: Settings) -> Topic:
+    """Initialize a topic to READY through the real pipeline (shared smoke setup)."""
+    topic = _make_topic(db_conn)
+    init_entries = [
+        RssEntry(
+            title="Article One",
+            link=_ARTICLE_1,
+            summary="Summary of article one.",
+            published=datetime(2025, 1, 1, 12, 0, 0, tzinfo=UTC),
+        ),
+    ]
+    with (
+        _inject_transport(_build_transport(init_entries)),
+        stub_llm_boundary(),
+    ):
+        await initialize_new_topic(topic, db_conn, settings)
+    assert topic.status == TopicStatus.READY
+    return topic
+
+
+async def test_below_threshold_suppresses_notification_end_to_end(db_conn: sqlite3.Connection) -> None:
+    """OVH-161: has_new_info=True but below the confidence threshold => no notify,
+    no knowledge update, but the article is still marked processed.
+
+    Drives a real NoveltyResult through the real thresholding gate (not a mocked
+    branch): the integration seam where the per-topic/global threshold flows into
+    ``check_topic``. A wiring bug (threshold not applied, or processed-flag skipped
+    on the suppressed branch) would surface here but stays green in the fully
+    mocked unit tests.
+    """
+    settings = _settings()
+    settings.min_confidence_threshold = 0.9
+    topic = await _init_ready_topic(db_conn, settings)
+
+    knowledge_before = get_knowledge_state(db_conn, topic.id)
+    assert knowledge_before is not None
+
+    check_entries = [
+        RssEntry(
+            title="Article Two",
+            link=_ARTICLE_2,
+            summary="Summary of article two: a marginal development.",
+            published=datetime(2025, 1, 2, 12, 0, 0, tzinfo=UTC),
+        ),
+    ]
+    # New info, but confidence (0.5) is below the 0.9 threshold => suppressed.
+    novelty = NoveltyResult(
+        has_new_info=True,
+        summary="A low-confidence development.",
+        key_facts=["Maybe a release"],
+        source_urls=[_ARTICLE_2],
+        confidence=0.5,
+        relevance=0.9,
+    )
+
+    with (
+        _inject_transport(_build_transport(check_entries)),
+        stub_llm_boundary(novelty=novelty),
+        patch("app.checker.send_notification_per_url", new=AsyncMock()) as mock_notify,
+        patch("app.checker.send_webhooks", new=AsyncMock()) as mock_webhooks,
+    ):
+        result = await check_topic(topic, db_conn, settings)
+
+    # Detected new info, but no delivery was attempted at all.
+    assert result.has_new_info is True
+    assert result.notification_sent is False
+    mock_notify.assert_not_awaited()
+    mock_webhooks.assert_not_awaited()
+
+    # No pending rows were queued (suppression is not a delivery failure).
+    assert list_pending_notifications(db_conn) == []
+    assert list_pending_webhooks(db_conn) == []
+
+    # Knowledge state was NOT updated (the suppressed branch skips update_knowledge).
+    knowledge_after = get_knowledge_state(db_conn, topic.id)
+    assert knowledge_after is not None
+    assert knowledge_after.updated_at == knowledge_before.updated_at
+
+    # The article is STILL marked processed so it is never re-analyzed.
+    articles = list_articles_for_topic(db_conn, topic.id)
+    article_two = next(a for a in articles if a.url == _ARTICLE_2)
+    assert article_two.processed is True
+
+
+async def test_delivery_failure_queues_pending_notification_end_to_end(db_conn: sqlite3.Connection) -> None:
+    """OVH-161: an above-threshold notify whose delivery fails is queued for retry.
+
+    ``send_notification_per_url`` returns a failed ``NotificationDelivery`` (the
+    real Apprise call is the only thing stubbed); the rest of ``check_topic``
+    runs for real. Pins that the failed URL lands in ``pending_notifications``
+    with its scoped url, correlated to the same committed CheckResult.
+    """
+    settings = _settings()
+    topic = await _init_ready_topic(db_conn, settings)
+
+    check_entries = [
+        RssEntry(
+            title="Article Two",
+            link=_ARTICLE_2,
+            summary="Summary of article two: a brand-new development.",
+            published=datetime(2025, 1, 2, 12, 0, 0, tzinfo=UTC),
+        ),
+    ]
+    novelty = NoveltyResult(
+        has_new_info=True,
+        summary="A new development was announced.",
+        key_facts=["New fact: release confirmed"],
+        source_urls=[_ARTICLE_2],
+        confidence=0.95,
+        relevance=0.9,
+    )
+    failed_url = "tgram://token/chatid"
+
+    with (
+        _inject_transport(_build_transport(check_entries)),
+        stub_llm_boundary(novelty=novelty),
+        patch(
+            "app.checker.send_notification_per_url",
+            new=AsyncMock(return_value=[NotificationDelivery(url=failed_url, ok=False, error="boom")]),
+        ),
+        patch("app.checker.send_webhooks", new=AsyncMock(return_value=0)),
+    ):
+        result = await check_topic(topic, db_conn, settings)
+
+    # The check committed a CheckResult flagging the delivery failure.
+    assert result.id is not None
+    assert result.notification_sent is False
+    assert result.notification_error is not None
+
+    # The failed URL was queued for retry, scoped to that URL only.
+    pending = list_pending_notifications(db_conn)
+    assert len(pending) == 1
+    queued = pending[0]
+    assert queued.url == failed_url
+    assert queued.topic_id == topic.id
+
+
+async def test_compression_path_runs_offline_end_to_end(db_conn: sqlite3.Connection) -> None:
+    """OVH-162: a tiny knowledge budget drives the real over-budget compression
+    branch through the full pipeline, served entirely by the stub (no live call).
+
+    Before the stub learned ``CompressedKnowledge`` this scenario AssertionError-ed
+    inside the stub. Here init produces an over-budget summary, the real
+    ``compress_knowledge`` calls ``compress_knowledge_summary`` (served by the
+    stub), and the persisted state fits the budget.
+    """
+    settings = _settings()
+    # Tiny budget so the canned init summary overflows and triggers compression.
+    settings.knowledge_state_max_tokens = 3
+    topic = _make_topic(db_conn)
+
+    init_entries = [
+        RssEntry(
+            title="Article One",
+            link=_ARTICLE_1,
+            summary="Summary of article one.",
+            published=datetime(2025, 1, 1, 12, 0, 0, tzinfo=UTC),
+        ),
+    ]
+    # Verbose init summary (overflows budget=3); compression returns 2 short words.
+    init_update = KnowledgeStateUpdate(
+        sufficient_data=True,
+        confidence=0.9,
+        updated_summary="One two three four five six seven eight nine ten eleven twelve.",
+        token_count=0,
+    )
+    compressed = CompressedKnowledge(compressed_summary="Dense facts", token_count=0)
+
+    with (
+        _inject_transport(_build_transport(init_entries)),
+        stub_llm_boundary(knowledge_init=init_update, compressed=compressed),
+    ):
+        await initialize_new_topic(topic, db_conn, settings)
+
+    assert topic.status == TopicStatus.READY
+    knowledge = get_knowledge_state(db_conn, topic.id)
+    assert knowledge is not None
+    # Compression branch ran: the stored summary is the compressed text, and the
+    # recomputed token_count fits the (tiny) budget.
+    assert knowledge.summary_text == "Dense facts"
+    assert knowledge.token_count <= settings.knowledge_state_max_tokens
