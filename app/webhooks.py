@@ -24,6 +24,7 @@ from app.crud import (
     release_stale_webhook_claims,
 )
 from app.database import short_conn
+from app.log_redaction import redact_url
 from app.url_validation import is_private_url
 
 logger = logging.getLogger(__name__)
@@ -68,7 +69,7 @@ async def send_webhook(url: str, payload: dict, timeout: float = _WEBHOOK_TIMEOU
     pre-existing, architectural limitation shared by all outbound fetches.
     """
     if await asyncio.to_thread(is_private_url, url):
-        logger.warning("Blocked webhook to private/reserved URL: %s", url)
+        logger.warning("Blocked webhook to private/reserved URL: %s", redact_url(url))
         return False
 
     try:
@@ -77,16 +78,16 @@ async def send_webhook(url: str, payload: dict, timeout: float = _WEBHOOK_TIMEOU
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
             response = await client.post(url, json=payload)
             response.raise_for_status()
-            logger.info("Webhook delivered to %s (status %d)", url, response.status_code)
+            logger.info("Webhook delivered to %s (status %d)", redact_url(url), response.status_code)
             return True
     except httpx.TimeoutException:
-        logger.warning("Webhook timeout for %s", url)
+        logger.warning("Webhook timeout for %s", redact_url(url))
         return False
     except httpx.HTTPStatusError as exc:
-        logger.warning("Webhook HTTP %d for %s", exc.response.status_code, url)
+        logger.warning("Webhook HTTP %d for %s", exc.response.status_code, redact_url(url))
         return False
     except Exception:
-        logger.warning("Webhook error for %s", url, exc_info=True)
+        logger.warning("Webhook error for %s", redact_url(url), exc_info=True)
         return False
 
 
@@ -135,7 +136,7 @@ async def send_webhooks(
                 create_pending_webhook(conn, topic_id, url, payload, check_result_id)
                 queued = True
             except Exception:
-                logger.warning("Failed to enqueue webhook for retry (url=%s)", url, exc_info=True)
+                logger.warning("Failed to enqueue webhook for retry (url=%s)", redact_url(url), exc_info=True)
 
     if queued:
         assert conn is not None
@@ -209,9 +210,20 @@ async def _drain_pending_webhooks(
         released = release_stale_webhook_claims(snapshot, stale_cutoff)
         if released:
             logger.warning("Released %d stale webhook claim(s)", released)
-        expired = delete_expired_webhooks(snapshot)
-        if expired:
-            logger.warning("Deleted %d expired pending webhook(s)", expired)
+        abandoned = delete_expired_webhooks(snapshot)
+        for item in abandoned:
+            # One WARNING per permanently-dropped delivery so an abandoned
+            # webhook is observable: identify it by topic/check ids and the
+            # redacted destination (never the secret-bearing full URL) (OVH-040).
+            logger.warning(
+                "Abandoning webhook after max retries (topic_id=%s check_result_id=%s url=%s created_at=%s)",
+                item.topic_id,
+                item.check_result_id,
+                redact_url(item.url),
+                item.created_at.isoformat(),
+            )
+        if abandoned:
+            logger.warning("Deleted %d expired pending webhook(s)", len(abandoned))
         snapshot.commit()
         pending = list_pending_webhooks(snapshot)
 
