@@ -86,5 +86,11 @@ async def extract_article_content(
         extracted = cast(str | None, trafilatura.extract(html, favor_recall=True))
         if extracted:
             return _truncate(extracted, max_content_length)
+        # OVH-045: HTML fetched but both passes extracted nothing (JS-heavy,
+        # paywall, anti-bot). Surface the summary-degradation so an operator can
+        # tell the LLM is reasoning over the short RSS summary, not full text.
+        logger.info("trafilatura extracted nothing for %s, using RSS summary", url)
+    else:
+        logger.debug("No HTML fetched for %s, using RSS summary", url)
 
     return _truncate(fallback_summary, max_content_length)
