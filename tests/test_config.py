@@ -1,5 +1,6 @@
 """Tests for configuration loading and validation."""
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -85,7 +86,11 @@ class TestConfigLoading:
         with pytest.raises(ValidationError):
             load_settings(config_path=config)
 
-    def test_optional_base_url(self, tmp_path: Path) -> None:
+    def test_optional_base_url(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Clear the env model override so the YAML's local provider (ollama) is used —
+        # otherwise the cloud env model would strip base_url (OVH-104).
+        monkeypatch.delenv("TOPIC_WATCH_LLM__MODEL", raising=False)
+        monkeypatch.delenv("TOPIC_WATCH_LLM__API_KEY", raising=False)
         config = tmp_path / "config.yml"
         config.write_text('llm:\n  model: "ollama/llama3"\n  api_key: "na"\n  base_url: "http://localhost:11434"\n')
         settings = load_settings(config_path=config)
@@ -350,3 +355,104 @@ class TestTimeoutValidation:
 
         data = yaml.safe_load(config_file.read_text())
         assert data["apprise_timeout_seconds"] == 45
+
+
+class TestUnknownYamlKey:
+    """OVH-004: an unknown top-level YAML key must not crash startup."""
+
+    def test_unknown_top_level_key_does_not_crash(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A stale/renamed top-level key loads (is ignored) instead of raising."""
+        monkeypatch.delenv("TOPIC_WATCH_LLM__API_KEY", raising=False)
+        monkeypatch.delenv("TOPIC_WATCH_LLM__MODEL", raising=False)
+        config = tmp_path / "config.yml"
+        config.write_text('llm:\n  model: "openai/gpt-4o-mini"\n  api_key: "sk-test"\nremoved_legacy_setting: 42\n')
+        # Must not raise ValidationError (extra_forbidden) — startup stays alive.
+        settings = load_settings(config_path=config)
+        assert settings.llm.model == "openai/gpt-4o-mini"
+        assert settings.is_configured()
+
+    def test_unknown_top_level_key_logs_warning(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Dropping an unknown key emits a warning naming the key."""
+        monkeypatch.delenv("TOPIC_WATCH_LLM__API_KEY", raising=False)
+        monkeypatch.delenv("TOPIC_WATCH_LLM__MODEL", raising=False)
+        config = tmp_path / "config.yml"
+        config.write_text('llm:\n  model: "openai/gpt-4o-mini"\n  api_key: "sk-test"\nremoved_legacy_setting: 42\n')
+        with caplog.at_level(logging.WARNING, logger="app.config"):
+            load_settings(config_path=config)
+        assert any("removed_legacy_setting" in r.message for r in caplog.records)
+
+    def test_known_keys_do_not_warn(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A config of only known keys produces no unknown-key warning."""
+        monkeypatch.delenv("TOPIC_WATCH_LLM__API_KEY", raising=False)
+        monkeypatch.delenv("TOPIC_WATCH_LLM__MODEL", raising=False)
+        config = tmp_path / "config.yml"
+        config.write_text('llm:\n  model: "openai/gpt-4o-mini"\n  api_key: "sk-test"\ncheck_interval: "6h"\n')
+        with caplog.at_level(logging.WARNING, logger="app.config"):
+            load_settings(config_path=config)
+        assert not any("Unknown" in r.message and "config key" in r.message for r in caplog.records)
+
+
+class TestBaseUrlModelStripping:
+    """OVH-104: cloud-provider base_url stripping is enforced once on the model."""
+
+    def test_model_drops_base_url_for_cloud_provider(self) -> None:
+        """Constructing Settings with a cloud model + base_url drops base_url."""
+        settings = Settings(
+            llm={"model": "anthropic/claude-haiku-4-5", "api_key": "sk", "base_url": "http://localhost:11434"},
+        )  # type: ignore[call-arg]
+        assert settings.llm.base_url is None
+
+    def test_model_keeps_base_url_for_local_provider(self) -> None:
+        """A self-hosted provider keeps its base_url."""
+        settings = Settings(
+            llm={"model": "ollama/llama3", "api_key": "na", "base_url": "http://localhost:11434"},
+        )  # type: ignore[call-arg]
+        assert settings.llm.base_url == "http://localhost:11434"
+
+    def test_base_url_round_trips_for_local_provider(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """load(save(x)) preserves base_url for a local provider (symmetric)."""
+        from app.config import save_settings_to_yaml
+
+        # Clear the cloud env model so the reloaded model stays a local provider.
+        monkeypatch.delenv("TOPIC_WATCH_LLM__MODEL", raising=False)
+        monkeypatch.delenv("TOPIC_WATCH_LLM__API_KEY", raising=False)
+        settings = Settings(
+            llm={"model": "ollama/llama3", "api_key": "na", "base_url": "http://localhost:11434"},
+        )  # type: ignore[call-arg]
+        config_file = tmp_path / "config.yml"
+        save_settings_to_yaml(settings, config_file)
+        reloaded = load_settings(config_path=config_file)
+        assert reloaded.llm.base_url == "http://localhost:11434"
+
+
+class TestProviderTypoCaseInsensitive:
+    """OVH-105: provider-typo suggestion must match case-insensitively."""
+
+    def test_is_close_case_insensitive(self) -> None:
+        """_is_close treats case-mismatched-but-identical strings as close."""
+        from app.config import _is_close
+
+        assert _is_close("OpenAI", "openai") is True
+        assert _is_close("ANTHROPIC", "anthropic") is True
+
+    def test_is_close_real_typo_still_matches(self) -> None:
+        """A genuine typo of differing length still registers as close."""
+        from app.config import _is_close
+
+        assert _is_close("opena", "openai") is True
+
+    def test_capitalized_known_provider_recognized_no_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A case-mismatched valid provider ('OpenAI') is recognized — no typo warning."""
+        with caplog.at_level(logging.WARNING, logger="app.config"):
+            Settings(llm={"model": "OpenAI/gpt-4o", "api_key": "sk"})  # type: ignore[call-arg]
+        assert not any("Did you mean" in r.message for r in caplog.records)
+
+    def test_typo_provider_still_suggests(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A genuine typo ('opena') still produces a suggestion."""
+        with caplog.at_level(logging.WARNING, logger="app.config"):
+            Settings(llm={"model": "opena/gpt-4o", "api_key": "sk"})  # type: ignore[call-arg]
+        assert any("Did you mean" in r.message for r in caplog.records)

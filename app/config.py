@@ -6,6 +6,7 @@ for nested keys (e.g., TOPIC_WATCH_LLM__API_KEY).
 """
 
 import logging
+import os
 import shutil
 from pathlib import Path
 from typing import Self
@@ -66,6 +67,19 @@ def is_cloud_provider(model_str: str) -> bool:
     return provider in CLOUD_PROVIDERS if provider else False
 
 
+# Env var that supplies the LLM API key (env > YAML; see settings_customise_sources).
+_API_KEY_ENV_VAR = "TOPIC_WATCH_LLM__API_KEY"
+
+
+def is_api_key_env_sourced() -> bool:
+    """Return True if the LLM API key is supplied via environment (env > YAML).
+
+    When True, the settings UI must treat the key as read-only and the save path must
+    NOT materialize the env-derived secret into plaintext config.yml (OVH-003).
+    """
+    return bool(os.environ.get(_API_KEY_ENV_VAR))
+
+
 class LLMSettings(BaseModel):
     """LLM provider configuration."""
 
@@ -102,6 +116,9 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="TOPIC_WATCH_",
         env_nested_delimiter="__",
+        # Forward-compat: a stale/renamed top-level YAML key must not crash startup
+        # (OVH-004). Unknown keys are dropped; the model_validator below logs a warning.
+        extra="ignore",
     )
 
     llm: LLMSettings = LLMSettings()
@@ -178,12 +195,34 @@ class Settings(BaseSettings):
     @model_validator(mode="before")
     @classmethod
     def migrate_check_interval_hours(cls, data: dict) -> dict:  # type: ignore[override]
-        """Backward compat: convert old check_interval_hours to check_interval string."""
-        if isinstance(data, dict) and "check_interval_hours" in data:
-            hours = data.pop("check_interval_hours")
-            if "check_interval" not in data and hours is not None:
-                data["check_interval"] = f"{int(hours)}h"
+        """Backward compat: convert old check_interval_hours to check_interval string.
+
+        Also warns about any remaining unrecognized top-level keys, which extra='ignore'
+        silently drops (OVH-004). Migration runs first so renamed-but-handled keys
+        (check_interval_hours) do not produce a spurious warning.
+        """
+        if isinstance(data, dict):
+            if "check_interval_hours" in data:
+                hours = data.pop("check_interval_hours")
+                if "check_interval" not in data and hours is not None:
+                    data["check_interval"] = f"{int(hours)}h"
+            known = set(cls.model_fields)
+            for key in data:
+                if key not in known:
+                    logger.warning("Unknown config key '%s' ignored (renamed or removed?)", key)
         return data
+
+    @model_validator(mode="after")
+    def strip_base_url_for_cloud_provider(self) -> Self:
+        """Drop base_url for cloud providers — enforced once on the model (OVH-104).
+
+        A cloud provider uses its own endpoint, so a stale base_url (e.g. left over
+        from a prior Ollama config) is invalid. Stripping here makes save/load
+        symmetric and removes the need to repeat the check at every call site.
+        """
+        if self.llm.base_url and is_cloud_provider(self.llm.model):
+            self.llm.base_url = None
+        return self
 
     @model_validator(mode="after")
     def validate_llm_model_format(self) -> Self:
@@ -193,8 +232,9 @@ class Settings(BaseSettings):
             return self
         known_providers = CLOUD_PROVIDERS | frozenset(LOCAL_PROVIDER_DEFAULTS)
         if "/" in model_str:
+            # LiteLLM is case-insensitive, so a capitalized but valid provider is fine (OVH-105).
             provider = model_str.split("/")[0]
-            if provider not in known_providers:
+            if provider.lower() not in known_providers:
                 close = [p for p in sorted(known_providers) if _is_close(provider, p)]
                 if close:
                     logger.warning(
@@ -224,7 +264,8 @@ class Settings(BaseSettings):
 
 
 def _is_close(a: str, b: str) -> bool:
-    """Check if two strings are likely typos of each other."""
+    """Check if two strings are likely typos of each other (case-insensitive, OVH-105)."""
+    a, b = a.lower(), b.lower()
     if abs(len(a) - len(b)) > 2:
         return False
     return bool(a and b and a[0] == b[0] and abs(len(a) - len(b)) <= 1)
@@ -277,14 +318,34 @@ def load_settings(config_path: Path | None = None) -> Settings:
         _yaml_file_override = None
 
 
-def save_settings_to_yaml(settings: "Settings", config_path: Path) -> None:
-    """Write current settings back to the YAML config file."""
+def save_settings_to_yaml(settings: "Settings", config_path: Path, preserve_api_key: bool = False) -> None:
+    """Write current settings back to the YAML config file.
+
+    Args:
+        settings: The settings to persist.
+        config_path: Destination YAML path.
+        preserve_api_key: When True, keep whatever api_key is already on disk instead
+            of writing ``settings.llm.api_key``. Used when the key is env-sourced so the
+            env secret is not materialized into plaintext config.yml (OVH-003).
+    """
     effective_path = config_path
+
+    api_key_to_write = settings.llm.api_key
+    if preserve_api_key:
+        # Read the existing on-disk value so an env-derived secret never lands here.
+        existing_key = ""
+        if effective_path.exists():
+            try:
+                existing = yaml.safe_load(effective_path.read_text()) or {}
+                existing_key = (existing.get("llm") or {}).get("api_key", "") or ""
+            except (OSError, yaml.YAMLError):
+                logger.warning("Could not read existing config to preserve api_key; leaving it blank")
+        api_key_to_write = existing_key
 
     data: dict = {
         "llm": {
             "model": settings.llm.model,
-            "api_key": settings.llm.api_key,
+            "api_key": api_key_to_write,
         },
         "notifications": {},
         "check_interval": settings.check_interval,
@@ -309,7 +370,8 @@ def save_settings_to_yaml(settings: "Settings", config_path: Path) -> None:
         "secure_cookies": settings.secure_cookies,
     }
 
-    if settings.llm.base_url and not is_cloud_provider(settings.llm.model):
+    # base_url is already None for cloud providers (stripped on the model, OVH-104).
+    if settings.llm.base_url:
         data["llm"]["base_url"] = settings.llm.base_url
 
     if settings.notifications.urls:
