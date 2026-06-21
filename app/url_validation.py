@@ -12,10 +12,13 @@ risks breaking HTTPS feed fetching (SNI / cert verification); this is an
 accepted limitation for a single-user self-hosted tool.
 """
 
+import asyncio
 import ipaddress
 import logging
 import re
 import socket
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -26,7 +29,23 @@ logger = logging.getLogger(__name__)
 # Mirrors httpx's own default to keep behaviour familiar.
 _MAX_REDIRECTS = 20
 
-# Patterns that indicate a private/reserved network address
+# Wall-clock bound (seconds) on a single blocking getaddrinfo. socket.getaddrinfo
+# ignores socket.setdefaulttimeout, so we run it under a dedicated executor and
+# abandon the lookup past this deadline. Caps how long one crafted slow/non-
+# resolving host can occupy a worker (OVH-148); on timeout we fail closed.
+_RESOLVE_TIMEOUT = 5.0
+
+# Patterns that indicate a private/reserved network address.
+#
+# Layer-1 string match is a fast pre-filter for the canonical IPv4 private/
+# reserved forms and the two unambiguous IPv6 *literal* forms (loopback ``::1``
+# and link-local ``fe80:`` — both contain a colon and so can never match a bare
+# hostname). IPv6 ULA (fc00::/7) and IPv4-mapped (``::ffff:``) literals are
+# intentionally NOT matched here: a bare ``^f[cd]`` over-blocked legitimate
+# fc-/fd- hostnames (OVH-142) and a blanket ``^::ffff:`` over-blocked public
+# mapped addresses (OVH-169). Those literals arrive bracketed, so urlparse hands
+# us the bare IP and layer-2 (getaddrinfo + ipaddress) classifies them correctly
+# — private mapped/ULA still blocked, public mapped allowed.
 _PRIVATE_NETLOC_PATTERNS = [
     re.compile(r"^localhost(:\d+)?$", re.IGNORECASE),
     re.compile(r"^127\."),
@@ -36,14 +55,37 @@ _PRIVATE_NETLOC_PATTERNS = [
     re.compile(r"^169\.254\."),
     re.compile(r"^0\.0\.0\.0"),
     re.compile(r"^::1$"),  # IPv6 loopback
-    re.compile(r"^::ffff:", re.IGNORECASE),  # IPv6-mapped IPv4
-    re.compile(r"^f[cd]", re.IGNORECASE),  # IPv6 ULA (fc00::/7)
     re.compile(r"^fe80:", re.IGNORECASE),  # IPv6 link-local
 ]
 
 # RFC 6598 carrier-grade NAT range. Not flagged by ipaddress.is_private/.is_reserved,
 # so it is checked explicitly — on CGNAT hosts it can reach carrier infrastructure.
 _CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _getaddrinfo_bounded(hostname: str, timeout: float) -> list:
+    """Run ``socket.getaddrinfo`` with a wall-clock timeout.
+
+    ``getaddrinfo`` is blocking and ignores ``socket.setdefaulttimeout``, so a
+    slow/non-resolving host could otherwise pin a worker for the OS resolver's
+    full default timeout. Running it in a single-shot executor and waiting only
+    ``timeout`` seconds bounds the *caller's* wait (OVH-148). On timeout we raise
+    ``TimeoutError`` (handled by the fail-closed caller) WITHOUT joining the
+    executor — ``shutdown(wait=False)`` returns immediately so the caller is not
+    stuck behind the lookup; the abandoned worker exits on its own once the OS
+    resolver itself times out (bounded, not unbounded).
+    """
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dns-resolve")
+    future = pool.submit(socket.getaddrinfo, hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    try:
+        result = future.result(timeout=timeout)
+    except FuturesTimeoutError:
+        # Abandon without joining: a blocked getaddrinfo would make a waiting
+        # shutdown hang for the full OS resolver timeout, defeating the bound.
+        pool.shutdown(wait=False)
+        raise TimeoutError(f"DNS resolution for {hostname!r} exceeded {timeout}s") from None
+    pool.shutdown(wait=False)
+    return result
 
 
 def _resolved_ip_is_private(hostname: str) -> bool:
@@ -57,9 +99,12 @@ def _resolved_ip_is_private(hostname: str) -> bool:
     private hostname formats; this layer adds protection against encoding
     bypasses (hex IP, decimal IP, DNS rebinding) that resolve to private
     addresses.
+
+    DNS resolution is bounded by ``_RESOLVE_TIMEOUT`` (OVH-148): a slow lookup
+    times out and is treated as unverifiable (blocked) rather than hanging.
     """
     try:
-        infos = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        infos = _getaddrinfo_bounded(hostname, _RESOLVE_TIMEOUT)
         for _family, _type, _proto, _canonname, sockaddr in infos:
             addr = ipaddress.ip_address(sockaddr[0])
             if (
@@ -72,7 +117,10 @@ def _resolved_ip_is_private(hostname: str) -> bool:
                 return True
         return False
     except (socket.gaierror, ValueError, OSError):
-        return True  # fail closed: an unresolvable host cannot be verified as public
+        # Fail closed: an unresolvable host cannot be verified as public.
+        # TimeoutError (raised by _getaddrinfo_bounded) is an OSError subclass,
+        # so a bounded-out slow resolver also lands here and is treated as blocked.
+        return True
 
 
 def is_private_url(url: str) -> bool:
@@ -144,9 +192,23 @@ async def safe_send(
     is validated with :func:`is_private_url` BEFORE the next hop is sent, so an
     attacker-controlled public host cannot 3xx-redirect into loopback/RFC-1918.
 
-    Raises :class:`PrivateRedirectError` if any redirect target is private or if
-    the redirect limit is exceeded.
+    The initial request URL is validated with the SAME scheme + private-host
+    checks as every redirect hop BEFORE the first send (OVH-140), so a caller
+    that forgets the separate :func:`is_private_url` guard can never have this
+    helper fetch a private/loopback or non-http(s) initial target.
+
+    Raises :class:`PrivateRedirectError` if the initial URL or any redirect
+    target is private/non-http(s), or if the redirect limit is exceeded.
     """
+    initial_url = str(request.url)
+    if urlparse(initial_url).scheme not in ("http", "https"):
+        logger.warning("Blocked request to non-http(s) URL: %s", initial_url)
+        raise PrivateRedirectError(f"Non-http(s) scheme blocked: {initial_url}")
+    # is_private_url does blocking DNS; offload so the event loop is not stalled.
+    if await asyncio.to_thread(is_private_url, initial_url):
+        logger.warning("Blocked request to private/reserved URL: %s", initial_url)
+        raise PrivateRedirectError(f"Request to private/reserved address blocked: {initial_url}")
+
     response = await client.send(request)
     redirects = 0
     while _is_redirect_status(response.status_code):
