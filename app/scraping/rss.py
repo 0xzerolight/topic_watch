@@ -14,6 +14,7 @@ from calendar import timegm
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from html.parser import HTMLParser
 from time import struct_time
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
@@ -108,6 +109,44 @@ def _resolve_google_news_url(link: str, description: str) -> str:
     return link
 
 
+class _HTMLTextExtractor(HTMLParser):
+    """Collect only the text nodes of an HTML fragment, discarding all markup."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        self._parts.append(data)
+
+    def text(self) -> str:
+        return "".join(self._parts)
+
+
+def _strip_html(value: str) -> str:
+    """Reduce an HTML fragment to whitespace-collapsed plain text (OVH-112).
+
+    RSS summary fallbacks (notably Google News' ``<ol><li><a>`` link lists) are
+    HTML. Storing that raw as ``raw_content`` wastes the novelty-prompt budget on
+    tag/href noise and inflates the ``[STUB]`` byte-count heuristic. This keeps the
+    human-readable text, drops the markup, and unescapes entities. A tag-free
+    string round-trips to (a whitespace-collapsed) copy of itself, so plain
+    summaries are effectively untouched. Never raises: a malformed fragment falls
+    back to the original input.
+    """
+    if not value or ("<" not in value and "&" not in value):
+        return value
+    try:
+        parser = _HTMLTextExtractor()
+        parser.feed(value)
+        parser.close()
+        text = parser.text()
+    except Exception:
+        logger.debug("HTML strip failed; keeping raw summary", exc_info=True)
+        return value
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def _parse_entry(raw_entry: dict, source_feed: str) -> FeedEntry | None:
     """Convert a feedparser entry dict to a FeedEntry, or None if invalid."""
     title = raw_entry.get("title", "").strip()
@@ -122,8 +161,14 @@ def _parse_entry(raw_entry: dict, source_feed: str) -> FeedEntry | None:
         if content_list and isinstance(content_list, list):
             summary = content_list[0].get("value", "")
 
-    # Google News RSS uses redirect URLs — resolve to actual article URLs
+    # Google News RSS uses redirect URLs — resolve to actual article URLs.
+    # Done on the RAW summary because the resolver regex-extracts <a href>.
     url = _resolve_google_news_url(url, summary)
+
+    # OVH-112: strip HTML AFTER url resolution so the STORED summary (which becomes
+    # raw_content when extraction fails) is plain text, not tag/href noise. The
+    # content hash is url|title only, so dedup is unaffected.
+    summary = _strip_html(summary)
 
     # Defense-in-depth (OVH-014): a non-http(s) scheme (javascript:, data:, ...)
     # must never reach the DB, where it would later render into an href.

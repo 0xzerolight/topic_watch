@@ -224,6 +224,52 @@ class TestParseEntry:
         assert entry is not None
         assert entry.summary == "The summary"
 
+    def test_html_summary_is_stripped_to_text(self) -> None:
+        """OVH-112: HTML in an RSS summary is stripped to plain text before storage.
+
+        Google News summaries are <ol><li><a> link lists; storing that raw as
+        raw_content wastes the novelty-prompt budget on tag/href noise. The link
+        text survives, the markup does not.
+        """
+        raw = {
+            "title": "Roundup",
+            "link": "https://example.com/roundup",
+            "summary": (
+                '<ol><li><a href="https://news.google.com/x">Headline One</a></li>'
+                '<li><a href="https://news.google.com/y">Headline Two</a></li></ol>'
+            ),
+        }
+        entry = _parse_entry(raw, "feed")
+        assert entry is not None
+        assert "Headline One" in entry.summary
+        assert "Headline Two" in entry.summary
+        # No markup, no href noise survives into the stored summary.
+        assert "<" not in entry.summary and ">" not in entry.summary
+        assert "href" not in entry.summary
+        assert "news.google.com" not in entry.summary
+
+    def test_html_entities_in_summary_are_unescaped(self) -> None:
+        """OVH-112: HTML entities decode to their characters when tags are stripped."""
+        raw = {
+            "title": "Entities",
+            "link": "https://example.com/e",
+            "summary": "<p>Apple &amp; Google &lt;merge&gt;</p>",
+        }
+        entry = _parse_entry(raw, "feed")
+        assert entry is not None
+        assert entry.summary == "Apple & Google <merge>"
+
+    def test_plain_text_summary_is_unchanged(self) -> None:
+        """OVH-112: a tag-free summary passes through verbatim (no false rewrites)."""
+        raw = {
+            "title": "Plain",
+            "link": "https://example.com/p",
+            "summary": "Just a plain sentence with no markup.",
+        }
+        entry = _parse_entry(raw, "feed")
+        assert entry is not None
+        assert entry.summary == "Just a plain sentence with no markup."
+
 
 # ============================================================
 # TestFetchFeed (async, mocked httpx)
