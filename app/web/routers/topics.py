@@ -281,6 +281,25 @@ async def topic_status(
     )
 
 
+def _topic_row_context(conn: sqlite3.Connection, topic: Topic, topic_id: int) -> dict:
+    """Build the shared ``_topic_row.html`` context (OVH-154).
+
+    Single source for the topic-row partial's data: the topic, its most recent
+    check, and a COUNT-based article total. Used by both the check/redirect path
+    and toggle-active so the article-count source can no longer drift between
+    them. ``just_checked`` is intentionally NOT included here — callers add it
+    only where a fresh check just ran (see ``_topic_row_response``); omitting it
+    leaves the marker falsy so an unrelated re-render like toggle-active does not
+    re-fire a browser notification (OVH-119).
+    """
+    checks = list_check_results(conn, topic_id, limit=1)
+    return {
+        "topic": topic,
+        "last_check": checks[0] if checks else None,
+        "article_count": count_articles_for_topic(conn, topic_id),
+    }
+
+
 def _topic_row_response(
     request: Request,
     conn: sqlite3.Connection,
@@ -298,18 +317,10 @@ def _topic_row_response(
     if not request.headers.get("HX-Request"):
         return RedirectResponse(url=f"/topics/{topic_id}", status_code=303)
 
-    checks = list_check_results(conn, topic_id, limit=1)
-    last_check = checks[0] if checks else None
-    article_count = count_articles_for_topic(conn, topic_id)
     return templates.TemplateResponse(
         request,
         "_topic_row.html",
-        {
-            "topic": topic,
-            "last_check": last_check,
-            "article_count": article_count,
-            "just_checked": just_checked,
-        },
+        {**_topic_row_context(conn, topic, topic_id), "just_checked": just_checked},
     )
 
 
@@ -365,19 +376,13 @@ async def toggle_active(
     update_topic(conn, topic)
     conn.commit()
 
-    # HTMX request from dashboard — return updated row partial
+    # HTMX request from dashboard — return updated row partial. No just_checked:
+    # a toggle is not a fresh check, so the marker stays absent (OVH-119/OVH-154).
     if request.headers.get("HX-Request"):
-        checks = list_check_results(conn, topic_id, limit=1)
-        last_check = checks[0] if checks else None
-        article_count = count_articles_for_topic(conn, topic_id)
         return templates.TemplateResponse(
             request,
             "_topic_row.html",
-            {
-                "topic": topic,
-                "last_check": last_check,
-                "article_count": article_count,
-            },
+            _topic_row_context(conn, topic, topic_id),
         )
 
     return RedirectResponse(url=f"/topics/{topic_id}", status_code=303)
