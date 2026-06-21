@@ -68,8 +68,10 @@ upsert_env() {
     local key="$1"
     local value="$2"
     local file="$3"
+    # Owner-only on every write path so the .env (LLM API key) is never even
+    # briefly group/world-readable, not just after the trailing chmod (OVH-063).
     if [ ! -f "$file" ]; then
-        echo "${key}=${value}" > "$file"
+        (umask 077; echo "${key}=${value}" > "$file")
     elif grep -q "^${key}=" "$file"; then
         # Replace the existing line via a temp file (portable, no sed -i portability issues)
         local tmp
@@ -84,6 +86,11 @@ upsert_env() {
 
 upsert_env "PUID" "${HOST_UID}" "${ENV_FILE}"
 upsert_env "PGID" "${HOST_GID}" "${ENV_FILE}"
+
+# Restrict the .env to the owner: it holds the LLM API key (and any user-added
+# secrets). Without this it is created world/group-readable by the default umask,
+# leaking the key to other users on a shared host (OVH-063).
+chmod 600 "${ENV_FILE}"
 
 if [ "$HOST_UID" != "1000" ] || [ "$HOST_GID" != "1000" ]; then
     info "Host UID/GID is ${HOST_UID}:${HOST_GID} (not 1000); wrote PUID/PGID to .env"
