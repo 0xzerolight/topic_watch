@@ -107,8 +107,16 @@ async def compress_knowledge(
     rather than raising, so an over-budget update never crashes the pipeline.
 
     Returns:
-        ``(summary_text, token_count)`` guaranteed to fit the budget. The
-        ``token_count`` is recomputed with the authoritative ``count_tokens``.
+        ``(summary_text, token_count)`` fitting the budget in the normal case.
+        The ``token_count`` is recomputed with the authoritative ``count_tokens``.
+
+        Overflow caveat (OVH-164): the fallback ``_truncate_to_budget`` keeps the
+        first sentence intact rather than ever returning empty text. So when the
+        fallback fires AND that single leading sentence alone exceeds
+        ``max_tokens`` (a single mega-sentence with no boundaries to truncate at),
+        the returned ``token_count`` may be > the budget. Persisting it is the
+        deliberate lesser evil — losing the only sentence would drop all facts —
+        but callers must not assume the result always fits.
     """
     max_tokens = settings.knowledge_state_max_tokens
     model = settings.llm.model

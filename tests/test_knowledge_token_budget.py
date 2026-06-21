@@ -200,6 +200,39 @@ class TestCompressKnowledge:
         assert count <= 500
         assert "Still three." not in text
 
+    async def test_single_mega_sentence_overflow_persists_over_budget(self) -> None:
+        """OVH-164: the one documented path where the result can exceed the budget.
+
+        When the LLM's compression is still over budget AND consists of a single
+        sentence (no boundaries to truncate at), ``_truncate_to_budget`` keeps that
+        sentence intact rather than returning empty — so the returned token_count
+        is legitimately > max_tokens. Pins this overflow contract (and the honest
+        docstring caveat) so a future "always fits" refactor that silently drops
+        the only sentence is caught.
+        """
+        topic = _make_topic()
+        long_summary = "Old verbose summary text."
+        # One sentence, no internal boundaries; _heavy_word_count makes it overflow.
+        compressed = CompressedKnowledge(
+            compressed_summary="One huge unsplittable mega sentence with many words and no boundaries",
+            token_count=0,
+        )
+        settings = _make_settings(max_tokens=500)
+
+        with (
+            patch(
+                "app.analysis.knowledge.compress_knowledge_summary",
+                new_callable=AsyncMock,
+                return_value=compressed,
+            ),
+            patch("app.analysis.knowledge.count_tokens", side_effect=_heavy_word_count),
+        ):
+            text, count = await compress_knowledge(long_summary, topic, settings)
+
+        # Facts preserved (never truncated to empty), but the budget is exceeded.
+        assert text == compressed.compressed_summary
+        assert count > 500
+
 
 # ============================================================
 # TestInitializeKnowledgeBudget (async, db_conn)
