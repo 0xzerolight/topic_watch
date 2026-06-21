@@ -15,6 +15,7 @@ Pipeline transaction safety (OVH-007/066/099/101):
 """
 
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -31,6 +32,7 @@ from app.crud import (
     delete_topic,
     get_topic,
     list_pending_webhooks,
+    recover_stuck_researching,
     recover_stuck_topics,
 )
 from app.models import Article, KnowledgeState, Topic, TopicStatus
@@ -254,6 +256,53 @@ class TestRecoverStuckTopicsNoCommit:
         assert get_topic(mem_conn, researching.id).status == TopicStatus.ERROR
         assert get_topic(mem_conn, ready.id).status == TopicStatus.READY
         assert get_topic(mem_conn, error.id).status == TopicStatus.ERROR
+
+
+class TestRecoverStuckResearchingNoCommit:
+    """OVH-087: recover_stuck_researching must NOT call conn.commit() internally,
+    mirroring recover_stuck_topics — the get_db caller owns the commit (invariant
+    #12). A rollback after the call must revert the status change."""
+
+    def _stuck_topic(self, conn: sqlite3.Connection) -> int:
+        """Create a RESEARCHING topic backdated past the stuck timeout."""
+        topic = create_topic(
+            conn,
+            Topic(name="Stuck Researching", description="d", status=TopicStatus.RESEARCHING),
+        )
+        old_time = datetime.now(UTC) - timedelta(minutes=20)
+        conn.execute(
+            "UPDATE topics SET status_changed_at = ? WHERE id = ?",
+            (old_time.isoformat(), topic.id),
+        )
+        conn.commit()
+        return topic.id
+
+    def test_recover_stuck_researching_update_not_auto_committed(self, db_conn: sqlite3.Connection) -> None:
+        """The status change is visible only after the caller commits; a rollback reverts it."""
+        topic_id = self._stuck_topic(db_conn)
+
+        count = recover_stuck_researching(db_conn, timeout_minutes=15)
+        assert count == 1
+
+        # Rollback to undo the (uncommitted) update.
+        db_conn.rollback()
+
+        recovered = get_topic(db_conn, topic_id)
+        assert recovered is not None
+        assert recovered.status == TopicStatus.RESEARCHING
+
+    def test_recover_stuck_researching_committed_by_caller(self, db_conn: sqlite3.Connection) -> None:
+        """When the caller commits, the recovery persists (as get_db does)."""
+        topic_id = self._stuck_topic(db_conn)
+
+        count = recover_stuck_researching(db_conn, timeout_minutes=15)
+        assert count == 1
+
+        db_conn.commit()
+
+        recovered = get_topic(db_conn, topic_id)
+        assert recovered is not None
+        assert recovered.status == TopicStatus.ERROR
 
 
 class TestNoWriteLockAcrossExtractionAwait:
