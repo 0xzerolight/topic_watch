@@ -322,6 +322,56 @@ class TestFetchNewArticlesCrossTopicDedup:
         # No HTTP fetch happened — content was reused.
         extract_mock.assert_not_called()
 
+    async def test_reused_article_carries_originating_provider(self, db_conn: sqlite3.Connection) -> None:
+        """OVH-114: a reused row keeps the ORIGINATING provider, not the current one.
+
+        source_provider (m009) records which provider actually fetched the content.
+        Cross-topic dedup copies bytes fetched by another topic's provider, so the
+        reused row's attribution must point at that originating provider — not the
+        provider that produced this topic's feed entry. A freshly fetched row, by
+        contrast, is stamped with the current topic's provider.
+        """
+        topic_a = _make_topic(db_conn, "Topic A")
+        topic_b = _make_topic(db_conn, "Topic B")
+
+        url = "https://example.com/shared-provider"
+        title = "Shared Provider Article"
+        content_hash = compute_article_hash(url, title)
+
+        # Pre-stored content was fetched via Bing for topic A.
+        existing = Article(
+            topic_id=topic_a.id,
+            title=title,
+            url=url,
+            content_hash=content_hash,
+            raw_content="Body fetched via Bing",
+            source_feed="https://topic-a-feed.example.com/rss",
+            source_provider="Bing News",
+        )
+        create_article(db_conn, existing)
+        db_conn.commit()
+
+        entry = self._make_entry(url=url, title=title)
+        extract_mock = AsyncMock(return_value="Freshly fetched content")
+
+        # Topic B's feed comes from Google News this cycle.
+        with (
+            patch(
+                "app.scraping.fetch_feeds_for_topic",
+                return_value=FeedResponse(entries=[entry], provider_name="Google News"),
+            ),
+            patch("app.scraping.extract_article_content", extract_mock),
+        ):
+            stored = (await fetch_new_articles_for_topic(topic_b, db_conn)).articles
+
+        assert len(stored) == 1
+        reused = stored[0]
+        assert reused.topic_id == topic_b.id
+        assert reused.raw_content == "Body fetched via Bing"
+        # Attribution carries the ORIGINATING provider, not topic B's Google News.
+        assert reused.source_provider == "Bing News"
+        extract_mock.assert_not_called()
+
     async def test_fetches_normally_when_no_cross_topic_match(self, db_conn: sqlite3.Connection) -> None:
         """When no cross-topic article exists, content is fetched normally."""
         topic = _make_topic(db_conn, "Topic A")

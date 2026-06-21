@@ -64,6 +64,7 @@ def _make_check_result(
     has_new_info: bool = True,
     stage_error: str | None = None,
     notification_error: str | None = None,
+    notification_sent: bool = False,
 ) -> CheckResult:
     result = CheckResult(
         topic_id=topic_id,
@@ -72,7 +73,7 @@ def _make_check_result(
         articles_new=2,
         has_new_info=has_new_info,
         llm_response=None,
-        notification_sent=False,
+        notification_sent=notification_sent,
         notification_error=notification_error,
         stage_error=stage_error,
     )
@@ -273,6 +274,33 @@ async def test_export_topic_csv_contains_check_data(
     # All rows should have the topic_id
     for row in rows:
         assert row["topic_id"] == str(topic.id)
+
+
+async def test_export_topic_csv_booleans_render_as_0_and_1(
+    client: httpx.AsyncClient,
+    db_conn: sqlite3.Connection,
+) -> None:
+    """OVH-111: boolean columns export as 0/1, not Python 'True'/'False'.
+
+    Matches the on-disk INTEGER representation (to_insert_dict stores 0/1) and the
+    JSON export's booleans, so a numeric-aware CSV importer parses them correctly.
+    """
+    topic = _make_topic(db_conn)
+    assert topic.id is not None
+    _make_check_result(db_conn, topic.id, has_new_info=True, notification_sent=True)
+    _make_check_result(db_conn, topic.id, has_new_info=False, notification_sent=False)
+
+    response = await client.get(f"/topics/{topic.id}/export/csv")
+
+    assert response.status_code == 200
+    rows = list(csv.DictReader(io.StringIO(response.text)))
+    assert len(rows) == 2
+    rendered = {(r["has_new_info"], r["notification_sent"]) for r in rows}
+    assert rendered == {("1", "1"), ("0", "0")}
+    # No Python bool literals leaked into any cell.
+    for row in rows:
+        assert row["has_new_info"] in ("0", "1")
+        assert row["notification_sent"] in ("0", "1")
 
 
 async def test_export_topic_csv_surfaces_stage_error(

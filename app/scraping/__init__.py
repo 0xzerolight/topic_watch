@@ -161,9 +161,11 @@ async def fetch_new_articles_for_topic(
             feeds_failed=feeds_failed,
         )
 
-    # 2. Filter to entries not already in DB; split into reuse vs. fetch-needed
+    # 2. Filter to entries not already in DB; split into reuse vs. fetch-needed.
+    # Reuse tuples also carry the ORIGINATING provider (OVH-114) so the reused row
+    # is attributed to whoever actually fetched the bytes, not this topic's provider.
     new_entries: list[tuple[FeedEntry, str]] = []
-    reuse_entries: list[tuple[FeedEntry, str, str]] = []  # (entry, hash, reused_content)
+    reuse_entries: list[tuple[FeedEntry, str, str, str | None]] = []  # (entry, hash, content, provider)
     for entry in entries:
         content_hash = compute_article_hash(entry.url, entry.title)
         if article_hash_exists(conn, topic.id, content_hash):
@@ -179,7 +181,7 @@ async def fetch_new_articles_for_topic(
             # entry's (possibly unresolved news.google.com redirect). The hash was
             # already computed above from entry.url, so dedup stays intact.
             entry.url = existing.url
-            reuse_entries.append((entry, content_hash, existing.raw_content))
+            reuse_entries.append((entry, content_hash, existing.raw_content, existing.source_provider))
         else:
             new_entries.append((entry, content_hash))
 
@@ -193,18 +195,21 @@ async def fetch_new_articles_for_topic(
 
     # 3. Combine reuse + fetch candidates, sort by published date (newest first,
     # None dates last), and apply the limit. Selection is purely recency-first.
+    # Each candidate carries (entry, hash, reused_content, provider); provider is
+    # the originating one for reused rows and None for fresh fetches (stamped with
+    # this topic's provider later).
     datetime_min = datetime.min.replace(tzinfo=UTC)
-    all_candidates: list[tuple[FeedEntry, str, str | None]] = [(e, h, c) for e, h, c in reuse_entries] + [
-        (e, h, None) for e, h in new_entries
-    ]
+    all_candidates: list[tuple[FeedEntry, str, str | None, str | None]] = [
+        (e, h, c, p) for e, h, c, p in reuse_entries
+    ] + [(e, h, None, None) for e, h in new_entries]
     all_candidates.sort(
         key=lambda t: t[0].published or datetime_min,
         reverse=True,
     )
     all_candidates = all_candidates[:max_articles]
 
-    reuse_batch = [(e, h, c) for e, h, c in all_candidates if c is not None]
-    fetch_batch = [(e, h) for e, h, c in all_candidates if c is None]
+    reuse_batch = [(e, h, c, p) for e, h, c, p in all_candidates if c is not None]
+    fetch_batch = [(e, h) for e, h, c, _ in all_candidates if c is None]
 
     # 3b. Resolve Google News redirect URLs for entries that need content fetching.
     # Done after dedup+limiting to minimize requests (typically ~10 URLs, not 100).
@@ -241,20 +246,21 @@ async def fetch_new_articles_for_topic(
             content_tasks = [_extract(entry) for entry, _ in fetch_batch]
             contents = list(await asyncio.gather(*content_tasks, return_exceptions=True))
 
-    # 5. Normalize both batches into a uniform (entry, content_hash, content) list,
-    # then run a single insert loop. Reused content is already resolved; freshly
-    # fetched content needs the BaseException -> summary -> None coercion first.
-    pending: list[tuple[FeedEntry, str, str | None]] = list(reuse_batch)
+    # 5. Normalize both batches into a uniform (entry, hash, content, provider) list,
+    # then run a single insert loop. Reused content is already resolved and carries
+    # its originating provider; freshly fetched rows carry provider=None (meaning
+    # "this topic's provider") and need the BaseException -> summary -> None coercion.
+    pending: list[tuple[FeedEntry, str, str | None, str | None]] = list(reuse_batch)
     for (entry, content_hash), content in zip(fetch_batch, contents, strict=False):
         if isinstance(content, BaseException):
             logger.warning("Content extraction failed for %s: %s", entry.url, content)
             content = entry.summary
         resolved_content = content if isinstance(content, str) and content else None
-        pending.append((entry, content_hash, resolved_content))
+        pending.append((entry, content_hash, resolved_content, None))
 
     stored: list[Article] = []
     dropped_duplicates = 0
-    for entry, content_hash, resolved_content in pending:
+    for entry, content_hash, resolved_content, origin_provider in pending:
         article = Article(
             topic_id=topic.id,
             title=entry.title,
@@ -262,7 +268,9 @@ async def fetch_new_articles_for_topic(
             content_hash=content_hash,
             raw_content=resolved_content,
             source_feed=entry.source_feed,
-            source_provider=response.provider_name,
+            # OVH-114: reused rows keep the originating provider; fresh rows (None)
+            # are attributed to the provider that produced this topic's feed.
+            source_provider=origin_provider if origin_provider is not None else response.provider_name,
         )
         if _insert_or_count_dup(conn, article, topic.name, stored):
             continue
