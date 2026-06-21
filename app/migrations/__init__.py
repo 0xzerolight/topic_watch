@@ -20,6 +20,7 @@ from app.migrations.m010_pending_webhooks import up as m010_up
 from app.migrations.m011_topic_thresholds import up as m011_up
 from app.migrations.m012_check_result_tokens import up as m012_up
 from app.migrations.m013_topic_init_attempts import up as m013_up
+from app.migrations.m014_perf_indexes import up as m014_up
 
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "baseline schema version", m001_up),
@@ -35,4 +36,5 @@ MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (11, "add confidence/relevance threshold columns to topics", m011_up),
     (12, "add prompt/completion token columns to check_results", m012_up),
     (13, "add init_attempts column to topics", m013_up),
+    (14, "add performance indexes to articles", m014_up),
 ]
