@@ -761,6 +761,104 @@ class TestMigrations:
             conn_after.close()
         assert applied is None
 
+    def test_partial_failure_commits_prior_migrations_and_resumes(self, tmp_path, monkeypatch) -> None:
+        """OVH-060: a crash mid-sequence durably records the migrations that DID succeed,
+        and a re-run resumes from there without re-running already-applied migrations."""
+        import app.migrations as migrations_mod
+        from app.database import get_connection, init_db
+
+        db_path = tmp_path / "partial.db"
+        init_db(db_path)  # establish an existing DB at the real head version
+
+        good_version = 9001
+        bad_version = 9002
+
+        good_calls: list[int] = []
+
+        def _good(conn: sqlite3.Connection) -> None:
+            good_calls.append(1)
+            conn.execute("CREATE TABLE IF NOT EXISTS ovh060_marker (id INTEGER PRIMARY KEY)")
+
+        def _boom(_conn: sqlite3.Connection) -> None:
+            raise ValueError("simulated mid-sequence migration failure")
+
+        # First migration succeeds, second fails — the second must NOT undo the first.
+        monkeypatch.setattr(
+            migrations_mod,
+            "MIGRATIONS",
+            [
+                (good_version, "good migration", _good),
+                (bad_version, "broken migration", _boom),
+            ],
+        )
+
+        conn = get_connection(db_path)
+        try:
+            with pytest.raises(ValueError, match="simulated mid-sequence migration failure"):
+                run_migrations(conn, db_path=db_path)
+        finally:
+            conn.close()
+
+        assert good_calls == [1], "good migration should have run exactly once"
+
+        # The good migration's progress must be durable on a FRESH connection
+        # (proves it was committed, not merely buffered on the failed connection).
+        conn_check = get_connection(db_path)
+        try:
+            good_recorded = conn_check.execute(
+                "SELECT version FROM schema_version WHERE version=?", (good_version,)
+            ).fetchone()
+            bad_recorded = conn_check.execute(
+                "SELECT version FROM schema_version WHERE version=?", (bad_version,)
+            ).fetchone()
+            marker = conn_check.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='ovh060_marker'"
+            ).fetchone()
+        finally:
+            conn_check.close()
+        assert good_recorded is not None, "good migration version must be durably committed"
+        assert bad_recorded is None, "failed migration version must not be recorded"
+        assert marker is not None, "good migration's DDL must be durable"
+
+        # Re-run with the second migration now fixed: the good one must NOT re-run.
+        good_calls.clear()
+        second_calls: list[int] = []
+
+        def _now_fixed(conn: sqlite3.Connection) -> None:
+            second_calls.append(1)
+            conn.execute("CREATE TABLE IF NOT EXISTS ovh060_marker2 (id INTEGER PRIMARY KEY)")
+
+        monkeypatch.setattr(
+            migrations_mod,
+            "MIGRATIONS",
+            [
+                (good_version, "good migration", _good),
+                (bad_version, "now fixed migration", _now_fixed),
+            ],
+        )
+
+        conn2 = get_connection(db_path)
+        try:
+            run_migrations(conn2, db_path=db_path)
+        finally:
+            conn2.close()
+
+        assert good_calls == [], "already-applied migration must not re-run on resume"
+        assert second_calls == [1], "the previously-failed migration must run on resume"
+
+        conn_final = get_connection(db_path)
+        try:
+            applied = {
+                r[0]
+                for r in conn_final.execute(
+                    "SELECT version FROM schema_version WHERE version IN (?, ?)",
+                    (good_version, bad_version),
+                ).fetchall()
+            }
+        finally:
+            conn_final.close()
+        assert applied == {good_version, bad_version}
+
 
 class TestRecoverStuckTopics:
     """Tests for recover_stuck_topics."""
