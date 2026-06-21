@@ -18,7 +18,6 @@ from app.models import (
     PendingWebhook,
     Topic,
     TopicStatus,
-    _coerce_required_dt,
 )
 
 logger = logging.getLogger(__name__)
@@ -242,25 +241,11 @@ def _query_dashboard_rows(
         topic = Topic.from_row(row)
         last_check = None
         if row["cr_id"] is not None and topic.id is not None:
-            last_check = CheckResult(
-                id=row["cr_id"],
-                topic_id=topic.id,
-                # Route the required datetime through the same defensive coercion
-                # CheckResult.from_row uses (OVH-108): a corrupt/legacy checked_at
-                # cell degrades to now(UTC) with a warning instead of 500-ing the
-                # dashboard. This path builds the model directly (no full blob), so
-                # it must apply the guard itself.
-                checked_at=_coerce_required_dt(row["cr_checked_at"]),
-                articles_found=row["cr_articles_found"],
-                articles_new=row["cr_articles_new"],
-                has_new_info=bool(row["cr_has_new_info"]),
-                # Confidence comes pre-extracted from SQL (OVH-052); the full
-                # llm_response blob is intentionally NOT shipped on this path.
-                llm_response=None,
-                confidence=row["cr_confidence"],
-                notification_sent=bool(row["cr_notification_sent"]),
-                notification_error=row["cr_notification_error"],
-            )
+            # Map the cr_-prefixed join aliases to the model via the shared helper
+            # so the dashboard path no longer re-implements CheckResult's coercion
+            # coupling inline (OVH-151). Confidence stays pre-extracted by SQL and
+            # the full llm_response blob is intentionally not shipped here (OVH-052).
+            last_check = CheckResult.from_dashboard_row(row, topic.id)
         result.append(
             {
                 "topic": topic,

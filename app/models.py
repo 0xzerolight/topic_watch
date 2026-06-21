@@ -327,6 +327,31 @@ class CheckResult(SQLiteModel):
         except (ValueError, TypeError):
             return None
 
+    @classmethod
+    def from_dashboard_row(cls, row: sqlite3.Row, topic_id: int) -> Self:
+        """Build the partial CheckResult the dashboard listing carries (OVH-151).
+
+        The dashboard SELECT joins each topic to its latest check via ``cr_``-
+        prefixed aliases and pre-extracts ``confidence`` with SQL ``json_extract``,
+        so the full ``llm_response`` blob is never shipped/parsed per topic
+        (OVH-052). This maps those aliases to the model, routing the required
+        ``checked_at`` through the same defensive coercion ``from_row`` uses
+        (OVH-108) so a corrupt/legacy cell degrades to now(UTC) instead of 500-ing
+        the dashboard. ``llm_response`` is intentionally left ``None`` on this path.
+        """
+        return cls(
+            id=row["cr_id"],
+            topic_id=topic_id,
+            checked_at=_coerce_required_dt(row["cr_checked_at"]),
+            articles_found=row["cr_articles_found"],
+            articles_new=row["cr_articles_new"],
+            has_new_info=bool(row["cr_has_new_info"]),
+            llm_response=None,
+            confidence=row["cr_confidence"],
+            notification_sent=bool(row["cr_notification_sent"]),
+            notification_error=row["cr_notification_error"],
+        )
+
 
 class FeedHealth(SQLiteModel):
     """Health tracking for a single feed URL.

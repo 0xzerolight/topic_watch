@@ -537,3 +537,42 @@ class TestSQLiteModelSharedInterop:
         assert "confidence" not in cr.to_insert_dict()
         pn = PendingNotification(topic_id=1, title="t", body="b", claimed_at="x")
         assert "claimed_at" not in pn.to_insert_dict()
+
+
+class TestCheckResultFromDashboardRow:
+    """OVH-151: CheckResult.from_dashboard_row maps the cr_-prefixed join aliases."""
+
+    def _dash_row(self, **overrides: object) -> dict:
+        row = {
+            "cr_id": 7,
+            "cr_checked_at": "2026-06-13T12:00:00+00:00",
+            "cr_articles_found": 4,
+            "cr_articles_new": 2,
+            "cr_has_new_info": 1,
+            "cr_confidence": 0.75,
+            "cr_notification_sent": 0,
+            "cr_notification_error": None,
+        }
+        row.update(overrides)
+        return row
+
+    def test_maps_aliases_to_model(self) -> None:
+        cr = CheckResult.from_dashboard_row(self._dash_row(), topic_id=3)
+        assert cr.id == 7
+        assert cr.topic_id == 3
+        assert cr.checked_at.year == 2026
+        assert cr.articles_found == 4
+        assert cr.articles_new == 2
+        assert cr.has_new_info is True
+        assert cr.notification_sent is False
+        # Confidence is pre-extracted by SQL on this path; blob never shipped.
+        assert cr.confidence == 0.75
+        assert cr.llm_response is None
+
+    def test_corrupt_checked_at_degrades_to_now(self) -> None:
+        cr = CheckResult.from_dashboard_row(self._dash_row(cr_checked_at="garbage"), topic_id=1)
+        assert isinstance(cr.checked_at, datetime)
+
+    def test_null_confidence_stays_none(self) -> None:
+        cr = CheckResult.from_dashboard_row(self._dash_row(cr_confidence=None), topic_id=1)
+        assert cr.confidence is None
