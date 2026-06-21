@@ -78,7 +78,7 @@ async def create_topic_handler(
     relevance_threshold: str = Form(""),
 ):
     """Create a new topic and kick off initial research in the background."""
-    mode, urls, parsed_interval, errors = validate_topic_form(feed_mode, feed_urls, check_interval)
+    mode, urls, parsed_interval, errors = await validate_topic_form(feed_mode, feed_urls, check_interval)
     tag_list = [t.strip() for t in tags.split(",") if t.strip()]
     conf_threshold = parse_threshold(confidence_threshold, "Confidence threshold", errors)
     rel_threshold = parse_threshold(relevance_threshold, "Relevance threshold", errors)
@@ -421,7 +421,7 @@ async def edit_topic_handler(
     if topic is None:
         raise HTTPException(status_code=404, detail="Topic not found")
 
-    mode, urls, parsed_interval, errors = validate_topic_form(feed_mode, feed_urls, check_interval)
+    mode, urls, parsed_interval, errors = await validate_topic_form(feed_mode, feed_urls, check_interval)
     tag_list = [t.strip() for t in tags.split(",") if t.strip()]
     conf_threshold = parse_threshold(confidence_threshold, "Confidence threshold", errors)
     rel_threshold = parse_threshold(relevance_threshold, "Relevance threshold", errors)
