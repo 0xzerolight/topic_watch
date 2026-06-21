@@ -58,6 +58,7 @@ article_retention_days: 90
 # web_page_size: 20
 # feed_max_retries: 2
 # content_fetch_concurrency: 3
+# topic_check_concurrency: 3
 # scheduler_misfire_grace_time: 300
 # scheduler_jitter_seconds: 30
 # llm_max_retries: 2
