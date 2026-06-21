@@ -1,8 +1,27 @@
 """Tests for OPML import/export functionality."""
 
+from collections.abc import Iterator
 from unittest.mock import patch
 
+import pytest
+
 from app.opml import MAX_IMPORT_TOPICS, export_opml, parse_opml
+
+
+@pytest.fixture(autouse=True)
+def _stub_feed_url_validation() -> Iterator[None]:
+    """OVH-083: stub the SSRF resolver so parse tests never make live DNS calls.
+
+    ``validate_feed_url`` resolves each host (fail-closed SSRF check), so any
+    unmocked ``parse_opml`` call here would hit the network — flaky on CI runners
+    without outbound DNS and green-for-the-wrong-reason behind a captive resolver.
+    Every parse/round-trip test treats all URLs as valid; the one dedicated SSRF
+    test (``test_ssrf_private_url_skipped``) overrides this with its own explicit,
+    DNS-free mock.
+    """
+    with patch("app.opml.validate_feed_url", return_value=None):
+        yield
+
 
 VALID_OPML = """<?xml version="1.0" encoding="UTF-8"?>
 <opml version="2.0">
@@ -91,12 +110,25 @@ class TestParseOPML:
         assert result.topics[0]["name"] == "example.com"
 
     def test_ssrf_private_url_skipped(self):
+        """OVH-083: the one dedicated SSRF test, mocked explicitly (no live DNS).
+
+        ``validate_feed_url`` is mocked to reject ONLY the private URL, proving
+        ``parse_opml`` routes a validation error into ``skipped_invalid`` and drops
+        the offending feed — without resolving any host on the network.
+        """
         opml = """<?xml version="1.0"?>
         <opml version="2.0"><body>
             <outline text="Private" xmlUrl="http://localhost:8080/feed" />
             <outline text="Public" xmlUrl="https://example.com/feed" />
         </body></opml>"""
-        result = parse_opml(opml, set())
+
+        def fake_validate(url: str) -> str | None:
+            if "localhost" in url:
+                return f"Feed URL points to a private/reserved address: {url}"
+            return None
+
+        with patch("app.opml.validate_feed_url", side_effect=fake_validate):
+            result = parse_opml(opml, set())
         assert len(result.topics) == 1
         assert result.topics[0]["name"] == "Public"
         assert result.skipped_invalid == 1
