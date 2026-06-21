@@ -79,3 +79,27 @@ jobs:
 
       - name: Build Docker image
         run: docker build -t topic-watch:ci .
+
+  security:
+    # Dependency vulnerability scan (OVH-062). Hash-locked pins protect install
+    # integrity but pin a vulnerable version as firmly as a safe one — this is
+    # the gate that flags newly-disclosed CVEs in the litellm/lxml/trafilatura
+    # tree that parses untrusted feed content. Non-blocking for now
+    # (continue-on-error); promote to required once the baseline is clean.
+    runs-on: ubuntu-latest
+    needs: lint
+    continue-on-error: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.11"
+
+      - name: Install pip-audit
+        run: pip install pip-audit
+
+      - name: Audit runtime dependencies for known advisories
+        run: pip-audit --requirement requirements.txt
