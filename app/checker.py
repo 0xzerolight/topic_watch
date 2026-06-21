@@ -31,8 +31,8 @@ from app.crud import (
     update_topic_init_status,
 )
 from app.database import get_db, short_conn
-from app.models import CheckResult, PendingNotification, Topic, TopicStatus
-from app.notifications import format_notification, send_notification
+from app.models import CheckResult, NotificationDelivery, PendingNotification, Topic, TopicStatus
+from app.notifications import format_notification, redact_url, send_notification, send_notification_per_url
 from app.scraping import fetch_new_articles_for_topic
 from app.webhooks import retry_pending_webhooks, send_webhooks
 
@@ -233,20 +233,16 @@ async def _check_topic_inner(
     # Step 7: Irreversible network sends, now that durable state is committed.
     if should_notify and notification is not None:
         title, body = notification
-        try:
-            sent = await send_notification(title, body, settings)
-            result.notification_sent = sent
-            if not sent:
-                result.notification_error = "Delivery failed"
-                _queue_notification(conn, topic_id, title, body)
-        except Exception as exc:
-            logger.warning(
-                "Notification failed for topic '%s'",
-                topic.name,
-                exc_info=True,
-            )
-            result.notification_error = str(exc)
-            _queue_notification(conn, topic_id, title, body)
+        # Deliver per-URL so a partial failure (one channel down) re-queues only
+        # the failed targets — the channels that already delivered are never
+        # re-sent on retry (OVH-039). send_notification_per_url never raises.
+        deliveries = await send_notification_per_url(title, body, settings)
+        result.notification_sent = bool(deliveries) and all(d.ok for d in deliveries)
+        failed = [d for d in deliveries if not d.ok]
+        if failed:
+            # Surface the first/aggregated reason without leaking a raw URL.
+            result.notification_error = _summarize_delivery_failures(failed)
+            _queue_failed_notifications(conn, topic_id, title, body, deliveries)
 
         # Send webhooks (independent of Apprise success/failure). Pass the
         # connection + topic_id + check_result_id so failed deliveries are
@@ -296,16 +292,51 @@ def _record_result(conn: sqlite3.Connection, result: CheckResult) -> CheckResult
     return created
 
 
-def _queue_notification(conn: sqlite3.Connection, topic_id: int, title: str, body: str) -> None:
-    """Queue a failed notification for retry."""
-    try:
-        create_pending_notification(
-            conn,
-            PendingNotification(topic_id=topic_id, title=title, body=body),
-        )
-        logger.info("Queued notification for retry (topic_id=%d)", topic_id)
-    except Exception:
-        logger.warning("Failed to queue notification for retry", exc_info=True)
+def _summarize_delivery_failures(failed: list[NotificationDelivery]) -> str:
+    """Build a redacted, operator-readable summary of failed deliveries.
+
+    Surfaces the per-channel reason (OVH-039) without leaking any raw URL/token
+    (OVH-027): each entry is ``scheme://host: reason``.
+    """
+    parts = [f"{redact_url(d.url)}: {d.error or 'delivery failed'}" for d in failed]
+    return "; ".join(parts)
+
+
+def _queue_failed_notifications(
+    conn: sqlite3.Connection,
+    topic_id: int,
+    title: str,
+    body: str,
+    deliveries: list[NotificationDelivery],
+) -> None:
+    """Queue one pending row per FAILED URL for retry.
+
+    Only the targets that failed are queued, each scoped to its own URL, so the
+    retry drain re-hits exactly those channels and never re-delivers to the ones
+    that already succeeded (OVH-039). The per-URL failure reason is stored as
+    ``last_error`` for diagnostics.
+    """
+    for d in deliveries:
+        if d.ok:
+            continue
+        try:
+            create_pending_notification(
+                conn,
+                PendingNotification(
+                    topic_id=topic_id,
+                    title=title,
+                    body=body,
+                    url=d.url,
+                    last_error=d.error,
+                ),
+            )
+            logger.info(
+                "Queued notification for retry (topic_id=%d, url=%s)",
+                topic_id,
+                redact_url(d.url),
+            )
+        except Exception:
+            logger.warning("Failed to queue notification for retry", exc_info=True)
 
 
 async def retry_pending_notifications(
@@ -382,10 +413,17 @@ async def _drain_pending_notifications(
             logger.debug("Notification id=%d already claimed by another drain; skipping", notification.id)
             continue
 
+        # Retry only the URL this row is scoped to (OVH-039) so a partial-batch
+        # failure never re-delivers to channels that already succeeded. Legacy
+        # rows with url=None fall back to all configured URLs.
+        last_error: str | None = None
         try:
-            sent = await send_notification(notification.title, notification.body, settings)
+            sent = await send_notification(notification.title, notification.body, settings, url=notification.url)
+            if not sent:
+                last_error = "delivery failed"
         except Exception:
             sent = False
+            last_error = "retry error"
             logger.warning("Retry error for notification id=%d", notification.id, exc_info=True)
 
         # Apply this single result and commit immediately. On failure,
@@ -396,7 +434,7 @@ async def _drain_pending_notifications(
                 delete_pending_notification(apply_conn, notification.id)
                 logger.info("Retry succeeded for notification id=%d", notification.id)
             else:
-                increment_notification_retry(apply_conn, notification.id)
+                increment_notification_retry(apply_conn, notification.id, last_error)
                 logger.warning("Retry failed for notification id=%d", notification.id)
             apply_conn.commit()
 

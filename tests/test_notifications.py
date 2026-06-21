@@ -15,7 +15,12 @@ from app.config import LLMSettings, NotificationSettings, Settings
 from app.crud import create_pending_notification, create_topic, list_pending_notifications
 from app.database import get_connection, init_db
 from app.models import PendingNotification, Topic, TopicStatus
-from app.notifications import format_notification, send_notification
+from app.notifications import (
+    format_notification,
+    redact_url,
+    send_notification,
+    send_notification_per_url,
+)
 
 
 def _make_settings(**overrides) -> Settings:
@@ -246,7 +251,7 @@ class TestNotificationDrainSingleFlight:
         first_send_started = asyncio.Event()
         release = asyncio.Event()
 
-        async def slow_send(title: str, body: str, _settings) -> bool:  # noqa: ANN001
+        async def slow_send(title: str, body: str, _settings, *, url=None) -> bool:  # noqa: ANN001
             first_send_started.set()
             await release.wait()
             sent_counts[title] += 1
@@ -285,7 +290,7 @@ class TestNotificationDrainSingleFlight:
 
         send_calls: list[str] = []
 
-        async def record_send(title: str, body: str, _settings) -> bool:  # noqa: ANN001
+        async def record_send(title: str, body: str, _settings, *, url=None) -> bool:  # noqa: ANN001
             send_calls.append(title)
             return True
 
@@ -300,3 +305,190 @@ class TestNotificationDrainSingleFlight:
             assert row["claimed_at"] == "2999-01-01T00:00:00+00:00"
         finally:
             verify.close()
+
+
+# --- URL redaction (OVH-027) ---
+
+
+class TestRedactUrl:
+    """redact_url never leaks userinfo/token/query, keeps scheme+host."""
+
+    def test_keeps_scheme_and_host(self) -> None:
+        assert redact_url("slack://host.example.com/path") == "slack://host.example.com"
+
+    def test_strips_userinfo_and_token(self) -> None:
+        # tgram://<bot-token>@... — the token must not survive redaction.
+        red = redact_url("tgram://123456:ABCDEF-secret-token@chat")
+        assert "secret-token" not in red
+        assert "ABCDEF" not in red
+
+    def test_strips_query_string(self) -> None:
+        red = redact_url("json://host/?password=hunter2")
+        assert "hunter2" not in red
+        assert red.startswith("json://host")
+
+    def test_handles_garbage(self) -> None:
+        # Never raises; returns a non-empty masked placeholder.
+        assert redact_url("") != ""
+        assert isinstance(redact_url("::not a url::"), str)
+
+
+# --- per-URL delivery (OVH-027 / OVH-039) ---
+
+
+class TestSendNotificationPerUrl:
+    """Per-URL delivery so partial failures can be re-queued individually."""
+
+    @patch("app.notifications.apprise.Apprise")
+    async def test_returns_one_result_per_url(self, mock_apprise: MagicMock) -> None:
+        instances = [MagicMock(), MagicMock()]
+        instances[0].add.return_value = True
+        instances[0].notify.return_value = True
+        instances[1].add.return_value = True
+        instances[1].notify.return_value = False
+        mock_apprise.side_effect = instances
+        settings = _make_settings(notifications=NotificationSettings(urls=["json://a", "json://b"]))
+
+        results = await send_notification_per_url("T", "B", settings)
+
+        assert [(r.url, r.ok) for r in results] == [("json://a", True), ("json://b", False)]
+
+    @patch("app.notifications.apprise.Apprise")
+    async def test_invalid_url_marked_failed_not_dropped(self, mock_apprise: MagicMock) -> None:
+        """A URL apprise can't add() is reported as failed (OVH-027), not silently dropped."""
+        good, bad = MagicMock(), MagicMock()
+        good.add.return_value = True
+        good.notify.return_value = True
+        bad.add.return_value = False  # invalid URL
+        mock_apprise.side_effect = [good, bad]
+        settings = _make_settings(notifications=NotificationSettings(urls=["json://good", "::invalid::"]))
+
+        results = await send_notification_per_url("T", "B", settings)
+
+        by_url = {r.url: r for r in results}
+        assert by_url["json://good"].ok is True
+        assert by_url["::invalid::"].ok is False
+        # The valid URL still delivered.
+        good.notify.assert_called_once()
+        # The invalid URL was never notify()'d (add failed first).
+        bad.notify.assert_not_called()
+
+    @patch("app.notifications.apprise.Apprise")
+    async def test_only_named_url_sent_when_url_given(self, mock_apprise: MagicMock) -> None:
+        """Passing url= sends to only that URL (the retry-drain per-row path)."""
+        inst = MagicMock()
+        inst.add.return_value = True
+        inst.notify.return_value = True
+        mock_apprise.return_value = inst
+        settings = _make_settings(notifications=NotificationSettings(urls=["json://a", "json://b", "json://c"]))
+
+        results = await send_notification_per_url("T", "B", settings, url="json://b")
+
+        assert [r.url for r in results] == ["json://b"]
+        inst.add.assert_called_once_with("json://b")
+
+    @patch("app.notifications.apprise.Apprise")
+    async def test_invalid_url_logged_redacted(self, mock_apprise: MagicMock, caplog) -> None:  # noqa: ANN001
+        """The invalid URL warning is emitted with the token redacted."""
+        import logging as _logging
+
+        inst = MagicMock()
+        inst.add.return_value = False
+        mock_apprise.return_value = inst
+        settings = _make_settings(notifications=NotificationSettings(urls=["tgram://123:SECRETTOKEN@chat"]))
+
+        with caplog.at_level(_logging.WARNING, logger="app.notifications"):
+            await send_notification_per_url("T", "B", settings, url="tgram://123:SECRETTOKEN@chat")
+
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "SECRETTOKEN" not in joined
+        assert "invalid notification url" in joined.lower()
+
+
+class TestSendNotificationStillNonRaising:
+    """send_notification keeps its boolean contract and never raises (OVH-039)."""
+
+    @patch("app.notifications.apprise.Apprise")
+    async def test_returns_false_when_one_of_many_fails(self, mock_apprise: MagicMock) -> None:
+        first, second = MagicMock(), MagicMock()
+        first.add.return_value = True
+        first.notify.return_value = True
+        second.add.return_value = True
+        second.notify.return_value = False
+        mock_apprise.side_effect = [first, second]
+        settings = _make_settings(notifications=NotificationSettings(urls=["json://a", "json://b"]))
+
+        result = await send_notification("T", "B", settings)
+        assert result is False
+
+    @patch("app.notifications.apprise.Apprise")
+    async def test_does_not_raise_on_per_url_exception(self, mock_apprise: MagicMock) -> None:
+        inst = MagicMock()
+        inst.add.return_value = True
+        inst.notify.side_effect = Exception("boom")
+        mock_apprise.return_value = inst
+        settings = _make_settings()
+
+        result = await send_notification("T", "B", settings)
+        assert result is False
+
+
+# --- retry does not re-send already-succeeded URLs (OVH-039) ---
+
+
+class TestRetryOnlyResendsFailedUrls:
+    """A partial failure queues only the failed URL; retry never re-hits the rest."""
+
+    async def test_partial_failure_requeues_only_failed_url(self, tmp_path) -> None:  # noqa: ANN001
+        """check_topic-style queueing: a 3-URL send with one failure queues 1 row for that URL."""
+        from app.checker import _queue_failed_notifications
+        from app.models import NotificationDelivery
+
+        db_path = tmp_path / "test.db"
+        init_db(db_path)
+        conn = get_connection(db_path)
+        try:
+            topic = create_topic(conn, Topic(name="Notif", description="d", status=TopicStatus.READY))
+            conn.commit()
+            deliveries = [
+                NotificationDelivery(url="json://a", ok=True),
+                NotificationDelivery(url="json://b", ok=False, error="HTTP 500"),
+                NotificationDelivery(url="json://c", ok=True),
+            ]
+            _queue_failed_notifications(conn, topic.id, "T", "B", deliveries)
+            conn.commit()
+            pending = list_pending_notifications(conn)
+        finally:
+            conn.close()
+
+        assert len(pending) == 1
+        assert pending[0].url == "json://b"
+        assert pending[0].last_error == "HTTP 500"
+
+    async def test_retry_drain_sends_only_to_queued_url(self, tmp_path) -> None:  # noqa: ANN001
+        """A pending row carrying url=json://b retries only json://b, not the whole batch."""
+        db_path = tmp_path / "test.db"
+        init_db(db_path)
+        conn = get_connection(db_path)
+        try:
+            topic = create_topic(conn, Topic(name="Notif", description="d", status=TopicStatus.READY))
+            conn.commit()
+            create_pending_notification(
+                conn,
+                PendingNotification(topic_id=topic.id, title="T", body="B", url="json://b"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # The retry drain must call send_notification scoped to the queued URL only.
+        sent_urls: list[str | None] = []
+
+        async def record_send(title: str, body: str, _settings, *, url=None) -> bool:  # noqa: ANN001
+            sent_urls.append(url)
+            return True
+
+        with patch("app.checker.send_notification", side_effect=record_send):
+            await retry_pending_notifications(settings=_make_settings(), db_path=db_path)
+
+        assert sent_urls == ["json://b"]
