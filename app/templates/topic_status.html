@@ -1,4 +1,11 @@
-{% if topic.status.value == "new" %}
+{% if topic is none %}
+<article>
+    <header>Topic Removed</header>
+    <p>This topic no longer exists — it may have been deleted in another tab.</p>
+    <p><a href="/" role="button" class="contrast outline" style="font-size: 0.875rem;">Back to Dashboard</a></p>
+</article>
+
+{% elif topic.status.value == "new" %}
 <article>
     <header>Pending Initialization</header>
     <p>This topic will be initialized on the next scheduler cycle (~1 minute). Articles will be fetched and an initial knowledge state will be built automatically.</p>
