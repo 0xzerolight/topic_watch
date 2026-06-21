@@ -103,33 +103,52 @@ def _safe_href(url: str | None) -> str:
     return url if scheme in ("http", "https") else "#"
 
 
+def _confidence_value(confidence: float | int | None) -> str:
+    """Render a confidence scalar (already extracted) as a colored badge.
+
+    Used on the dashboard, where the confidence is read via SQL ``json_extract``
+    so the full ``llm_response`` blob is never shipped/parsed per topic
+    (OVH-052). ``None`` (no check / missing confidence) renders as ``-``.
+    """
+    if confidence is None:
+        return "-"
+    try:
+        score = float(confidence)
+    except (ValueError, TypeError):
+        return "-"
+
+    if score >= 0.8:
+        bg, color = "#2ecc40", "#fff"
+    elif score >= 0.5:
+        bg, color = "#ffdc00", "#111"
+    else:
+        bg, color = "#ff4136", "#fff"
+
+    score_text = f"{score:.2f}"
+    return Markup(  # type: ignore[no-any-return]
+        f'<span style="background:{bg};color:{color};padding:0.15em 0.5em;'
+        f'border-radius:0.25em;font-size:0.85em;font-weight:600;" '
+        f'title="Confidence: {score_text}">{score_text}</span>'
+    )
+
+
 def _confidence_badge(llm_response: str | None) -> str:
-    """Render a confidence score as a colored badge from llm_response JSON."""
+    """Render a confidence badge from a full ``llm_response`` JSON blob.
+
+    Used on paths that already hold the blob (e.g. the per-check history table).
+    The dashboard listing uses :func:`_confidence_value` on a pre-extracted
+    scalar instead so it never ships the blob (OVH-052).
+    """
     if not llm_response:
         return "-"
 
     try:
         data = json_mod.loads(llm_response)
         confidence = data.get("confidence")
-        if confidence is None:
-            return "-"
-        confidence = float(confidence)
-    except (json_mod.JSONDecodeError, ValueError, TypeError):
+    except json_mod.JSONDecodeError:
         return "-"
 
-    if confidence >= 0.8:
-        bg, color = "#2ecc40", "#fff"
-    elif confidence >= 0.5:
-        bg, color = "#ffdc00", "#111"
-    else:
-        bg, color = "#ff4136", "#fff"
-
-    score_text = f"{confidence:.2f}"
-    return Markup(  # type: ignore[no-any-return]
-        f'<span style="background:{bg};color:{color};padding:0.15em 0.5em;'
-        f'border-radius:0.25em;font-size:0.85em;font-weight:600;" '
-        f'title="Confidence: {score_text}">{score_text}</span>'
-    )
+    return _confidence_value(confidence)
 
 
 def _feed_source_name(feed_url: str) -> str:
@@ -155,4 +174,5 @@ templates.env.filters["sanitize_error"] = _sanitize_error
 templates.env.filters["mask_url"] = _mask_url
 templates.env.filters["safe_href"] = _safe_href
 templates.env.filters["confidence_badge"] = _confidence_badge
+templates.env.filters["confidence_value"] = _confidence_value
 templates.env.filters["feed_source_name"] = _feed_source_name

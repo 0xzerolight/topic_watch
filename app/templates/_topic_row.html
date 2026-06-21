@@ -23,7 +23,7 @@
     <td>
         {% if last_check %}
             <span title="{{ last_check.checked_at.strftime('%Y-%m-%d %H:%M') }}">{{ last_check.checked_at | timeago }}</span>
-            <br><small>{{ last_check.llm_response | confidence_badge }}</small>
+            <br><small>{{ last_check.confidence | confidence_value }}</small>
         {% else %}
             Never
         {% endif %}

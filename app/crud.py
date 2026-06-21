@@ -195,6 +195,12 @@ def recover_stuck_researching(conn: sqlite3.Connection, timeout_minutes: int = 1
 # recent check result plus an article-count subquery. Only the WHERE clause
 # varies between the unfiltered dashboard and the filtered search; values always
 # flow through ``?`` placeholders.
+#
+# Confidence is read with SQLite ``json_extract`` so the dashboard renders the
+# confidence badge from a single scalar instead of shipping the full
+# ``llm_response`` blob (several KB) per topic and re-parsing it in Python
+# (OVH-052). The blob is selected only on detail/export paths that need the
+# payload. ``json_extract`` over a fixed column path is parameter-free SQL.
 _DASHBOARD_SELECT = """
     SELECT t.*,
            cr.id AS cr_id,
@@ -202,7 +208,7 @@ _DASHBOARD_SELECT = """
            cr.articles_found AS cr_articles_found,
            cr.articles_new AS cr_articles_new,
            cr.has_new_info AS cr_has_new_info,
-           cr.llm_response AS cr_llm_response,
+           json_extract(cr.llm_response, '$.confidence') AS cr_confidence,
            cr.notification_sent AS cr_notification_sent,
            cr.notification_error AS cr_notification_error,
            (SELECT COUNT(*) FROM articles WHERE articles.topic_id = t.id) AS article_count
@@ -242,7 +248,10 @@ def _query_dashboard_rows(
                 articles_found=row["cr_articles_found"],
                 articles_new=row["cr_articles_new"],
                 has_new_info=bool(row["cr_has_new_info"]),
-                llm_response=row["cr_llm_response"],
+                # Confidence comes pre-extracted from SQL (OVH-052); the full
+                # llm_response blob is intentionally NOT shipped on this path.
+                llm_response=None,
+                confidence=row["cr_confidence"],
                 notification_sent=bool(row["cr_notification_sent"]),
                 notification_error=row["cr_notification_error"],
             )
