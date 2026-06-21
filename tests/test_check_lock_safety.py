@@ -1,10 +1,21 @@
-"""Tests for CheckingState async-safe check tracking."""
+"""Tests for CheckingState async-safe check tracking and retry-drain claims."""
 
 import asyncio
+import sqlite3
 import time
 
 import pytest
 
+from app.crud import (
+    claim_pending_notification,
+    claim_pending_webhook,
+    create_pending_notification,
+    create_pending_webhook,
+    create_topic,
+    release_stale_notification_claims,
+    release_stale_webhook_claims,
+)
+from app.models import PendingNotification, Topic, TopicStatus
 from app.web.state import CheckingState
 
 
@@ -168,3 +179,65 @@ async def test_state_not_corrupted_after_concurrent_finish(state: CheckingState)
     # All entries should be startable again
     for tid in range(5):
         assert await state.start_check(tid) is True
+
+
+# --- Retry-drain atomic claim (cross-process double-delivery guard, OVH-017) ---
+
+
+def _make_topic(conn: sqlite3.Connection) -> Topic:
+    topic = create_topic(conn, Topic(name="Claimed", description="d", status=TopicStatus.READY))
+    conn.commit()
+    return topic
+
+
+def test_notification_claim_succeeds_once_then_fails(db_conn: sqlite3.Connection) -> None:
+    """Only the first claim of an unclaimed notification wins; a second loses."""
+    topic = _make_topic(db_conn)
+    n = create_pending_notification(db_conn, PendingNotification(topic_id=topic.id, title="T", body="B"))
+    db_conn.commit()
+
+    assert claim_pending_notification(db_conn, n.id, "2025-01-01T00:00:00+00:00") is True
+    # Second claim of the now-claimed row loses (would have caused a double-send).
+    assert claim_pending_notification(db_conn, n.id, "2025-01-01T00:00:01+00:00") is False
+
+
+def test_webhook_claim_succeeds_once_then_fails(db_conn: sqlite3.Connection) -> None:
+    """Only the first claim of an unclaimed webhook wins; a second loses."""
+    topic = _make_topic(db_conn)
+    webhook_id = create_pending_webhook(db_conn, topic.id, "https://a.com/hook", {"k": "v"})
+    db_conn.commit()
+
+    assert claim_pending_webhook(db_conn, webhook_id, "2025-01-01T00:00:00+00:00") is True
+    assert claim_pending_webhook(db_conn, webhook_id, "2025-01-01T00:00:01+00:00") is False
+
+
+def test_release_stale_notification_claim_rearms_row(db_conn: sqlite3.Connection) -> None:
+    """A claim older than the cutoff is released so the row can be re-claimed."""
+    topic = _make_topic(db_conn)
+    n = create_pending_notification(db_conn, PendingNotification(topic_id=topic.id, title="T", body="B"))
+    db_conn.commit()
+    assert claim_pending_notification(db_conn, n.id, "2020-01-01T00:00:00+00:00") is True
+    db_conn.commit()
+
+    # A fresh claim (newer) is NOT released; an old one is.
+    released = release_stale_notification_claims(db_conn, "2020-06-01T00:00:00+00:00")
+    db_conn.commit()
+    assert released == 1
+    # Re-claimable now.
+    assert claim_pending_notification(db_conn, n.id, "2025-01-01T00:00:00+00:00") is True
+
+
+def test_release_stale_webhook_claim_rearms_row(db_conn: sqlite3.Connection) -> None:
+    """Stale webhook claims are released; recent ones are left alone."""
+    topic = _make_topic(db_conn)
+    webhook_id = create_pending_webhook(db_conn, topic.id, "https://a.com/hook", {"k": "v"})
+    db_conn.commit()
+    assert claim_pending_webhook(db_conn, webhook_id, "2020-01-01T00:00:00+00:00") is True
+    db_conn.commit()
+
+    # Cutoff before the claim time: nothing released.
+    assert release_stale_webhook_claims(db_conn, "2019-01-01T00:00:00+00:00") == 0
+    # Cutoff after the claim time: released and re-claimable.
+    assert release_stale_webhook_claims(db_conn, "2020-06-01T00:00:00+00:00") == 1
+    db_conn.commit()
+    assert claim_pending_webhook(db_conn, webhook_id, "2025-01-01T00:00:00+00:00") is True
