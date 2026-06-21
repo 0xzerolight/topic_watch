@@ -350,6 +350,29 @@ def _filter_restated_key_facts(key_facts: list[str], knowledge_summary: str) -> 
     return [fact for fact in key_facts if not _is_restatement(fact, knowledge_summary)]
 
 
+# --- source_urls subset guard (prompt-injection output validation) ---
+
+
+def _filter_source_urls(source_urls: list[str], articles: list[Article]) -> list[str]:
+    """Keep only LLM-returned source_urls that match an input article URL.
+
+    A successful-but-manipulated completion can emit an attacker-chosen
+    source_url (e.g. a phishing link injected via feed text) that still passes
+    schema validation and would otherwise flow into notifications/webhooks
+    (OVH-058). Cross-checking against the input set drops any smuggled URL while
+    preserving order and de-duplicating. Comparison is on the exact URL string,
+    matching how the URLs were presented to the model.
+    """
+    allowed = {article.url for article in articles}
+    seen: set[str] = set()
+    kept: list[str] = []
+    for url in source_urls:
+        if url in allowed and url not in seen:
+            kept.append(url)
+            seen.add(url)
+    return kept
+
+
 # --- Public API ---
 
 
@@ -396,6 +419,9 @@ async def analyze_articles(
     novelty.prompt_tokens = usage.prompt_tokens
     novelty.completion_tokens = usage.completion_tokens
     novelty.key_facts = _filter_restated_key_facts(novelty.key_facts, knowledge_summary)
+    # Drop any source_url not in the input set so an injected completion cannot
+    # smuggle an attacker-chosen URL into notifications/webhooks (OVH-058).
+    novelty.source_urls = _filter_source_urls(novelty.source_urls, articles)
     return novelty
 
 
