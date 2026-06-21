@@ -560,20 +560,29 @@ async def _check_all_topics_inner(
 
     logger.info("Starting check cycle for %d due topics", len(due_topics))
 
-    results: list[CheckResult] = []
-    for topic in due_topics:
-        # Fresh, short-lived connection per topic so no connection is held
-        # across that topic's HTTP/LLM awaits.
-        try:
-            with get_db(db_path) as conn:
-                result = await check_topic(topic, conn, settings)
-            results.append(result)
-        except Exception:
-            logger.error(
-                "Unexpected error checking topic '%s'",
-                topic.name,
-                exc_info=True,
-            )
+    # Bound per-topic checks so a slow topic does not head-of-line-block the rest
+    # within this single tick (OVH-055). This stays inside the one whole-cycle
+    # gate (settled #9: one minute-tick job); each per-topic ``check_topic`` still
+    # funnels through its own ``_checking_state`` per-topic guard. Mirrors the
+    # ``content_fetch_concurrency`` Semaphore precedent. Each topic keeps its own
+    # short-lived connection so concurrent checks never share a handle.
+    semaphore = asyncio.Semaphore(settings.topic_check_concurrency)
+
+    async def _check_one(topic: Topic) -> CheckResult | None:
+        async with semaphore:
+            try:
+                with get_db(db_path) as conn:
+                    return await check_topic(topic, conn, settings)
+            except Exception:
+                logger.error(
+                    "Unexpected error checking topic '%s'",
+                    topic.name,
+                    exc_info=True,
+                )
+                return None
+
+    gathered = await asyncio.gather(*(_check_one(topic) for topic in due_topics))
+    results: list[CheckResult] = [r for r in gathered if r is not None]
 
     logger.info(
         "Check cycle complete: %d topics checked, %d with new info",

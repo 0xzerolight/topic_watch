@@ -158,6 +158,9 @@ class Settings(BaseSettings):
     web_page_size: int = Field(default=20, ge=5, le=200, description="Number of items per page in web UI")
     feed_max_retries: int = Field(default=2, ge=1, le=10, description="Maximum retry attempts for feed fetching")
     content_fetch_concurrency: int = Field(default=3, ge=1, le=20, description="Max concurrent article content fetches")
+    topic_check_concurrency: int = Field(
+        default=3, ge=1, le=20, description="Max concurrent per-topic checks within one scheduler tick"
+    )
     scheduler_misfire_grace_time: int = Field(
         default=300, ge=30, le=3600, description="APScheduler misfire grace time in seconds"
     )
@@ -361,6 +364,7 @@ def save_settings_to_yaml(settings: "Settings", config_path: Path, preserve_api_
         "web_page_size": settings.web_page_size,
         "feed_max_retries": settings.feed_max_retries,
         "content_fetch_concurrency": settings.content_fetch_concurrency,
+        "topic_check_concurrency": settings.topic_check_concurrency,
         "scheduler_misfire_grace_time": settings.scheduler_misfire_grace_time,
         "scheduler_jitter_seconds": settings.scheduler_jitter_seconds,
         "llm_max_retries": settings.llm_max_retries,
