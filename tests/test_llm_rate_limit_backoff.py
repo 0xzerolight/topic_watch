@@ -1,7 +1,9 @@
 """Tests for rate-limit-aware retry with exponential backoff in LLM functions."""
 
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import instructor
 import litellm
 import pytest
 
@@ -346,3 +348,140 @@ class TestGenerateKnowledgeUpdateRateLimit:
 
         mock_create.assert_called_once()
         mock_sleep.assert_not_called()
+
+
+# ============================================================
+# TestRealInstructorStackBackoff (OVH-008)
+# ============================================================
+#
+# The mock-client tests above feed a bare ``RateLimitError`` straight out of
+# ``create_with_completion`` — a shape production can never produce. In reality
+# instructor wraps the underlying ``litellm.acompletion`` call in its own
+# retry/error layer, so a 429 surfaces as ``InstructorRetryException`` (its
+# ``__cause__`` is a tenacity ``RetryError``, not a ``RateLimitError``). These
+# tests drive the REAL instructor stack via a fake ``acompletion`` that raises
+# ``RateLimitError`` from inside the instructor call, so they catch the dead-code
+# regression the unit tests above structurally cannot.
+
+
+@contextmanager
+def _real_instructor_raising(exc_factory):
+    """Patch ``_get_client`` to a REAL instructor client over a fake acompletion.
+
+    ``instructor.from_litellm`` is given a fake completion coroutine that raises
+    whatever ``exc_factory()`` returns on every call, so the genuine instructor
+    retry/wrapping layer runs (the bug surface), but no network call happens.
+    Yields a ``{"calls": int}`` dict counting how many times the fake completion
+    was invoked.
+    """
+    import app.analysis.llm as llm_module
+
+    counter = {"calls": 0}
+
+    async def _fake_acompletion(*_args, **_kwargs):
+        counter["calls"] += 1
+        raise exc_factory()
+
+    real_client = instructor.from_litellm(_fake_acompletion)
+    prev = llm_module._client
+    llm_module._client = None
+    try:
+        with patch("app.analysis.llm._get_client", return_value=real_client):
+            yield counter
+    finally:
+        llm_module._client = prev
+
+
+class TestRealInstructorStackBackoff:
+    async def test_backoff_fires_through_real_instructor_wrapping(self) -> None:
+        """A 429 raised inside the real instructor stack triggers the backoff.
+
+        Regression guard for OVH-008: instructor wraps RateLimitError, so the
+        operator-facing 'Rate limit hit ... retrying in Ns' warning and the
+        asyncio.sleep between attempts must still fire on the real path.
+        """
+        settings = _make_settings(llm_max_retries=2)
+
+        sleeps: list[float] = []
+
+        async def _record_sleep(delay: float) -> None:
+            sleeps.append(delay)
+
+        with (
+            _real_instructor_raising(_make_rate_limit_error),
+            patch("app.analysis.llm.asyncio.sleep", side_effect=_record_sleep),
+            patch("app.analysis.llm.logger") as mock_logger,
+        ):
+            result = await analyze_articles([_make_article()], "Known facts.", _make_topic(), settings)
+
+        # analyze_articles stays fail-safe (settled decision #3).
+        assert result.has_new_info is False
+        assert result.confidence == 0.0
+        assert result.error is not None
+
+        # Backoff actually slept between attempts (llm_max_retries=2 -> 2 sleeps).
+        assert len(sleeps) == 2
+        assert all(d > 0 for d in sleeps)
+
+        # The operator-facing rate-limit warning fired (was dead before the fix).
+        warning_msgs = [c.args[0] for c in mock_logger.warning.call_args_list if c.args]
+        assert any("Rate limit" in m for m in warning_msgs)
+
+    async def test_instructor_does_not_immediately_hammer_on_rate_limit(self) -> None:
+        """Each backoff attempt makes exactly one provider call, not max_retries.
+
+        Before the fix, instructor retried the 429 immediately ``max_retries``
+        times per attempt (zero delay, hammering the throttled provider). After
+        the fix, instructor must NOT retry on RateLimitError, so the call count
+        equals the number of backoff attempts (initial + retries), not a product.
+        """
+        settings = _make_settings(llm_max_retries=2)
+
+        with (
+            _real_instructor_raising(_make_rate_limit_error) as counter,
+            patch("app.analysis.llm.asyncio.sleep", new=AsyncMock()),
+        ):
+            await analyze_articles([_make_article()], "Known facts.", _make_topic(), settings)
+
+        # llm_max_retries=2 -> 3 backoff attempts (initial + 2 retries), one
+        # provider call each. NOT 3 * (validation retries) — instructor must not
+        # immediately re-fire on the 429.
+        assert counter["calls"] == 3
+
+    async def test_validation_retry_still_works_for_non_rate_limit(self) -> None:
+        """Instructor still retries genuine validation failures (not 429s).
+
+        Disabling instructor's retry-on-RateLimitError must not disable its
+        structured-output validation retries. A persistent validation failure
+        should still be attempted ``llm_max_retries + 1`` times by instructor
+        within a SINGLE backoff attempt (no rate-limit sleep involved).
+        """
+        settings = _make_settings(llm_max_retries=2)
+
+        def _validation_error() -> Exception:
+            # Not a RateLimitError: instructor owns the retry for this one.
+            return litellm.APIError(
+                status_code=400,
+                message="bad output",
+                llm_provider="openai",
+                model="gpt-4",
+            )
+
+        sleeps: list[float] = []
+
+        async def _record_sleep(delay: float) -> None:
+            sleeps.append(delay)
+
+        with (
+            _real_instructor_raising(_validation_error) as counter,
+            patch("app.analysis.llm.asyncio.sleep", side_effect=_record_sleep),
+        ):
+            result = await analyze_articles([_make_article()], "Known facts.", _make_topic(), settings)
+
+        # Fail-safe result, and no rate-limit *backoff* delay (this is not a 429).
+        # Instructor's own between-retry waits are 0.0 (no wait policy); our
+        # rate-limit backoff would inject a positive base_delay, which it must not.
+        assert result.has_new_info is False
+        assert all(d == 0 for d in sleeps)
+        # Instructor retried the non-429 itself: max_retries + 1 = 3 attempts.
+        assert counter["calls"] == 3
