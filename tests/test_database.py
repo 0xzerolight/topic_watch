@@ -572,6 +572,52 @@ class TestMigrations:
         assert loaded.prompt_tokens == 123
         assert loaded.completion_tokens == 45
 
+    def test_perf_indexes_exist(self, db_conn: sqlite3.Connection) -> None:
+        """Migration m014 adds performance indexes on the articles table."""
+        index_names = {
+            row[0]
+            for row in db_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='articles'"
+            ).fetchall()
+        }
+        assert "idx_articles_content_hash_lookup" in index_names
+        assert "idx_articles_fetched_at" in index_names
+        assert "idx_articles_topic_fetched_at" in index_names
+
+    def test_perf_index_content_hash_used(self, db_conn: sqlite3.Connection) -> None:
+        """content_hash lookup uses an index (SEARCH not SCAN)."""
+        plan = db_conn.execute(
+            "EXPLAIN QUERY PLAN SELECT topic_id, raw_content FROM articles WHERE content_hash = ?",
+            ("abc",),
+        ).fetchall()
+        detail = " ".join(str(row[-1]) for row in plan)
+        assert "USING INDEX" in detail
+        assert "SCAN articles" not in detail
+
+    def test_perf_index_topic_fetched_at_used(self, db_conn: sqlite3.Connection) -> None:
+        """topic-scoped fetched_at ORDER BY is index-ordered (no temp B-tree)."""
+        plan = db_conn.execute(
+            "EXPLAIN QUERY PLAN SELECT * FROM articles WHERE topic_id = ? ORDER BY fetched_at DESC LIMIT 10",
+            (1,),
+        ).fetchall()
+        detail = " ".join(str(row[-1]) for row in plan)
+        assert "USING INDEX" in detail
+        assert "USE TEMP B-TREE" not in detail
+
+    def test_perf_indexes_idempotent(self, db_conn: sqlite3.Connection) -> None:
+        """Re-running migrations does not error and keeps the indexes present."""
+        run_migrations(db_conn)
+        run_migrations(db_conn)
+        index_names = {
+            row[0]
+            for row in db_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='articles'"
+            ).fetchall()
+        }
+        assert "idx_articles_content_hash_lookup" in index_names
+        assert "idx_articles_fetched_at" in index_names
+        assert "idx_articles_topic_fetched_at" in index_names
+
 
 class TestRecoverStuckTopics:
     """Tests for recover_stuck_topics."""
