@@ -311,10 +311,16 @@ class TestNotificationDrainSingleFlight:
 
 
 class TestRedactUrl:
-    """redact_url never leaks userinfo/token/query, keeps scheme+host."""
+    """redact_url never leaks userinfo/token/query, keeps scheme+host.
+
+    Fold-in: app.notifications.redact_url is now the canonical
+    app.log_redaction.redact_url, which keeps a short non-secret leading path
+    segment for context while still dropping userinfo/query/long secret segments.
+    """
 
     def test_keeps_scheme_and_host(self) -> None:
-        assert redact_url("slack://host.example.com/path") == "slack://host.example.com"
+        red = redact_url("slack://host.example.com/path")
+        assert red.startswith("slack://host.example.com")
 
     def test_strips_userinfo_and_token(self) -> None:
         # tgram://<bot-token>@... — the token must not survive redaction.

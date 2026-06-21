@@ -30,3 +30,13 @@ def test_no_scheme_returns_masked():
 def test_invalid_url_returns_masked():
     # Pass something that won't have a scheme
     assert _mask_url("://broken") == "****"
+
+
+def test_hides_host_even_though_canonical_redact_would_show_it():
+    # Fold-in: _mask_url builds on log_redaction.redact_url but stays stronger for
+    # the UI by hiding the host too. The canonical helper would keep the host.
+    from app.log_redaction import redact_url
+
+    url = "ntfy://ntfy.example.com/sometopic"
+    assert "ntfy.example.com" in redact_url(url)  # canonical keeps host
+    assert _mask_url(url) == "ntfy://****"  # UI filter hides it
