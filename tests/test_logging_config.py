@@ -6,6 +6,7 @@ import logging
 
 import pytest
 
+from app.check_context import check_id_var
 from app.logging_config import JSONFormatter, setup_logging
 
 
@@ -24,6 +25,20 @@ def reset_logging():
     _reset_root_logger()
 
 
+@pytest.fixture
+def set_check_id():
+    """Set check_id_var to a sentinel for the test, resetting it afterwards.
+
+    Restores the prior contextvar token so the sentinel never leaks into other
+    tests sharing the process-wide context.
+    """
+    token = check_id_var.set("abcd1234")
+    try:
+        yield "abcd1234"
+    finally:
+        check_id_var.reset(token)
+
+
 class TestSetupLoggingPlainText:
     def test_no_env_var_uses_plain_text_formatter(self, monkeypatch):
         monkeypatch.delenv("TOPIC_WATCH_LOG_FORMAT", raising=False)
@@ -40,6 +55,52 @@ class TestSetupLoggingPlainText:
         assert root.handlers, "Root logger should have at least one handler"
         handler = root.handlers[0]
         assert not isinstance(handler.formatter, JSONFormatter)
+
+    def test_text_output_renders_check_id_and_message(self, monkeypatch, set_check_id):
+        """OVH-090: the default (text) branch must attach the CheckIdFilter and
+        render the correlation id alongside the message. The two structural
+        tests above never make a real log call, so a deleted filter loop would
+        slip through; this redirects the handler to a StringIO and asserts the
+        rendered line carries both the check_id and the message."""
+        monkeypatch.setenv("TOPIC_WATCH_LOG_FORMAT", "text")
+        # logging.basicConfig is a no-op if root already has a handler; under
+        # pytest the logging plugin installs its own capture handler around the
+        # call, so clear it first to guarantee setup_logging installs the text
+        # handler we then redirect (mirrors the JSON branch's handler reset).
+        logging.root.handlers.clear()
+        setup_logging()
+
+        stream = io.StringIO()
+        root = logging.root
+        text_handler = root.handlers[0]
+        text_handler.stream = stream
+        root.setLevel(logging.INFO)
+
+        logging.getLogger("test.text_check_id").info("hello text mode")
+        text_handler.flush()
+
+        rendered = stream.getvalue()
+        assert "abcd1234" in rendered, rendered
+        assert "hello text mode" in rendered, rendered
+
+    def test_text_output_renders_dash_when_no_check_id(self, monkeypatch):
+        """At default (no check_id set) the text line carries the '-' placeholder."""
+        monkeypatch.setenv("TOPIC_WATCH_LOG_FORMAT", "text")
+        logging.root.handlers.clear()
+        setup_logging()
+
+        stream = io.StringIO()
+        root = logging.root
+        text_handler = root.handlers[0]
+        text_handler.stream = stream
+        root.setLevel(logging.INFO)
+
+        logging.getLogger("test.text_no_check_id").info("no correlation id")
+        text_handler.flush()
+
+        rendered = stream.getvalue()
+        assert "[-]" in rendered, rendered
+        assert "no correlation id" in rendered, rendered
 
 
 class TestSetupLoggingJSON:
@@ -70,6 +131,35 @@ class TestSetupLoggingJSON:
         assert parsed["logger"] == "test.json_output"
         assert parsed["message"] == "hello world"
         assert "timestamp" in parsed
+
+    def test_json_output_emits_check_id(self, monkeypatch, set_check_id):
+        """OVH-089: when a check_id is set, it is carried into the JSON output —
+        the whole point of the correlation-id feature. The existing JSON test
+        runs with no var set, so a removed filter wiring would silently emit '-'
+        and stay green; this asserts the id round-trips."""
+        monkeypatch.setenv("TOPIC_WATCH_LOG_FORMAT", "json")
+
+        stream = io.StringIO()
+        setup_logging()
+        logging.root.handlers[0].stream = stream
+
+        logging.getLogger("test.json_check_id").info("with correlation id")
+
+        parsed = json.loads(stream.getvalue().strip())
+        assert parsed["check_id"] == set_check_id
+
+    def test_json_output_check_id_dash_at_default(self, monkeypatch):
+        """With no check_id set, the JSON output carries the '-' placeholder."""
+        monkeypatch.setenv("TOPIC_WATCH_LOG_FORMAT", "json")
+
+        stream = io.StringIO()
+        setup_logging()
+        logging.root.handlers[0].stream = stream
+
+        logging.getLogger("test.json_no_check_id").info("no correlation id")
+
+        parsed = json.loads(stream.getvalue().strip())
+        assert parsed["check_id"] == "-"
 
     def test_json_timestamp_is_iso_format(self, monkeypatch):
         monkeypatch.setenv("TOPIC_WATCH_LOG_FORMAT", "json")
