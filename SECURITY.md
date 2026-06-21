@@ -40,6 +40,45 @@ When deploying Topic Watch on a public network:
 - **Keep dependencies updated.** Dependabot is configured on the repository. For self-hosted installs, run `pip install --upgrade -r requirements.txt` periodically.
 - **Use the Docker image.** It runs as a non-root user with resource limits.
 
+## Install Script Trust
+
+The one-line installers (`scripts/install.sh`, `scripts/install.ps1`) are meant to be run with `curl | bash` / `irm | iex`. That convenience carries the usual trade-off: your shell executes whatever the URL returns, and by default the scripts fetch the `docker-compose` file (which selects the container image) from the same source. Both are pulled from the **mutable `main` branch** with no commit pin, tag, signature, or checksum, so a repository/branch compromise or a man-in-the-middle proxy could run arbitrary code as the invoking user.
+
+To reduce that trust before running either installer:
+
+- **Read it first.** Download the script and review it, or run it from a local checkout, instead of piping straight to a shell.
+- **Pin a ref.** Set `TOPIC_WATCH_REF` to a release tag or commit SHA and fetch the installer from that same ref. This pins both the installer and the `docker-compose` file it downloads:
+
+  ```bash
+  # Linux / macOS
+  TOPIC_WATCH_REF=v1.1.2 curl -fsSL \
+    https://raw.githubusercontent.com/0xzerolight/topic_watch/v1.1.2/scripts/install.sh | bash
+  ```
+
+  ```powershell
+  # Windows (PowerShell)
+  $env:TOPIC_WATCH_REF="v1.1.2"
+  irm https://raw.githubusercontent.com/0xzerolight/topic_watch/v1.1.2/scripts/install.ps1 | iex
+  ```
+
+### Autostart persistence
+
+The installers can set up boot/login autostart (a systemd user service + `loginctl enable-linger` on Linux; a Startup-folder shortcut on Windows). This is **opt-in**: the installer prompts when run interactively and skips autostart in a non-interactive piped run unless you pass `TOPIC_WATCH_AUTOSTART=yes`. The closing summary echoes the exact uninstall commands.
+
+To remove autostart later:
+
+```bash
+# Linux
+systemctl --user disable --now topic-watch
+rm -f ~/.config/systemd/user/topic-watch.service
+loginctl disable-linger "$USER"
+```
+
+```powershell
+# Windows — delete the Startup-folder shortcut
+Remove-Item "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\Topic Watch.lnk"
+```
+
 ## Known Limitations
 
 - **SSRF / DNS rebinding (TOCTOU).** Feed and webhook URLs are validated against private/reserved addresses, including a DNS-resolution layer that now fails closed (an unresolvable host is blocked). Redirects are re-validated per hop. However, validation resolves DNS at check time while httpx re-resolves at connect time, leaving a narrow rebinding window between validation and fetch. Eliminating it would require a pinned-IP connect transport that risks breaking HTTPS feed fetching (SNI / cert verification), so it is an accepted limitation for this single-user self-hosted tool.
