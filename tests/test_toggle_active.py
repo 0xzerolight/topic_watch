@@ -7,9 +7,9 @@ import httpx
 import pytest
 
 from app.config import LLMSettings, NotificationSettings, Settings
-from app.crud import create_topic, get_topic
+from app.crud import create_check_result, create_topic, get_topic
 from app.main import app
-from app.models import FeedMode, Topic, TopicStatus
+from app.models import CheckResult, FeedMode, Topic, TopicStatus
 from app.web.dependencies import get_db_conn, get_settings
 
 CSRF_TEST_TOKEN = "test-csrf-token-for-toggle-tests"
@@ -192,3 +192,28 @@ class TestToggleActive:
         unchanged = get_topic(db_conn, topic.id)
         assert unchanged is not None
         assert unchanged.is_active is True
+
+    async def test_toggle_htmx_row_omits_just_checked(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """OVH-119: a toggle re-render must NOT mark data-just-checked, even when the
+        latest check found new info — otherwise the dashboard re-fires a stale
+        browser notification on every enable/disable."""
+        topic = _make_topic(db_conn, name="New-Info Topic", is_active=True)
+        create_check_result(
+            db_conn,
+            CheckResult(topic_id=topic.id, articles_found=2, has_new_info=True),
+        )
+        db_conn.commit()
+
+        response = await client.post(
+            f"/topics/{topic.id}/toggle-active",
+            headers={"HX-Request": "true"},
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 200
+        # The latest check found new info, so the stale notification marker is present...
+        assert 'data-new-info="true"' in response.text
+        # ...but the fresh-check gate must be absent on a toggle re-render.
+        assert "data-just-checked" not in response.text

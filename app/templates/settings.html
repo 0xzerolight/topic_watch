@@ -310,6 +310,14 @@ function toggleBrowserNotifications(enabled) {
                 TopicWatchNotifications.setEnabled(false);
                 updateBrowserNotifUI();
             }
+        }).catch(function() {
+            // requestPermission() can reject (Permissions-Policy disabled,
+            // cross-origin iframe, insecure context, older Safari). Treat a
+            // rejected promise like a denial so the toggle the user just clicked
+            // doesn't stay checked while no permission was granted.
+            document.getElementById("browser-notif-toggle").checked = false;
+            TopicWatchNotifications.setEnabled(false);
+            updateBrowserNotifUI();
         });
     } else {
         TopicWatchNotifications.setEnabled(false);

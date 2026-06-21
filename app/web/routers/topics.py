@@ -243,8 +243,20 @@ async def topic_status(
     )
 
 
-def _topic_row_response(request: Request, conn: sqlite3.Connection, topic: Topic, topic_id: int) -> Response:
-    """Render the topic-row partial for HTMX, or redirect to the detail page for a full navigation."""
+def _topic_row_response(
+    request: Request,
+    conn: sqlite3.Connection,
+    topic: Topic,
+    topic_id: int,
+    *,
+    just_checked: bool = False,
+) -> Response:
+    """Render the topic-row partial for HTMX, or redirect to the detail page for a full navigation.
+
+    ``just_checked`` marks the row as the result of a fresh check (emits
+    ``data-just-checked`` for the dashboard afterSwap handler) so unrelated
+    re-renders like toggle-active don't re-fire a browser notification (OVH-119).
+    """
     if not request.headers.get("HX-Request"):
         return RedirectResponse(url=f"/topics/{topic_id}", status_code=303)
 
@@ -258,6 +270,7 @@ def _topic_row_response(request: Request, conn: sqlite3.Connection, topic: Topic
             "topic": topic,
             "last_check": last_check,
             "article_count": article_count,
+            "just_checked": just_checked,
         },
     )
 
@@ -296,7 +309,7 @@ async def check_topic_handler(
     db_path = getattr(request.app.state, "db_path", None)
     background_tasks.add_task(background._run_single_check, topic_id, settings, db_path)
 
-    return _topic_row_response(request, conn, topic, topic_id)
+    return _topic_row_response(request, conn, topic, topic_id, just_checked=True)
 
 
 @router.post("/topics/{topic_id}/toggle-active", dependencies=[Depends(verify_csrf)])
