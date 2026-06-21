@@ -684,6 +684,54 @@ class TestCheckTopic:
         assert row["processed"] == 1
 
 
+# --- check_id_var lifecycle (OVH-088) ---
+
+
+class TestCheckTopicResetsCheckIdVar:
+    """check_topic resets check_id_var in a finally so one topic's correlation id
+    cannot leak into the next topic's log lines within the same scheduler tick."""
+
+    async def test_check_id_var_reset_after_success(self, db_conn: sqlite3.Connection) -> None:
+        from app.check_context import check_id_var
+
+        topic = _make_topic(db_conn, name="ResetSuccess")
+        settings = _make_settings()
+
+        token = check_id_var.set("sentinel-id")
+        try:
+            with patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[], total_feed_entries=0),
+            ):
+                await check_topic(topic, db_conn, settings)
+            assert check_id_var.get() is None
+        finally:
+            check_id_var.reset(token)
+
+    async def test_check_id_var_reset_after_inner_pipeline_raises(self, db_conn: sqlite3.Connection) -> None:
+        """Even when the inner pipeline raises, the finally still resets the var."""
+        from app.check_context import check_id_var
+
+        topic = _make_topic(db_conn, name="ResetRaise")
+        settings = _make_settings()
+
+        token = check_id_var.set("sentinel-id")
+        try:
+            with (
+                patch(
+                    "app.checker._check_topic_inner",
+                    new_callable=AsyncMock,
+                    side_effect=RuntimeError("pipeline boom"),
+                ),
+                pytest.raises(RuntimeError, match="pipeline boom"),
+            ):
+                await check_topic(topic, db_conn, settings)
+            assert check_id_var.get() is None
+        finally:
+            check_id_var.reset(token)
+
+
 # --- initialize_new_topic ---
 
 

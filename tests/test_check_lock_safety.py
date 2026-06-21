@@ -450,3 +450,59 @@ async def test_concurrent_init_claim_only_one_wins(tmp_path) -> None:
     results = await asyncio.gather(asyncio.to_thread(_claim), asyncio.to_thread(_claim))
     assert results.count(True) == 1
     assert results.count(False) == 1
+
+
+# --- Cross-entry-point race: pipeline check_topic vs JSON API (OVH-086) ---
+
+
+async def test_cross_entry_point_check_topic_blocks_api_trigger(
+    db_conn: sqlite3.Connection, monkeypatch, clean_state
+) -> None:
+    """The real shared ``_checking_state`` singleton dedups across entry points.
+
+    Earlier lock tests exercised either the mutex object alone or two calls
+    through the SAME entry point. This drives the genuine hazard: a slow
+    ``check_topic`` (pipeline entry, e.g. a scheduler minute-tick) is in flight,
+    and the JSON ``api_trigger_check`` entry point (a manual API call) hits the
+    SAME topic mid-flight. Both reach ``app.web.state._checking_state``, so the
+    second entry point must be deduped — here a 409 — instead of launching a
+    duplicate fetch+analyze+notify that double-spends the LLM and double-notifies.
+    """
+    from fastapi import HTTPException
+
+    from app.checker import check_topic
+    from app.scraping import FetchResult
+    from app.web.api import api_trigger_check
+
+    topic = create_topic(db_conn, Topic(name="CrossEntry", description="d", status=TopicStatus.READY))
+    db_conn.commit()
+    settings = _make_settings()
+
+    in_flight = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow_fetch(*args, **kwargs):
+        # Signal that check_topic now HOLDS the per-topic guard, then block so
+        # the API entry point races it mid-flight.
+        in_flight.set()
+        await release.wait()
+        return FetchResult(articles=[], total_feed_entries=0)
+
+    monkeypatch.setattr("app.checker.fetch_new_articles_for_topic", _slow_fetch)
+
+    pipeline = asyncio.create_task(check_topic(topic, db_conn, settings))
+    try:
+        await asyncio.wait_for(in_flight.wait(), timeout=1.0)
+        # check_topic is mid-flight and owns the slot. The API entry point shares
+        # the same singleton, so it must reject with 409 (not run the pipeline).
+        with pytest.raises(HTTPException) as exc_info:
+            await api_trigger_check(topic.id, conn=db_conn, settings=settings)
+        assert exc_info.value.status_code == 409
+    finally:
+        release.set()
+        await pipeline
+
+    # The pipeline run completed normally (its slot released in finally).
+    result = pipeline.result()
+    assert result.stage_error != "skipped: already in flight"
+    assert await clean_state.is_checking(topic.id) is False
