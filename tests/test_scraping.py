@@ -2,7 +2,7 @@
 
 import sqlite3
 from datetime import UTC, datetime
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -1030,6 +1030,36 @@ class TestFeedFetchRetry:
             entries = await fetch_feed("https://example.com/feed.xml", client)
 
         assert entries == []
+
+    async def test_exhaustion_retries_full_max_attempts_then_sleeps_between(self) -> None:
+        """OVH-074: exhaustion must actually RETRY, not just fail once.
+
+        Pins the exhaustion-after-retrying contract the test name claims: the
+        handler is invoked exactly ``max_attempts`` times and ``asyncio.sleep``
+        is awaited the between-attempts count (``max_attempts - 1``). Without
+        this, a regression silently setting ``max_attempts`` to 1 (or removing
+        the retry loop) would pass the sibling 'returns empty' test unchanged.
+        """
+        max_attempts = 2
+        call_count = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            raise httpx.ReadTimeout("timeout")
+
+        transport = httpx.MockTransport(handler)
+        # Patch the backoff sleep in the rss module so the test does not actually
+        # wait, and so we can assert it is awaited exactly between attempts.
+        with patch("app.scraping.rss.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            async with httpx.AsyncClient(transport=transport) as client:
+                entries = await fetch_feed("https://example.com/feed.xml", client, max_attempts=max_attempts)
+
+        assert entries == []
+        # Retried to exhaustion: one call per attempt.
+        assert call_count == max_attempts
+        # Slept only BETWEEN attempts, never after the final failure.
+        assert mock_sleep.await_count == max_attempts - 1
 
 
 # ============================================================
