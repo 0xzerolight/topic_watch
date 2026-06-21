@@ -40,6 +40,14 @@ class FetchResult:
     Surfaces otherwise-silent article loss so callers/monitoring can detect it.
     Each increment corresponds to a WARNING-level log entry.
     """
+    feeds_total: int = 0
+    """Number of feed fetches attempted (manual: configured URLs; auto: provider
+    attempts including cascade)."""
+    feeds_failed: int = 0
+    """How many of those fetches failed. ``0 < feeds_failed < feeds_total`` is a
+    *degraded* check — some sources silently dropped out — which is logged at
+    WARNING so it is not indistinguishable from a healthy partial yield (OVH-130).
+    """
 
 
 def _insert_or_count_dup(
@@ -101,7 +109,12 @@ async def fetch_new_articles_for_topic(
                 else:
                     upsert_feed_health_failure(conn, feed_url, error_msg or "Unknown error")
             except Exception:
-                logger.debug("Failed to record feed health for %s", feed_url, exc_info=True)
+                # feed_health is the ONLY persisted record of per-feed failures, so
+                # a swallowed write (locked DB under WAL contention, schema drift,
+                # disk error) leaves the dashboard showing stale health while feeds
+                # silently break. Surface it at WARNING — matching the dropped-
+                # duplicates loss convention — not DEBUG (OVH-132).
+                logger.warning("Failed to record feed health for %s", feed_url, exc_info=True)
 
         return callback
 
@@ -118,8 +131,33 @@ async def fetch_new_articles_for_topic(
     )
     conn.commit()
     entries = response.entries
+
+    feeds_total = response.feeds_total
+    feeds_failed = response.feeds_failed
+    # Surface a degraded check: when SOME but not all feeds failed, total_feed_entries
+    # only reflects the survivors, so the check looks like a healthy partial yield.
+    # Log a WARNING so degraded coverage is distinguishable from healthy (OVH-130).
+    if 0 < feeds_failed < feeds_total:
+        logger.warning(
+            "Topic '%s': partial feed-fetch failure — %d of %d feed fetch(es) failed",
+            topic.name,
+            feeds_failed,
+            feeds_total,
+        )
+    elif feeds_total and feeds_failed >= feeds_total:
+        logger.warning(
+            "Topic '%s': all %d feed fetch(es) failed",
+            topic.name,
+            feeds_total,
+        )
+
     if not entries:
-        return FetchResult(articles=[], total_feed_entries=0)
+        return FetchResult(
+            articles=[],
+            total_feed_entries=0,
+            feeds_total=feeds_total,
+            feeds_failed=feeds_failed,
+        )
 
     # 2. Filter to entries not already in DB; split into reuse vs. fetch-needed
     new_entries: list[tuple[FeedEntry, str]] = []
@@ -144,7 +182,12 @@ async def fetch_new_articles_for_topic(
             new_entries.append((entry, content_hash))
 
     if not new_entries and not reuse_entries:
-        return FetchResult(articles=[], total_feed_entries=len(entries))
+        return FetchResult(
+            articles=[],
+            total_feed_entries=len(entries),
+            feeds_total=feeds_total,
+            feeds_failed=feeds_failed,
+        )
 
     # 3. Combine reuse + fetch candidates, sort by published date (newest first,
     # None dates last), and apply the limit. Selection is purely recency-first.
@@ -229,4 +272,6 @@ async def fetch_new_articles_for_topic(
         articles=stored,
         total_feed_entries=len(entries),
         dropped_duplicates=dropped_duplicates,
+        feeds_total=feeds_total,
+        feeds_failed=feeds_failed,
     )

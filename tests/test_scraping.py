@@ -561,6 +561,36 @@ class TestFetchFeedsForTopic:
 
         assert len(response.entries) == 2  # Got entries from the good feed
 
+    async def test_manual_partial_failure_counts_feeds(self) -> None:
+        """OVH-130: a manual fetch where some feeds fail reports feeds_total /
+        feeds_failed so a degraded check is distinguishable from a healthy one."""
+        transport = _mock_transport(
+            {
+                "good": (200, _SAMPLE_RSS),
+                "bad": (500, "Error"),
+            }
+        )
+        topic = Topic(
+            name="T",
+            description="d",
+            feed_mode=FeedMode.MANUAL,
+            feed_urls=[
+                "https://example.com/good.xml",
+                "https://example.com/bad.xml",
+            ],
+        )
+        original_init = httpx.AsyncClient.__init__
+
+        def patched_init(self_client, **kwargs):
+            kwargs["transport"] = transport
+            original_init(self_client, **kwargs)
+
+        with patch.object(httpx.AsyncClient, "__init__", patched_init):
+            response = await fetch_feeds_for_topic(topic)
+
+        assert response.feeds_total == 2
+        assert response.feeds_failed == 1
+
     async def test_auto_mode_uses_router(self) -> None:
         """Auto mode uses the router to select a provider (Bing first by default)."""
         from app.scraping.routing import ProviderRouter
@@ -655,6 +685,75 @@ class TestFetchFeedsForTopic:
 
         assert len(response.entries) == 2
         assert response.provider_name == "google_news"
+
+    async def test_cascade_log_labels_failed_vs_empty(self, caplog: pytest.LogCaptureFixture) -> None:
+        """OVH-133: the cascade log distinguishes a failed provider from an empty
+        one and names the reason it is cascading."""
+        import logging
+
+        from app.scraping.providers import BingNewsProvider, GoogleNewsProvider
+        from app.scraping.routing import ProviderRouter
+
+        transport = _mock_transport(
+            {
+                "bing.com": (500, "Error"),  # failed, not empty
+                "news.google.com": (200, _SAMPLE_RSS),
+            }
+        )
+        topic = Topic(name="Test", description="d", feed_mode=FeedMode.AUTO)
+        router = ProviderRouter(providers=[BingNewsProvider(), GoogleNewsProvider()])
+
+        original_init = httpx.AsyncClient.__init__
+
+        def patched_init(self_client, **kwargs):
+            kwargs["transport"] = transport
+            original_init(self_client, **kwargs)
+
+        with (
+            patch.object(httpx.AsyncClient, "__init__", patched_init),
+            caplog.at_level(logging.INFO, logger="app.scraping.rss"),
+        ):
+            await fetch_feeds_for_topic(topic, router=router)
+
+        cascade_logs = [r.getMessage() for r in caplog.records if "cascading to" in r.getMessage()]
+        assert len(cascade_logs) == 1
+        # Distinguishes 'fetch failed' from an empty result, and names the target.
+        assert "fetch failed" in cascade_logs[0]
+        assert "bing_news" in cascade_logs[0]
+        assert "google_news" in cascade_logs[0]
+
+    async def test_cascade_log_labels_empty_result(self, caplog: pytest.LogCaptureFixture) -> None:
+        """OVH-133: an empty-but-OK first provider is labelled 'no entries', not 'failed'."""
+        import logging
+
+        from app.scraping.providers import BingNewsProvider, GoogleNewsProvider
+        from app.scraping.routing import ProviderRouter
+
+        transport = _mock_transport(
+            {
+                "bing.com": (200, _EMPTY_RSS),  # empty, not failed
+                "news.google.com": (200, _SAMPLE_RSS),
+            }
+        )
+        topic = Topic(name="Test", description="d", feed_mode=FeedMode.AUTO)
+        router = ProviderRouter(providers=[BingNewsProvider(), GoogleNewsProvider()])
+
+        original_init = httpx.AsyncClient.__init__
+
+        def patched_init(self_client, **kwargs):
+            kwargs["transport"] = transport
+            original_init(self_client, **kwargs)
+
+        with (
+            patch.object(httpx.AsyncClient, "__init__", patched_init),
+            caplog.at_level(logging.INFO, logger="app.scraping.rss"),
+        ):
+            await fetch_feeds_for_topic(topic, router=router)
+
+        cascade_logs = [r.getMessage() for r in caplog.records if "cascading to" in r.getMessage()]
+        assert len(cascade_logs) == 1
+        assert "no entries" in cascade_logs[0]
+        assert "fetch failed" not in cascade_logs[0]
 
     async def test_auto_both_fail(self) -> None:
         """When both providers fail, returns empty and marks both unhealthy."""
@@ -986,6 +1085,84 @@ class TestFetchNewArticlesForTopic:
 
         assert len(stored) == 1
         assert stored[0].raw_content == "Fallback summary text"
+
+    async def test_partial_feed_failure_surfaced(
+        self, db_conn: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """OVH-130: a degraded check (some feeds failed) propagates the counts to
+        the FetchResult and logs a WARNING so it is distinguishable from healthy."""
+        import logging
+
+        topic = self._make_topic(db_conn)
+        entries = [
+            FeedEntry(
+                title="Survivor",
+                url="https://example.com/survivor",
+                summary="S",
+                source_feed="feed",
+            )
+        ]
+        # 1 of 3 feeds survived (2 failed) — total_feed_entries=1 alone hides that.
+        response = FeedResponse(entries=entries, feeds_total=3, feeds_failed=2)
+        with (
+            patch("app.scraping.fetch_feeds_for_topic", return_value=response),
+            patch("app.scraping.extract_article_content", return_value="content"),
+            caplog.at_level(logging.WARNING, logger="app.scraping"),
+        ):
+            result = await fetch_new_articles_for_topic(topic, db_conn)
+
+        assert result.feeds_total == 3
+        assert result.feeds_failed == 2
+        partial = [r.getMessage() for r in caplog.records if "partial feed-fetch failure" in r.getMessage()]
+        assert len(partial) == 1
+        assert "2 of 3" in partial[0]
+
+    async def test_no_partial_warning_when_all_feeds_ok(
+        self, db_conn: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """OVH-130: a fully-healthy fetch (no failures) must NOT log the degraded warning."""
+        import logging
+
+        topic = self._make_topic(db_conn)
+        entries = [
+            FeedEntry(title="A", url="https://example.com/a", summary="S", source_feed="feed"),
+        ]
+        response = FeedResponse(entries=entries, feeds_total=2, feeds_failed=0)
+        with (
+            patch("app.scraping.fetch_feeds_for_topic", return_value=response),
+            patch("app.scraping.extract_article_content", return_value="content"),
+            caplog.at_level(logging.WARNING, logger="app.scraping"),
+        ):
+            result = await fetch_new_articles_for_topic(topic, db_conn)
+
+        assert result.feeds_failed == 0
+        assert not [r for r in caplog.records if "partial feed-fetch failure" in r.getMessage()]
+
+    async def test_feed_health_write_failure_warns(
+        self, db_conn: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """OVH-132: a swallowed feed_health DB write surfaces at WARNING, not DEBUG —
+        loss of health telemetry must be visible."""
+        import logging
+
+        topic = self._make_topic(db_conn)
+
+        async def _fake_fetch(topic_arg, *, timeout, max_attempts, health_callback):
+            # Simulate a successful feed fetch that triggers a health write.
+            if health_callback:
+                health_callback("https://example.com/feed.xml", True, None)
+            return FeedResponse(entries=[])
+
+        with (
+            patch("app.scraping.fetch_feeds_for_topic", side_effect=_fake_fetch),
+            patch("app.scraping.upsert_feed_health_success", side_effect=Exception("locked")),
+            caplog.at_level(logging.WARNING, logger="app.scraping"),
+        ):
+            await fetch_new_articles_for_topic(topic, db_conn)
+
+        warns = [r for r in caplog.records if "Failed to record feed health" in r.getMessage()]
+        assert len(warns) == 1
+        assert warns[0].levelno == logging.WARNING
 
 
 # ============================================================
