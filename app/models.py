@@ -263,13 +263,22 @@ class DashboardStats(BaseModel):
 
 
 class PendingNotification(BaseModel):
-    """A notification that failed to send and should be retried."""
+    """A notification that failed to send and should be retried.
+
+    Scoped to a single ``url`` when that target failed (OVH-039): a partial
+    batch failure queues one row per failed URL so retry never re-hits the
+    targets that already delivered. ``url`` is NULL on legacy/whole-batch rows,
+    in which case the drain falls back to every configured URL. ``last_error``
+    records the most recent failure reason for operator diagnostics.
+    """
 
     id: int | None = None
     topic_id: int
     check_result_id: int | None = None
     title: str
     body: str
+    url: str | None = None
+    last_error: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     retry_count: int = 0
     max_retries: int = 3
@@ -287,6 +296,18 @@ class PendingNotification(BaseModel):
         d = self.model_dump(exclude={"id", "claimed_at"})
         d["created_at"] = d["created_at"].isoformat()
         return d
+
+
+class NotificationDelivery(BaseModel):
+    """Per-URL outcome of a notification delivery attempt.
+
+    Lets the pipeline re-queue only the targets that failed (OVH-039) and
+    surface a per-channel reason without leaking the raw URL (OVH-027).
+    """
+
+    url: str
+    ok: bool
+    error: str | None = None
 
 
 class PendingWebhook(BaseModel):

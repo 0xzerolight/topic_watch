@@ -33,7 +33,7 @@ from app.crud import (
     list_pending_webhooks,
     recover_stuck_topics,
 )
-from app.models import Article, KnowledgeState, Topic, TopicStatus
+from app.models import Article, KnowledgeState, NotificationDelivery, Topic, TopicStatus
 from app.scraping import FetchResult
 from app.scraping.rss import FeedEntry, FeedResponse
 
@@ -363,9 +363,9 @@ class TestCommitBeforeSendOrdering:
 
         send_attempted = {"value": False}
 
-        async def _record_send(*_args, **_kwargs) -> bool:
+        async def _record_send(*_args, **_kwargs) -> list[NotificationDelivery]:
             send_attempted["value"] = True
-            return True
+            return [NotificationDelivery(url="json://localhost", ok=True)]
 
         with (
             patch(
@@ -375,7 +375,7 @@ class TestCommitBeforeSendOrdering:
             ),
             patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
             patch("app.checker.update_knowledge", new_callable=AsyncMock, return_value=_write_result()),
-            patch("app.checker.send_notification", side_effect=_record_send),
+            patch("app.checker.send_notification_per_url", side_effect=_record_send),
             patch("app.checker.send_webhooks", new_callable=AsyncMock, return_value=0),
             patch(
                 "app.checker.create_check_result",
@@ -405,7 +405,7 @@ class TestCommitBeforeSendOrdering:
 
         processed_at_send: dict[str, object] = {}
 
-        async def _check_processed_on_send(*_args, **_kwargs) -> bool:
+        async def _check_processed_on_send(*_args, **_kwargs) -> list[NotificationDelivery]:
             # At send time, a *separate* connection should already see the article
             # marked processed (durable state committed before send).
             side = sqlite3.connect(str(_conn_db_path(db_conn)), check_same_thread=False)
@@ -415,7 +415,7 @@ class TestCommitBeforeSendOrdering:
                 processed_at_send["processed"] = bool(row["processed"]) if row else None
             finally:
                 side.close()
-            return True
+            return [NotificationDelivery(url="json://localhost", ok=True)]
 
         with (
             patch(
@@ -425,7 +425,7 @@ class TestCommitBeforeSendOrdering:
             ),
             patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
             patch("app.checker.update_knowledge", new_callable=AsyncMock, return_value=_write_result()),
-            patch("app.checker.send_notification", side_effect=_check_processed_on_send),
+            patch("app.checker.send_notification_per_url", side_effect=_check_processed_on_send),
             patch("app.checker.send_webhooks", new_callable=AsyncMock, return_value=0),
         ):
             result = await check_topic(topic, db_conn, settings)
@@ -458,7 +458,11 @@ class TestCommitBeforeSendOrdering:
             patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
             patch("app.checker.update_knowledge", new_callable=AsyncMock, return_value=_write_result()),
             # Delivery fails -> row must record notification_sent=0 + the reason.
-            patch("app.checker.send_notification", new_callable=AsyncMock, return_value=False),
+            patch(
+                "app.checker.send_notification_per_url",
+                new_callable=AsyncMock,
+                return_value=[NotificationDelivery(url="json://localhost", ok=False, error="delivery failed")],
+            ),
             patch("app.checker.send_webhooks", new_callable=AsyncMock, return_value=0),
         ):
             result = await check_topic(topic, db_conn, settings)
@@ -468,7 +472,8 @@ class TestCommitBeforeSendOrdering:
         assert persisted is not None
         assert persisted.has_new_info is True
         assert persisted.notification_sent is False
-        assert persisted.notification_error == "Delivery failed"
+        # Per-URL failures are summarized redacted (scheme://host: reason) (OVH-039).
+        assert persisted.notification_error == "json://localhost: delivery failed"
 
 
 class TestWebhookCheckResultId:
@@ -498,7 +503,11 @@ class TestWebhookCheckResultId:
             ),
             patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
             patch("app.checker.update_knowledge", new_callable=AsyncMock, return_value=_write_result()),
-            patch("app.checker.send_notification", new_callable=AsyncMock, return_value=True),
+            patch(
+                "app.checker.send_notification_per_url",
+                new_callable=AsyncMock,
+                return_value=[NotificationDelivery(url="json://localhost", ok=True)],
+            ),
             # Force the webhook POST to fail so it is enqueued for retry.
             patch("app.webhooks.send_webhook", new_callable=AsyncMock, return_value=False),
         ):
