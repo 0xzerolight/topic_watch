@@ -792,20 +792,23 @@ class TestCheckTopic:
         mock_send.assert_called_once()
 
 
-# --- check_id_var lifecycle (OVH-088) ---
+# --- check_id_var lifecycle (OVH-088, OVH-103) ---
 
 
 class TestCheckTopicResetsCheckIdVar:
-    """check_topic resets check_id_var in a finally so one topic's correlation id
-    cannot leak into the next topic's log lines within the same scheduler tick."""
+    """check_topic uses the leak-safe token idiom (OVH-103): it RESTORES whatever
+    correlation id the caller had set rather than clobbering it to None, so a
+    nested check_topic inside an outer flow that owns its own check_id leaves that
+    outer id intact. With no outer id, the var returns to its default (None)."""
 
-    async def test_check_id_var_reset_after_success(self, db_conn: sqlite3.Connection) -> None:
+    async def test_outer_check_id_restored_after_nested_check(self, db_conn: sqlite3.Connection) -> None:
+        """An outer caller's check_id survives a nested check_topic (OVH-103)."""
         from app.check_context import check_id_var
 
         topic = _make_topic(db_conn, name="ResetSuccess")
         settings = _make_settings()
 
-        token = check_id_var.set("sentinel-id")
+        token = check_id_var.set("outer-sentinel")
         try:
             with patch(
                 "app.checker.fetch_new_articles_for_topic",
@@ -813,18 +816,35 @@ class TestCheckTopicResetsCheckIdVar:
                 return_value=FetchResult(articles=[], total_feed_entries=0),
             ):
                 await check_topic(topic, db_conn, settings)
-            assert check_id_var.get() is None
+            # OVH-103: the inner finally restores the prior token, not None.
+            assert check_id_var.get() == "outer-sentinel"
         finally:
             check_id_var.reset(token)
 
-    async def test_check_id_var_reset_after_inner_pipeline_raises(self, db_conn: sqlite3.Connection) -> None:
-        """Even when the inner pipeline raises, the finally still resets the var."""
+    async def test_var_returns_to_default_when_no_outer_id(self, db_conn: sqlite3.Connection) -> None:
+        """With no outer id set, check_topic leaves the var at its default."""
+        from app.check_context import check_id_var
+
+        topic = _make_topic(db_conn, name="ResetDefault")
+        settings = _make_settings()
+
+        assert check_id_var.get() is None
+        with patch(
+            "app.checker.fetch_new_articles_for_topic",
+            new_callable=AsyncMock,
+            return_value=FetchResult(articles=[], total_feed_entries=0),
+        ):
+            await check_topic(topic, db_conn, settings)
+        assert check_id_var.get() is None
+
+    async def test_outer_check_id_restored_after_inner_pipeline_raises(self, db_conn: sqlite3.Connection) -> None:
+        """Even when the inner pipeline raises, the finally restores the outer id."""
         from app.check_context import check_id_var
 
         topic = _make_topic(db_conn, name="ResetRaise")
         settings = _make_settings()
 
-        token = check_id_var.set("sentinel-id")
+        token = check_id_var.set("outer-sentinel")
         try:
             with (
                 patch(
@@ -835,7 +855,162 @@ class TestCheckTopicResetsCheckIdVar:
                 pytest.raises(RuntimeError, match="pipeline boom"),
             ):
                 await check_topic(topic, db_conn, settings)
+            assert check_id_var.get() == "outer-sentinel"
+        finally:
+            check_id_var.reset(token)
+
+    async def test_inner_check_uses_its_own_check_id_during_run(self, db_conn: sqlite3.Connection) -> None:
+        """Inside the pipeline the var holds the freshly generated id (not the
+        outer one), then the outer id is restored afterwards."""
+        from app.check_context import check_id_var
+
+        topic = _make_topic(db_conn, name="InnerId")
+        settings = _make_settings()
+
+        seen: dict[str, str | None] = {}
+
+        async def _capture(*_args, **_kwargs):
+            seen["inner"] = check_id_var.get()
+            return FetchResult(articles=[], total_feed_entries=0)
+
+        token = check_id_var.set("outer-sentinel")
+        try:
+            with patch("app.checker.fetch_new_articles_for_topic", side_effect=_capture):
+                await check_topic(topic, db_conn, settings)
+            assert seen["inner"] is not None
+            assert seen["inner"] != "outer-sentinel"
+            assert check_id_var.get() == "outer-sentinel"
+        finally:
+            check_id_var.reset(token)
+
+
+# --- init / retry-drain correlation id (OVH-102) ---
+
+
+class TestInitAndRetryCarryCheckId:
+    """OVH-102: the multi-round init flow and the notification retry-drain must
+    run under a generated check_id so a single topic's init / a single drain is
+    traceable across interleaved scheduler ticks (no '-' correlation placeholder).
+    The token idiom is used so any outer caller's id is restored afterwards."""
+
+    async def test_initialize_new_topic_sets_check_id_during_run(self, db_conn: sqlite3.Connection) -> None:
+        from app.check_context import check_id_var
+        from app.checker import initialize_new_topic
+
+        topic = _make_topic(db_conn, name="InitCid", status=TopicStatus.NEW, status_changed_at=None)
+        settings = _make_settings()
+
+        seen: dict[str, str | None] = {}
+
+        async def _capture(*_args, **_kwargs):
+            seen["fetch"] = check_id_var.get()
+            return FetchResult(articles=[], total_feed_entries=0)
+
+        assert check_id_var.get() is None
+        with patch("app.checker.fetch_new_articles_for_topic", side_effect=_capture):
+            await initialize_new_topic(topic, db_conn, settings)
+
+        # The init flow ran under a real correlation id, not the '-' placeholder.
+        assert seen["fetch"] is not None
+        assert seen["fetch"] != "-"
+        # And it restored the prior (default) afterwards.
+        assert check_id_var.get() is None
+
+    async def test_initialize_new_topic_restores_outer_check_id(self, db_conn: sqlite3.Connection) -> None:
+        """A caller that owns an outer check_id keeps it after init returns."""
+        from app.check_context import check_id_var
+        from app.checker import initialize_new_topic
+
+        topic = _make_topic(db_conn, name="InitOuter", status=TopicStatus.NEW, status_changed_at=None)
+        settings = _make_settings()
+
+        token = check_id_var.set("outer-sentinel")
+        try:
+            with patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[], total_feed_entries=0),
+            ):
+                await initialize_new_topic(topic, db_conn, settings)
+            assert check_id_var.get() == "outer-sentinel"
+        finally:
+            check_id_var.reset(token)
+
+    async def test_initialize_new_topic_logs_carry_check_id(self, db_conn: sqlite3.Connection, caplog) -> None:  # noqa: ANN001
+        """Init log lines carry a non-'-' check_id (the whole point of OVH-102)."""
+        import logging
+
+        from app.check_context import CheckIdFilter, check_id_var
+        from app.checker import initialize_new_topic
+
+        topic = _make_topic(db_conn, name="InitLog", status=TopicStatus.NEW, status_changed_at=None)
+        settings = _make_settings()
+
+        check_id_filter = CheckIdFilter()
+        caplog.handler.addFilter(check_id_filter)
+        try:
             assert check_id_var.get() is None
+            with (
+                caplog.at_level(logging.INFO, logger="app.checker"),
+                patch(
+                    "app.checker.fetch_new_articles_for_topic",
+                    new_callable=AsyncMock,
+                    return_value=FetchResult(articles=[], total_feed_entries=0),
+                ),
+            ):
+                await initialize_new_topic(topic, db_conn, settings)
+        finally:
+            caplog.handler.removeFilter(check_id_filter)
+
+        init_records = [r for r in caplog.records if r.name == "app.checker"]
+        assert init_records, "expected init log lines"
+        # Every init log line carried a real correlation id, never the placeholder.
+        assert all(getattr(r, "check_id", "-") not in (None, "-") for r in init_records)
+
+    async def test_retry_drain_sets_check_id_during_run(self, db_conn: sqlite3.Connection) -> None:
+        """The notification retry-drain runs under a generated check_id (OVH-102)."""
+        from app.check_context import check_id_var
+
+        topic = _make_topic(db_conn)
+        create_pending_notification(
+            db_conn,
+            PendingNotification(topic_id=topic.id, title="T", body="B"),
+        )
+        db_conn.commit()
+        settings = _make_settings()
+
+        seen: dict[str, str | None] = {}
+
+        async def _capture(*_args, **_kwargs):
+            seen["send"] = check_id_var.get()
+            return True
+
+        assert check_id_var.get() is None
+        with patch("app.checker.send_notification", side_effect=_capture):
+            await retry_pending_notifications(db_conn, settings)
+
+        assert seen["send"] is not None
+        assert seen["send"] != "-"
+        # The drain restored the prior (default) contextvar afterwards.
+        assert check_id_var.get() is None
+
+    async def test_retry_drain_restores_outer_check_id(self, db_conn: sqlite3.Connection) -> None:
+        """An outer caller's check_id survives the retry-drain (token idiom)."""
+        from app.check_context import check_id_var
+
+        topic = _make_topic(db_conn)
+        create_pending_notification(
+            db_conn,
+            PendingNotification(topic_id=topic.id, title="T", body="B"),
+        )
+        db_conn.commit()
+        settings = _make_settings()
+
+        token = check_id_var.set("outer-sentinel")
+        try:
+            with patch("app.checker.send_notification", new_callable=AsyncMock, return_value=True):
+                await retry_pending_notifications(db_conn, settings)
+            assert check_id_var.get() == "outer-sentinel"
         finally:
             check_id_var.reset(token)
 
