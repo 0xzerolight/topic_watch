@@ -688,6 +688,63 @@ class TestHtmxErrorSurfacing:
         assert "retry" in js.lower()
 
 
+# --- Browser-notification robustness (OVH-117 / OVH-118 / OVH-119) ---
+
+
+class TestBrowserNotificationRobustness:
+    """Source-presence assertions for client-side notification guards."""
+
+    def _notifications_js(self) -> str:
+        from pathlib import Path
+
+        return (Path(__file__).resolve().parent.parent / "app" / "static" / "notifications.js").read_text()
+
+    def _settings_html(self) -> str:
+        from pathlib import Path
+
+        return (Path(__file__).resolve().parent.parent / "app" / "templates" / "settings.html").read_text()
+
+    def _dashboard_html(self) -> str:
+        from pathlib import Path
+
+        return (Path(__file__).resolve().parent.parent / "app" / "templates" / "dashboard.html").read_text()
+
+    def test_notification_construction_is_guarded(self) -> None:
+        """OVH-117: new Notification() is wrapped in try/catch so an Illegal-constructor
+        throw (Android Chrome) can't abort the afterSwap handler / leave inconsistent UI."""
+        js = self._notifications_js()
+        # The constructor *call* (not the comment) must sit inside a try block that
+        # has a matching catch immediately after it.
+        ctor_idx = js.find("n = new Notification(")
+        assert ctor_idx != -1, "expected an assigned `new Notification(...)` call"
+        # The nearest preceding `try {` opens the guard block...
+        try_idx = js.rfind("try {", 0, ctor_idx)
+        assert try_idx != -1, "Notification construction is not inside a try block"
+        # ...and a catch closes it after the constructor.
+        catch_idx = js.find("} catch", ctor_idx)
+        assert catch_idx != -1, "Notification construction has no matching catch"
+
+    def test_request_permission_chain_has_rejection_handler(self) -> None:
+        """OVH-118: the requestPermission() chain has a rejection handler that
+        unchecks the toggle and persists setEnabled(false) instead of leaving it
+        checked-but-disabled."""
+        html = self._settings_html()
+        assert ".catch(" in html
+        # The rejection handler mirrors the denial path: uncheck + persist false.
+        catch_idx = html.find(".catch(")
+        catch_body = html[catch_idx:]
+        assert "checked = false" in catch_body
+        assert "setEnabled(false)" in catch_body
+
+    def test_dashboard_notification_gated_on_just_checked(self) -> None:
+        """OVH-119: the dashboard afterSwap handler only fires on a fresh check
+        (data-just-checked), not on any topic-row re-render (e.g. toggle-active)."""
+        html = self._dashboard_html()
+        assert "data-just-checked" in html
+        # The fire condition requires the just-checked marker alongside new-info.
+        assert 'justChecked === "true"' in html
+
+
 # --- Re-init ---
 
 
@@ -770,6 +827,23 @@ class TestCheckNow:
 
         assert response.status_code == 200
         assert f'id="topic-{topic.id}"' in response.text
+
+    async def test_check_htmx_row_marks_just_checked(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """OVH-119: a fresh /check HTMX response marks the row data-just-checked so the
+        dashboard notification fires for this swap (but not for unrelated re-renders)."""
+        topic = _make_topic(db_conn)
+
+        with patch("app.web.routers.background._run_single_check", new_callable=AsyncMock):
+            response = await client.post(
+                f"/topics/{topic.id}/check",
+                headers={"HX-Request": "true"},
+                follow_redirects=False,
+            )
+
+        assert response.status_code == 200
+        assert 'data-just-checked="true"' in response.text
 
     async def test_check_non_htmx_redirects(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
         """OVH-005: a plain-form /check redirects to the topic detail page (no orphan <tr>)."""
