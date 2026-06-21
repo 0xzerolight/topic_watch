@@ -1,8 +1,10 @@
-"""OPML import/export and bulk topic export routes."""
+"""OPML import/export routes.
 
-import json
+Per-topic JSON/CSV and the bulk topics-JSON export live in ``exports.py``
+(OVH-155); this module keeps the OPML-specific import/export.
+"""
+
 import sqlite3
-from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import RedirectResponse, StreamingResponse
@@ -14,27 +16,6 @@ from app.web.csrf import verify_csrf
 from app.web.dependencies import get_db_conn, get_settings
 
 router = APIRouter()
-
-
-@router.get("/export/topics/json")
-async def export_all_topics_json(
-    conn: sqlite3.Connection = Depends(get_db_conn),
-):
-    """Export all topics as JSON."""
-    topics = list_topics(conn)
-
-    data = {
-        "topics": [t.model_dump(mode="json") for t in topics],
-        "exported_at": datetime.now(UTC).isoformat(),
-    }
-
-    content = json.dumps(data, indent=2, default=str)
-
-    return StreamingResponse(
-        iter([content]),
-        media_type="application/json",
-        headers={"Content-Disposition": 'attachment; filename="topics_export.json"'},
-    )
 
 
 @router.get("/export/opml")
