@@ -201,6 +201,11 @@ def run_migrations(conn: sqlite3.Connection, db_path: Path | None = None) -> Non
         try:
             up_func(conn)
             conn.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+            # Commit per-migration so progress is durable: a crash between two
+            # migrations leaves the DB at a clean recorded version and the next
+            # run resumes from there, rather than re-running already-applied
+            # (possibly non-idempotent) migrations against a changed schema.
+            conn.commit()
         except Exception:
             logger.exception(
                 "Migration %d (%s) failed; DB restored from backup at %s",
@@ -210,7 +215,6 @@ def run_migrations(conn: sqlite3.Connection, db_path: Path | None = None) -> Non
             )
             raise
         logger.info("Applied migration %d: %s", version, description)
-    conn.commit()
 
 
 def init_db(db_path: Path | None = None) -> None:
