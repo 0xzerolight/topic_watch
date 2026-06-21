@@ -3,20 +3,30 @@
 import asyncio
 import sqlite3
 import time
+from unittest.mock import AsyncMock
 
 import pytest
 
+from app.config import LLMSettings, Settings
 from app.crud import (
+    claim_new_topic_for_init,
     claim_pending_notification,
     claim_pending_webhook,
     create_pending_notification,
     create_pending_webhook,
     create_topic,
+    get_topic,
     release_stale_notification_claims,
     release_stale_webhook_claims,
 )
 from app.models import PendingNotification, Topic, TopicStatus
-from app.web.state import CheckingState
+from app.web.state import CheckingState, _checking_state
+
+
+def _make_settings(**overrides) -> Settings:
+    defaults = {"llm": LLMSettings(model="openai/gpt-4o-mini", api_key="test-key-12345678")}
+    defaults.update(overrides)
+    return Settings(**defaults)
 
 
 @pytest.fixture
@@ -241,3 +251,202 @@ def test_release_stale_webhook_claim_rearms_row(db_conn: sqlite3.Connection) -> 
     assert release_stale_webhook_claims(db_conn, "2020-06-01T00:00:00+00:00") == 1
     db_conn.commit()
     assert claim_pending_webhook(db_conn, webhook_id, "2025-01-01T00:00:00+00:00") is True
+
+
+# --- check_topic per-topic guard authoritative across entry points (OVH-096) ---
+
+
+@pytest.fixture
+def clean_state():
+    """Ensure the process-global _checking_state singleton is empty around a test."""
+    _checking_state._topics.clear()
+    _checking_state._start_times.clear()
+    _checking_state._checking_all = False
+    yield _checking_state
+    _checking_state._topics.clear()
+    _checking_state._start_times.clear()
+    _checking_state._checking_all = False
+
+
+def _patch_empty_fetch(monkeypatch):
+    """Patch the scraper so check_topic returns early at 'no new articles' (no LLM)."""
+    from app.scraping import FetchResult
+
+    async def _no_articles(*args, **kwargs):
+        return FetchResult(articles=[], total_feed_entries=0)
+
+    monkeypatch.setattr("app.checker.fetch_new_articles_for_topic", _no_articles)
+
+
+async def test_check_topic_skips_when_already_in_flight(db_conn: sqlite3.Connection, monkeypatch, clean_state) -> None:
+    """A second check_topic on an already-claimed topic skips the pipeline (OVH-096)."""
+    from app.checker import check_topic
+
+    topic = create_topic(db_conn, Topic(name="Guarded", description="d", status=TopicStatus.READY))
+    db_conn.commit()
+    settings = _make_settings()
+
+    fetch_spy = AsyncMock(side_effect=AssertionError("pipeline must not run while in flight"))
+    monkeypatch.setattr("app.checker.fetch_new_articles_for_topic", fetch_spy)
+
+    # Simulate an in-flight check by pre-claiming the per-topic slot.
+    assert await clean_state.start_check(topic.id) is True
+    result = await check_topic(topic, db_conn, settings)
+
+    assert result.stage_error == "skipped: already in flight"
+    fetch_spy.assert_not_awaited()
+
+
+async def test_check_topic_acquires_and_releases_guard(db_conn: sqlite3.Connection, monkeypatch, clean_state) -> None:
+    """check_topic claims the per-topic guard for the run and releases it after (OVH-096)."""
+    from app.checker import check_topic
+
+    topic = create_topic(db_conn, Topic(name="Solo", description="d", status=TopicStatus.READY))
+    db_conn.commit()
+    settings = _make_settings()
+    _patch_empty_fetch(monkeypatch)
+
+    assert await clean_state.is_checking(topic.id) is False
+    await check_topic(topic, db_conn, settings)
+    # Released in finally -> startable again.
+    assert await clean_state.is_checking(topic.id) is False
+    assert await clean_state.start_check(topic.id) is True
+
+
+async def test_check_topic_guard_false_does_not_touch_state(
+    db_conn: sqlite3.Connection, monkeypatch, clean_state
+) -> None:
+    """guard=False runs even when the slot is taken (caller owns the guard)."""
+    from app.checker import check_topic
+
+    topic = create_topic(db_conn, Topic(name="Owned", description="d", status=TopicStatus.READY))
+    db_conn.commit()
+    settings = _make_settings()
+    _patch_empty_fetch(monkeypatch)
+
+    # Caller already holds the slot; guard=False must still execute the pipeline.
+    assert await clean_state.start_check(topic.id) is True
+    result = await check_topic(topic, db_conn, settings, guard=False)
+    assert result.stage_error != "skipped: already in flight"
+    # The slot the caller owns is untouched by the inner run.
+    assert await clean_state.is_checking(topic.id) is True
+
+
+async def test_concurrent_check_topic_only_one_runs_pipeline(
+    db_conn: sqlite3.Connection, monkeypatch, tmp_path, clean_state
+) -> None:
+    """Two concurrent check_topic calls on the same topic: only one runs the pipeline."""
+    from app.checker import check_topic
+    from app.database import get_db, init_db
+    from app.scraping import FetchResult
+
+    db_path = tmp_path / "race.db"
+    init_db(db_path)
+    with get_db(db_path) as seed:
+        topic = create_topic(seed, Topic(name="Racer", description="d", status=TopicStatus.READY))
+        seed.commit()
+    settings = _make_settings()
+
+    runs = 0
+
+    async def _slow_fetch(*args, **kwargs):
+        nonlocal runs
+        runs += 1
+        await asyncio.sleep(0.05)
+        return FetchResult(articles=[], total_feed_entries=0)
+
+    monkeypatch.setattr("app.checker.fetch_new_articles_for_topic", _slow_fetch)
+
+    async def _do_check():
+        with get_db(db_path) as conn:
+            return await check_topic(topic, conn, settings)
+
+    results = await asyncio.gather(_do_check(), _do_check())
+    skipped = [r for r in results if r.stage_error == "skipped: already in flight"]
+    assert runs == 1
+    assert len(skipped) == 1
+
+
+# --- check_all_topics whole-cycle gate shared with web check-all (OVH-034) ---
+
+
+async def test_check_all_skips_when_cycle_already_in_flight(monkeypatch, clean_state) -> None:
+    """A check_all_topics run while a cycle is in flight skips (OVH-034)."""
+    from app.checker import check_all_topics
+
+    settings = _make_settings()
+    inner = AsyncMock(side_effect=AssertionError("cycle must not run twice"))
+    monkeypatch.setattr("app.checker._check_all_topics_inner", inner)
+
+    # Simulate a web check-all already holding the whole-cycle gate.
+    assert await clean_state.start_check_all() is True
+    result = await check_all_topics(settings)
+    assert result == []
+    inner.assert_not_awaited()
+
+
+async def test_check_all_releases_gate_after_run(monkeypatch, clean_state) -> None:
+    """check_all_topics releases the whole-cycle gate so the next caller proceeds."""
+    from app.checker import check_all_topics
+
+    settings = _make_settings()
+    monkeypatch.setattr("app.checker._check_all_topics_inner", AsyncMock(return_value=[]))
+
+    await check_all_topics(settings)
+    assert await clean_state.is_checking_all() is False
+    # Gate is free again.
+    assert await clean_state.start_check_all() is True
+
+
+async def test_check_all_guard_false_skips_gate(monkeypatch, clean_state) -> None:
+    """guard=False runs the inner cycle even if the gate is held (caller owns it)."""
+    from app.checker import check_all_topics
+
+    settings = _make_settings()
+    inner = AsyncMock(return_value=[])
+    monkeypatch.setattr("app.checker._check_all_topics_inner", inner)
+
+    assert await clean_state.start_check_all() is True
+    await check_all_topics(settings, guard=False)
+    inner.assert_awaited_once()
+
+
+# --- Atomic NEW -> RESEARCHING init claim (OVH-032) ---
+
+
+def test_claim_new_topic_for_init_wins_once(db_conn: sqlite3.Connection) -> None:
+    """Only the first claim transitions NEW -> RESEARCHING; a second loses."""
+    topic = create_topic(db_conn, Topic(name="ToInit", description="d", status=TopicStatus.NEW))
+    db_conn.commit()
+
+    assert claim_new_topic_for_init(db_conn, topic.id) is True
+    # Row is now RESEARCHING, not NEW -> second claim fails.
+    assert claim_new_topic_for_init(db_conn, topic.id) is False
+    refreshed = get_topic(db_conn, topic.id)
+    assert refreshed.status == TopicStatus.RESEARCHING
+
+
+def test_claim_new_topic_for_init_noop_when_not_new(db_conn: sqlite3.Connection) -> None:
+    """A topic that is not NEW (already READY) cannot be claimed for init."""
+    topic = create_topic(db_conn, Topic(name="Ready", description="d", status=TopicStatus.READY))
+    db_conn.commit()
+    assert claim_new_topic_for_init(db_conn, topic.id) is False
+
+
+async def test_concurrent_init_claim_only_one_wins(tmp_path) -> None:
+    """Two connections racing claim_new_topic_for_init: exactly one wins."""
+    from app.database import get_db, init_db
+
+    db_path = tmp_path / "init.db"
+    init_db(db_path)
+    with get_db(db_path) as seed:
+        topic = create_topic(seed, Topic(name="Race", description="d", status=TopicStatus.NEW))
+        seed.commit()
+
+    def _claim() -> bool:
+        with get_db(db_path) as conn:
+            return claim_new_topic_for_init(conn, topic.id)
+
+    results = await asyncio.gather(asyncio.to_thread(_claim), asyncio.to_thread(_claim))
+    assert results.count(True) == 1
+    assert results.count(False) == 1
