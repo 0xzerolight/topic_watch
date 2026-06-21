@@ -648,8 +648,11 @@ async def export_topic_csv(
                 _csv_safe(check.checked_at.isoformat()),
                 _csv_safe(check.articles_found),
                 _csv_safe(check.articles_new),
-                _csv_safe(check.has_new_info),
-                _csv_safe(check.notification_sent),
+                # OVH-111: emit 0/1, not Python "True"/"False" — consistent with
+                # the on-disk INTEGER and the JSON export. int() flows through
+                # _csv_safe unchanged (non-strings are returned as-is).
+                _csv_safe(int(check.has_new_info)),
+                _csv_safe(int(check.notification_sent)),
                 _csv_safe(check.notification_error or ""),
                 _csv_safe(check.stage_error or ""),
             ]
