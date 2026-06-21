@@ -46,23 +46,47 @@ class KnowledgeWriteResult:
 
 
 def _truncate_to_budget(text: str, max_tokens: int, model: str) -> tuple[str, int]:
-    """Truncate text by removing trailing sentences until it fits the token budget."""
+    """Truncate text by keeping leading sentences until it fits the token budget.
+
+    Keeps the largest leading prefix of sentences whose token count fits
+    ``max_tokens`` (dropping trailing sentences), falling back to the first
+    sentence as-is when even that overflows. Identical semantics to a one-at-a-
+    time trailing-drop loop, but the kept-sentence count is located by binary
+    search so the model-aware ``count_tokens`` runs O(log n) times instead of
+    O(n) (OVH-049).
+    """
     token_count = count_tokens(text, model)
     if token_count <= max_tokens:
         return text, token_count
 
     sentences = re.split(r"(?<=[.!?])\s+", text)
-    if len(sentences) <= 1:
+    n = len(sentences)
+    if n <= 1:
         return text, token_count
 
-    while len(sentences) > 1:
-        sentences.pop()
-        truncated = " ".join(sentences)
-        token_count = count_tokens(truncated, model)
-        if token_count <= max_tokens:
-            return truncated, token_count
+    def count_first(k: int) -> int:
+        return count_tokens(" ".join(sentences[:k]), model)
 
-    # Down to one sentence — return as-is
+    # The full text (k == n) is already known to overflow, so search [1, n-1]
+    # for the largest k whose leading prefix fits. ``best`` tracks the latest
+    # fitting prefix and its authoritative token count.
+    lo, hi = 1, n - 1
+    best_k = 0
+    best_count = 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        mid_count = count_first(mid)
+        if mid_count <= max_tokens:
+            best_k = mid
+            best_count = mid_count
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    if best_k:
+        return " ".join(sentences[:best_k]), best_count
+
+    # Even the first sentence overflows — return it as-is (lossy but never empty).
     final = sentences[0]
     return final, count_tokens(final, model)
 

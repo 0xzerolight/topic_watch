@@ -134,6 +134,9 @@ into key_facts. Every fact in key_facts must pass BOTH tests: (1) "Is this absen
 from the current knowledge state?" and (2) "Does this directly address what the \
 description asks about?" If the new development is conveyed by the summary alone \
 and no fact is genuinely new, return an empty key_facts list. \
+When has_new_info is true, write a one-to-two sentence neutral summary of the new \
+development in `summary` (it is the lead-in the downstream knowledge update merges \
+from); set `summary` to null ONLY when has_new_info is false. \
 List the source article URLs in source_urls. \
 Set confidence using this scale:
 - 0.9-1.0: Official/primary source, unambiguous new fact, directly answers the topic description
