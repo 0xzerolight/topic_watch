@@ -11,13 +11,13 @@ from app.config import (
     LOCAL_PROVIDER_DEFAULTS,
     Settings,
     is_api_key_env_sourced,
-    is_cloud_provider,
     load_settings,
     save_settings_to_yaml,
 )
 from app.notifications import send_notification
 from app.web.csrf import verify_csrf
 from app.web.dependencies import get_settings
+from app.web.routers._validation import format_validation_errors, strip_base_url
 from app.web.routers.templates import templates
 
 logger = logging.getLogger(__name__)
@@ -148,10 +148,9 @@ async def complete_setup(
     if not getattr(request.app.state, "setup_required", False):
         return RedirectResponse(url="/", status_code=303)
 
-    # Strip base_url for cloud providers (e.g. stale Ollama URL when switching to Anthropic)
-    effective_base_url = llm_base_url.strip() or None
-    if effective_base_url and is_cloud_provider(llm_model):
-        effective_base_url = None
+    # Strip base_url for cloud providers (e.g. stale Ollama URL when switching to
+    # Anthropic) so the pre-flight check sees the value the model will persist (OVH-153).
+    effective_base_url = strip_base_url(llm_base_url, llm_model)
 
     form_values = {
         "llm_model": llm_model,
@@ -184,11 +183,10 @@ async def complete_setup(
             status_code=422,
         )
     except ValidationError as exc:
-        errors = [f"{' → '.join(str(loc) for loc in e['loc'])}: {e['msg']}" for e in exc.errors()]
         return templates.TemplateResponse(
             request,
             "setup.html",
-            {"setup_mode": True, "errors": errors, "form": form_values, **_provider_ctx},
+            {"setup_mode": True, "errors": format_validation_errors(exc), "form": form_values, **_provider_ctx},
             status_code=422,
         )
     except Exception as exc:
@@ -261,8 +259,10 @@ async def update_settings(request: Request):
     # field is read-only in the UI and the on-disk value is preserved on save.
     api_key_env_sourced = is_api_key_env_sourced()
     effective_api_key = llm_api_key.strip() or request.app.state.settings.llm.api_key
-    # base_url is stripped for cloud providers once on the Settings model (OVH-104).
-    effective_base_url = llm_base_url.strip() or None
+    # Shared normalization (OVH-153): blank -> None and cloud-provider stripping.
+    # The Settings model also enforces the latter (OVH-104); applying it here keeps
+    # setup and settings on the same seam.
+    effective_base_url = strip_base_url(llm_base_url, llm_model)
 
     # Scalar fields are passed as strings; Pydantic coerces and validates them.
     scalar_kwargs = {field: form_values[field] for field in _SCALAR_FORM_FIELDS}
@@ -305,14 +305,13 @@ async def update_settings(request: Request):
         )
         request.app.state.settings = new_settings
     except ValidationError as exc:
-        errors = [f"{' → '.join(str(loc) for loc in e['loc'])}: {e['msg']}" for e in exc.errors()]
         return templates.TemplateResponse(
             request,
             "settings.html",
             _settings_template_ctx(
                 request,
                 settings=request.app.state.settings,
-                errors=errors,
+                errors=format_validation_errors(exc),
                 form=form_values,
             ),
             status_code=422,
