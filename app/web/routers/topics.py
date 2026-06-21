@@ -22,6 +22,7 @@ from app.crud import (
     get_feed_health,
     get_knowledge_state,
     get_topic,
+    get_topic_by_name,
     list_articles_for_topic,
     list_check_results,
     sum_check_tokens,
@@ -76,7 +77,7 @@ async def create_topic_handler(
     conf_threshold = parse_threshold(confidence_threshold, "Confidence threshold", errors)
     rel_threshold = parse_threshold(relevance_threshold, "Relevance threshold", errors)
 
-    if errors:
+    def _render_errors() -> HTMLResponse:
         return templates.TemplateResponse(
             request,
             "topic_add.html",
@@ -96,6 +97,13 @@ async def create_topic_handler(
             status_code=422,
         )
 
+    if errors:
+        return _render_errors()
+
+    if get_topic_by_name(conn, name) is not None:
+        errors.append("A topic with that name already exists")
+        return _render_errors()
+
     topic = Topic(
         name=name,
         description=description,
@@ -108,8 +116,14 @@ async def create_topic_handler(
         confidence_threshold=conf_threshold,
         relevance_threshold=rel_threshold,
     )
-    created = create_topic(conn, topic)
-    conn.commit()
+    try:
+        created = create_topic(conn, topic)
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # Defense-in-depth against a name race between the pre-check and INSERT.
+        conn.rollback()
+        errors.append("A topic with that name already exists")
+        return _render_errors()
 
     assert created.id is not None
     db_path = getattr(request.app.state, "db_path", None)
