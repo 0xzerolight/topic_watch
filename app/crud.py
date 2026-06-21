@@ -777,6 +777,26 @@ def get_new_topics(conn: sqlite3.Connection, limit: int = 1) -> list[Topic]:
     return [Topic.from_row(row) for row in rows]
 
 
+def claim_new_topic_for_init(conn: sqlite3.Connection, topic_id: int) -> bool:
+    """Atomically claim a NEW topic for initialization (NEW -> RESEARCHING).
+
+    Returns True only if this caller won the claim (rowcount == 1). A concurrent
+    init (a same-minute web Retry click, a second scheduler tick on another
+    process, or a CLI init) that already transitioned the row out of NEW loses
+    here, so only one initializer proceeds (OVH-032). Mirrors the conditional-UPDATE
+    pattern in ``recover_stuck_researching``. Commits so the claim is durable and
+    immediately visible to concurrent WAL connections.
+    """
+    now = datetime.now(UTC).isoformat()
+    cursor = conn.execute(
+        """UPDATE topics SET status = ?, status_changed_at = ?, error_message = ?
+           WHERE id = ? AND status = ?""",
+        (TopicStatus.RESEARCHING.value, now, None, topic_id, TopicStatus.NEW.value),
+    )
+    conn.commit()
+    return cursor.rowcount == 1
+
+
 def get_all_feed_urls(conn: sqlite3.Connection) -> set[str]:
     """Get all feed URLs across all topics for OPML dedup."""
     rows = conn.execute("SELECT DISTINCT json_each.value FROM topics, json_each(topics.feed_urls)").fetchall()

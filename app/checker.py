@@ -34,6 +34,7 @@ from app.database import get_db, short_conn
 from app.models import CheckResult, PendingNotification, Topic, TopicStatus
 from app.notifications import format_notification, send_notification
 from app.scraping import fetch_new_articles_for_topic
+from app.web.state import _checking_state
 from app.webhooks import retry_pending_webhooks, send_webhooks
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,8 @@ async def check_topic(
     topic: Topic,
     conn: sqlite3.Connection,
     settings: Settings,
+    *,
+    guard: bool = True,
 ) -> CheckResult:
     """Run the full check pipeline for a single topic.
 
@@ -75,14 +78,48 @@ async def check_topic(
         6. Mark articles as processed
         7. Record and return CheckResult
 
+    Concurrency: ``check_topic`` is the single per-topic funnel, so it acquires
+    the process-wide ``_checking_state`` guard itself (OVH-096). The scheduler
+    ``check_all_topics`` loop, the UI check-all, the JSON API, and the CLI all
+    reach the pipeline through here, so a same-topic check already in flight is
+    skipped (returns a CheckResult with ``stage_error='skipped: already in
+    flight'`` and no LLM/notification work). Callers that already hold the guard
+    (the manual web ``/check`` path, which acquires it synchronously so it can
+    return the current row immediately) pass ``guard=False`` to avoid
+    self-blocking on the entry they already own.
+
     Args:
         topic: The topic to check. Must have an id and be in READY status.
         conn: Database connection for reads and writes.
         settings: Application settings.
+        guard: When True (default), acquire/release the per-topic in-flight
+            guard. Pass False when the caller already holds it.
 
     Returns:
         CheckResult recording the outcome of this check.
     """
+    if topic.id is None:
+        raise ValueError("Topic must have an ID")
+    topic_id: int = topic.id
+
+    if not guard:
+        return await _check_topic_guarded(topic, conn, settings)
+
+    if not await _checking_state.start_check(topic_id):
+        logger.info("Topic '%s' (id=%d) already being checked; skipping", topic.name, topic_id)
+        return CheckResult(topic_id=topic_id, stage_error="skipped: already in flight")
+    try:
+        return await _check_topic_guarded(topic, conn, settings)
+    finally:
+        await _checking_state.finish_check(topic_id)
+
+
+async def _check_topic_guarded(
+    topic: Topic,
+    conn: sqlite3.Connection,
+    settings: Settings,
+) -> CheckResult:
+    """Run the pipeline with a fresh check_id (caller owns the in-flight guard)."""
     if topic.id is None:
         raise ValueError("Topic must have an ID")
 
@@ -404,6 +441,8 @@ async def _drain_pending_notifications(
 async def check_all_topics(
     settings: Settings,
     db_path: Path | None = None,
+    *,
+    guard: bool = True,
 ) -> list[CheckResult]:
     """Check all active, ready topics for new information.
 
@@ -421,13 +460,41 @@ async def check_all_topics(
     Each topic is checked independently. Errors in one topic do not
     affect others.
 
+    Concurrency: this is the single whole-cycle funnel, so it acquires the
+    process-wide ``start_check_all`` gate itself (OVH-034). The scheduler tick,
+    the UI check-all, and the CLI all share it, so a tick overlapping a UI
+    check-all (or vice versa) skips rather than running two full cycles that
+    double-drain the retry queues and double-notify. Each per-topic
+    ``check_topic`` additionally holds the per-topic guard (OVH-096). Callers
+    that already hold the whole-cycle gate (the web handler, which acquires it
+    synchronously to decide whether to enqueue) pass ``guard=False``.
+
     Args:
         settings: Application settings.
         db_path: Optional database path override for testing.
+        guard: When True (default), acquire/release the whole-cycle gate. Pass
+            False when the caller already holds it.
 
     Returns:
         List of CheckResults, one per topic checked.
     """
+    if not guard:
+        return await _check_all_topics_inner(settings, db_path)
+
+    if not await _checking_state.start_check_all():
+        logger.info("Check-all already in flight; skipping overlapping cycle")
+        return []
+    try:
+        return await _check_all_topics_inner(settings, db_path)
+    finally:
+        await _checking_state.finish_check_all()
+
+
+async def _check_all_topics_inner(
+    settings: Settings,
+    db_path: Path | None,
+) -> list[CheckResult]:
+    """Run one whole check cycle (caller owns the whole-cycle gate)."""
     # Retry any failed deliveries from previous cycles. Each retry function
     # manages its own short-lived connections: it snapshots pending rows,
     # sends with NO connection held, and commits per item.
