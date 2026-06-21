@@ -215,19 +215,50 @@ class CheckResult(BaseModel):
     # exception summary). NULL on clean runs. Distinct from notification_error,
     # which only covers delivery.
     stage_error: str | None = None
+    # Non-persisted: confidence scalar extracted from llm_response. The dashboard
+    # listing populates this via SQL ``json_extract`` so it can render the
+    # confidence badge WITHOUT shipping/parsing the full llm_response blob per
+    # topic (OVH-052). Never written back to the DB (excluded from inserts).
+    confidence: float | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Self:
         """Construct a CheckResult from a database row."""
         data = dict(row)
+        # ``confidence`` is a derived, non-column field; drop any stray DB key so
+        # it is only ever set explicitly here from the loaded blob.
+        data.pop("confidence", None)
         data["has_new_info"] = bool(data["has_new_info"])
         data["notification_sent"] = bool(data["notification_sent"])
         data["checked_at"] = _coerce_required_dt(data.get("checked_at"))
+        # Derive confidence from the already-loaded blob on the single-row paths
+        # (detail/history) so the badge renders without a second parse. The
+        # dashboard path skips the blob entirely and sets ``confidence`` via SQL
+        # json_extract (OVH-052).
+        data["confidence"] = cls._confidence_from_blob(data.get("llm_response"))
         return cls(**data)
+
+    @staticmethod
+    def _confidence_from_blob(llm_response: object) -> float | None:
+        """Extract the confidence scalar from an llm_response JSON blob."""
+        if not isinstance(llm_response, str) or not llm_response:
+            return None
+        try:
+            value = json.loads(llm_response).get("confidence")
+        except (json.JSONDecodeError, AttributeError):
+            return None
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return None
 
     def to_insert_dict(self) -> dict:
         """Return a dict for SQL INSERT (excludes auto-generated id)."""
-        d = self.model_dump(exclude={"id"})
+        # ``confidence`` is derived from llm_response, not a real column — never
+        # persist it (OVH-052).
+        d = self.model_dump(exclude={"id", "confidence"})
         d["checked_at"] = d["checked_at"].isoformat()
         d["has_new_info"] = int(d["has_new_info"])
         d["notification_sent"] = int(d["notification_sent"])
