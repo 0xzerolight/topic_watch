@@ -59,13 +59,27 @@ def list_topics(
     conn: sqlite3.Connection,
     active_only: bool = False,
     tag: str | None = None,
+    is_active: bool | None = None,
 ) -> list[Topic]:
-    """List all topics, optionally filtering to active ones and/or by tag."""
+    """List all topics, optionally filtering by active state and/or tag.
+
+    The active state is a tri-state filter:
+    - ``is_active=True``  -> only active topics  (``WHERE is_active = 1``)
+    - ``is_active=False`` -> only inactive topics (``WHERE is_active = 0``)
+    - ``is_active=None``  -> no active-state filter
+
+    ``active_only=True`` is kept as a backwards-compatible one-way shorthand for
+    ``is_active=True``; an explicit ``is_active`` value takes precedence.
+    """
     where_clauses = []
     params: list = []
 
-    if active_only:
-        where_clauses.append("t.is_active = 1")
+    if is_active is None and active_only:
+        is_active = True
+
+    if is_active is not None:
+        where_clauses.append("t.is_active = ?")
+        params.append(1 if is_active else 0)
 
     if tag:
         where_clauses.append("json_each.value = ?")

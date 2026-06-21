@@ -30,8 +30,12 @@ async def api_list_topics(
     tag: str | None = None,
     conn: sqlite3.Connection = Depends(get_db_conn),
 ) -> list[Topic]:
-    """List all topics with optional filters."""
-    return list_topics(conn, active_only=active is True if active is not None else False, tag=tag)
+    """List all topics with optional filters.
+
+    ``active`` is a tri-state filter: ``true`` returns only active topics,
+    ``false`` returns only inactive topics, and omitting it returns all topics.
+    """
+    return list_topics(conn, is_active=active, tag=tag)
 
 
 @router.get("/topics/{topic_id}")
