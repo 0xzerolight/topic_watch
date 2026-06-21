@@ -182,9 +182,14 @@ document.body.addEventListener("htmx:afterSwap", function(event) {
         // For outerHTML swaps, detail.target is the old (detached) element.
         // Look up the new element by ID instead.
         var target = document.getElementById(detailTarget.id) || detailTarget;
+        // Only fire for a fresh check: the /check response sets data-just-checked,
+        // while unrelated row re-renders (e.g. toggle-active) do not. Without this
+        // gate, toggling a topic whose last check found new info re-fires a
+        // duplicate notification for stale info (OVH-119).
+        var justChecked = target.getAttribute("data-just-checked");
         var newInfo = target.getAttribute("data-new-info");
         var topicName = target.getAttribute("data-topic-name");
-        if (newInfo === "true" && topicName) {
+        if (justChecked === "true" && newInfo === "true" && topicName) {
             var link = target.querySelector("a");
             TopicWatchNotifications.show(
                 "New Info: " + topicName,
