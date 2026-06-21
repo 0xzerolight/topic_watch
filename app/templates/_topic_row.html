@@ -1,6 +1,7 @@
 <tr id="topic-{{ topic.id }}"{% if not topic.is_active %} style="opacity: 0.5"{% endif %}
     data-topic-name="{{ topic.name }}"
-    {% if last_check and last_check.has_new_info %}data-new-info="true"{% endif %}>
+    {% if last_check and last_check.has_new_info %}data-new-info="true"{% endif %}
+    {% if just_checked %}data-just-checked="true"{% endif %}>
     <td>
         <input type="checkbox" name="topic_ids" value="{{ topic.id }}"
                class="topic-select" aria-label="Select {{ topic.name }}" onchange="updateBulkBar()">
