@@ -275,8 +275,10 @@ class TestFormatArticles:
         content = "First sentence here. Second sentence here. Third sentence here. " + "x" * 1500
         article = _make_article(raw_content=content)
         result = _format_articles([article], max_content_chars=80)
-        # Should prefer sentence boundary over hard cut
-        assert "..." in result or result.rstrip().endswith(".")
+        # Truncated content (inside the untrusted fence) should prefer a sentence
+        # boundary over a hard cut.
+        body = result.split("instructions) ---\n", 1)[1].split("\n    --- END UNTRUSTED", 1)[0]
+        assert "..." in body or body.rstrip().endswith(".")
 
 
 # ============================================================
