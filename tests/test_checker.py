@@ -219,23 +219,30 @@ class TestCheckTopic:
         assert result.id is not None
 
     async def test_notification_failure_captured_and_queued(self, db_conn: sqlite3.Connection) -> None:
-        """Notification failure should be recorded and queued for retry."""
+        """Notification failure should be recorded and queued for retry.
+
+        OVH-085: the source article is persisted and asserted ``processed==1``
+        after the failed send — failed-but-queued articles are still marked
+        processed (the queued notification is the only recovery path; a
+        reordering that only marks processed on success would fail here).
+        """
         topic = _make_topic(db_conn, name="NotifFail")
         create_knowledge_state(
             db_conn,
             KnowledgeState(topic_id=topic.id, summary_text="Summary.", token_count=10),
         )
+        # Persist a real article so its processed flag can be asserted from the DB.
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
         db_conn.commit()
         settings = _make_settings()
 
-        articles = [_make_article(topic_id=topic.id)]
         novelty = NoveltyResult(has_new_info=True, summary="Update", confidence=0.9, relevance=0.9)
 
         with (
             patch(
                 "app.checker.fetch_new_articles_for_topic",
                 new_callable=AsyncMock,
-                return_value=FetchResult(articles=articles, total_feed_entries=len(articles)),
+                return_value=FetchResult(articles=[article], total_feed_entries=1),
             ),
             patch(
                 "app.checker.analyze_articles",
@@ -261,24 +268,33 @@ class TestCheckTopic:
         assert "Topic Watch:" in pending[0].title
         assert pending[0].last_error == "SMTP error"
 
+        # OVH-085: the article is marked processed even though the send failed.
+        assert article.id is not None
+        proc = db_conn.execute("SELECT processed FROM articles WHERE id = ?", (article.id,)).fetchone()
+        assert proc["processed"] == 1
+
     async def test_notification_delivery_failure_queued(self, db_conn: sqlite3.Connection) -> None:
-        """When send_notification returns False, notification is queued for retry."""
+        """When send_notification returns False, notification is queued for retry.
+
+        OVH-085: also pins that the source article is marked ``processed==1`` on
+        the delivery-returned-False failure path.
+        """
         topic = _make_topic(db_conn, name="DeliveryFail")
         create_knowledge_state(
             db_conn,
             KnowledgeState(topic_id=topic.id, summary_text="Summary.", token_count=10),
         )
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
         db_conn.commit()
         settings = _make_settings()
 
-        articles = [_make_article(topic_id=topic.id)]
         novelty = NoveltyResult(has_new_info=True, summary="Update", confidence=0.9, relevance=0.9)
 
         with (
             patch(
                 "app.checker.fetch_new_articles_for_topic",
                 new_callable=AsyncMock,
-                return_value=FetchResult(articles=articles, total_feed_entries=len(articles)),
+                return_value=FetchResult(articles=[article], total_feed_entries=1),
             ),
             patch(
                 "app.checker.analyze_articles",
@@ -301,6 +317,11 @@ class TestCheckTopic:
         pending = list_pending_notifications(db_conn)
         assert len(pending) == 1
         assert pending[0].url == "json://localhost"
+
+        # OVH-085: the article is marked processed even though delivery failed.
+        assert article.id is not None
+        proc = db_conn.execute("SELECT processed FROM articles WHERE id = ?", (article.id,)).fetchone()
+        assert proc["processed"] == 1
 
     async def test_llm_response_stored_as_json(self, db_conn: sqlite3.Connection) -> None:
         """The NoveltyResult should be serialized to llm_response."""
@@ -682,6 +703,93 @@ class TestCheckTopic:
         assert article.id is not None
         row = db_conn.execute("SELECT processed FROM articles WHERE id = ?", (article.id,)).fetchone()
         assert row["processed"] == 1
+
+    async def test_confidence_equal_to_threshold_sends_notification(self, db_conn: sqlite3.Connection) -> None:
+        """OVH-075: confidence EXACTLY at the threshold notifies (locks ``<`` not ``<=``).
+
+        The gate is ``novelty.confidence < threshold``: an equal value must pass.
+        A regression flipping the operator to ``<=`` would suppress at the
+        boundary and this test would fail.
+        """
+        topic = _make_topic(db_conn, name="ConfBoundary")
+        create_knowledge_state(
+            db_conn,
+            KnowledgeState(topic_id=topic.id, summary_text="Known facts.", token_count=20),
+        )
+        db_conn.commit()
+        settings = _make_settings(min_confidence_threshold=0.7)
+
+        articles = [_make_article(topic_id=topic.id)]
+        novelty = NoveltyResult(
+            has_new_info=True,
+            summary="Boundary confidence update",
+            confidence=0.7,  # exactly equal to the threshold
+            relevance=0.9,
+        )
+
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=articles, total_feed_entries=len(articles)),
+            ),
+            patch(
+                "app.checker.analyze_articles",
+                new_callable=AsyncMock,
+                return_value=novelty,
+            ),
+            patch(
+                "app.checker.update_knowledge", new_callable=AsyncMock, return_value=_make_write_result()
+            ) as mock_update,
+            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)) as mock_send,
+        ):
+            result = await check_topic(topic, db_conn, settings)
+
+        assert result.has_new_info is True
+        assert result.notification_sent is True
+        mock_update.assert_called_once()
+        mock_send.assert_called_once()
+
+    async def test_relevance_equal_to_threshold_sends_notification(self, db_conn: sqlite3.Connection) -> None:
+        """OVH-075: relevance EXACTLY at the threshold notifies (locks ``<`` not ``<=``)."""
+        topic = _make_topic(db_conn, name="RelBoundary")
+        create_knowledge_state(
+            db_conn,
+            KnowledgeState(topic_id=topic.id, summary_text="Known facts.", token_count=20),
+        )
+        db_conn.commit()
+        settings = _make_settings(min_relevance_threshold=0.5)
+
+        articles = [_make_article(topic_id=topic.id)]
+        novelty = NoveltyResult(
+            has_new_info=True,
+            summary="Boundary relevance update",
+            confidence=0.9,
+            relevance=0.5,  # exactly equal to the threshold
+        )
+
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=articles, total_feed_entries=len(articles)),
+            ),
+            patch(
+                "app.checker.analyze_articles",
+                new_callable=AsyncMock,
+                return_value=novelty,
+            ),
+            patch(
+                "app.checker.update_knowledge", new_callable=AsyncMock, return_value=_make_write_result()
+            ) as mock_update,
+            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)) as mock_send,
+        ):
+            result = await check_topic(topic, db_conn, settings)
+
+        assert result.has_new_info is True
+        assert result.notification_sent is True
+        mock_update.assert_called_once()
+        mock_send.assert_called_once()
 
 
 # --- check_id_var lifecycle (OVH-088) ---
