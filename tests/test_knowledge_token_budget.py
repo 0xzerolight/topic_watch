@@ -1,5 +1,7 @@
 """Tests for the token-budget handling (LLM compression + truncation fallback) in knowledge.py."""
 
+import math
+import re
 import sqlite3
 from unittest.mock import AsyncMock, patch
 
@@ -430,3 +432,122 @@ class TestUpdateKnowledgeBudget:
 
         assert state.summary_text == updated_summary
         compress_mock.assert_not_called()
+
+
+# ============================================================
+# TestTruncateToBudgetCharacterization (OVH-049)
+# ============================================================
+#
+# The binary-search rewrite of _truncate_to_budget must be a pure algorithmic
+# optimization: identical output to the old keep-leading/drop-trailing impl,
+# with O(log n) tokenizer calls instead of O(n).
+
+
+def _old_truncate_to_budget(text: str, max_tokens: int, count_tokens) -> tuple[str, int]:
+    """The pre-OVH-049 O(n^2) reference implementation (oracle for output parity)."""
+    token_count = count_tokens(text)
+    if token_count <= max_tokens:
+        return text, token_count
+
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    if len(sentences) <= 1:
+        return text, token_count
+
+    while len(sentences) > 1:
+        sentences.pop()
+        truncated = " ".join(sentences)
+        token_count = count_tokens(truncated)
+        if token_count <= max_tokens:
+            return truncated, token_count
+
+    final = sentences[0]
+    return final, count_tokens(final)
+
+
+class _CountingTokenizer:
+    """A deterministic word-count tokenizer that records how often it is called."""
+
+    def __init__(self, tokens_per_word: int = 1) -> None:
+        self.tokens_per_word = tokens_per_word
+        self.calls = 0
+
+    def __call__(self, text: str, model: str = "m") -> int:
+        self.calls += 1
+        return len(text.split()) * self.tokens_per_word
+
+
+_SAMPLE_TEXTS = [
+    # Many short single-word sentences (worst case for the old impl).
+    " ".join(f"S{i}." for i in range(50)),
+    # Two-word sentences.
+    " ".join(f"Fact {i}." for i in range(30)),
+    # Mixed lengths with !/? terminators.
+    "Alpha beta gamma. Delta! Epsilon zeta? Eta theta iota kappa. Lambda mu. Nu xi omicron pi rho.",
+    # Short, already under any reasonable budget.
+    "Just one sentence here.",
+    # Single very long sentence (no split points).
+    "word " * 40,
+]
+
+
+class TestTruncateToBudgetCharacterization:
+    def test_output_identical_to_old_impl(self) -> None:
+        """New binary-search impl yields byte-identical output to the old loop."""
+        for text in _SAMPLE_TEXTS:
+            for max_tokens in (1, 2, 5, 10, 25, 1000):
+                old = _CountingTokenizer()
+                expected_text, expected_count = _old_truncate_to_budget(text, max_tokens, old)
+
+                new = _CountingTokenizer()
+                with patch("app.analysis.knowledge.count_tokens", side_effect=new):
+                    got_text, got_count = _truncate_to_budget(text, max_tokens, model="m")
+
+                assert got_text == expected_text, f"text={text!r} budget={max_tokens}"
+                assert got_count == expected_count, f"text={text!r} budget={max_tokens}"
+
+    def test_output_identical_with_multi_token_words(self) -> None:
+        """Parity holds when tokens != words (each word weighs >1 token)."""
+        for text in _SAMPLE_TEXTS:
+            for max_tokens in (3, 7, 50, 300):
+                old = _CountingTokenizer(tokens_per_word=4)
+                expected_text, expected_count = _old_truncate_to_budget(text, max_tokens, old)
+
+                new = _CountingTokenizer(tokens_per_word=4)
+                with patch("app.analysis.knowledge.count_tokens", side_effect=new):
+                    got_text, got_count = _truncate_to_budget(text, max_tokens, model="m")
+
+                assert got_text == expected_text, f"text={text!r} budget={max_tokens}"
+                assert got_count == expected_count, f"text={text!r} budget={max_tokens}"
+
+    def test_uses_fewer_tokenizer_calls_than_old_impl(self) -> None:
+        """The new impl makes strictly fewer tokenizer calls on a many-sentence text."""
+        text = " ".join(f"S{i}." for i in range(64))  # 64 single-word sentences
+        max_tokens = 4
+
+        old = _CountingTokenizer()
+        _old_truncate_to_budget(text, max_tokens, old)
+
+        new = _CountingTokenizer()
+        with patch("app.analysis.knowledge.count_tokens", side_effect=new):
+            _truncate_to_budget(text, max_tokens, model="m")
+
+        assert new.calls < old.calls
+        # O(log n) bound: bisection over n sentences plus a small constant of
+        # bookkeeping calls (initial full count, final recount).
+        n = 64
+        assert new.calls <= 3 * math.ceil(math.log2(n + 1)) + 5
+
+    def test_tokenizer_call_count_scales_logarithmically(self) -> None:
+        """Doubling the sentence count adds only a constant number of calls."""
+
+        def calls_for(num_sentences: int) -> int:
+            text = " ".join(f"S{i}." for i in range(num_sentences))
+            tok = _CountingTokenizer()
+            with patch("app.analysis.knowledge.count_tokens", side_effect=tok):
+                _truncate_to_budget(text, max_tokens=4, model="m")
+            return tok.calls
+
+        small = calls_for(16)
+        large = calls_for(256)  # 16x more sentences
+        # Linear would be ~16x; logarithmic adds a small constant per doubling.
+        assert large <= small + 12
