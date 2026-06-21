@@ -111,6 +111,10 @@ async def fetch_new_articles_for_topic(
                 entry.title,
                 existing.topic_id,
             )
+            # OVH-025: adopt the originating article's RESOLVED url instead of this
+            # entry's (possibly unresolved news.google.com redirect). The hash was
+            # already computed above from entry.url, so dedup stays intact.
+            entry.url = existing.url
             reuse_entries.append((entry, content_hash, existing.raw_content))
         else:
             new_entries.append((entry, content_hash))

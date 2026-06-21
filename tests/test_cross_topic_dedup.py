@@ -204,6 +204,52 @@ class TestFetchNewArticlesCrossTopicDedup:
         # HTTP fetch should NOT have been called
         extract_mock.assert_not_called()
 
+    async def test_reused_article_carries_resolved_url(self, db_conn: sqlite3.Connection) -> None:
+        """OVH-025: reuse path stores the resolved publisher URL, not the Google redirect.
+
+        Both topics fetch the same Google News entry, so the content_hash (computed
+        from the redirect URL) matches. Topic A's article URL was later resolved to the
+        real publisher URL. Topic B must reuse that resolved URL, while keeping the hash.
+        """
+        topic_a = _make_topic(db_conn, "Topic A")
+        topic_b = _make_topic(db_conn, "Topic B")
+
+        redirect_url = "https://news.google.com/rss/articles/ABC123?oc=5"
+        resolved_url = "https://publisher.example.com/real-article"
+        title = "Shared Article"
+        # Hash is computed from the (unresolved) redirect URL that both feeds emit.
+        content_hash = compute_article_hash(redirect_url, title)
+
+        # Topic A already stored the article with the RESOLVED url but the redirect hash.
+        existing = Article(
+            topic_id=topic_a.id,
+            title=title,
+            url=resolved_url,
+            content_hash=content_hash,
+            raw_content="Pre-fetched content from topic A",
+            source_feed="https://news.google.com/rss/search?q=x",
+        )
+        create_article(db_conn, existing)
+        db_conn.commit()
+
+        # Topic B's feed entry still carries the unresolved redirect URL.
+        entry = self._make_entry(url=redirect_url, title=title)
+        extract_mock = AsyncMock(return_value="Freshly fetched content")
+
+        with (
+            patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=[entry])),
+            patch("app.scraping.extract_article_content", extract_mock),
+        ):
+            stored = (await fetch_new_articles_for_topic(topic_b, db_conn)).articles
+
+        assert len(stored) == 1
+        # The stored URL is the resolved publisher URL, not the Google redirect.
+        assert stored[0].url == resolved_url
+        # Dedup must be preserved: the hash is unchanged.
+        assert stored[0].content_hash == content_hash
+        assert stored[0].raw_content == "Pre-fetched content from topic A"
+        extract_mock.assert_not_called()
+
     async def test_fetches_normally_when_no_cross_topic_match(self, db_conn: sqlite3.Connection) -> None:
         """When no cross-topic article exists, content is fetched normally."""
         topic = _make_topic(db_conn, "Topic A")

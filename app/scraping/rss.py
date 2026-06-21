@@ -192,9 +192,30 @@ async def fetch_feed_with_status(
                 parsed = feedparser.parse(response.text)
                 entries = []
                 for raw in parsed.entries:
-                    entry = _parse_entry(raw, feed_url)
+                    # OVH-024: isolate each entry so one malformed entry does not
+                    # discard the whole feed. The outer handlers below stay for
+                    # genuine fetch/parse-level failures only.
+                    try:
+                        entry = _parse_entry(raw, feed_url)
+                    except Exception:
+                        logger.warning("Skipping malformed feed entry in %s", feed_url, exc_info=True)
+                        continue
                     if entry:
                         entries.append(entry)
+                # OVH-044: feedparser flags malformed/non-feed bodies as bozo. If
+                # bozo with zero recovered entries, treat it as a soft failure so it
+                # surfaces in feed_health and engages the provider cascade; if bozo
+                # but entries were still recovered, just note it and proceed.
+                if getattr(parsed, "bozo", 0):
+                    bozo_exc = getattr(parsed, "bozo_exception", None)
+                    if not entries:
+                        logger.warning("Feed parse error (bozo) with no entries: %s — %s", feed_url, bozo_exc)
+                        if health_callback:
+                            health_callback(feed_url, False, f"Feed parse error: {bozo_exc}")
+                        return [], False
+                    logger.debug(
+                        "Feed flagged bozo but %d entries recovered: %s — %s", len(entries), feed_url, bozo_exc
+                    )
                 if health_callback:
                     health_callback(feed_url, True, None)
                 return entries, True
