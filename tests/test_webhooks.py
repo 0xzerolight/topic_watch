@@ -236,6 +236,16 @@ class TestSendWebhook:
         assert result is False
         mock_cls.assert_not_called()
 
+    async def test_malformed_ipv6_url_returns_false_not_raises(self) -> None:
+        """OVH-131: a malformed IPv6 literal makes urlparse raise ValueError, but
+        send_webhook honors its 'Never raises' contract — returns False, no POST.
+        """
+        # urlparse("http://[::1") raises ValueError("Invalid IPv6 URL").
+        with patch("app.webhooks.httpx.AsyncClient") as mock_cls:
+            result = await send_webhook("http://[::1", {"key": "value"})
+        assert result is False
+        mock_cls.assert_not_called()
+
     async def test_posts_to_correct_url(self) -> None:
         mock_response = MagicMock()
         mock_response.status_code = 204

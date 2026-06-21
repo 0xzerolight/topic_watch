@@ -282,7 +282,9 @@ async def _check_topic_inner(
         if failed:
             # Surface the first/aggregated reason without leaking a raw URL.
             result.notification_error = _summarize_delivery_failures(failed)
-            _queue_failed_notifications(conn, topic_id, title, body, deliveries)
+            # Correlate queued rows to this check (OVH-040 traceability), mirroring
+            # the webhook path which already threads check_result_id.
+            _queue_failed_notifications(conn, topic_id, title, body, deliveries, check_result_id=result.id)
 
         # Send webhooks (independent of Apprise success/failure). Pass the
         # connection + topic_id + check_result_id so failed deliveries are
@@ -348,13 +350,16 @@ def _queue_failed_notifications(
     title: str,
     body: str,
     deliveries: list[NotificationDelivery],
+    check_result_id: int | None = None,
 ) -> None:
     """Queue one pending row per FAILED URL for retry.
 
     Only the targets that failed are queued, each scoped to its own URL, so the
     retry drain re-hits exactly those channels and never re-delivers to the ones
     that already succeeded (OVH-039). The per-URL failure reason is stored as
-    ``last_error`` for diagnostics.
+    ``last_error`` for diagnostics, and ``check_result_id`` correlates each queued
+    row to its originating check (OVH-040), so an abandoned-after-max-retries
+    notification can be attributed to a specific check.
     """
     for d in deliveries:
         if d.ok:
@@ -364,6 +369,7 @@ def _queue_failed_notifications(
                 conn,
                 PendingNotification(
                     topic_id=topic_id,
+                    check_result_id=check_result_id,
                     title=title,
                     body=body,
                     url=d.url,

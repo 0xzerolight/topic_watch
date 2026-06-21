@@ -317,6 +317,10 @@ class TestCheckTopic:
         pending = list_pending_notifications(db_conn)
         assert len(pending) == 1
         assert pending[0].url == "json://localhost"
+        # OVH-040 traceability: the queued row is correlated to its check result
+        # (previously NULL for notifications; the webhook path already did this).
+        assert result.id is not None
+        assert pending[0].check_result_id == result.id
 
         # OVH-085: the article is marked processed even though delivery failed.
         assert article.id is not None

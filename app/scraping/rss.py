@@ -53,11 +53,19 @@ class FeedResponse:
     Wraps the parsed entries with metadata about which provider was
     used, so downstream code can make provider-specific decisions
     (e.g. Google News URL resolution) without importing provider classes.
+
+    ``feeds_total`` / ``feeds_failed`` expose per-fetch health so the check
+    pipeline can distinguish a healthy partial yield from a degraded check where
+    some sources silently dropped out (OVH-130). For AUTO mode a single provider
+    is fetched (with at most one cascade), so the counts reflect that attempt;
+    for MANUAL mode they count the topic's explicit feed URLs.
     """
 
     entries: list[FeedEntry] = field(default_factory=list)
     provider_name: str | None = None
     needs_url_resolution: bool = False
+    feeds_total: int = 0
+    feeds_failed: int = 0
 
 
 def compute_article_hash(url: str, title: str) -> str:
@@ -316,39 +324,70 @@ async def _fetch_auto(
         )
 
         if entries:
-            router.mark_healthy(provider.name, observed_epoch=provider_epoch)
+            if router.mark_healthy(provider.name, observed_epoch=provider_epoch):
+                logger.info("Provider %s recovered (back to healthy)", provider.name)
             return FeedResponse(
                 entries=entries,
                 provider_name=provider.name,
                 needs_url_resolution=provider.needs_url_resolution(),
+                feeds_total=1,
+                feeds_failed=0,
             )
 
         # No entries. Only a real fetch error marks the provider unhealthy —
         # a legitimately-empty-but-successful feed must not trigger cascade/cooldown.
-        if not fetch_ok:
-            router.mark_unhealthy(provider.name)
+        # Distinguish those two cases in the log so a silently-failing provider is
+        # not indistinguishable from a genuinely-empty one (OVH-133).
+        if not fetch_ok and router.mark_unhealthy(provider.name):
+            logger.warning("Provider %s marked unhealthy (failure threshold reached)", provider.name)
+        reason = "fetch failed" if not fetch_ok else "returned no entries (empty result)"
         next_provider = router.get_next_provider(provider)
         if next_provider is None:
-            return FeedResponse(entries=[], provider_name=provider.name, needs_url_resolution=False)
+            logger.warning("Provider %s %s; no fallback provider available", provider.name, reason)
+            return FeedResponse(
+                entries=[],
+                provider_name=provider.name,
+                needs_url_resolution=False,
+                feeds_total=1,
+                feeds_failed=1 if not fetch_ok else 0,
+            )
 
-        logger.info("Provider %s returned no entries, falling back to %s", provider.name, next_provider.name)
+        logger.info("Provider %s %s, cascading to %s", provider.name, reason, next_provider.name)
         feed_url = next_provider.build_feed_url(topic)
         next_epoch = router.health_epoch(next_provider.name)
-        entries, fetch_ok = await fetch_feed_with_status(
+        entries, next_fetch_ok = await fetch_feed_with_status(
             feed_url, client, timeout=timeout, max_attempts=max_attempts, health_callback=health_callback
         )
+        first_failed = 1 if not fetch_ok else 0
 
         if entries:
-            router.mark_healthy(next_provider.name, observed_epoch=next_epoch)
+            if router.mark_healthy(next_provider.name, observed_epoch=next_epoch):
+                logger.info("Provider %s recovered (back to healthy)", next_provider.name)
             return FeedResponse(
                 entries=entries,
                 provider_name=next_provider.name,
                 needs_url_resolution=next_provider.needs_url_resolution(),
+                feeds_total=2,
+                feeds_failed=first_failed,
             )
 
-        if not fetch_ok:
-            router.mark_unhealthy(next_provider.name)
-        return FeedResponse(entries=[], provider_name=next_provider.name, needs_url_resolution=False)
+        if not next_fetch_ok and router.mark_unhealthy(next_provider.name):
+            logger.warning("Provider %s marked unhealthy (failure threshold reached)", next_provider.name)
+        next_reason = "fetch failed" if not next_fetch_ok else "returned no entries (empty result)"
+        logger.warning(
+            "Provider cascade exhausted: %s %s, fallback %s %s",
+            provider.name,
+            reason,
+            next_provider.name,
+            next_reason,
+        )
+        return FeedResponse(
+            entries=[],
+            provider_name=next_provider.name,
+            needs_url_resolution=False,
+            feeds_total=2,
+            feeds_failed=first_failed + (1 if not next_fetch_ok else 0),
+        )
 
 
 async def _fetch_manual(
@@ -366,21 +405,32 @@ async def _fetch_manual(
         timeout=timeout,
         follow_redirects=False,
     ) as client:
+        # fetch_feed_with_status reports per-feed success so a partial failure
+        # (some of N feeds down) is countable, not just absorbed into a smaller
+        # entry list (OVH-130).
         tasks = [
-            fetch_feed(url, client, timeout=timeout, max_attempts=max_attempts, health_callback=health_callback)
+            fetch_feed_with_status(
+                url, client, timeout=timeout, max_attempts=max_attempts, health_callback=health_callback
+            )
             for url in topic.feed_urls
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
     seen_urls: set[str] = set()
     entries: list[FeedEntry] = []
+    feeds_total = len(topic.feed_urls)
+    feeds_failed = 0
     for result in results:
         if isinstance(result, BaseException):
             logger.warning("Feed fetch failed: %s", result)
+            feeds_failed += 1
             continue
-        for entry in result:
+        feed_entries, fetch_ok = result
+        if not fetch_ok:
+            feeds_failed += 1
+        for entry in feed_entries:
             if entry.url not in seen_urls:
                 seen_urls.add(entry.url)
                 entries.append(entry)
 
-    return FeedResponse(entries=entries)
+    return FeedResponse(entries=entries, feeds_total=feeds_total, feeds_failed=feeds_failed)
