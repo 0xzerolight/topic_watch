@@ -67,11 +67,9 @@ def _reset_stats_cache():
     """Reset the dashboard stats cache between tests to prevent bleed."""
     from app.web import state
 
-    state._stats_cache["data"] = None
-    state._stats_cache["expires"] = 0.0
+    state._stats_cache.reset()
     yield
-    state._stats_cache["data"] = None
-    state._stats_cache["expires"] = 0.0
+    state._stats_cache.reset()
 
 
 @pytest.fixture(autouse=True)
