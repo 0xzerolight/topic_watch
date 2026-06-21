@@ -350,6 +350,28 @@ class TestBuildNoveltyMessages:
         system_msg = messages[0]["content"]
         assert "Set relevance" in system_msg
 
+    def test_system_message_instructs_summary_population(self) -> None:
+        # OVH-026: the novelty summary feeds the knowledge-update prompt's
+        # "New Findings to Incorporate" block, so the system prompt must tell
+        # the model to write it (null only when there is no new info).
+        topic = _make_topic()
+        articles = [_make_article()]
+        messages = build_novelty_messages(articles, "Known.", topic)
+        system_msg = messages[0]["content"]
+        lowered = system_msg.lower()
+        assert "summary" in lowered
+        # An explicit instruction to populate the summary field.
+        assert "in `summary`" in lowered or "in summary" in lowered
+        assert "has_new_info is false" in lowered
+
+    def test_novelty_result_summary_field_has_description(self) -> None:
+        # OVH-026: instructor surfaces Field descriptions to the model, so the
+        # summary field must carry one (the prompt instruction alone is not
+        # enough — instructor builds the schema from the model).
+        field = NoveltyResult.model_fields["summary"]
+        assert field.description, "summary Field must have a description for instructor"
+        assert "summary" in field.description.lower()
+
 
 # ============================================================
 # TestBuildKnowledgeInitMessages
