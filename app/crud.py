@@ -441,6 +441,26 @@ def create_check_result(conn: sqlite3.Connection, result: CheckResult) -> CheckR
     return result
 
 
+def update_check_result_delivery(
+    conn: sqlite3.Connection,
+    check_result_id: int,
+    *,
+    notification_sent: bool,
+    notification_error: str | None,
+) -> None:
+    """Record the post-send delivery outcome on an existing check_result row.
+
+    The CheckResult is created and committed *before* the irreversible network
+    sends (OVH-066/OVH-101); this updates only the delivery-outcome columns
+    afterwards so the durable novelty state never depends on a send succeeding.
+    The caller commits.
+    """
+    conn.execute(
+        "UPDATE check_results SET notification_sent = ?, notification_error = ? WHERE id = ?",
+        (int(notification_sent), notification_error, check_result_id),
+    )
+
+
 def get_check_result(conn: sqlite3.Connection, check_id: int) -> CheckResult | None:
     """Get a check result by ID, or None if not found."""
     row = conn.execute("SELECT * FROM check_results WHERE id = ?", (check_id,)).fetchone()
