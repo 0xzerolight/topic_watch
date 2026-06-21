@@ -13,10 +13,12 @@ import pytest
 from app.models import (
     Article,
     CheckResult,
+    FeedMode,
     KnowledgeState,
     PendingNotification,
     PendingWebhook,
     Topic,
+    TopicStatus,
 )
 
 
@@ -477,3 +479,61 @@ class TestSafeJsonWarnings:
             topic = Topic.from_row(row)
         assert topic.feed_urls == ["https://example.com/feed.xml"]
         assert not any("feed_urls" in r.message for r in caplog.records)
+
+
+class TestSQLiteModelSharedInterop:
+    """OVH-150: the shared SQLiteModel base coercions every persisted model uses.
+
+    Characterization of the centralized row<->model interop so the per-model
+    ``from_row``/``to_insert_dict`` keep emitting the documented SQLite storage
+    forms (0/1 INTEGER bools, ISO-8601 datetimes, JSON TEXT, StrEnum ``.value``).
+    """
+
+    def test_subclasses_share_one_base(self) -> None:
+        from app.models import SQLiteModel
+
+        for model in (Topic, Article, CheckResult, KnowledgeState, PendingNotification, PendingWebhook):
+            assert issubclass(model, SQLiteModel)
+
+    def test_bool_serialized_as_int(self) -> None:
+        """bool fields round-trip to 0/1 INTEGER (not Python True/False)."""
+        topic = Topic(name="T", description="d", is_active=False)
+        data = topic.to_insert_dict()
+        assert data["is_active"] == 0
+        assert isinstance(data["is_active"], int) and not isinstance(data["is_active"], bool)
+
+    def test_strenum_serialized_as_value(self) -> None:
+        """StrEnum fields (feed_mode, status) serialize to their ``.value``."""
+        topic = Topic(name="T", description="d", status=TopicStatus.READY, feed_mode=FeedMode.MANUAL)
+        data = topic.to_insert_dict()
+        assert data["status"] == "ready"
+        assert data["feed_mode"] == "manual"
+
+    def test_datetime_serialized_as_isoformat(self) -> None:
+        from datetime import UTC
+
+        topic = Topic(name="T", description="d", created_at=datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC))
+        data = topic.to_insert_dict()
+        assert data["created_at"] == "2026-01-02T03:04:05+00:00"
+
+    def test_optional_datetime_none_stays_none(self) -> None:
+        topic = Topic(name="T", description="d", status_changed_at=None)
+        data = topic.to_insert_dict()
+        assert data["status_changed_at"] is None
+
+    def test_json_field_serialized_as_text(self) -> None:
+        topic = Topic(name="T", description="d", feed_urls=["a", "b"], tags=["x"])
+        data = topic.to_insert_dict()
+        assert data["feed_urls"] == '["a", "b"]'
+        assert data["tags"] == '["x"]'
+
+    def test_id_always_excluded_from_insert(self) -> None:
+        topic = Topic(id=99, name="T", description="d")
+        assert "id" not in topic.to_insert_dict()
+
+    def test_insert_exclude_drops_extra_fields(self) -> None:
+        """CheckResult drops ``confidence``; PendingWebhook/Notification drop ``claimed_at``."""
+        cr = CheckResult(topic_id=1, confidence=0.5)
+        assert "confidence" not in cr.to_insert_dict()
+        pn = PendingNotification(topic_id=1, title="t", body="b", claimed_at="x")
+        assert "claimed_at" not in pn.to_insert_dict()
