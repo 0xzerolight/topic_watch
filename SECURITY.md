@@ -37,7 +37,7 @@ When deploying Topic Watch on a public network:
 - **Enable secure cookies.** Set `TOPIC_WATCH_SECURE_COOKIES=true` (or `secure_cookies: true` in `data/config.yml`) so cookies are only sent over HTTPS connections.
 - **Restrict network access.** Bind Topic Watch to `127.0.0.1` and proxy from your reverse proxy. Do not expose port 8000 directly to the internet.
 - **Protect `data/config.yml`.** This file contains your LLM API key. Ensure it is not world-readable (`chmod 600 data/config.yml`).
-- **Keep dependencies updated.** Dependabot is configured on the repository. For self-hosted installs, run `pip install --upgrade -r requirements.txt` periodically.
+- **Keep dependencies updated.** `requirements.txt` is a hash-pinned lockfile (exact `==` versions plus `--hash` entries), so `pip install --upgrade -r requirements.txt` cannot raise versions — it is a no-op for upgrades. Updates land through the configured Dependabot PRs; to bump versions locally, regenerate the lockfile with `make lock` and reinstall.
 - **Use the Docker image.** It runs as a non-root user with resource limits.
 
 ## Install Script Trust
