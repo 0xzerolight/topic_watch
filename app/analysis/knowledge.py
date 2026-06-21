@@ -95,7 +95,7 @@ async def compress_knowledge(
     text: str,
     topic: Topic,
     settings: Settings,
-) -> tuple[str, int]:
+) -> tuple[str, int, TokenUsage]:
     """Fit a knowledge summary into the token budget without losing facts.
 
     Calls the LLM to condense ``text`` to within ``knowledge_state_max_tokens``,
@@ -107,8 +107,17 @@ async def compress_knowledge(
     rather than raising, so an over-budget update never crashes the pipeline.
 
     Returns:
-        ``(summary_text, token_count)`` fitting the budget in the normal case.
-        The ``token_count`` is recomputed with the authoritative ``count_tokens``.
+        ``(summary_text, token_count, usage)`` fitting the budget in the normal
+        case. ``usage`` is the compression round-trip's ``TokenUsage`` so its
+        cost flows into the per-check totals instead of vanishing (OVH-129); it
+        is ``TokenUsage()`` (zero) on the truncation-fallback path, where no LLM
+        round-trip succeeded.
+
+        ``token_count`` is the authoritative ``count_tokens`` value. On the
+        success path it reuses the count ``compress_knowledge_summary`` already
+        computed over the same string (itself ``count_tokens`` output, not an
+        LLM-claimed number), avoiding a redundant model-aware re-tokenization
+        (OVH-135).
 
         Overflow caveat (OVH-164): the fallback ``_truncate_to_budget`` keeps the
         first sentence intact rather than ever returning empty text. So when the
@@ -128,11 +137,14 @@ async def compress_knowledge(
             topic.name,
             exc_info=True,
         )
-        return _truncate_to_budget(text, max_tokens, model)
+        text_out, count_out = _truncate_to_budget(text, max_tokens, model)
+        return text_out, count_out, TokenUsage()
 
-    # Recompute authoritatively — never trust a self-reported count.
+    usage = TokenUsage(result.prompt_tokens, result.completion_tokens)
     compressed = result.compressed_summary
-    token_count = count_tokens(compressed, model)
+    # Reuse the count compress_knowledge_summary already computed (count_tokens
+    # output over this exact string), not a redundant recount (OVH-135).
+    token_count = result.token_count
     if token_count > max_tokens:
         # Compression undershot the budget — truncate what it produced rather
         # than persist an over-budget state.
@@ -142,14 +154,15 @@ async def compress_knowledge(
             token_count,
             max_tokens,
         )
-        return _truncate_to_budget(compressed, max_tokens, model)
+        text_out, count_out = _truncate_to_budget(compressed, max_tokens, model)
+        return text_out, count_out, usage
 
     logger.info(
         "Compressed knowledge for topic '%s' to %d tokens",
         topic.name,
         token_count,
     )
-    return compressed, token_count
+    return compressed, token_count, usage
 
 
 async def initialize_knowledge(
@@ -174,6 +187,10 @@ async def initialize_knowledge(
         raise ValueError("Topic must have an ID")
 
     result = await generate_initial_knowledge(articles, topic, settings)
+    # Track total LLM cost: the generation call plus any compression round-trip
+    # that fires below (OVH-129).
+    prompt_tokens = result.prompt_tokens
+    completion_tokens = result.completion_tokens
 
     if not result.sufficient_data:
         logger.warning(
@@ -192,11 +209,13 @@ async def initialize_knowledge(
             result.token_count,
             settings.knowledge_state_max_tokens,
         )
-        result.updated_summary, result.token_count = await compress_knowledge(
+        result.updated_summary, result.token_count, compress_usage = await compress_knowledge(
             result.updated_summary,
             topic,
             settings,
         )
+        prompt_tokens += compress_usage.prompt_tokens
+        completion_tokens += compress_usage.completion_tokens
 
     state = KnowledgeState(
         topic_id=topic.id,
@@ -213,7 +232,7 @@ async def initialize_knowledge(
     )
     return KnowledgeWriteResult(
         state=created,
-        usage=TokenUsage(result.prompt_tokens, result.completion_tokens),
+        usage=TokenUsage(prompt_tokens, completion_tokens),
         sufficient_data=result.sufficient_data,
     )
 
@@ -257,10 +276,15 @@ async def update_knowledge(
             result.token_count,
             settings.knowledge_state_max_tokens,
         )
-        result.updated_summary, result.token_count = await compress_knowledge(
+        result.updated_summary, result.token_count, compress_usage = await compress_knowledge(
             result.updated_summary,
             topic,
             settings,
+        )
+        # Fold the compression round-trip's cost into the reported usage (OVH-129).
+        usage = TokenUsage(
+            usage.prompt_tokens + compress_usage.prompt_tokens,
+            usage.completion_tokens + compress_usage.completion_tokens,
         )
 
     current.summary_text = result.updated_summary
