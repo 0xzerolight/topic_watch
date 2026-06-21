@@ -79,11 +79,17 @@ async def extract_article_content(
     """Extract article text from a URL, falling back to the RSS summary."""
     html = await _fetch_html(url, client, timeout=timeout)
     if html:
-        extracted = cast(str | None, trafilatura.extract(html, favor_precision=True))
+        # OVH-115: parse the DOM once and reuse the tree across both extraction
+        # passes instead of re-parsing the raw HTML each time (verified
+        # output-identical at trafilatura 2.0.0). load_html returns None on
+        # unparseable input, in which case both passes fall through to the
+        # summary as before.
+        tree = trafilatura.load_html(html)
+        extracted = cast(str | None, trafilatura.extract(tree, favor_precision=True))
         if extracted:
             return _truncate(extracted, max_content_length)
         # Second attempt: favor recall over precision for JS-heavy or complex sites
-        extracted = cast(str | None, trafilatura.extract(html, favor_recall=True))
+        extracted = cast(str | None, trafilatura.extract(tree, favor_recall=True))
         if extracted:
             return _truncate(extracted, max_content_length)
         # OVH-045: HTML fetched but both passes extracted nothing (JS-heavy,
