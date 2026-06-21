@@ -22,6 +22,7 @@ from app.migrations.m012_check_result_tokens import up as m012_up
 from app.migrations.m013_topic_init_attempts import up as m013_up
 from app.migrations.m014_perf_indexes import up as m014_up
 from app.migrations.m015_check_result_stage_error import up as m015_up
+from app.migrations.m016_pending_claimed_at import up as m016_up
 
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "baseline schema version", m001_up),
@@ -39,4 +40,5 @@ MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (13, "add init_attempts column to topics", m013_up),
     (14, "add performance indexes to articles", m014_up),
     (15, "add stage_error column to check_results", m015_up),
+    (16, "add claimed_at column to retry queues", m016_up),
 ]
