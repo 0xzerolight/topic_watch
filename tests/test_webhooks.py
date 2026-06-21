@@ -211,6 +211,31 @@ class TestSendWebhook:
         result = await send_webhook("http://127.0.0.1:8080/hook", {})
         assert result is False
 
+    async def test_blocks_file_scheme_before_post(self) -> None:
+        """file:// is rejected by the scheme allowlist before any POST (OVH-141).
+
+        The httpx client must never be constructed for a non-http(s) scheme, so
+        a transport/config change can't expose the first hop.
+        """
+        with patch("app.webhooks.httpx.AsyncClient") as mock_cls:
+            result = await send_webhook("file:///etc/passwd", {"key": "value"})
+        assert result is False
+        mock_cls.assert_not_called()
+
+    async def test_blocks_gopher_scheme_before_post(self) -> None:
+        """gopher:// is rejected by the scheme allowlist before any POST (OVH-141)."""
+        with patch("app.webhooks.httpx.AsyncClient") as mock_cls:
+            result = await send_webhook("gopher://example.com/7", {})
+        assert result is False
+        mock_cls.assert_not_called()
+
+    async def test_blocks_ftp_scheme_before_post(self) -> None:
+        """ftp:// is rejected by the scheme allowlist before any POST (OVH-141)."""
+        with patch("app.webhooks.httpx.AsyncClient") as mock_cls:
+            result = await send_webhook("ftp://example.com/file", {})
+        assert result is False
+        mock_cls.assert_not_called()
+
     async def test_posts_to_correct_url(self) -> None:
         mock_response = MagicMock()
         mock_response.status_code = 204
