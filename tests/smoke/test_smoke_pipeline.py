@@ -31,14 +31,21 @@ import pytest
 
 from app.analysis.llm import NoveltyResult
 from app.checker import check_topic, initialize_new_topic
-from app.config import LLMSettings, Settings
-from app.crud import create_topic, get_knowledge_state, list_articles_for_topic, list_check_results
+from app.config import LLMSettings, NotificationSettings, Settings
+from app.crud import (
+    create_topic,
+    get_knowledge_state,
+    list_articles_for_topic,
+    list_check_results,
+    list_pending_webhooks,
+)
 from app.models import CheckResult, FeedMode, NotificationDelivery, Topic, TopicStatus
-from tests.helpers import RssEntry, build_rss_transport, stub_llm_boundary
+from tests.helpers import RssEntry, build_rss_transport, build_rss_xml, stub_llm_boundary
 
 _FEED_URL = "https://example.com/feed.xml"
 _ARTICLE_1 = "https://example.com/article-1"
 _ARTICLE_2 = "https://example.com/article-2"
+_WEBHOOK_URL = "https://hooks.example.com/topic-watch"
 
 _ARTICLE_HTML = (
     "<html><body><article><h1>{title}</h1>"
@@ -209,3 +216,111 @@ async def test_initialize_then_check_pipeline(db_conn: sqlite3.Connection) -> No
     # The new article was stored (init's article + this one).
     all_articles = list_articles_for_topic(db_conn, topic.id)
     assert len(all_articles) == 2
+
+
+def _build_webhook_failing_transport(entries: list[RssEntry]) -> httpx.MockTransport:
+    """Serve the RSS feed + article HTML, but fail the webhook POST with 500.
+
+    The webhook POST is identified by its URL; everything else is the canned
+    feed/article content so the real scraping pipeline runs unchanged.
+    """
+    feed_xml = build_rss_xml(entries)
+    article_html = _ARTICLE_HTML.format(title="Article Two")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if _WEBHOOK_URL in url:
+            # Real send_webhooks path: a 5xx makes send_webhook return False, so
+            # the delivery is enqueued to pending_webhooks via the held conn.
+            return httpx.Response(500, text="webhook receiver down")
+        if _ARTICLE_2 in url:
+            return httpx.Response(200, text=article_html, headers={"content-type": "text/html"})
+        if "example.com/feed" in url:
+            return httpx.Response(200, text=feed_xml, headers={"content-type": "application/rss+xml"})
+        return httpx.Response(404, text="Not found")
+
+    return httpx.MockTransport(handler)
+
+
+async def test_check_topic_queues_webhook_through_held_conn_on_500(db_conn: sqlite3.Connection) -> None:
+    """OVH-073: a failed webhook delivery is queued through check_topic's held conn.
+
+    Unlike the other smoke test, ``send_webhooks`` is NOT patched — it runs for
+    real against a MockTransport that returns 500 for the webhook POST. This
+    exercises the constitution-sensitive path where check_topic threads ONE
+    connection through HTTP + LLM awaits and then a webhook send that itself does
+    DB writes (enqueue to pending_webhooks). The assertions pin that:
+
+      * a ``pending_webhooks`` row is written via the held connection, correlated
+        to the committed CheckResult (``check_result_id`` non-NULL, OVH-101), and
+      * check_topic still committed its CheckResult.
+
+    A regression leaving the held connection in a bad transaction state (or a
+    nested writer deadlocking under WAL) would surface here.
+    """
+    settings = _settings()
+    settings.notifications = NotificationSettings(webhook_urls=[_WEBHOOK_URL])
+    topic = _make_topic(db_conn)
+
+    # --- Phase 1: initialize the topic (stub LLM + delivery; no webhooks yet) ---
+    init_entries = [
+        RssEntry(
+            title="Article One",
+            link=_ARTICLE_1,
+            summary="Summary of article one.",
+            published=datetime(2025, 1, 1, 12, 0, 0, tzinfo=UTC),
+        ),
+    ]
+    with (
+        _inject_transport(_build_transport(init_entries)),
+        stub_llm_boundary(),
+    ):
+        await initialize_new_topic(topic, db_conn, settings)
+    assert topic.status == TopicStatus.READY
+
+    # --- Phase 2: check against a new article; the webhook POST fails (500) ---
+    check_entries = [
+        RssEntry(
+            title="Article Two",
+            link=_ARTICLE_2,
+            summary="Summary of article two: a brand-new development.",
+            published=datetime(2025, 1, 2, 12, 0, 0, tzinfo=UTC),
+        ),
+    ]
+    novelty = NoveltyResult(
+        has_new_info=True,
+        summary="A new development was announced.",
+        key_facts=["New fact: release confirmed"],
+        source_urls=[_ARTICLE_2],
+        confidence=0.95,
+        relevance=0.9,
+    )
+
+    with (
+        _inject_transport(_build_webhook_failing_transport(check_entries)),
+        stub_llm_boundary(novelty=novelty),
+        # Stub only the Apprise delivery — the webhook queue path stays real.
+        patch(
+            "app.checker.send_notification_per_url",
+            new=AsyncMock(return_value=[NotificationDelivery(url="json://localhost", ok=True)]),
+        ),
+        # Let the real webhook POST reach the MockTransport (skip the SSRF DNS check).
+        patch("app.webhooks.is_private_url", return_value=False),
+    ):
+        result = await check_topic(topic, db_conn, settings)
+
+    # The CheckResult was created and committed (queued webhook correlates to it).
+    assert isinstance(result, CheckResult)
+    assert result.id is not None
+    recorded = list_check_results(db_conn, topic.id)
+    assert len(recorded) == 1
+    assert recorded[0].id == result.id
+
+    # The failed webhook was queued via the held connection — readable on db_conn.
+    pending = list_pending_webhooks(db_conn)
+    assert len(pending) == 1
+    queued = pending[0]
+    assert queued["topic_id"] == topic.id
+    assert queued["url"] == _WEBHOOK_URL
+    # check_result_id is populated (created before the send), not NULL (OVH-101).
+    assert queued["check_result_id"] == result.id

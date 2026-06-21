@@ -551,3 +551,143 @@ class TestTruncateToBudgetCharacterization:
         large = calls_for(256)  # 16x more sentences
         # Linear would be ~16x; logarithmic adds a small constant per doubling.
         assert large <= small + 12
+
+
+# TestCompressionTriggerBoundary (OVH-077)
+# ============================================================
+
+
+class TestCompressionTriggerBoundary:
+    """OVH-077: the compression trigger is a strict ``>`` against the budget.
+
+    A summary of EXACTLY max_tokens must NOT compress (stored verbatim);
+    max_tokens + 1 MUST compress. A regression flipping ``>`` to ``>=`` (needless
+    at-budget compression, extra LLM cost) or to a slack threshold (silent
+    over-budget persistence) would change behavior at exactly these two cells.
+    The LLM-reported ``token_count`` drives the trigger, so it is set directly.
+    """
+
+    _BUDGET = 500
+
+    async def test_init_at_budget_not_compressed(self, db_conn: sqlite3.Connection) -> None:
+        """token_count == max_tokens: no compression, summary stored verbatim."""
+        topic = create_topic(db_conn, Topic(name="Init At Budget", description="D", feed_urls=[]))
+        db_conn.commit()
+
+        summary = "Exactly at budget summary."
+        llm_result = KnowledgeStateUpdate(
+            sufficient_data=True,
+            confidence=0.9,
+            updated_summary=summary,
+            token_count=self._BUDGET,  # == budget
+        )
+        compress_mock = AsyncMock()
+        settings = _make_settings(max_tokens=self._BUDGET)
+
+        with (
+            patch(
+                "app.analysis.knowledge.generate_initial_knowledge",
+                new_callable=AsyncMock,
+                return_value=llm_result,
+            ),
+            patch("app.analysis.knowledge.compress_knowledge_summary", compress_mock),
+        ):
+            state = (await initialize_knowledge(topic, [], db_conn, settings)).state
+
+        compress_mock.assert_not_called()
+        assert state.summary_text == summary
+        assert state.token_count == self._BUDGET
+
+    async def test_init_one_over_budget_compressed(self, db_conn: sqlite3.Connection) -> None:
+        """token_count == max_tokens + 1: compression runs."""
+        topic = create_topic(db_conn, Topic(name="Init Over Budget", description="D", feed_urls=[]))
+        db_conn.commit()
+
+        llm_result = KnowledgeStateUpdate(
+            sufficient_data=True,
+            confidence=0.9,
+            updated_summary="Over budget summary needing compression.",
+            token_count=self._BUDGET + 1,  # == budget + 1
+        )
+        compressed = CompressedKnowledge(compressed_summary="Tight.", token_count=0)
+        compress_mock = AsyncMock(return_value=compressed)
+        settings = _make_settings(max_tokens=self._BUDGET)
+
+        with (
+            patch(
+                "app.analysis.knowledge.generate_initial_knowledge",
+                new_callable=AsyncMock,
+                return_value=llm_result,
+            ),
+            patch("app.analysis.knowledge.compress_knowledge_summary", compress_mock),
+            # Recompute of the compressed output fits the budget (1 word = 1 token).
+            patch("app.analysis.knowledge.count_tokens", side_effect=_word_count_tokens),
+        ):
+            state = (await initialize_knowledge(topic, [], db_conn, settings)).state
+
+        compress_mock.assert_awaited_once()
+        assert state.summary_text == "Tight."
+
+    async def test_update_at_budget_not_compressed(self, db_conn: sqlite3.Connection) -> None:
+        """token_count == max_tokens on update: no compression, summary verbatim."""
+        topic = create_topic(db_conn, Topic(name="Update At Budget", description="D", feed_urls=[]))
+        db_conn.commit()
+        create_knowledge_state(db_conn, KnowledgeState(topic_id=topic.id, summary_text="Old.", token_count=1))
+        db_conn.commit()
+
+        summary = "Update exactly at budget."
+        llm_result = KnowledgeStateUpdate(
+            sufficient_data=True,
+            confidence=0.9,
+            updated_summary=summary,
+            token_count=self._BUDGET,  # == budget
+        )
+        compress_mock = AsyncMock()
+        novelty = NoveltyResult(has_new_info=True, summary="X", confidence=0.8)
+        settings = _make_settings(max_tokens=self._BUDGET)
+
+        with (
+            patch(
+                "app.analysis.knowledge.generate_knowledge_update",
+                new_callable=AsyncMock,
+                return_value=llm_result,
+            ),
+            patch("app.analysis.knowledge.compress_knowledge_summary", compress_mock),
+        ):
+            state = (await update_knowledge(topic, novelty, db_conn, settings)).state
+
+        compress_mock.assert_not_called()
+        assert state.summary_text == summary
+        assert state.token_count == self._BUDGET
+
+    async def test_update_one_over_budget_compressed(self, db_conn: sqlite3.Connection) -> None:
+        """token_count == max_tokens + 1 on update: compression runs."""
+        topic = create_topic(db_conn, Topic(name="Update Over Budget", description="D", feed_urls=[]))
+        db_conn.commit()
+        create_knowledge_state(db_conn, KnowledgeState(topic_id=topic.id, summary_text="Old.", token_count=1))
+        db_conn.commit()
+
+        llm_result = KnowledgeStateUpdate(
+            sufficient_data=True,
+            confidence=0.9,
+            updated_summary="Update over budget needing compression.",
+            token_count=self._BUDGET + 1,  # == budget + 1
+        )
+        compressed = CompressedKnowledge(compressed_summary="Tight.", token_count=0)
+        compress_mock = AsyncMock(return_value=compressed)
+        novelty = NoveltyResult(has_new_info=True, summary="X", confidence=0.8)
+        settings = _make_settings(max_tokens=self._BUDGET)
+
+        with (
+            patch(
+                "app.analysis.knowledge.generate_knowledge_update",
+                new_callable=AsyncMock,
+                return_value=llm_result,
+            ),
+            patch("app.analysis.knowledge.compress_knowledge_summary", compress_mock),
+            patch("app.analysis.knowledge.count_tokens", side_effect=_word_count_tokens),
+        ):
+            state = (await update_knowledge(topic, novelty, db_conn, settings)).state
+
+        compress_mock.assert_awaited_once()
+        assert state.summary_text == "Tight."

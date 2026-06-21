@@ -250,6 +250,78 @@ class TestFetchNewArticlesCrossTopicDedup:
         assert stored[0].raw_content == "Pre-fetched content from topic A"
         extract_mock.assert_not_called()
 
+    async def test_reused_article_keeps_new_entry_provenance(self, db_conn: sqlite3.Connection) -> None:
+        """OVH-084: reuse inherits ONLY raw_content; url/title/source_feed stay the new entry's.
+
+        The point of cross-topic dedup is to reuse the expensive raw_content while
+        keeping the rest of the row tied to THIS topic's own feed entry. The
+        pre-stored article is given a different source_feed and a case-variant
+        title that still hashes equal (the hash lowercases url|title before
+        hashing), so a regression copying the matched article's fields would be
+        detectable:
+
+          * url      -> the resolved existing.url (per OVH-025), NOT the new entry's
+          * title    -> the NEW entry's title (correct, not the stored case-variant)
+          * source_feed -> the NEW entry's feed (feed-health attribution stays correct)
+          * raw_content -> inherited from the existing article (the only reuse)
+        """
+        topic_a = _make_topic(db_conn, "Topic A")
+        topic_b = _make_topic(db_conn, "Topic B")
+
+        redirect_url = "https://news.google.com/rss/articles/XYZ789?oc=5"
+        resolved_url = "https://publisher.example.com/the-real-article"
+        new_entry_title = "Shared Headline"
+        # A case variant of the title — lowercases to the same string, so
+        # compute_article_hash (which lowercases url|title) yields the SAME hash.
+        stored_variant_title = "shared HEADLINE"
+        new_entry_feed = "https://topic-b-own-feed.example.com/rss"
+        existing_feed = "https://topic-a-other-feed.example.com/rss"
+
+        content_hash = compute_article_hash(redirect_url, new_entry_title)
+        # Sanity: the case/whitespace-variant hashes identically (drives the match).
+        assert compute_article_hash(redirect_url, stored_variant_title) == content_hash
+
+        existing = Article(
+            topic_id=topic_a.id,
+            title=stored_variant_title,
+            url=resolved_url,
+            content_hash=content_hash,
+            raw_content="Expensive pre-fetched body from topic A",
+            source_feed=existing_feed,
+        )
+        create_article(db_conn, existing)
+        db_conn.commit()
+
+        entry = FeedEntry(
+            title=new_entry_title,
+            url=redirect_url,
+            summary="Summary text",
+            source_feed=new_entry_feed,
+        )
+        extract_mock = AsyncMock(return_value="Freshly fetched content")
+
+        with (
+            patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=[entry])),
+            patch("app.scraping.extract_article_content", extract_mock),
+        ):
+            stored = (await fetch_new_articles_for_topic(topic_b, db_conn)).articles
+
+        assert len(stored) == 1
+        reused = stored[0]
+        # Row belongs to the new topic.
+        assert reused.topic_id == topic_b.id
+        # Only raw_content is inherited from the matched article.
+        assert reused.raw_content == "Expensive pre-fetched body from topic A"
+        # Title is the NEW entry's, not the stored case-variant.
+        assert reused.title == new_entry_title
+        # source_feed is the NEW entry's feed (correct feed-health attribution).
+        assert reused.source_feed == new_entry_feed
+        # url is the resolved existing.url (OVH-025), and the hash is preserved.
+        assert reused.url == resolved_url
+        assert reused.content_hash == content_hash
+        # No HTTP fetch happened — content was reused.
+        extract_mock.assert_not_called()
+
     async def test_fetches_normally_when_no_cross_topic_match(self, db_conn: sqlite3.Connection) -> None:
         """When no cross-topic article exists, content is fetched normally."""
         topic = _make_topic(db_conn, "Topic A")
