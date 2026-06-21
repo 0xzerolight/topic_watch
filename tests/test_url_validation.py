@@ -108,6 +108,16 @@ class TestIsPrivateUrl:
         _stub_resolves_to(monkeypatch, "::ffff:93.184.216.34")
         assert is_private_url("http://[::ffff:93.184.216.34]/path") is False
 
+    def test_ipv6_mapped_ipv4_cgnat(self, monkeypatch) -> None:
+        """A CGNAT IPv4-mapped IPv6 literal must be blocked (OVH-169 follow-up).
+
+        ``::ffff:100.64.0.1`` keeps ``version == 6``, so the version==4 CGNAT
+        gate was skipped and ipaddress flags no other predicate — the mapped
+        address must be unwrapped to its embedded IPv4 and re-classified.
+        """
+        _stub_resolves_to(monkeypatch, "::ffff:100.64.0.1")
+        assert is_private_url("http://[::ffff:100.64.0.1]/path") is True
+
     # --- fc-/fd- hostnames must not be mistaken for IPv6 ULA (OVH-142) ---
 
     def test_fc_hostname_allowed(self, monkeypatch) -> None:
