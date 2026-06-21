@@ -10,3 +10,7 @@ services:
       - TOPIC_WATCH_LLM__MODEL=ollama/llama3.3
       - TOPIC_WATCH_LLM__API_KEY=unused
       - TOPIC_WATCH_LLM__BASE_URL=http://host.docker.internal:11434
+    # On native Linux Docker Engine, host.docker.internal does not resolve
+    # without this mapping. macOS/Windows Docker Desktop resolve it automatically.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
