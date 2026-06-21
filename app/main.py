@@ -45,7 +45,8 @@ async def lifespan(app: FastAPI):
     if settings.is_configured():
         with get_db(db_path) as conn:
             recover_stuck_topics(conn)
-        start_scheduler(settings, db_path=db_path)
+        # Wire the app so scheduler jobs read live settings from app.state (OVH-015/036).
+        start_scheduler(settings, db_path=db_path, app=app)
         logger.info("Topic Watch web UI started")
     else:
         logger.info("Topic Watch started in setup mode — visit /setup to configure")
