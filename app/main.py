@@ -99,3 +99,25 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         {"status_code": 422, "detail": "Invalid request", "version": __version__},
         status_code=422,
     )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> HTMLResponse | JSONResponse:
+    """Catch-all for unhandled errors: branded HTML for browsers, JSON for API clients.
+
+    Logs the full exception server-side but never leaks the traceback or internal
+    detail to the client (mirrors the two dual-render handlers above).
+    """
+    logger.exception("Unhandled exception while handling %s %s", request.method, request.url.path)
+
+    if _wants_json(request):
+        return JSONResponse({"detail": "Internal server error"}, status_code=500)
+
+    from app import __version__
+
+    return templates.TemplateResponse(
+        request,
+        "error.html",
+        {"status_code": 500, "detail": "Something went wrong.", "version": __version__},
+        status_code=500,
+    )

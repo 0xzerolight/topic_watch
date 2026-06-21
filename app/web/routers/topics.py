@@ -198,7 +198,17 @@ async def topic_status(
     """HTMX partial: knowledge state fragment for polling during research."""
     topic = get_topic(conn, topic_id)
     if topic is None:
-        raise HTTPException(status_code=404, detail="Topic not found")
+        # Topic deleted mid-research: return a 200 terminal fragment (no polling
+        # trigger) so the every-3s HTMX poll swaps it in and stops (OVH-048).
+        return templates.TemplateResponse(
+            request,
+            "topic_status.html",
+            {
+                "topic": None,
+                "knowledge": None,
+                "knowledge_state_max_tokens": settings.knowledge_state_max_tokens,
+            },
+        )
 
     knowledge = get_knowledge_state(conn, topic_id)
 
