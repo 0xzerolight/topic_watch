@@ -539,12 +539,17 @@ def sum_check_tokens(conn: sqlite3.Connection, topic_id: int) -> tuple[int, int]
 
 
 def create_pending_notification(conn: sqlite3.Connection, notification: PendingNotification) -> PendingNotification:
-    """Store a failed notification for later retry."""
+    """Store a failed notification for later retry.
+
+    ``url`` scopes the row to a single failed target so retry never re-hits the
+    targets that already delivered (OVH-039); ``last_error`` records why it
+    failed for operator diagnostics.
+    """
     data = notification.to_insert_dict()
     cursor = conn.execute(
         """INSERT INTO pending_notifications (topic_id, check_result_id,
-           title, body, created_at, retry_count, max_retries)
-           VALUES (:topic_id, :check_result_id, :title, :body,
+           title, body, url, last_error, created_at, retry_count, max_retries)
+           VALUES (:topic_id, :check_result_id, :title, :body, :url, :last_error,
            :created_at, :retry_count, :max_retries)""",
         data,
     )
@@ -583,16 +588,24 @@ def claim_pending_notification(conn: sqlite3.Connection, notification_id: int, c
     return cursor.rowcount == 1
 
 
-def increment_notification_retry(conn: sqlite3.Connection, notification_id: int) -> None:
+def increment_notification_retry(conn: sqlite3.Connection, notification_id: int, last_error: str | None = None) -> None:
     """Increment the retry count and release the claim for a pending notification.
 
     Clearing ``claimed_at`` re-arms the row so the next cycle can re-claim and
-    retry it.
+    retry it. ``last_error`` (when given) records the most recent failure reason
+    so a permanently-broken channel is distinguishable from a transient blip.
     """
-    conn.execute(
-        "UPDATE pending_notifications SET retry_count = retry_count + 1, claimed_at = NULL WHERE id = ?",
-        (notification_id,),
-    )
+    if last_error is not None:
+        conn.execute(
+            "UPDATE pending_notifications "
+            "SET retry_count = retry_count + 1, claimed_at = NULL, last_error = ? WHERE id = ?",
+            (last_error, notification_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE pending_notifications SET retry_count = retry_count + 1, claimed_at = NULL WHERE id = ?",
+            (notification_id,),
+        )
 
 
 def delete_pending_notification(conn: sqlite3.Connection, notification_id: int) -> None:
