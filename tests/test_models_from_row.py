@@ -311,3 +311,76 @@ class TestRequiredDatetimeWarnings:
             topic = Topic.from_row(self._topic_row("not-a-date"))
         assert isinstance(topic.created_at, datetime)
         assert any("Corrupt required datetime" in r.message for r in caplog.records)
+
+
+class TestSafeJsonWarnings:
+    """OVH-023: _safe_json must log a WARNING (with the field name) on corruption."""
+
+    def _topic_row(self) -> dict:
+        return {
+            "id": 1,
+            "name": "Topic",
+            "description": "desc",
+            "feed_urls": "[]",
+            "feed_mode": "auto",
+            "created_at": "2026-06-13T12:00:00+00:00",
+            "status_changed_at": None,
+            "is_active": 1,
+            "status": "ready",
+            "error_message": None,
+            "check_interval_minutes": 60,
+            "tags": "[]",
+        }
+
+    def test_corrupt_feed_urls_logs_warning_and_yields_empty(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Corrupt feed_urls JSON logs a warning naming the field and yields []."""
+        row = self._topic_row()
+        row["feed_urls"] = "{not valid json"
+        with caplog.at_level(logging.WARNING, logger="app.models"):
+            topic = Topic.from_row(row)
+        assert topic.feed_urls == []
+        assert any("feed_urls" in r.message for r in caplog.records)
+
+    def test_corrupt_tags_logs_warning_with_field_name(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Corrupt tags JSON logs a warning naming the field and yields []."""
+        row = self._topic_row()
+        row["tags"] = "}}}bad"
+        with caplog.at_level(logging.WARNING, logger="app.models"):
+            topic = Topic.from_row(row)
+        assert topic.tags == []
+        assert any("tags" in r.message for r in caplog.records)
+
+    def test_wrong_type_feed_urls_logs_warning_and_yields_default(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Valid JSON of the wrong type (e.g. a number) is rejected with a warning."""
+        row = self._topic_row()
+        row["feed_urls"] = "42"
+        with caplog.at_level(logging.WARNING, logger="app.models"):
+            topic = Topic.from_row(row)
+        assert topic.feed_urls == []
+        assert any("feed_urls" in r.message for r in caplog.records)
+
+    def test_corrupt_payload_logs_warning_with_field_name(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Corrupt PendingWebhook payload JSON logs a warning naming the field."""
+        row = {
+            "id": 1,
+            "topic_id": 1,
+            "check_result_id": None,
+            "url": "https://example.com/hook",
+            "payload": "{not valid json",
+            "created_at": "2026-06-13T12:00:00+00:00",
+            "retry_count": 0,
+            "max_retries": 3,
+        }
+        with caplog.at_level(logging.WARNING, logger="app.models"):
+            hook = PendingWebhook.from_row(row)
+        assert hook.payload == {}
+        assert any("payload" in r.message for r in caplog.records)
+
+    def test_valid_json_does_not_warn(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A well-formed JSON cell of the correct type emits no warning."""
+        row = self._topic_row()
+        row["feed_urls"] = '["https://example.com/feed.xml"]'
+        with caplog.at_level(logging.WARNING, logger="app.models"):
+            topic = Topic.from_row(row)
+        assert topic.feed_urls == ["https://example.com/feed.xml"]
+        assert not any("feed_urls" in r.message for r in caplog.records)
