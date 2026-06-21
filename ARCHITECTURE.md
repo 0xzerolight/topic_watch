@@ -77,7 +77,7 @@ All application code lives under `app/`.
 
 | Module | Responsibility |
 |--------|---------------|
-| `models.py` | Pydantic models: `Topic`, `Article`, `KnowledgeState`, `CheckResult`, `FeedHealth`, `DashboardStats`, `PendingNotification`. Enums: `TopicStatus` (new/researching/ready/error), `FeedMode` (auto/manual). Each model has `from_row()` and `to_insert_dict()` for SQLite interop; datetime cells are coerced defensively. |
+| `models.py` | Pydantic models: `Topic`, `Article`, `KnowledgeState`, `CheckResult`, `FeedHealth`, `DashboardStats`, `PendingNotification`, `PendingWebhook`. Enums: `TopicStatus` (new/researching/ready/error), `FeedMode` (auto/manual). Each model has `from_row()` and `to_insert_dict()` for SQLite interop; datetime cells are coerced defensively. |
 | `crud.py` | All database operations grouped by model. Topic/Article/KnowledgeState/CheckResult CRUD, feed health upserts, pending notification + pending webhook queues, dashboard aggregation, article retention cleanup, stuck topic recovery. |
 | `database.py` | SQLite connection factory (WAL mode, foreign keys, busy timeout). Schema initialization (`init_db`). Migration runner (`run_migrations`) — backs up the DB before applying pending migrations. |
 | `migrations/` | 13 sequential migrations registered in `__init__.py` as `(version, description, up_function)` tuples. Tracked in `schema_version` table. Migrations are append-only. |
@@ -238,7 +238,7 @@ On first run, `config.example.yml` is auto-copied to `data/config.yml`.
 
 **Feed resilience.** Timeouts and 5xx errors get configurable retries. Feed health is tracked per-URL. Empty feeds are not errors.
 
-**Stuck topic recovery.** Topics stuck in RESEARCHING are recovered to ERROR status by `recover_stuck_researching`, run both on startup and by a periodic scheduler job (every 5 min, 15-minute stuck timeout).
+**Stuck topic recovery.** Two distinct paths recover RESEARCHING topics to ERROR. At startup `recover_stuck_topics` clears *every* RESEARCHING topic immediately — after a restart the background task is dead, so any such topic is definitively stuck. During runtime the periodic scheduler job (every 5 min) calls `recover_stuck_researching`, which only recovers topics that have been RESEARCHING longer than the 15-minute timeout (via `status_changed_at`).
 
 ## Security Model
 
