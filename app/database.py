@@ -194,12 +194,21 @@ def run_migrations(conn: sqlite3.Connection, db_path: Path | None = None) -> Non
         return
 
     path = db_path or DEFAULT_DB_PATH
-    _backup_db(path)
+    backup_path = _backup_db(path)
     logger.info("Running %d pending migration(s) from version %d", len(pending), current)
 
     for version, description, up_func in pending:
-        up_func(conn)
-        conn.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+        try:
+            up_func(conn)
+            conn.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+        except Exception:
+            logger.exception(
+                "Migration %d (%s) failed; DB restored from backup at %s",
+                version,
+                description,
+                backup_path,
+            )
+            raise
         logger.info("Applied migration %d: %s", version, description)
     conn.commit()
 
