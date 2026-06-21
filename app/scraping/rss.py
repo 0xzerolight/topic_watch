@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from time import struct_time
 from typing import TYPE_CHECKING
+from urllib.parse import urlparse
 
 import feedparser
 import httpx
@@ -95,7 +96,14 @@ def _resolve_google_news_url(link: str, description: str) -> str:
     match = _GOOGLE_NEWS_HREF_RE.search(description)
     if match:
         real_url = match.group(1)
-        if real_url and not real_url.startswith("https://news.google.com/"):
+        # Defense-in-depth (OVH-014): only adopt an http(s) href from the
+        # untrusted description; a javascript:/data: href must fall back to the
+        # safe Google redirect link rather than become the article URL.
+        if (
+            real_url
+            and not real_url.startswith("https://news.google.com/")
+            and urlparse(real_url).scheme.lower() in ("http", "https")
+        ):
             return real_url
     return link
 
@@ -116,6 +124,12 @@ def _parse_entry(raw_entry: dict, source_feed: str) -> FeedEntry | None:
 
     # Google News RSS uses redirect URLs — resolve to actual article URLs
     url = _resolve_google_news_url(url, summary)
+
+    # Defense-in-depth (OVH-014): a non-http(s) scheme (javascript:, data:, ...)
+    # must never reach the DB, where it would later render into an href.
+    if urlparse(url).scheme.lower() not in ("http", "https"):
+        logger.warning("Dropping feed entry with non-http(s) link scheme: %s", url)
+        return None
 
     return FeedEntry(
         title=title,

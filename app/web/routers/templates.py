@@ -86,6 +86,23 @@ def _mask_url(url: str) -> str:
         return "****"
 
 
+def _safe_href(url: str | None) -> str:
+    """Return ``url`` only if its scheme is http(s), else ``"#"``.
+
+    Jinja autoescape neutralizes quotes/angle brackets but NOT a ``javascript:``
+    or ``data:text/html`` scheme inside an href, so an attacker-controlled feed
+    link could otherwise plant a clickable script in the app origin. Allowlist
+    the scheme before render, mirroring url_validation.validate_feed_url.
+    """
+    if not url:
+        return "#"
+    try:
+        scheme = urlparse(url.strip()).scheme.lower()
+    except Exception:
+        return "#"
+    return url if scheme in ("http", "https") else "#"
+
+
 def _confidence_badge(llm_response: str | None) -> str:
     """Render a confidence score as a colored badge from llm_response JSON."""
     if not llm_response:
@@ -136,5 +153,6 @@ def _feed_source_name(feed_url: str) -> str:
 templates.env.filters["timeago"] = _timeago
 templates.env.filters["sanitize_error"] = _sanitize_error
 templates.env.filters["mask_url"] = _mask_url
+templates.env.filters["safe_href"] = _safe_href
 templates.env.filters["confidence_badge"] = _confidence_badge
 templates.env.filters["feed_source_name"] = _feed_source_name
