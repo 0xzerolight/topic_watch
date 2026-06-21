@@ -519,10 +519,85 @@ class TestTopicStatus:
         assert "Retry" in response.text
         assert "hx-trigger" not in response.text
 
-    async def test_status_404(self, client: httpx.AsyncClient) -> None:
-        """Nonexistent topic returns 404."""
+    async def test_status_deleted_returns_terminal_fragment(self, client: httpx.AsyncClient) -> None:
+        """Deleted/nonexistent topic returns a 200 terminal fragment that stops polling (OVH-048)."""
         response = await client.get("/topics/9999/status")
-        assert response.status_code == 404
+        # 200 so HTMX swaps the fragment instead of leaving an eternal spinner.
+        assert response.status_code == 200
+        # No polling trigger remains, so the every-3s poll stops.
+        assert "hx-trigger" not in response.text
+        # Surfaces the failure to the user.
+        assert "no longer exists" in response.text.lower()
+
+
+# --- Generic exception handler (OVH-046) ---
+
+
+class TestGenericExceptionHandler:
+    """Tests for @app.exception_handler(Exception) — unhandled errors."""
+
+    @pytest.fixture(autouse=True)
+    def _boom_route(self):
+        """Register a throwaway route that raises an unhandled exception."""
+
+        async def boom():
+            raise RuntimeError("kaboom secret detail")
+
+        app.add_api_route("/_test/boom", boom, methods=["GET"])
+        yield
+        app.router.routes = [r for r in app.router.routes if getattr(r, "path", None) != "/_test/boom"]
+
+    @pytest.fixture
+    async def error_client(self) -> AsyncGenerator[httpx.AsyncClient, None]:
+        """Client that returns the handler's 500 response rather than re-raising.
+
+        Starlette's ServerErrorMiddleware sends the handler response AND re-raises
+        so the ASGI server can log/close; raise_app_exceptions=False mirrors what a
+        real server (uvicorn) shows the client — the rendered 500.
+        """
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            yield ac
+
+    async def test_browser_gets_branded_html(self, error_client: httpx.AsyncClient) -> None:
+        """A generic unhandled 500 renders the branded error.html for browser requests."""
+        response = await error_client.get("/_test/boom", headers={"accept": "text/html"})
+        assert response.status_code == 500
+        assert "text/html" in response.headers["content-type"]
+        # Branded error page chrome (base.html footer / heading).
+        assert "Topic Watch" in response.text
+        assert "500" in response.text
+        # No traceback / internal detail leaked.
+        assert "kaboom" not in response.text
+        assert "RuntimeError" not in response.text
+        assert "Traceback" not in response.text
+
+    async def test_json_client_gets_envelope(self, error_client: httpx.AsyncClient) -> None:
+        """A generic unhandled 500 returns the JSON envelope for API clients."""
+        response = await error_client.get("/_test/boom", headers={"accept": "application/json"})
+        assert response.status_code == 500
+        assert response.json() == {"detail": "Internal server error"}
+        # No traceback / internal detail leaked.
+        assert "kaboom" not in response.text
+        assert "RuntimeError" not in response.text
+
+
+# --- Global HTMX error surfacing (OVH-011) ---
+
+
+class TestHtmxErrorSurfacing:
+    """Tests asserting the global HTMX error listener is wired into the client JS."""
+
+    def test_response_and_send_error_listeners_present(self) -> None:
+        """notifications.js registers global htmx:responseError and htmx:sendError listeners."""
+        from pathlib import Path
+
+        js = (Path(__file__).resolve().parent.parent / "app" / "static" / "notifications.js").read_text()
+        assert "htmx:responseError" in js
+        assert "htmx:sendError" in js
+        # Surfaces a toast and offers a retry affordance.
+        assert "toast" in js.lower()
+        assert "retry" in js.lower()
 
 
 # --- Re-init ---
