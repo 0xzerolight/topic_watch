@@ -534,6 +534,23 @@ class TestCompressKnowledgeSummary:
         assert "Verbose summary." in call_kwargs["messages"][1]["content"]
         assert "Compress Topic" in call_kwargs["messages"][1]["content"]
 
+    async def test_exposes_completion_usage(self) -> None:
+        """OVH-129: compression captures the completion's token usage so its cost
+        is not invisible in the per-check totals."""
+        expected = CompressedKnowledge(compressed_summary="Condensed.", token_count=0)
+        completion = _FakeCompletion(_FakeUsage(prompt_tokens=321, completion_tokens=54))
+        mock_client, _ = _mock_instructor_client(expected, completion=completion)
+        settings = _make_settings()
+
+        with (
+            patch("app.analysis.llm._get_client", return_value=mock_client),
+            patch("app.analysis.llm.count_tokens", return_value=11),
+        ):
+            result = await compress_knowledge_summary("Verbose summary.", _make_topic(), settings)
+
+        assert result.prompt_tokens == 321
+        assert result.completion_tokens == 54
+
     async def test_raises_on_llm_error(self) -> None:
         mock_client, mock_create = _mock_instructor_client(None)
         mock_create.side_effect = Exception("compress failed")
@@ -563,6 +580,25 @@ class TestCountTokens:
         text = "a" * 400
         count = count_tokens(text, "unknown/model")
         assert count == 100  # len(400) // 4
+
+    @patch("app.analysis.llm.litellm.token_counter", side_effect=Exception("fail"))
+    def test_fallback_warns_once_per_model(self, mock_counter, caplog) -> None:
+        """OVH-136: the char/4 fallback diverges from the model tokenizer, so the
+        first fallback for a model WARNs (budget decisions on a wrong unit are
+        observable); later fallbacks for the same model stay quiet (no log flood).
+        """
+        import logging
+
+        from app.analysis import llm as llm_mod
+
+        llm_mod._token_fallback_warned.discard("flaky/model")
+        with caplog.at_level(logging.WARNING, logger="app.analysis.llm"):
+            count_tokens("some text", "flaky/model")
+            count_tokens("more text", "flaky/model")
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING and "flaky/model" in r.getMessage()]
+        assert len(warnings) == 1
+        assert "fallback" in warnings[0].getMessage().lower()
 
 
 class TestEffectiveBaseUrl:
@@ -1209,6 +1245,51 @@ class TestKnowledgeWriteResultUsage:
         assert result.sufficient_data is False
         assert result.usage.prompt_tokens == 33
         assert result.usage.completion_tokens == 11
+
+    async def test_update_folds_compression_usage_into_total(self, db_conn: sqlite3.Connection) -> None:
+        """OVH-129: when an over-budget update triggers compression, the
+        compression round-trip's tokens are added to the reported usage."""
+        topic = Topic(name="UsageCompress", description="D", feed_urls=[])
+        topic = create_topic(db_conn, topic)
+        db_conn.commit()
+        create_knowledge_state(db_conn, KnowledgeState(topic_id=topic.id, summary_text="Old.", token_count=10))
+        db_conn.commit()
+        settings = _make_settings(knowledge_state_max_tokens=500)
+
+        novelty = NoveltyResult(has_new_info=True, summary="X", confidence=0.8)
+        # Update call: 90/25, and reports an over-budget token_count to trigger compression.
+        llm_result = KnowledgeStateUpdate(
+            sufficient_data=True,
+            confidence=0.9,
+            updated_summary="Long over-budget summary.",
+            token_count=501,
+            prompt_tokens=90,
+            completion_tokens=25,
+        )
+        # Compression call: 200/40, fits the budget.
+        compressed = CompressedKnowledge(
+            compressed_summary="Tight.",
+            token_count=5,
+            prompt_tokens=200,
+            completion_tokens=40,
+        )
+        with (
+            patch(
+                "app.analysis.knowledge.generate_knowledge_update",
+                new_callable=AsyncMock,
+                return_value=llm_result,
+            ),
+            patch(
+                "app.analysis.knowledge.compress_knowledge_summary",
+                new_callable=AsyncMock,
+                return_value=compressed,
+            ),
+        ):
+            result = await update_knowledge(topic, novelty, db_conn, settings)
+
+        # Update (90/25) + compression (200/40) folded together.
+        assert result.usage.prompt_tokens == 290
+        assert result.usage.completion_tokens == 65
 
 
 # ============================================================
