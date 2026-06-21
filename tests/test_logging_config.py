@@ -120,6 +120,66 @@ class TestJSONFormatterException:
         assert "exception" not in parsed
 
 
+class TestUvicornLoggersJSON:
+    """OVH-041: in JSON mode, uvicorn loggers must flow through the root JSON handler."""
+
+    @pytest.fixture(autouse=True)
+    def reset_uvicorn_loggers(self):
+        """Restore uvicorn loggers to a clean state around each test."""
+        names = ("uvicorn", "uvicorn.error", "uvicorn.access")
+        saved = {n: (logging.getLogger(n).handlers[:], logging.getLogger(n).propagate) for n in names}
+        yield
+        for n, (handlers, propagate) in saved.items():
+            lg = logging.getLogger(n)
+            lg.handlers = handlers
+            lg.propagate = propagate
+
+    def test_json_mode_retargets_uvicorn_loggers(self, monkeypatch):
+        monkeypatch.setenv("TOPIC_WATCH_LOG_FORMAT", "json")
+        # Simulate uvicorn having installed its own text handlers.
+        for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+            lg = logging.getLogger(name)
+            lg.handlers = [logging.StreamHandler()]
+            lg.propagate = False
+
+        setup_logging()
+
+        for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+            lg = logging.getLogger(name)
+            assert lg.handlers == [], f"{name} should have no own handlers in JSON mode"
+            assert lg.propagate is True, f"{name} should propagate to root in JSON mode"
+
+    def test_uvicorn_access_output_is_valid_json(self, monkeypatch):
+        monkeypatch.setenv("TOPIC_WATCH_LOG_FORMAT", "json")
+        setup_logging()
+
+        stream = io.StringIO()
+        logging.root.handlers[0].stream = stream
+
+        access_logger = logging.getLogger("uvicorn.access")
+        access_logger.setLevel(logging.INFO)
+        access_logger.info('127.0.0.1 - "GET / HTTP/1.1" 200')
+
+        output = stream.getvalue().strip()
+        assert output, "Expected uvicorn.access output to reach the root JSON handler"
+        parsed = json.loads(output)
+        assert parsed["logger"] == "uvicorn.access"
+        assert parsed["level"] == "INFO"
+        assert "check_id" in parsed
+
+    def test_plain_text_mode_leaves_uvicorn_loggers_untouched(self, monkeypatch):
+        monkeypatch.setenv("TOPIC_WATCH_LOG_FORMAT", "text")
+        own_handler = logging.StreamHandler()
+        lg = logging.getLogger("uvicorn.access")
+        lg.handlers = [own_handler]
+        lg.propagate = False
+
+        setup_logging()
+
+        assert lg.handlers == [own_handler]
+        assert lg.propagate is False
+
+
 class TestJSONFormatterExtraFields:
     def test_extra_fields_included_in_json(self, monkeypatch):
         monkeypatch.setenv("TOPIC_WATCH_LOG_FORMAT", "json")

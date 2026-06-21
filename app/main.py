@@ -14,8 +14,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.responses import Response
 
 from app import __version__ as _app_version
+from app.check_context import generate_check_id, request_id_var
 from app.config import DEFAULT_CONFIG_PATH, load_settings, resolve_db_path
 from app.crud import recover_stuck_topics
 from app.database import get_db, init_db
@@ -28,6 +31,28 @@ from app.web.routers.templates import templates
 from app.web.setup_middleware import SetupRedirectMiddleware
 
 logger = logging.getLogger(__name__)
+
+REQUEST_ID_HEADER = "X-Request-ID"
+
+
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    """Correlate each inbound request with an id surfaced to logs and echoed back.
+
+    Reads the inbound ``X-Request-ID`` header if present (so an upstream proxy's
+    trace id is preserved), otherwise generates one. Sets ``request_id_var`` for
+    the request scope (the logging filter surfaces it as ``check_id``) and echoes
+    the id back in the response header (OVH-043).
+    """
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        request_id = request.headers.get(REQUEST_ID_HEADER) or generate_check_id()
+        token = request_id_var.set(request_id)
+        try:
+            response = await call_next(request)
+        finally:
+            request_id_var.reset(token)
+        response.headers[REQUEST_ID_HEADER] = request_id
+        return response
 
 
 @asynccontextmanager
@@ -59,6 +84,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Topic Watch", version=_app_version, lifespan=lifespan)
 app.add_middleware(CSRFMiddleware)
 app.add_middleware(SetupRedirectMiddleware)
+# Added last so it wraps everything: the correlation id is set before any other
+# middleware/handler runs and is available to all of their log lines.
+app.add_middleware(RequestIdMiddleware)
 app.include_router(router)
 app.include_router(api_router)
 app.mount("/static", StaticFiles(directory=str(Path(__file__).resolve().parent / "static")), name="static")

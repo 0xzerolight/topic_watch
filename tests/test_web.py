@@ -1,5 +1,6 @@
 """Tests for the web UI: routes, templates, and HTMX interactions."""
 
+import logging
 import sqlite3
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
@@ -78,6 +79,65 @@ async def client(
             yield ac
 
     app.dependency_overrides.clear()
+
+
+# --- Request correlation id (OVH-043) ---
+
+
+class TestRequestId:
+    """OVH-043: every request carries an X-Request-ID echoed back and visible to logs."""
+
+    async def test_response_echoes_generated_request_id(self, client: httpx.AsyncClient) -> None:
+        """A request with no X-Request-ID gets one generated and echoed in the response."""
+        response = await client.get("/")
+        rid = response.headers.get("X-Request-ID")
+        assert rid, "Response should carry an X-Request-ID header"
+        assert rid != "-"
+        assert len(rid) >= 8
+
+    async def test_response_echoes_inbound_request_id(self, client: httpx.AsyncClient) -> None:
+        """A client-supplied X-Request-ID is preserved and echoed back."""
+        response = await client.get("/", headers={"X-Request-ID": "client-supplied-123"})
+        assert response.headers.get("X-Request-ID") == "client-supplied-123"
+
+    async def test_request_id_set_in_context_during_request(self) -> None:
+        """While a request is in flight, request_id_var (and thus logs) carries the inbound id."""
+        from app.check_context import CheckIdFilter, request_id_var
+        from app.main import RequestIdMiddleware
+
+        seen: dict[str, str] = {}
+
+        async def inner_app(scope, receive, send):
+            # Resolve through the filter exactly as a log record would mid-request.
+            record = logging.makeLogRecord({})
+            CheckIdFilter().filter(record)
+            seen["ctx"] = request_id_var.get()
+            seen["filter"] = record.check_id
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        middleware = RequestIdMiddleware(inner_app)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=middleware), base_url="http://test") as ac:
+            response = await ac.get("/", headers={"X-Request-ID": "trace-me-42"})
+
+        assert seen["ctx"] == "trace-me-42"
+        assert seen["filter"] == "trace-me-42", "CheckIdFilter must surface the request id"
+        assert response.headers.get("X-Request-ID") == "trace-me-42"
+
+    async def test_request_id_cleared_after_request(self) -> None:
+        """The contextvar is reset after the request so ids do not leak across requests."""
+        from app.check_context import request_id_var
+        from app.main import RequestIdMiddleware
+
+        async def inner_app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        middleware = RequestIdMiddleware(inner_app)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=middleware), base_url="http://test") as ac:
+            await ac.get("/", headers={"X-Request-ID": "leaky-1"})
+
+        assert request_id_var.get() is None
 
 
 # --- Dashboard ---
