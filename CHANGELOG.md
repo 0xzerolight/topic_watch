@@ -54,6 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - SSRF check now fails closed on DNS resolution failure (unresolvable hosts are treated as private and blocked)
 - SSRF check now blocks CGNAT (`100.64.0.0/10`) and the full IPv6 ULA range (`fc00::/7`)
 - Bump python-multipart and pytest to patch known CVEs
+- Exclude the secret-bearing `.env` from the Docker build context (`.dockerignore`)
+- Install scripts document the `curl | bash` / `irm | iex` mutable-`main` risk and support pinning a tag/commit via `TOPIC_WATCH_REF`
+- Boot/login autostart is now opt-in in the install scripts (prompt or `TOPIC_WATCH_AUTOSTART`), with documented uninstall steps
 
 ## [1.1.2] - 2026-04-04
 

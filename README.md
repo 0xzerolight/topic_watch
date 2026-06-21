@@ -59,16 +59,22 @@ curl -fsSL https://raw.githubusercontent.com/0xzerolight/topic_watch/main/script
 irm https://raw.githubusercontent.com/0xzerolight/topic_watch/main/scripts/install.ps1 | iex
 ```
 
-Pulls the image, starts the container, creates a desktop shortcut + auto-start, and opens the setup wizard. Set your LLM API key in the wizard.
+Pulls the image, starts the container, creates a desktop/Start Menu shortcut, and opens the setup wizard. Set your LLM API key in the wizard.
 
-Override install location and port:
+The installer asks before setting up boot/login autostart (systemd user service + linger on Linux, a Startup shortcut on Windows) — it is opt-in, not silent. A piped `curl | bash` / `irm | iex` run cannot prompt, so it defaults to **no autostart**; pass `TOPIC_WATCH_AUTOSTART=yes` to enable it non-interactively.
+
+> **Before you pipe a script to a shell:** `curl | bash` and `irm | iex` run whatever the URL returns. By default these scripts fetch from the mutable `main` branch with no pin or checksum. For a verifiable install, review the script first (or download and run it), and pin a release tag or commit with `TOPIC_WATCH_REF` — this also pins the `docker-compose` file the installer downloads. See [SECURITY.md](SECURITY.md#install-script-trust).
+
+Override install location, port, ref, and autostart:
 
 ```bash
 # Linux / macOS
-TOPIC_WATCH_DIR=~/my-path TOPIC_WATCH_PORT=9000 curl -fsSL .../scripts/install.sh | bash
+TOPIC_WATCH_DIR=~/my-path TOPIC_WATCH_PORT=9000 TOPIC_WATCH_REF=v1.1.2 TOPIC_WATCH_AUTOSTART=yes \
+  curl -fsSL https://raw.githubusercontent.com/0xzerolight/topic_watch/v1.1.2/scripts/install.sh | bash
 
 # Windows (PowerShell)
-$env:TOPIC_WATCH_DIR="C:\TopicWatch"; $env:TOPIC_WATCH_PORT="9000"; irm .../scripts/install.ps1 | iex
+$env:TOPIC_WATCH_DIR="C:\TopicWatch"; $env:TOPIC_WATCH_PORT="9000"; $env:TOPIC_WATCH_REF="v1.1.2"; $env:TOPIC_WATCH_AUTOSTART="yes"
+irm https://raw.githubusercontent.com/0xzerolight/topic_watch/v1.1.2/scripts/install.ps1 | iex
 ```
 
 <details>
