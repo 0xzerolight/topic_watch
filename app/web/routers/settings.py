@@ -10,6 +10,7 @@ from app.config import (
     CLOUD_PROVIDERS,
     LOCAL_PROVIDER_DEFAULTS,
     Settings,
+    is_api_key_env_sourced,
     is_cloud_provider,
     load_settings,
     save_settings_to_yaml,
@@ -25,6 +26,42 @@ router = APIRouter()
 
 # Seconds to wait for the pre-flight credential ping before giving up.
 _PREFLIGHT_TIMEOUT = 15.0
+
+# Scalar Settings fields the settings form edits 1:1 (name on form == name on model).
+# Nested (llm/notifications), checkbox (secure_cookies) and infra-only (db_path) fields
+# are handled explicitly below. Derived from Settings so adding a field is one edit (OVH-069).
+_SCALAR_FORM_FIELDS: tuple[str, ...] = (
+    "check_interval",
+    "max_articles_per_check",
+    "knowledge_state_max_tokens",
+    "article_retention_days",
+    "feed_fetch_timeout",
+    "article_fetch_timeout",
+    "llm_analysis_timeout",
+    "llm_knowledge_timeout",
+    "apprise_timeout_seconds",
+    "web_page_size",
+    "min_confidence_threshold",
+    "min_relevance_threshold",
+    "feed_max_retries",
+    "content_fetch_concurrency",
+    "scheduler_misfire_grace_time",
+    "scheduler_jitter_seconds",
+    "llm_max_retries",
+    "llm_temperature",
+)
+
+
+def _settings_template_ctx(request: Request, **extra: object) -> dict:
+    """Shared template context for the settings page (provider lists + env-key state)."""
+    ctx: dict = {
+        "config_path": str(request.app.state.config_path),
+        "cloud_providers": sorted(CLOUD_PROVIDERS),
+        "local_provider_defaults": LOCAL_PROVIDER_DEFAULTS,
+        "api_key_env_sourced": is_api_key_env_sourced(),
+    }
+    ctx.update(extra)
+    return ctx
 
 
 class LLMValidationError(Exception):
@@ -167,86 +204,77 @@ async def settings_view(request: Request):
     return templates.TemplateResponse(
         request,
         "settings.html",
-        {
-            "settings": settings,
-            "config_path": str(request.app.state.config_path),
-            "cloud_providers": sorted(CLOUD_PROVIDERS),
-            "local_provider_defaults": LOCAL_PROVIDER_DEFAULTS,
-        },
+        _settings_template_ctx(request, settings=settings),
     )
 
 
 @router.post("/settings", dependencies=[Depends(verify_csrf)])
-async def update_settings(
-    request: Request,
-    llm_model: str = Form(...),
-    llm_api_key: str = Form(""),
-    llm_base_url: str = Form(""),
-    notification_urls: str = Form(""),
-    webhook_urls: str = Form(""),
-    check_interval: str = Form(...),
-    max_articles_per_check: int = Form(...),
-    knowledge_state_max_tokens: int = Form(2000),
-    article_retention_days: int = Form(90),
-    feed_fetch_timeout: float = Form(15.0),
-    article_fetch_timeout: float = Form(20.0),
-    llm_analysis_timeout: int = Form(60),
-    llm_knowledge_timeout: int = Form(120),
-    apprise_timeout_seconds: int = Form(30),
-    web_page_size: int = Form(20),
-    min_confidence_threshold: float = Form(0.7),
-    min_relevance_threshold: float = Form(0.5),
-    secure_cookies: bool = Form(False),
-    feed_max_retries: int = Form(2),
-    content_fetch_concurrency: int = Form(3),
-    scheduler_misfire_grace_time: int = Form(300),
-    scheduler_jitter_seconds: int = Form(30),
-    llm_max_retries: int = Form(2),
-    llm_temperature: float = Form(0.2),
-):
-    """Save updated settings to config file and reload into app state."""
+async def update_settings(request: Request):
+    """Save updated settings to config file and reload into app state.
+
+    Builds Settings from a single parsed form dict rather than restating each field
+    (OVH-069); the same dict is reused as ``form_values`` for the 422 re-render, so a
+    missed field can no longer render blank silently.
+    """
     from pydantic import ValidationError
 
     from app.config import LLMSettings, NotificationSettings
 
-    parsed_notification_urls = [u.strip() for u in notification_urls.splitlines() if u.strip()]
-    parsed_webhook_urls = [u.strip() for u in webhook_urls.splitlines() if u.strip()]
+    form = await request.form()
 
-    # If API key field is empty, retain existing key
-    effective_api_key = llm_api_key.strip() or request.app.state.settings.llm.api_key
+    def _get(name: str, default: str = "") -> str:
+        value = form.get(name, default)
+        return value if isinstance(value, str) else default
 
-    # Strip base_url for cloud providers (e.g. stale Ollama URL when switching to Anthropic)
-    effective_base_url = llm_base_url.strip() or None
-    if effective_base_url and is_cloud_provider(llm_model):
-        effective_base_url = None
+    llm_model = _get("llm_model")
+    llm_api_key = _get("llm_api_key")
+    llm_base_url = _get("llm_base_url")
+    notification_urls = _get("notification_urls")
+    webhook_urls = _get("webhook_urls")
+    # An HTML checkbox is absent when unchecked, present (value "true") when checked.
+    secure_cookies = form.get("secure_cookies") is not None
 
-    # Build a new Settings object to validate via Pydantic, then save
-    form_values = {
+    # form_values drives the 422 re-render; build it from the parsed form (single source).
+    form_values: dict = {
         "llm_model": llm_model,
         "llm_api_key": llm_api_key,
         "llm_base_url": llm_base_url,
         "notification_urls": notification_urls,
         "webhook_urls": webhook_urls,
-        "check_interval": check_interval,
-        "max_articles_per_check": max_articles_per_check,
-        "knowledge_state_max_tokens": knowledge_state_max_tokens,
-        "article_retention_days": article_retention_days,
-        "feed_fetch_timeout": feed_fetch_timeout,
-        "article_fetch_timeout": article_fetch_timeout,
-        "llm_analysis_timeout": llm_analysis_timeout,
-        "llm_knowledge_timeout": llm_knowledge_timeout,
-        "apprise_timeout_seconds": apprise_timeout_seconds,
-        "web_page_size": web_page_size,
-        "min_confidence_threshold": min_confidence_threshold,
-        "min_relevance_threshold": min_relevance_threshold,
         "secure_cookies": secure_cookies,
-        "feed_max_retries": feed_max_retries,
-        "content_fetch_concurrency": content_fetch_concurrency,
-        "scheduler_misfire_grace_time": scheduler_misfire_grace_time,
-        "scheduler_jitter_seconds": scheduler_jitter_seconds,
-        "llm_max_retries": llm_max_retries,
-        "llm_temperature": llm_temperature,
     }
+    for field in _SCALAR_FORM_FIELDS:
+        form_values[field] = _get(field)
+
+    parsed_notification_urls = [u.strip() for u in notification_urls.splitlines() if u.strip()]
+    parsed_webhook_urls = [u.strip() for u in webhook_urls.splitlines() if u.strip()]
+
+    # API key special-case: a blank field retains the current key (OVH-081). When the key
+    # is env-sourced we must not persist the env secret to plaintext YAML (OVH-003), so the
+    # field is read-only in the UI and the on-disk value is preserved on save.
+    api_key_env_sourced = is_api_key_env_sourced()
+    effective_api_key = llm_api_key.strip() or request.app.state.settings.llm.api_key
+    # base_url is stripped for cloud providers once on the Settings model (OVH-104).
+    effective_base_url = llm_base_url.strip() or None
+
+    # Scalar fields are passed as strings; Pydantic coerces and validates them.
+    scalar_kwargs = {field: form_values[field] for field in _SCALAR_FORM_FIELDS}
+
+    # llm_model is required; an empty value has no Pydantic constraint to trip, so guard it
+    # explicitly to keep the previous "blank model → 422" behavior (preserved across OVH-069).
+    if not llm_model.strip():
+        return templates.TemplateResponse(
+            request,
+            "settings.html",
+            _settings_template_ctx(
+                request,
+                settings=request.app.state.settings,
+                errors=["llm_model: Field required"],
+                form=form_values,
+            ),
+            status_code=422,
+        )
+
     try:
         new_settings = Settings(  # type: ignore[call-arg]
             llm=LLMSettings(
@@ -258,43 +286,28 @@ async def update_settings(
                 urls=parsed_notification_urls,
                 webhook_urls=parsed_webhook_urls,
             ),
-            check_interval=check_interval,
-            max_articles_per_check=max_articles_per_check,
-            knowledge_state_max_tokens=knowledge_state_max_tokens,
-            article_retention_days=article_retention_days,
-            feed_fetch_timeout=feed_fetch_timeout,
-            article_fetch_timeout=article_fetch_timeout,
-            llm_analysis_timeout=llm_analysis_timeout,
-            llm_knowledge_timeout=llm_knowledge_timeout,
-            apprise_timeout_seconds=apprise_timeout_seconds,
-            web_page_size=web_page_size,
-            min_confidence_threshold=min_confidence_threshold,
-            min_relevance_threshold=min_relevance_threshold,
             secure_cookies=secure_cookies,
-            feed_max_retries=feed_max_retries,
-            content_fetch_concurrency=content_fetch_concurrency,
-            scheduler_misfire_grace_time=scheduler_misfire_grace_time,
-            scheduler_jitter_seconds=scheduler_jitter_seconds,
-            llm_max_retries=llm_max_retries,
-            llm_temperature=llm_temperature,
             # db_path is infra-only (read-only in the UI); preserve current value.
             db_path=request.app.state.settings.db_path,
+            **scalar_kwargs,
         )
-        save_settings_to_yaml(new_settings, request.app.state.config_path)
+        save_settings_to_yaml(
+            new_settings,
+            request.app.state.config_path,
+            preserve_api_key=api_key_env_sourced,
+        )
         request.app.state.settings = new_settings
     except ValidationError as exc:
         errors = [f"{' → '.join(str(loc) for loc in e['loc'])}: {e['msg']}" for e in exc.errors()]
         return templates.TemplateResponse(
             request,
             "settings.html",
-            {
-                "settings": request.app.state.settings,
-                "config_path": str(request.app.state.config_path),
-                "errors": errors,
-                "form": form_values,
-                "cloud_providers": sorted(CLOUD_PROVIDERS),
-                "local_provider_defaults": LOCAL_PROVIDER_DEFAULTS,
-            },
+            _settings_template_ctx(
+                request,
+                settings=request.app.state.settings,
+                errors=errors,
+                form=form_values,
+            ),
             status_code=422,
         )
     except Exception as exc:
@@ -302,14 +315,12 @@ async def update_settings(
         return templates.TemplateResponse(
             request,
             "settings.html",
-            {
-                "settings": request.app.state.settings,
-                "config_path": str(request.app.state.config_path),
-                "errors": [f"Failed to save settings: {exc}"],
-                "form": form_values,
-                "cloud_providers": sorted(CLOUD_PROVIDERS),
-                "local_provider_defaults": LOCAL_PROVIDER_DEFAULTS,
-            },
+            _settings_template_ctx(
+                request,
+                settings=request.app.state.settings,
+                errors=[f"Failed to save settings: {exc}"],
+                form=form_values,
+            ),
             status_code=422,
         )
 

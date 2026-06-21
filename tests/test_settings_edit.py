@@ -26,6 +26,38 @@ def _make_settings(**overrides) -> Settings:
 CSRF_TEST_TOKEN = "test-csrf-token-for-settings-tests"
 
 
+def valid_form_data(**overrides) -> dict:
+    """A complete, valid POST /settings form payload (override individual fields)."""
+    data = {
+        "llm_model": "openai/gpt-4o-mini",
+        "llm_api_key": "",
+        "llm_base_url": "",
+        "notification_urls": "",
+        "webhook_urls": "",
+        "check_interval": "6h",
+        "max_articles_per_check": "10",
+        "knowledge_state_max_tokens": "2000",
+        "article_retention_days": "90",
+        "feed_fetch_timeout": "15.0",
+        "article_fetch_timeout": "20.0",
+        "llm_analysis_timeout": "60",
+        "llm_knowledge_timeout": "120",
+        "web_page_size": "20",
+        "min_confidence_threshold": "0.7",
+        "min_relevance_threshold": "0.5",
+        "secure_cookies": "true",
+        "feed_max_retries": "2",
+        "content_fetch_concurrency": "3",
+        "scheduler_misfire_grace_time": "300",
+        "scheduler_jitter_seconds": "30",
+        "llm_max_retries": "2",
+        "llm_temperature": "0.2",
+        "apprise_timeout_seconds": "30",
+    }
+    data.update(overrides)
+    return data
+
+
 @pytest.fixture
 async def client(
     db_conn: sqlite3.Connection,
@@ -178,34 +210,7 @@ class TestSettingsPost:
     """Tests for POST /settings."""
 
     def _valid_form_data(self, **overrides) -> dict:
-        data = {
-            "llm_model": "openai/gpt-4o-mini",
-            "llm_api_key": "",
-            "llm_base_url": "",
-            "notification_urls": "",
-            "webhook_urls": "",
-            "check_interval": "6h",
-            "max_articles_per_check": "10",
-            "knowledge_state_max_tokens": "2000",
-            "article_retention_days": "90",
-            "feed_fetch_timeout": "15.0",
-            "article_fetch_timeout": "20.0",
-            "llm_analysis_timeout": "60",
-            "llm_knowledge_timeout": "120",
-            "web_page_size": "20",
-            "min_confidence_threshold": "0.7",
-            "min_relevance_threshold": "0.5",
-            "secure_cookies": "true",
-            "feed_max_retries": "2",
-            "content_fetch_concurrency": "3",
-            "scheduler_misfire_grace_time": "300",
-            "scheduler_jitter_seconds": "30",
-            "llm_max_retries": "2",
-            "llm_temperature": "0.2",
-            "apprise_timeout_seconds": "30",
-        }
-        data.update(overrides)
-        return data
+        return valid_form_data(**overrides)
 
     async def test_valid_post_redirects(self, client: httpx.AsyncClient) -> None:
         """POST /settings with valid data redirects to /settings?saved=1."""
@@ -326,7 +331,7 @@ class TestSettingsPost:
         """POST /settings writes the correct content to the YAML file."""
         config_file = tmp_path / "config.yml"
 
-        def save_to_tmp(settings, config_path=None):
+        def save_to_tmp(settings, config_path=None, **kwargs):
             from app.config import save_settings_to_yaml as _real_save
 
             _real_save(settings, config_file)
@@ -473,3 +478,101 @@ class TestSettingsPost:
                 follow_redirects=False,
             )
         assert app.state.settings.llm.base_url is None
+
+
+class TestApiKeyRetention:
+    """OVH-081: a blank api-key field retains the existing key; a non-blank one overwrites."""
+
+    async def test_blank_key_retains_existing(self, client: httpx.AsyncClient) -> None:
+        """Submitting an empty llm_api_key keeps the current (sentinel) key."""
+        sentinel = "sk-sentinel-do-not-wipe"
+        app.state.settings = _make_settings(llm=LLMSettings(model="openai/gpt-4o-mini", api_key=sentinel))
+        with patch("app.web.routers.settings.save_settings_to_yaml"):
+            await client.post(
+                "/settings",
+                data=valid_form_data(llm_api_key=""),
+                follow_redirects=False,
+            )
+        assert app.state.settings.llm.api_key == sentinel
+
+    async def test_nonblank_key_overwrites(self, client: httpx.AsyncClient) -> None:
+        """Submitting a non-blank llm_api_key replaces the existing key."""
+        app.state.settings = _make_settings(llm=LLMSettings(model="openai/gpt-4o-mini", api_key="sk-old"))
+        with patch("app.web.routers.settings.save_settings_to_yaml"):
+            await client.post(
+                "/settings",
+                data=valid_form_data(llm_api_key="sk-new-explicit"),
+                follow_redirects=False,
+            )
+        assert app.state.settings.llm.api_key == "sk-new-explicit"
+
+
+class TestEnvSourcedSecretSafety:
+    """OVH-003: an env-supplied API key must not be materialized into plaintext YAML."""
+
+    async def test_env_key_not_written_when_blank_submitted(
+        self, client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When the key is env-sourced and the field is blank, save preserves the on-disk key."""
+        # On-disk YAML has an explicit (different) key; env supplies the live value.
+        config_file = tmp_path / "config.yml"
+        config_file.write_text('llm:\n  model: "openai/gpt-4o-mini"\n  api_key: "sk-on-disk-original"\n')
+        monkeypatch.setenv("TOPIC_WATCH_LLM__API_KEY", "sk-env-secret-keep-out")
+        # The running app's in-memory settings reflect the env value (as load_settings would).
+        app.state.settings = _make_settings(
+            llm=LLMSettings(model="openai/gpt-4o-mini", api_key="sk-env-secret-keep-out")
+        )
+        app.state.config_path = config_file
+
+        def save_real(settings, config_path=None, **kwargs):
+            from app.config import save_settings_to_yaml as _real_save
+
+            _real_save(settings, config_path or config_file, **kwargs)
+
+        with patch("app.web.routers.settings.save_settings_to_yaml", side_effect=save_real):
+            await client.post(
+                "/settings",
+                data=valid_form_data(llm_api_key=""),
+                follow_redirects=False,
+            )
+
+        data = yaml.safe_load(config_file.read_text())
+        # The env secret must NOT have leaked into the plaintext file.
+        assert data["llm"]["api_key"] != "sk-env-secret-keep-out"
+        # The prior on-disk value is preserved.
+        assert data["llm"]["api_key"] == "sk-on-disk-original"
+
+    async def test_env_key_edit_is_guarded_noop(
+        self, client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Editing the env-overridden key field does not overwrite the on-disk value."""
+        config_file = tmp_path / "config.yml"
+        config_file.write_text('llm:\n  model: "openai/gpt-4o-mini"\n  api_key: "sk-on-disk-original"\n')
+        monkeypatch.setenv("TOPIC_WATCH_LLM__API_KEY", "sk-env-secret")
+        app.state.settings = _make_settings(llm=LLMSettings(model="openai/gpt-4o-mini", api_key="sk-env-secret"))
+        app.state.config_path = config_file
+
+        def save_real(settings, config_path=None, **kwargs):
+            from app.config import save_settings_to_yaml as _real_save
+
+            _real_save(settings, config_path or config_file, **kwargs)
+
+        with patch("app.web.routers.settings.save_settings_to_yaml", side_effect=save_real):
+            # Operator types a new key in the UI; env override means this is a no-op on disk.
+            await client.post(
+                "/settings",
+                data=valid_form_data(llm_api_key="sk-typed-in-ui"),
+                follow_redirects=False,
+            )
+
+        data = yaml.safe_load(config_file.read_text())
+        assert data["llm"]["api_key"] == "sk-on-disk-original"
+
+    async def test_settings_page_marks_env_key_readonly(
+        self, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When the key is env-sourced, the API-key field is rendered read-only with a note."""
+        monkeypatch.setenv("TOPIC_WATCH_LLM__API_KEY", "sk-env-secret")
+        response = await client.get("/settings")
+        assert response.status_code == 200
+        assert "set via environment" in response.text.lower()
