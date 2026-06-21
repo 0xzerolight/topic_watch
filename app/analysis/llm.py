@@ -93,6 +93,11 @@ class NoveltyResult(BaseModel):
     )
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # Set ONLY on the fail-safe error path (LLM call failed). Lets the caller
+    # distinguish a genuine analysis failure from a clean "nothing new" result
+    # without making analyze_articles raise (settled decision #3). None on
+    # every successful call, including a legitimate has_new_info=False.
+    error: str | None = None
 
 
 class KnowledgeStateUpdate(BaseModel):
@@ -127,6 +132,12 @@ class CompressedKnowledge(BaseModel):
 
 
 # --- Helpers ---
+
+
+def _summarize_exc(exc: BaseException, *, limit: int = 200) -> str:
+    """One-line, length-bounded summary of an exception for stored error fields."""
+    summary = f"{type(exc).__name__}: {exc}".replace("\n", " ").strip()
+    return summary[:limit]
 
 
 _client: instructor.AsyncInstructor | None = None
@@ -321,9 +332,9 @@ async def analyze_articles(
 
     try:
         result, completion = await _call_with_rate_limit_retry(_do_call, max_retries=settings.llm_max_retries)
-    except Exception:
+    except Exception as exc:
         logger.warning("LLM analysis failed for topic '%s'", topic.name, exc_info=True)
-        return NoveltyResult(has_new_info=False, confidence=0.0)
+        return NoveltyResult(has_new_info=False, confidence=0.0, error=_summarize_exc(exc))
 
     novelty: NoveltyResult = result
     usage = _extract_usage(completion)
