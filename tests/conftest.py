@@ -37,23 +37,6 @@ def _isolate_app_state():
 
 
 @pytest.fixture(autouse=True)
-def _isolate_app_state():
-    """Snapshot/restore shared FastAPI app state between tests.
-
-    The app is a module-global imported across test files; a test that mutates
-    app.dependency_overrides or app.state and fails to clean up otherwise bleeds
-    into later tests, producing order-dependent failures. Reset around every test.
-    """
-    overrides = dict(app.dependency_overrides)
-    app_state = dict(app.state._state)
-    yield
-    app.dependency_overrides.clear()
-    app.dependency_overrides.update(overrides)
-    app.state._state.clear()
-    app.state._state.update(app_state)
-
-
-@pytest.fixture(autouse=True)
 def _stub_dns_resolution(monkeypatch: pytest.MonkeyPatch):
     """Resolve any hostname to a public IP by default.
 
