@@ -466,6 +466,28 @@ class TestSettingsPost:
         assert app.state.settings.min_relevance_threshold == 0.42
         assert app.state.settings.secure_cookies is True
 
+    async def test_edit_takes_effect_without_scheduler_restart(self, client: httpx.AsyncClient) -> None:
+        """OVH-015/036: a settings edit updates app.state (read live by the tick) without restart.
+
+        The scheduler reads settings from app.state at tick time, so update_settings must NOT
+        tear down / restart the scheduler — it only refreshes app.state.settings.
+        """
+        with (
+            patch("app.web.routers.settings.save_settings_to_yaml"),
+            patch("app.scheduler.start_scheduler") as mock_start,
+            patch("app.scheduler.stop_scheduler") as mock_stop,
+        ):
+            await client.post(
+                "/settings",
+                data=self._valid_form_data(check_interval="12h"),
+                follow_redirects=False,
+            )
+        # New value is live in app.state for the next tick.
+        assert app.state.settings.check_interval == "12h"
+        # No scheduler churn: reload is via app.state, not a restart.
+        mock_start.assert_not_called()
+        mock_stop.assert_not_called()
+
     async def test_cloud_provider_base_url_stripped(self, client: httpx.AsyncClient) -> None:
         """POST /settings with a cloud provider model strips any stale base_url."""
         with patch("app.web.routers.settings.save_settings_to_yaml"):

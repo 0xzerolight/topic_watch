@@ -99,6 +99,131 @@ class TestStartStopScheduler:
         """stop_scheduler should not error when no scheduler exists."""
         stop_scheduler()  # Should not raise
 
+    async def test_check_job_serializes_overlapping_ticks(self) -> None:
+        """OVH-171: max_instances=1 and coalesce guard against overlapping check cycles."""
+        settings = _make_settings()
+        scheduler = start_scheduler(settings)
+        try:
+            job = scheduler.get_job("check_all_topics")
+            assert job is not None
+            assert job.max_instances == 1
+            assert job.coalesce is True
+        finally:
+            stop_scheduler()
+
+    async def test_maintenance_jobs_have_generous_misfire_grace(self) -> None:
+        """OVH-029: cron maintenance jobs survive a slept/woken host (large misfire grace)."""
+        settings = _make_settings()
+        scheduler = start_scheduler(settings)
+        try:
+            for job_id in ("vacuum_db", "cleanup_old_articles"):
+                job = scheduler.get_job(job_id)
+                assert job is not None
+                # At least an hour so a delayed/woken host still runs missed maintenance.
+                assert job.misfire_grace_time is not None
+                assert job.misfire_grace_time >= 3600
+        finally:
+            stop_scheduler()
+
+    async def test_start_is_idempotent_no_leak(self) -> None:
+        """OVH-067/125: a second start_scheduler shuts the first down, no orphan."""
+        import asyncio
+
+        import app.scheduler as sched_module
+
+        settings = _make_settings()
+        first = start_scheduler(settings)
+        assert first.running
+        second = start_scheduler(settings)
+        try:
+            # The single ownership token now points at the new scheduler.
+            assert second.running
+            assert sched_module._scheduler is second
+            # The previously-running scheduler is shut down (AsyncIOScheduler defers the
+            # state flip to the loop), so it leaves no orphaned live ticks.
+            await asyncio.sleep(0)
+            assert not first.running
+        finally:
+            stop_scheduler()
+
+    async def test_check_job_reads_live_settings_from_app(self) -> None:
+        """OVH-015/036: when wired to an app, the tick reads settings from app.state."""
+        from types import SimpleNamespace
+
+        captured: list[Settings] = []
+
+        async def fake_run_check_cycle(settings, db_path=None):
+            captured.append(settings)
+
+        initial = _make_settings(check_interval="4h")
+        app = SimpleNamespace(state=SimpleNamespace(settings=initial, db_path=None))
+
+        scheduler = start_scheduler(initial, app=app)
+        try:
+            # Simulate an in-place settings edit after the scheduler is running.
+            edited = _make_settings(check_interval="12h")
+            app.state.settings = edited
+
+            with patch("app.scheduler._run_check_cycle", side_effect=fake_run_check_cycle):
+                job = scheduler.get_job("check_all_topics")
+                assert job is not None
+                await job.func(*job.args, **job.kwargs)
+
+            assert captured, "the check cycle should have run"
+            # The tick used the edited settings, not the ones bound at start.
+            assert captured[-1].check_interval == "12h"
+        finally:
+            stop_scheduler()
+
+
+class TestTickWrappers:
+    """OVH-015/036: tick wrappers resolve live settings/db_path from app.state."""
+
+    async def test_tick_recover_uses_live_db_path(self, tmp_path: Path) -> None:
+        from types import SimpleNamespace
+
+        from app.scheduler import _tick_recover
+
+        live_db = tmp_path / "live.db"
+        app = SimpleNamespace(state=SimpleNamespace(settings=_make_settings(), db_path=live_db))
+        with patch("app.scheduler._recover_stuck", new_callable=AsyncMock) as mock_recover:
+            await _tick_recover(timeout_minutes=15, db_path=None, app=app)
+        mock_recover.assert_awaited_once()
+        assert mock_recover.await_args.kwargs["db_path"] == live_db
+
+    async def test_tick_vacuum_uses_live_db_path(self, tmp_path: Path) -> None:
+        from types import SimpleNamespace
+
+        from app.scheduler import _tick_vacuum
+
+        live_db = tmp_path / "live.db"
+        app = SimpleNamespace(state=SimpleNamespace(settings=_make_settings(), db_path=live_db))
+        with patch("app.scheduler._vacuum_db", new_callable=AsyncMock) as mock_vacuum:
+            await _tick_vacuum(db_path=None, app=app)
+        mock_vacuum.assert_awaited_once_with(live_db)
+
+    async def test_tick_cleanup_uses_live_settings(self, tmp_path: Path) -> None:
+        from types import SimpleNamespace
+
+        from app.scheduler import _tick_cleanup
+
+        edited = _make_settings(article_retention_days=7)
+        app = SimpleNamespace(state=SimpleNamespace(settings=edited, db_path=tmp_path / "live.db"))
+        with patch("app.scheduler._cleanup_old_articles", new_callable=AsyncMock) as mock_cleanup:
+            await _tick_cleanup(settings=_make_settings(article_retention_days=90), db_path=None, app=app)
+        mock_cleanup.assert_awaited_once()
+        passed_settings = mock_cleanup.await_args.args[0]
+        assert passed_settings.article_retention_days == 7
+
+    async def test_tick_falls_back_to_bound_settings_without_app(self, tmp_path: Path) -> None:
+        from app.scheduler import _tick_cleanup
+
+        bound = _make_settings(article_retention_days=42)
+        with patch("app.scheduler._cleanup_old_articles", new_callable=AsyncMock) as mock_cleanup:
+            await _tick_cleanup(settings=bound, db_path=tmp_path / "x.db", app=None)
+        passed_settings = mock_cleanup.await_args.args[0]
+        assert passed_settings.article_retention_days == 42
+
 
 class TestScheduledCheck:
     """Tests for the _scheduled_check callback."""
