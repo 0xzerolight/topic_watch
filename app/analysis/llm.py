@@ -83,7 +83,15 @@ class NoveltyResult(BaseModel):
 
     reasoning: str = Field(default="", description="Brief chain-of-thought: what you compared, why you decided.")
     has_new_info: bool
-    summary: str | None = None
+    # Consumed by the knowledge-update prompt's "New Findings to Incorporate"
+    # block, so the model must populate it whenever there is new info (OVH-026).
+    summary: str | None = Field(
+        default=None,
+        description=(
+            "A one-to-two sentence neutral summary of the new development. "
+            "Required when has_new_info is true; null only when has_new_info is false."
+        ),
+    )
     key_facts: list[str] = []
     source_urls: list[str] = []
     confidence: float = Field(ge=0.0, le=1.0)
