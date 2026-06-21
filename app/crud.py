@@ -555,17 +555,42 @@ def create_pending_notification(conn: sqlite3.Connection, notification: PendingN
 def list_pending_notifications(
     conn: sqlite3.Connection,
 ) -> list[PendingNotification]:
-    """Get all pending notifications that haven't exceeded max retries."""
+    """Get pending notifications that haven't exceeded max retries.
+
+    Already-claimed rows (``claimed_at`` set) are excluded so a concurrent
+    drainer never re-snapshots an item another drainer is in the middle of
+    sending (see :func:`claim_pending_notification` / OVH-017).
+    """
     rows = conn.execute(
-        "SELECT * FROM pending_notifications WHERE retry_count < max_retries ORDER BY created_at ASC"
+        "SELECT * FROM pending_notifications "
+        "WHERE retry_count < max_retries AND claimed_at IS NULL "
+        "ORDER BY created_at ASC"
     ).fetchall()
     return [PendingNotification.from_row(row) for row in rows]
 
 
+def claim_pending_notification(conn: sqlite3.Connection, notification_id: int, claimed_at: str) -> bool:
+    """Atomically claim a pending notification for sending.
+
+    Returns True only if this caller won the claim (the row was unclaimed and
+    is now stamped). A concurrent drainer that lost the race gets False and
+    must skip the row, preventing double-delivery across processes.
+    """
+    cursor = conn.execute(
+        "UPDATE pending_notifications SET claimed_at = ? WHERE id = ? AND claimed_at IS NULL",
+        (claimed_at, notification_id),
+    )
+    return cursor.rowcount == 1
+
+
 def increment_notification_retry(conn: sqlite3.Connection, notification_id: int) -> None:
-    """Increment the retry count for a pending notification."""
+    """Increment the retry count and release the claim for a pending notification.
+
+    Clearing ``claimed_at`` re-arms the row so the next cycle can re-claim and
+    retry it.
+    """
     conn.execute(
-        "UPDATE pending_notifications SET retry_count = retry_count + 1 WHERE id = ?",
+        "UPDATE pending_notifications SET retry_count = retry_count + 1, claimed_at = NULL WHERE id = ?",
         (notification_id,),
     )
 
@@ -573,6 +598,20 @@ def increment_notification_retry(conn: sqlite3.Connection, notification_id: int)
 def delete_pending_notification(conn: sqlite3.Connection, notification_id: int) -> None:
     """Delete a pending notification (after successful send or max retries)."""
     conn.execute("DELETE FROM pending_notifications WHERE id = ?", (notification_id,))
+
+
+def release_stale_notification_claims(conn: sqlite3.Connection, cutoff: str) -> int:
+    """Release notification claims stamped at or before ``cutoff`` (ISO string).
+
+    A drainer that claims a row then crashes before applying its result would
+    otherwise leave the row claimed forever (and so never re-sent). Clearing
+    stale claims at snapshot time makes the queue self-healing.
+    """
+    cursor = conn.execute(
+        "UPDATE pending_notifications SET claimed_at = NULL WHERE claimed_at IS NOT NULL AND claimed_at <= ?",
+        (cutoff,),
+    )
+    return cursor.rowcount
 
 
 def delete_expired_notifications(conn: sqlite3.Connection) -> int:
@@ -617,21 +656,41 @@ def create_pending_webhook(
 
 
 def list_pending_webhooks(conn: sqlite3.Connection) -> list[dict]:
-    """Get all pending webhooks that haven't exceeded max retries.
+    """Get pending webhooks that haven't exceeded max retries.
 
     Each row is returned as a dict with the payload already decoded from JSON
-    (via the PendingWebhook model).
+    (via the PendingWebhook model). Already-claimed rows (``claimed_at`` set)
+    are excluded so a concurrent drainer never re-snapshots an item another
+    drainer is sending (see :func:`claim_pending_webhook` / OVH-017).
     """
     rows = conn.execute(
-        "SELECT * FROM pending_webhooks WHERE retry_count < max_retries ORDER BY created_at ASC"
+        "SELECT * FROM pending_webhooks WHERE retry_count < max_retries AND claimed_at IS NULL ORDER BY created_at ASC"
     ).fetchall()
     return [PendingWebhook.from_row(row).model_dump() for row in rows]
 
 
+def claim_pending_webhook(conn: sqlite3.Connection, webhook_id: int, claimed_at: str) -> bool:
+    """Atomically claim a pending webhook for sending.
+
+    Returns True only if this caller won the claim (the row was unclaimed and
+    is now stamped). A concurrent drainer that lost the race gets False and
+    must skip the row, preventing double-delivery across processes.
+    """
+    cursor = conn.execute(
+        "UPDATE pending_webhooks SET claimed_at = ? WHERE id = ? AND claimed_at IS NULL",
+        (claimed_at, webhook_id),
+    )
+    return cursor.rowcount == 1
+
+
 def increment_webhook_retry(conn: sqlite3.Connection, webhook_id: int) -> None:
-    """Increment the retry count for a pending webhook."""
+    """Increment the retry count and release the claim for a pending webhook.
+
+    Clearing ``claimed_at`` re-arms the row so the next cycle can re-claim and
+    retry it.
+    """
     conn.execute(
-        "UPDATE pending_webhooks SET retry_count = retry_count + 1 WHERE id = ?",
+        "UPDATE pending_webhooks SET retry_count = retry_count + 1, claimed_at = NULL WHERE id = ?",
         (webhook_id,),
     )
 
@@ -639,6 +698,19 @@ def increment_webhook_retry(conn: sqlite3.Connection, webhook_id: int) -> None:
 def delete_pending_webhook(conn: sqlite3.Connection, webhook_id: int) -> None:
     """Delete a pending webhook (after successful send or max retries)."""
     conn.execute("DELETE FROM pending_webhooks WHERE id = ?", (webhook_id,))
+
+
+def release_stale_webhook_claims(conn: sqlite3.Connection, cutoff: str) -> int:
+    """Release webhook claims stamped at or before ``cutoff`` (ISO string).
+
+    Mirrors :func:`release_stale_notification_claims`: a drainer that claims a
+    row then crashes before applying would otherwise strand it claimed forever.
+    """
+    cursor = conn.execute(
+        "UPDATE pending_webhooks SET claimed_at = NULL WHERE claimed_at IS NOT NULL AND claimed_at <= ?",
+        (cutoff,),
+    )
+    return cursor.rowcount
 
 
 def delete_expired_webhooks(conn: sqlite3.Connection) -> int:

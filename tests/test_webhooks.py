@@ -536,3 +536,102 @@ class TestWebhookRetryCrashSafety:
             assert list_pending_webhooks(verify) == []
         finally:
             verify.close()
+
+
+class TestWebhookDrainSingleFlight:
+    """Overlapping drains must deliver each queued webhook exactly once (OVH-017)."""
+
+    async def _enqueue(self, db_path, urls: list[str]) -> None:  # noqa: ANN001
+        from app.database import get_connection
+
+        conn = get_connection(db_path)
+        try:
+            topic = _make_topic(conn)
+            settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=urls))
+            novelty = _make_novelty()
+            with patch("app.webhooks.send_webhook", return_value=False):
+                await send_webhooks("Hooked", novelty, settings, conn=conn, topic_id=topic.id)
+        finally:
+            conn.close()
+
+    async def test_two_concurrent_drains_deliver_each_item_once(self, tmp_path) -> None:  # noqa: ANN001
+        """Two drains launched together send each pending webhook exactly once."""
+        import asyncio
+        import collections
+
+        from app.database import get_connection, init_db
+
+        db_path = tmp_path / "test.db"
+        init_db(db_path)
+        urls = ["https://a.com/hook", "https://b.com/hook", "https://c.com/hook"]
+        await self._enqueue(db_path, urls)
+        settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=urls))
+
+        sent_counts: collections.Counter[str] = collections.Counter()
+        first_send_started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_send(url: str, payload: dict, timeout: float = 10.0) -> bool:
+            # Block the first drain mid-send so the second drain overlaps it.
+            first_send_started.set()
+            await release.wait()
+            sent_counts[url] += 1
+            return True
+
+        with patch("app.webhooks.send_webhook", side_effect=slow_send):
+            drain1 = asyncio.create_task(retry_pending_webhooks(settings=settings, db_path=db_path))
+            await first_send_started.wait()
+            # Second drain starts while the first holds the single-flight lock.
+            drain2 = asyncio.create_task(retry_pending_webhooks(settings=settings, db_path=db_path))
+            await asyncio.sleep(0)  # let drain2 observe the locked guard
+            release.set()
+            await asyncio.gather(drain1, drain2)
+
+        # Each URL delivered exactly once despite the overlapping drain.
+        assert dict(sent_counts) == dict.fromkeys(urls, 1)
+
+        verify = get_connection(db_path)
+        try:
+            assert list_pending_webhooks(verify) == []
+        finally:
+            verify.close()
+
+    async def test_claimed_row_skipped_by_second_drainer(self, tmp_path) -> None:  # noqa: ANN001
+        """A row another process already claimed is skipped, not re-sent."""
+        from app.crud import claim_pending_webhook
+        from app.database import get_connection, init_db
+
+        db_path = tmp_path / "test.db"
+        init_db(db_path)
+        await self._enqueue(db_path, ["https://a.com/hook"])
+        settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=["https://a.com/hook"]))
+
+        # Simulate another process having claimed the only pending row.
+        claimer = get_connection(db_path)
+        try:
+            row = claimer.execute("SELECT id FROM pending_webhooks").fetchone()
+            webhook_id = row["id"]
+            assert claim_pending_webhook(claimer, webhook_id, "2999-01-01T00:00:00+00:00") is True
+            claimer.commit()
+        finally:
+            claimer.close()
+
+        send_calls: list[str] = []
+
+        async def record_send(url: str, payload: dict, timeout: float = 10.0) -> bool:
+            send_calls.append(url)
+            return True
+
+        with patch("app.webhooks.send_webhook", side_effect=record_send):
+            await retry_pending_webhooks(settings=settings, db_path=db_path)
+
+        # The claimed row was neither listed nor re-sent by this drainer.
+        assert send_calls == []
+        verify = get_connection(db_path)
+        try:
+            # Row still present and still claimed (untouched by this drain).
+            row = verify.execute("SELECT claimed_at FROM pending_webhooks").fetchone()
+            assert row is not None
+            assert row["claimed_at"] == "2999-01-01T00:00:00+00:00"
+        finally:
+            verify.close()
