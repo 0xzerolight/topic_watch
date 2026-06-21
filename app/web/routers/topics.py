@@ -9,10 +9,9 @@ import sqlite3
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
 
 from app.analysis.llm import NoveltyResult
-from app.checker import check_topic
 from app.config import Settings
 from app.crud import (
     count_articles_for_topic,
@@ -214,46 +213,14 @@ async def topic_status(
     )
 
 
-@router.post("/topics/{topic_id}/check", response_class=HTMLResponse, dependencies=[Depends(verify_csrf)])
-async def check_topic_handler(
-    request: Request,
-    topic_id: int,
-    conn: sqlite3.Connection = Depends(get_db_conn),
-    settings: Settings = Depends(get_settings),
-):
-    """Manual check trigger. Returns HTMX partial for the topic's table row."""
-    await _checking_state.clear_stale(600)
+def _topic_row_response(request: Request, conn: sqlite3.Connection, topic: Topic, topic_id: int) -> Response:
+    """Render the topic-row partial for HTMX, or redirect to the detail page for a full navigation."""
+    if not request.headers.get("HX-Request"):
+        return RedirectResponse(url=f"/topics/{topic_id}", status_code=303)
 
-    topic = get_topic(conn, topic_id)
-    if topic is None:
-        raise HTTPException(status_code=404, detail="Topic not found")
-
-    if not await _checking_state.start_check(topic_id):
-        # Already checking — return current state without re-checking
-        checks = list_check_results(conn, topic_id, limit=1)
-        last_check = checks[0] if checks else None
-        article_count = len(list_articles_for_topic(conn, topic_id))
-        return templates.TemplateResponse(
-            request,
-            "_topic_row.html",
-            {
-                "topic": topic,
-                "last_check": last_check,
-                "article_count": article_count,
-            },
-        )
-
-    try:
-        await check_topic(topic, conn, settings)
-    finally:
-        await _checking_state.finish_check(topic_id)
-
-    # Re-fetch topic (status may have changed) and latest check
-    topic = get_topic(conn, topic_id)
     checks = list_check_results(conn, topic_id, limit=1)
     last_check = checks[0] if checks else None
-    article_count = len(list_articles_for_topic(conn, topic_id))
-
+    article_count = count_articles_for_topic(conn, topic_id)
     return templates.TemplateResponse(
         request,
         "_topic_row.html",
@@ -263,6 +230,40 @@ async def check_topic_handler(
             "article_count": article_count,
         },
     )
+
+
+@router.post("/topics/{topic_id}/check", response_class=HTMLResponse, dependencies=[Depends(verify_csrf)])
+async def check_topic_handler(
+    request: Request,
+    topic_id: int,
+    background_tasks: BackgroundTasks,
+    conn: sqlite3.Connection = Depends(get_db_conn),
+    settings: Settings = Depends(get_settings),
+):
+    """Manual check trigger.
+
+    Enqueues the fetch+LLM pipeline as a background task (it opens its own
+    connection) and returns immediately, so the request connection is never
+    held across the long awaits. HTMX polling (``topic_status``) surfaces the
+    result. HTMX requests get the topic-row partial; plain-form submissions
+    redirect to the topic detail page.
+    """
+    await _checking_state.clear_stale(600)
+
+    topic = get_topic(conn, topic_id)
+    if topic is None:
+        raise HTTPException(status_code=404, detail="Topic not found")
+
+    if not await _checking_state.start_check(topic_id):
+        # Already checking — return current state without re-checking.
+        return _topic_row_response(request, conn, topic, topic_id)
+
+    # Defer the pipeline to a background task with its own connection; the
+    # task releases the per-topic guard when it completes.
+    db_path = getattr(request.app.state, "db_path", None)
+    background_tasks.add_task(background._run_single_check, topic_id, settings, db_path)
+
+    return _topic_row_response(request, conn, topic, topic_id)
 
 
 @router.post("/topics/{topic_id}/toggle-active", dependencies=[Depends(verify_csrf)])
