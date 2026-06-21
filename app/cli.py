@@ -2,6 +2,15 @@
 
 Provides manual access to the check pipeline, topic initialization,
 and topic listing. Run as: python -m app.cli <command>
+
+Concurrency constraint (OVH-097): the per-topic and whole-cycle in-flight
+guards (``app.web.state._checking_state``) are process-local. A CLI invocation
+gets its own fresh, empty guard state, so ``check``/``check-all``/``init`` do
+NOT coordinate with a running server's scheduler or UI. Running them against the
+SAME database as a live server can double-check a topic, double-spend the LLM,
+and emit duplicate notifications — directly against the novelty-only promise.
+Run CLI commands only when the server (and its scheduler) is stopped, or against
+a separate/offline database.
 """
 
 import argparse

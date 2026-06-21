@@ -356,6 +356,12 @@ python -m app.cli check-all           # Check all topics
 python -m app.cli init "Topic Name"   # Re-initialize knowledge state
 ```
 
+> **Run the CLI only when the server is stopped.** The in-flight check guards are
+> process-local, so `check`, `check-all`, and `init` do not coordinate with a
+> running server's scheduler or UI. Pointing them at the same database as a live
+> server can double-check a topic, double-spend the LLM, and send duplicate
+> notifications. Stop the server first, or use a separate/offline database.
+
 ## Updating
 
 **Docker (one-line install):**
