@@ -98,6 +98,10 @@ upsert_env() {
     else
         echo "${key}=${value}" >> "$file"
     fi
+    # Guarantee owner-only after every write path — including the append branch
+    # above and any pre-existing world-readable .env — not just the trailing
+    # chmod (OVH-063).
+    chmod 600 "$file"
 }
 
 upsert_env "PUID" "${HOST_UID}" "${ENV_FILE}"
