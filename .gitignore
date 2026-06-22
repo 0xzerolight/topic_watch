@@ -50,3 +50,4 @@ personal-docs/
 
 # Private development docs (public docs live in repo root)
 docs/
+.superpowers
