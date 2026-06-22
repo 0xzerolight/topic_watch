@@ -23,6 +23,7 @@ import feedparser
 import httpx
 from pydantic import BaseModel
 
+from app.log_redaction import redact_url
 from app.models import FeedMode, Topic
 from app.url_validation import is_private_url, safe_get
 
@@ -227,7 +228,7 @@ async def fetch_feed_with_status(
     an empty-but-valid feed does not get treated as a provider failure.
     """
     if await asyncio.to_thread(is_private_url, feed_url):
-        logger.warning("Blocked fetch to private URL: %s", feed_url)
+        logger.warning("Blocked fetch to private URL: %s", redact_url(feed_url))
         return [], False
     owns_client = client is None
     if owns_client:
