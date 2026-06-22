@@ -11,6 +11,7 @@ from typing import cast
 import httpx
 import trafilatura
 
+from app.log_redaction import redact_url
 from app.url_validation import is_private_url, safe_get
 
 logger = logging.getLogger(__name__)
@@ -38,7 +39,7 @@ async def _fetch_html(
 ) -> str | None:
     """Fetch a URL and return HTML text, or None on error."""
     if await asyncio.to_thread(is_private_url, url):
-        logger.warning("Blocked article fetch to private/reserved URL: %s", url)
+        logger.warning("Blocked article fetch to private/reserved URL: %s", redact_url(url))
         return None
     owns_client = client is None
     if owns_client:

@@ -23,6 +23,8 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
+from app.log_redaction import redact_url
+
 logger = logging.getLogger(__name__)
 
 # Bound on redirect hops we will follow while re-validating each target.
@@ -222,11 +224,11 @@ async def safe_send(
     """
     initial_url = str(request.url)
     if urlparse(initial_url).scheme not in ("http", "https"):
-        logger.warning("Blocked request to non-http(s) URL: %s", initial_url)
+        logger.warning("Blocked request to non-http(s) URL: %s", redact_url(initial_url))
         raise PrivateRedirectError(f"Non-http(s) scheme blocked: {initial_url}")
     # is_private_url does blocking DNS; offload so the event loop is not stalled.
     if await asyncio.to_thread(is_private_url, initial_url):
-        logger.warning("Blocked request to private/reserved URL: %s", initial_url)
+        logger.warning("Blocked request to private/reserved URL: %s", redact_url(initial_url))
         raise PrivateRedirectError(f"Request to private/reserved address blocked: {initial_url}")
 
     response = await client.send(request)
@@ -241,11 +243,11 @@ async def safe_send(
         # non-http(s) scheme would otherwise slip past the private-host check.
         if urlparse(next_url).scheme not in ("http", "https"):
             await response.aclose()
-            logger.warning("Blocked redirect to non-http(s) URL: %s", next_url)
+            logger.warning("Blocked redirect to non-http(s) URL: %s", redact_url(next_url))
             raise PrivateRedirectError(f"Redirect to non-http(s) scheme blocked: {next_url}")
         if await asyncio.to_thread(is_private_url, next_url):
             await response.aclose()
-            logger.warning("Blocked redirect to private/reserved URL: %s", next_url)
+            logger.warning("Blocked redirect to private/reserved URL: %s", redact_url(next_url))
             raise PrivateRedirectError(f"Redirect to private/reserved address blocked: {next_url}")
         redirects += 1
         if redirects > max_redirects:
