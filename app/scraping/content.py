@@ -37,7 +37,7 @@ async def _fetch_html(
     timeout: float = _ARTICLE_FETCH_TIMEOUT,
 ) -> str | None:
     """Fetch a URL and return HTML text, or None on error."""
-    if is_private_url(url):
+    if await asyncio.to_thread(is_private_url, url):
         logger.warning("Blocked article fetch to private/reserved URL: %s", url)
         return None
     owns_client = client is None
