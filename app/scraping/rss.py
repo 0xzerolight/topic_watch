@@ -226,7 +226,7 @@ async def fetch_feed_with_status(
     This lets callers distinguish "fetched OK but empty" from "fetch failed" so
     an empty-but-valid feed does not get treated as a provider failure.
     """
-    if is_private_url(feed_url):
+    if await asyncio.to_thread(is_private_url, feed_url):
         logger.warning("Blocked fetch to private URL: %s", feed_url)
         return [], False
     owns_client = client is None

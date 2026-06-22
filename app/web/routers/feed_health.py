@@ -1,5 +1,6 @@
 """Feed health dashboard and feed-URL validation routes."""
 
+import asyncio
 import sqlite3
 
 from fastapi import APIRouter, Depends, Form, Request
@@ -54,7 +55,7 @@ async def validate_feed_url(
 
     results = []
     for url in urls:
-        if is_private_url(url):
+        if await asyncio.to_thread(is_private_url, url):
             results.append({"url": url, "valid": False, "message": "Private/local URLs are not allowed"})
             continue
         try:

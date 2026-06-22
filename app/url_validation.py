@@ -243,7 +243,7 @@ async def safe_send(
             await response.aclose()
             logger.warning("Blocked redirect to non-http(s) URL: %s", next_url)
             raise PrivateRedirectError(f"Redirect to non-http(s) scheme blocked: {next_url}")
-        if is_private_url(next_url):
+        if await asyncio.to_thread(is_private_url, next_url):
             await response.aclose()
             logger.warning("Blocked redirect to private/reserved URL: %s", next_url)
             raise PrivateRedirectError(f"Redirect to private/reserved address blocked: {next_url}")
