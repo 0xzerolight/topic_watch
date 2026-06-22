@@ -164,7 +164,13 @@ class TestStartStopScheduler:
             edited = _make_settings(check_interval="12h")
             app.state.settings = edited
 
-            with patch("app.scheduler._run_check_cycle", side_effect=fake_run_check_cycle):
+            with (
+                patch("app.scheduler._run_check_cycle", side_effect=fake_run_check_cycle),
+                # Without this, the tick's _init_new_topics(settings, None) runs
+                # against the real data/ DB (db_path=None). This test only asserts
+                # settings propagation to the check cycle, so stub it out.
+                patch("app.scheduler._init_new_topics", new_callable=AsyncMock),
+            ):
                 job = scheduler.get_job("check_all_topics")
                 assert job is not None
                 await job.func(*job.args, **job.kwargs)
