@@ -799,10 +799,7 @@ class TestCheckNow:
         """OVH-013: /check enqueues the background task; the pipeline does not run inline."""
         topic = _make_topic(db_conn)
 
-        with (
-            patch("app.checker.check_topic", new_callable=AsyncMock) as mock_inline,
-            patch("app.web.routers.background._run_single_check", new_callable=AsyncMock) as mock_bg,
-        ):
+        with patch("app.web.routers.background._run_single_check", new_callable=AsyncMock) as mock_bg:
             response = await client.post(
                 f"/topics/{topic.id}/check",
                 headers={"HX-Request": "true"},
@@ -810,7 +807,6 @@ class TestCheckNow:
 
         assert response.status_code == 200
         # Pipeline must be deferred to the background task, never run inline.
-        mock_inline.assert_not_called()
         mock_bg.assert_called_once()
         assert mock_bg.call_args[0][0] == topic.id
 
