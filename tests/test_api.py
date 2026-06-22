@@ -53,7 +53,6 @@ class TestAPIListTopics:
         _seed_topic(db_conn, "Topic B", is_active=False)
         db_conn.commit()
 
-        app.state.db_path = None
         with TestClient(app) as client:
             # Override dependency to use test db
             from app.web.dependencies import get_db_conn

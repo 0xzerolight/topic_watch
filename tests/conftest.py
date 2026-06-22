@@ -63,6 +63,19 @@ def _safe_config_path(tmp_path: Path):
 
 
 @pytest.fixture(autouse=True)
+def _safe_lifespan_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Point the app lifespan's init_db at a temp DB.
+
+    The lifespan resolves its DB via ``app.main.resolve_db_path(settings)`` and
+    calls ``init_db`` on it. Under ``with TestClient(app)`` (test_api, test_setup)
+    that otherwise writes the real ``data/topic_watch.db`` and creates
+    ``data/backups``. Mirrors ``_safe_config_path`` for the DB path so no test
+    touches the real data/ directory.
+    """
+    monkeypatch.setattr("app.main.resolve_db_path", lambda settings: tmp_path / "lifespan.db")
+
+
+@pytest.fixture(autouse=True)
 def _reset_stats_cache():
     """Reset the dashboard stats cache between tests to prevent bleed."""
     from app.web import state
