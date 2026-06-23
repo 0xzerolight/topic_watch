@@ -138,7 +138,12 @@ class KnowledgeStateUpdate(BaseModel):
     """
 
     sufficient_data: bool = Field(
-        description="False if the articles lack enough relevant information to build a useful summary."
+        description=(
+            "False ONLY when the articles are entirely off-topic (unrelated to the description) "
+            "or establish no current state at all relevant to the description. "
+            "A negative or not-yet-occurred current state (e.g. 'X has not returned', "
+            "'the ban remains in place') IS sufficient — set this to true in that case."
+        )
     )
     confidence: float = Field(
         ge=0.0, le=1.0, description="How confident you are in the accuracy of this summary based on source articles."
