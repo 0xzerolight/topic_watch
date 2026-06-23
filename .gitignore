@@ -1,10 +1,8 @@
 # Config with secrets
 data/config.yml
-data/*.db
-data/*.db-wal
-data/*.db-shm
-data/*.db-journal
+data/*.db*
 data/backups/
+*.bak
 
 # Environment variables (may contain API keys)
 .env
