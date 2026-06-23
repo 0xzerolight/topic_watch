@@ -1233,7 +1233,7 @@ class TestCheckResultTokens:
 
 
 class TestMultiRoundInitialization:
-    """Insufficient init retries across cycles until MAX, then forces READY."""
+    """Insufficient init goes READY immediately (no bounce); sufficient init also goes READY."""
 
     async def _init(self, db_conn, topic, settings, *, sufficient: bool):
         from app.checker import initialize_new_topic
@@ -1254,23 +1254,45 @@ class TestMultiRoundInitialization:
             await initialize_new_topic(topic, db_conn, settings)
         return get_topic(db_conn, topic.id)
 
-    async def test_insufficient_returns_to_new_and_increments(self, db_conn: sqlite3.Connection) -> None:
+    async def test_insufficient_goes_ready_immediately(self, db_conn: sqlite3.Connection) -> None:
+        """Insufficient init no longer bounces to NEW — topic goes READY so baseline isn't discarded."""
         topic = _make_topic(db_conn, status=TopicStatus.NEW, status_changed_at=None)
         settings = _make_settings()
 
         updated = await self._init(db_conn, topic, settings, sufficient=False)
-        assert updated.status == TopicStatus.NEW
-        assert updated.init_attempts == 1
+        assert updated.status == TopicStatus.READY
+        assert updated.init_attempts == 0
         assert updated.status_changed_at is not None
 
-    async def test_exhausted_attempts_force_ready(self, db_conn: sqlite3.Connection) -> None:
-        topic = _make_topic(db_conn, status=TopicStatus.NEW, status_changed_at=None, init_attempts=3)
+    async def test_insufficient_goes_ready_and_mark_articles_processed_called(
+        self, db_conn: sqlite3.Connection
+    ) -> None:
+        """mark_articles_processed fires before the READY transition — articles not discarded."""
+        from app.checker import initialize_new_topic
+
+        topic = _make_topic(db_conn, status=TopicStatus.NEW, status_changed_at=None)
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
+        db_conn.commit()
         settings = _make_settings()
 
-        updated = await self._init(db_conn, topic, settings, sufficient=False)
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[article], total_feed_entries=1),
+            ),
+            patch(
+                "app.checker.initialize_knowledge",
+                new_callable=AsyncMock,
+                return_value=_make_write_result(sufficient_data=False),
+            ),
+            patch("app.checker.mark_articles_processed") as mock_mark,
+        ):
+            await initialize_new_topic(topic, db_conn, settings)
+
+        updated = get_topic(db_conn, topic.id)
         assert updated.status == TopicStatus.READY
-        # attempts reset on READY transition
-        assert updated.init_attempts == 0
+        mock_mark.assert_called_once_with(db_conn, [article.id])
 
     async def test_sufficient_goes_ready_and_resets(self, db_conn: sqlite3.Connection) -> None:
         topic = _make_topic(db_conn, status=TopicStatus.NEW, status_changed_at=None, init_attempts=2)
@@ -1279,15 +1301,6 @@ class TestMultiRoundInitialization:
         updated = await self._init(db_conn, topic, settings, sufficient=True)
         assert updated.status == TopicStatus.READY
         assert updated.init_attempts == 0
-
-    async def test_attempts_two_insufficient_stays_new_and_increments(self, db_conn: sqlite3.Connection) -> None:
-        """OVH-076 boundary: init_attempts=2 + insufficient → stays NEW, becomes 3 (last retry)."""
-        topic = _make_topic(db_conn, status=TopicStatus.NEW, status_changed_at=None, init_attempts=2)
-        settings = _make_settings()
-
-        updated = await self._init(db_conn, topic, settings, sufficient=False)
-        assert updated.status == TopicStatus.NEW
-        assert updated.init_attempts == 3
 
     async def _init_empty_fetch(self, db_conn, topic, settings):
         """Drive init where the fetch returns no articles (e.g. all already stored)."""
@@ -1321,24 +1334,18 @@ class TestMultiRoundInitialization:
         assert updated.init_attempts == 1
         assert updated.error_message is None
 
-    async def test_real_second_pass_empty_fetch_stays_new(self, db_conn: sqlite3.Connection) -> None:
-        """OVH-001 real path: pass 1 stores+marks articles (insufficient → NEW, attempts=1);
-        pass 2 fetch returns [] because every hash is already stored → stays NEW, not ERROR."""
+    async def test_insufficient_init_goes_ready_immediately_articles_marked(self, db_conn: sqlite3.Connection) -> None:
+        """OVH-001 real path: pass 1 stores+marks articles and goes READY (no bounce to NEW).
+        Articles are marked processed before the READY transition, so they are not discarded."""
         from app.checker import initialize_new_topic
 
         topic = _make_topic(db_conn, status=TopicStatus.NEW, status_changed_at=None, init_attempts=0)
         settings = _make_settings()
-        stored_hashes: set[str] = set()
+        created_article = create_article(db_conn, _make_article(id=None, topic_id=topic.id, content_hash="hash-1"))
+        db_conn.commit()
 
         async def fake_fetch(t, conn, **kwargs):
-            # Mimic real dedup: only return articles whose hash isn't already stored.
-            article = _make_article(id=None, topic_id=t.id, content_hash="hash-1")
-            if article.content_hash in stored_hashes:
-                return FetchResult(articles=[], total_feed_entries=1)
-            created = create_article(conn, article)
-            conn.commit()
-            stored_hashes.add(article.content_hash)
-            return FetchResult(articles=[created], total_feed_entries=1)
+            return FetchResult(articles=[created_article], total_feed_entries=1)
 
         with (
             patch("app.checker.fetch_new_articles_for_topic", side_effect=fake_fetch),
@@ -1348,18 +1355,12 @@ class TestMultiRoundInitialization:
                 return_value=_make_write_result(sufficient_data=False),
             ),
         ):
-            # Pass 1: stores the article, insufficient → back to NEW, attempts=1.
             await initialize_new_topic(topic, db_conn, settings)
-            after_pass1 = get_topic(db_conn, topic.id)
-            assert after_pass1.status == TopicStatus.NEW
-            assert after_pass1.init_attempts == 1
 
-            # Pass 2: fetch finds nothing new (already stored) → must NOT error.
-            await initialize_new_topic(after_pass1, db_conn, settings)
-
-        after_pass2 = get_topic(db_conn, topic.id)
-        assert after_pass2.status == TopicStatus.NEW
-        assert after_pass2.error_message is None
+        after_pass1 = get_topic(db_conn, topic.id)
+        assert after_pass1.status == TopicStatus.READY
+        assert after_pass1.init_attempts == 0
+        assert after_pass1.error_message is None
 
 
 class TestInitNoOverwriteConcurrentEdits:
@@ -1408,8 +1409,8 @@ class TestInitNoOverwriteConcurrentEdits:
         settings = _make_settings()
 
         updated = await self._drive_terminal_write(db_conn, topic, settings, sufficient=False)
-        assert updated.status == TopicStatus.NEW
-        assert updated.init_attempts == 1
+        assert updated.status == TopicStatus.READY
+        assert updated.init_attempts == 0
         assert updated.feed_urls == ["https://edited.example.com/feed.xml"]
         assert updated.confidence_threshold == 0.42
 

@@ -39,10 +39,6 @@ from app.webhooks import retry_pending_webhooks, send_webhooks
 
 logger = logging.getLogger(__name__)
 
-# Maximum number of initialization passes before a thin topic is forced READY
-# with whatever (insufficient) knowledge exists, to avoid looping forever.
-MAX_INIT_ATTEMPTS = 3
-
 # Single-flight guard: serializes notification drains within this process so
 # two overlapping drains (scheduler tick vs. a UI/CLI check-all) cannot both
 # walk the queue at once. The cross-process case is covered by the atomic
@@ -702,30 +698,14 @@ async def initialize_new_topic(
         if article_ids:
             mark_articles_processed(conn, article_ids)
 
-        if not write_result.sufficient_data and topic.init_attempts < MAX_INIT_ATTEMPTS:
-            # Thin data: retry on a later cycle. Bump attempts and send the topic
-            # back to NEW so the scheduler's gradual init re-runs it. Do NOT mark
-            # READY yet.
-            next_attempts = topic.init_attempts + 1
-            _set_init_status(TopicStatus.NEW, error_message=None, init_attempts=next_attempts)
-            logger.info(
-                "Knowledge for topic '%s' insufficient — retry %d/%d, back to NEW",
-                topic.name,
-                next_attempts,
-                MAX_INIT_ATTEMPTS,
-            )
-            return
-
-        # Either knowledge is sufficient, or attempts are exhausted: go READY.
         _set_init_status(TopicStatus.READY, error_message=None, init_attempts=0)
 
         if write_result.sufficient_data:
             logger.info("Knowledge initialized for topic '%s' — now READY", topic.name)
         else:
             logger.warning(
-                "Topic '%s' READY with insufficient knowledge after %d attempts",
+                "Topic '%s' READY with thin/insufficient knowledge — baseline stored, will self-heal on future checks",
                 topic.name,
-                MAX_INIT_ATTEMPTS,
             )
 
     except Exception as exc:
