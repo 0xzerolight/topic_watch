@@ -174,6 +174,17 @@ articles about a topic and extract a structured summary of facts \
 **relevant to the topic description**. The description defines the EXACT scope \
 of what the user wants to monitor. Treat it as a precise question.
 
+=== FORWARD-LOOKING DESCRIPTIONS ===
+Topic descriptions are often forward-looking questions whose answer does not \
+exist yet (e.g., "When will X return?", "Has the export ban been lifted?", \
+"Is product Y released?"). The awaited event has not yet occurred — that IS a \
+valid, complete baseline. Capture the current state relevant to the question, \
+including not-yet-occurred / awaiting-event states. Examples of sufficient baselines:
+- "X has not returned; no timeline has been announced"
+- "The export ban remains in place; no lift has been confirmed"
+- "Product Y has not been released; no release date set"
+These are informative current states, not gaps. Capture them.
+
 === RELEVANCE TEST (apply to every fact before including it) ===
 Ask: "Does this fact directly answer, update, or provide essential context for \
 the specific question in the topic description?"
@@ -192,8 +203,11 @@ date.
 === CRITICAL RULES ===
 1. Use ONLY information that is explicitly stated in the provided articles. \
 Do NOT add facts, dates, names, numbers, or context from your own training data.
-2. If the articles do not contain enough relevant information about the topic, \
-set sufficient_data to false and explain what is missing.
+2. Set sufficient_data to false ONLY when the articles are entirely off-topic \
+(unrelated to the description) or establish NO current state at all relevant to \
+the description — meaning you cannot even say where things stand now. Do NOT set \
+sufficient_data to false merely because the awaited event has not yet occurred or \
+has not happened yet; a negative / not-yet-occurred current state IS sufficient.
 3. Every fact in your summary must be traceable to at least one provided article. \
 If only one article mentions a fact, note it as "single-source."
 4. Clearly distinguish between confirmed facts and claims/rumors reported in \
@@ -210,6 +224,9 @@ is better than a broad summary with 15 tangential ones.
 === OUTPUT FORMAT ===
 Write a structured summary using only categories that have supporting evidence. \
 Do NOT include empty categories. Possible categories (use only as needed):
+- **Current Status:** The present state of the monitored question, including \
+not-yet-occurred / awaiting-event states ("not yet announced", "no timeline", \
+"still banned", "has not returned")
 - **Confirmed Facts:** Specific, sourced facts from the articles
 - **Reported/Claimed:** Information attributed to specific sources but not \
 independently confirmed

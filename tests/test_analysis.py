@@ -409,6 +409,49 @@ class TestBuildKnowledgeInitMessages:
         system_msg = messages[0]["content"]
         assert "relevant to the topic description" in system_msg
 
+    def test_init_prompt_teaches_absence_as_baseline(self) -> None:
+        """The init prompt must teach the LLM that a not-yet-occurred / negative
+        current state IS a sufficient baseline for forward-looking topics."""
+        topic = _make_topic()
+        articles = [_make_article()]
+        messages = build_knowledge_init_messages(articles, topic, max_tokens=2000)
+        system_msg = messages[0]["content"]
+        # Must explicitly call out forward-looking descriptions
+        assert "forward-looking" in system_msg
+        # Must name the not-yet-occurred / negative state concept
+        assert "not-yet-occurred" in system_msg or "not yet occurred" in system_msg
+
+    def test_init_prompt_narrows_sufficient_data_false_condition(self) -> None:
+        """sufficient_data=false must be narrowed: only for off-topic articles or
+        those establishing NO current state — not merely because the event hasn't happened."""
+        topic = _make_topic()
+        articles = [_make_article()]
+        messages = build_knowledge_init_messages(articles, topic, max_tokens=2000)
+        system_msg = messages[0]["content"]
+        # The narrowed condition must mention off-topic as one trigger
+        assert "off-topic" in system_msg
+        # Must clarify: sufficient_data=false is NOT just because event hasn't happened
+        assert "has not happened" in system_msg or "hasn't happened" in system_msg or "not yet occurred" in system_msg
+
+    def test_init_prompt_output_format_includes_current_status(self) -> None:
+        """The output format section must include a Current Status category so the
+        LLM knows where to capture not-yet-occurred / awaiting states."""
+        topic = _make_topic()
+        articles = [_make_article()]
+        messages = build_knowledge_init_messages(articles, topic, max_tokens=2000)
+        system_msg = messages[0]["content"]
+        assert "Current Status" in system_msg
+
+    def test_sufficient_data_field_description_reflects_narrowed_semantics(self) -> None:
+        """The Pydantic Field description for sufficient_data must document the narrowed
+        semantics: false only when off-topic or no current state can be established."""
+        field = KnowledgeStateUpdate.model_fields["sufficient_data"]
+        desc = field.description or ""
+        # Must mention off-topic or the narrowed condition
+        assert "off-topic" in desc or "no current state" in desc
+        # Must not remain the old, too-broad wording
+        assert "lack enough relevant information" not in desc
+
 
 # ============================================================
 # TestBuildKnowledgeUpdateMessages
