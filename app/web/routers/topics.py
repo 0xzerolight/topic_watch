@@ -356,9 +356,8 @@ async def reinit_topic(
     topic.status = TopicStatus.RESEARCHING
     topic.status_changed_at = datetime.now(UTC)
     topic.error_message = None
-    # OVH-098: explicit Retry restores the full thin-data retry budget, so a topic
-    # that previously bumped init_attempts before erroring does not start the retry
-    # with a reduced budget.
+    # Reset the (now vestigial) init_attempts counter so a re-init starts clean,
+    # in case stale DB state from an older build left it non-zero.
     topic.init_attempts = 0
     update_topic(conn, topic)
     conn.commit()
