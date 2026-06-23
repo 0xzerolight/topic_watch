@@ -36,9 +36,10 @@ class KnowledgeWriteResult:
         usage: ``TokenUsage`` consumed by the LLM call (prompt/completion tokens;
             both 0 if the provider omitted usage).
         sufficient_data: The LLM's ``sufficient_data`` verdict. For init, ``False``
-            means "insufficient data, worth retrying" (the state was still stored
-            with an explanation); ``True`` means good knowledge was built. For
-            update, ``False`` means the existing state was preserved unchanged.
+            means thin/off-topic articles (the state was still stored with an
+            explanation and the topic still goes READY); ``True`` means good
+            knowledge was built. For update, ``False`` means the existing state
+            was preserved unchanged.
     """
 
     state: KnowledgeState
@@ -210,8 +211,8 @@ async def initialize_knowledge(
     string-free signal the caller can branch on:
 
     * raises (hard error) -> set topic status to 'error'
-    * ``sufficient_data is False`` -> insufficient data, worth retrying in a later
-      cycle (the explanatory summary was still persisted)
+    * ``sufficient_data is False`` -> thin/off-topic articles; the explanatory
+      summary was still persisted as the baseline and the topic still goes READY
     * ``sufficient_data is True`` -> good knowledge was built and stored
     """
     if topic.id is None:
