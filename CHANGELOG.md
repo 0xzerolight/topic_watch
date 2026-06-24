@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - Per-topic confidence and relevance thresholds (override global defaults; high-stakes topics can demand stricter novelty)
 - Per-check LLM token cost shown in topic check history
-- Multi-round topic initialization that retries thin first-pass knowledge across cycles instead of going READY too early
+- Topic initialization reaches READY on the first pass even when early articles are thin or off-topic, storing an explanatory baseline summary that self-heals as fuller coverage arrives on later checks
 - Setup wizard pre-flight LLM credential validation (pings the model on submit; bad key/model is caught before completing setup)
 - Persistent webhook retry queue that survives restarts and respects `max_retries`
 - Knowledge compression that condenses over-budget knowledge via the LLM instead of truncating, preventing dropped facts from being re-detected as new
