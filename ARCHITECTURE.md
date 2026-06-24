@@ -60,6 +60,7 @@ All application code lives under `app/`.
 | `analysis/llm.py` | LiteLLM + Instructor wrappers. Defines `NoveltyResult` (with `confidence` and `relevance` scores), `KnowledgeStateUpdate`, and `TokenUsage`. Token counting, rate limit backoff with exponential delay. Returns safe default (`has_new_info=False`, `confidence=0.0`) on analysis failure. |
 | `analysis/prompts.py` | System and user prompt builders for novelty detection and knowledge init/update/compress. Articles truncated to 1500 chars in prompts. |
 | `analysis/knowledge.py` | Knowledge state initialization and updates with DB persistence. Token budget enforcement via summary compression. |
+| `analysis/restatement.py` | Pure phrase-matching filter (`filter_restated_key_facts`, re-exported by `llm.py`). Drops a key fact only when it is a clear restatement of the existing knowledge summary (normalized verbatim or long contiguous n-gram match), so already-known facts aren't re-flagged as new. Conservative by design. |
 
 ### Scraping
 
@@ -71,7 +72,6 @@ All application code lives under `app/`.
 | `scraping/providers.py` | News search provider definitions. `NewsProvider` Protocol plus `GoogleNewsProvider` / `BingNewsProvider` concrete classes that build keyword-search feed URLs from topic name + description (auto feed mode). |
 | `scraping/routing.py` | Health-based provider cascade. Tracks per-provider health in-memory and selects the first healthy provider per cycle (Bing first, Google second). Separate from the per-URL `feed_health` table. |
 | `scraping/google_news.py` | Resolves opaque Google News redirect URLs (`news.google.com/rss/articles/...`) to real article URLs via Google's `batchexecute` endpoint. |
-| `scraping/relevance.py` | Pre-LLM relevance scoring. `score_relevance()` rates an article 0.0–1.0 by keyword overlap between topic metadata and the entry's title/summary. |
 
 ### Data Layer
 
@@ -80,7 +80,7 @@ All application code lives under `app/`.
 | `models.py` | Pydantic models: `Topic`, `Article`, `KnowledgeState`, `CheckResult`, `FeedHealth`, `DashboardStats`, `PendingNotification`, `PendingWebhook`. Enums: `TopicStatus` (new/researching/ready/error), `FeedMode` (auto/manual). Each model has `from_row()` and `to_insert_dict()` for SQLite interop; datetime cells are coerced defensively. |
 | `crud.py` | All database operations grouped by model. Topic/Article/KnowledgeState/CheckResult CRUD, feed health upserts, pending notification + pending webhook queues, dashboard aggregation, article retention cleanup, stuck topic recovery. |
 | `database.py` | SQLite connection factory (WAL mode, foreign keys, busy timeout). Schema initialization (`init_db`). Migration runner (`run_migrations`) — backs up the DB before applying pending migrations. |
-| `migrations/` | 13 sequential migrations registered in `__init__.py` as `(version, description, up_function)` tuples. Tracked in `schema_version` table. Migrations are append-only. |
+| `migrations/` | 17 sequential migrations registered in `__init__.py` as `(version, description, up_function)` tuples. Tracked in `schema_version` table. Migrations are append-only. |
 | `interval.py` | Human-readable interval parsing/formatting (`m`/`h`/`d`/`w`/`M`, combined syntax like `"1w 3d 2h"`). Enforces min/max interval bounds. |
 | `opml.py` | OPML import/export. Parses feeds from RSS readers (FreshRSS, Miniflux, TT-RSS), validates feed URLs, and exports topics as OPML. |
 
@@ -93,7 +93,8 @@ The route handlers were split out of `routes.py` into the `web/routers/` package
 | `web/routes.py` | Backwards-compatible shim. Re-exports `router` from `web/routers/` so existing `from app.web.routes import router` imports still work. No handlers live here anymore. |
 | `web/routers/__init__.py` | Aggregate router. Includes the per-domain routers in include-order so static topic paths (`/topics/search`, `/topics/new`) register before the dynamic `/topics/{topic_id}` route. |
 | `web/routers/dashboard.py` | Dashboard page, `/health` check, and topic search. Reads the dashboard stats cache. |
-| `web/routers/topics.py` | Topic CRUD, detail/articles pages, manual check + init triggers, and per-topic CSV/JSON exports. |
+| `web/routers/topics.py` | Topic CRUD, detail/articles pages, and manual check + init triggers. |
+| `web/routers/exports.py` | Data export endpoints: all-topics JSON (`/export/topics/json`) and per-topic JSON/CSV (`/topics/{id}/export/json`, `/topics/{id}/export/csv`). |
 | `web/routers/settings.py` | Setup wizard, settings editor, and notification-test endpoint. Reads/writes config via `load_settings()` / `save_settings_to_yaml()`. |
 | `web/routers/feed_health.py` | Global feed-health dashboard and feed-URL validation endpoint (rate-limited). |
 | `web/routers/opml.py` | OPML import/export and bulk topic export (JSON). |
@@ -115,7 +116,8 @@ The route handlers were split out of `routes.py` into the `web/routers/` package
 | `logging_config.py` | Plain text or JSON structured logging. Controlled by `TOPIC_WATCH_LOG_FORMAT` and `TOPIC_WATCH_LOG_LEVEL` env vars. |
 | `check_context.py` | Correlation IDs via `contextvars.ContextVar`. `CheckIdFilter` injects check ID into all log records. |
 | `url_validation.py` | SSRF protection. Blocks private/reserved IPs (localhost, 10.x, 172.16-31.x, 192.168.x, link-local, CGNAT 100.64.0.0/10, IPv6 ULA). |
-| `notifications.py` | Apprise wrapper. Formats `NoveltyResult` into title/body. Sync Apprise send wrapped in `asyncio.to_thread()`. |
+| `notifications.py` | Apprise wrapper. Formats `NoveltyResult` into title/body. Sync Apprise send wrapped in `asyncio.to_thread()`. Re-exports `redact_url` from `log_redaction.py`. |
+| `log_redaction.py` | Log-hygiene helper. `redact_url` strips userinfo, query strings, fragments, and long (likely-secret) path segments from notification/webhook URLs, keeping scheme + host + a short path prefix for diagnostics. |
 | `webhooks.py` | JSON POST to configured webhook endpoints. Concurrent delivery via `asyncio.gather()`. Failed deliveries are queued in `pending_webhooks` and retried via `retry_pending_webhooks()` at the start of each check cycle. |
 | `cli.py` | Argparse CLI: `list`, `check`, `check-all`, `init`. |
 
