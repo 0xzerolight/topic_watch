@@ -1,8 +1,11 @@
 """Migration 013: Add init_attempts counter to topics.
 
-Tracks how many times a thin topic has been re-initialized after the LLM
-reported insufficient data, so the scheduler's gradual NEW-topic init can
-retry across cycles instead of marking a thin topic READY after one pass.
+Legacy column. It was added to drive multi-round initialization (bounce a thin
+topic back to NEW and retry across cycles when the LLM reported insufficient
+data), but that retry behavior was removed in b3b994c: thin topics now reach
+READY on the first pass with a baseline summary. The column is retained for
+schema continuity and is reset to 0 on the READY transition; it no longer gates
+any retry.
 """
 
 import sqlite3
