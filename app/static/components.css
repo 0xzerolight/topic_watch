@@ -40,18 +40,14 @@
   --app-text-xs: 0.75rem;
   --app-text-sm: 0.875rem;
   --app-stat: 1.75rem;
-  --app-h1: 1.5rem;
   /* Spacing (4px scale) */
   --app-1: 0.25rem;
   --app-2: 0.5rem;
   --app-3: 0.75rem;
   --app-4: 1rem;
   --app-6: 1.5rem;
-  --app-8: 2rem;
-  --app-12: 3rem;
   /* Radius */
   --app-radius: 0.5rem;
-  --app-radius-sm: 0.375rem;
   --app-radius-pill: 999px;
 }
 
@@ -182,7 +178,6 @@
 .badge--idle .badge-dot { background: var(--app-idle); }
 .badge--signal { background: var(--app-accent-soft); }
 .badge--signal .badge-dot { background: var(--app-accent); }
-.badge--soft { background: var(--app-surface-sunken); color: var(--app-ink-quiet); }
 
 /* Confidence badges (rendered by the confidence_value/confidence_badge filters) */
 .badge--conf-high { background: var(--app-ok-tint); }
@@ -212,7 +207,6 @@ a.chip:hover { background: var(--app-surface-sunken); }
   border-color: var(--app-accent);
   background: var(--app-accent-soft);
 }
-.chip--mode { font-weight: 400; }
 
 /* ============================================================
  * Data tables (hairlines, hover, problem rows, JS-free mobile collapse)
@@ -245,10 +239,6 @@ a.chip:hover { background: var(--app-surface-sunken); }
   box-shadow: inset 2px 0 0 var(--app-bad);
 }
 .data-table .row-inactive { opacity: 0.55; }
-.data-table--compact th,
-.data-table--compact td {
-  padding: var(--app-1) var(--app-3);
-}
 
 /* Inline error text inside a row (cell body, clamped) */
 .row-error {
@@ -360,21 +350,6 @@ a.chip:hover { background: var(--app-surface-sunken); }
   margin-bottom: 0;
 }
 
-/* Kebab = Pico's themed dropdown, compact + right-aligned popover */
-.kebab {
-  margin: 0;
-}
-.kebab > summary {
-  width: auto;
-  padding: 0.25rem 0.6rem;
-  margin: 0;
-}
-.kebab[class~="dropdown"] > ul {
-  right: 0;
-  left: auto;
-  min-width: 10rem;
-}
-
 /* ============================================================
  * Breadcrumb + active nav
  * ============================================================ */
@@ -416,16 +391,6 @@ a.chip:hover { background: var(--app-surface-sunken); }
   font-size: var(--app-text-xs);
   color: var(--app-ink-quiet);
 }
-.field--invalid input,
-.field--invalid textarea,
-.field--invalid select {
-  border-color: var(--app-bad);
-}
-.field-error {
-  margin-top: var(--app-1);
-  font-size: var(--app-text-xs);
-  color: var(--app-bad);
-}
 .schedule-preview {
   font-size: var(--app-text-sm);
   color: var(--app-ink-quiet);
@@ -450,22 +415,4 @@ a.chip:hover { background: var(--app-surface-sunken); }
 .empty-state .empty-title {
   font-weight: 600;
   color: var(--app-ink);
-}
-
-/* ============================================================
- * Sparkline (Phase 3 — viz.html macro). Theme-aware via currentColor.
- * ============================================================ */
-.sparkline {
-  display: inline-block;
-  color: var(--app-ink-quiet);
-  vertical-align: middle;
-}
-.sparkline .spark-line { fill: none; stroke: currentColor; stroke-width: 1.5; }
-.sparkline .spark-area { fill: var(--app-accent-soft); stroke: none; }
-.sparkline .spark-trend { fill: none; stroke: var(--app-accent); stroke-width: 1.5; }
-.sparkline .spark-last { fill: var(--app-accent); }
-
-/* Respect reduced-motion for any animated affordance defined here */
-@media (prefers-reduced-motion: reduce) {
-  .sparkline * { animation: none !important; }
 }
