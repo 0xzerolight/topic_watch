@@ -38,7 +38,14 @@ class NewsProvider(Protocol):
 
 
 class BingNewsProvider:
-    """Bing News RSS provider. No redirect resolution needed."""
+    """Bing News RSS provider.
+
+    Bing <link>s are ``apiclick.aspx`` redirects wrapping the real publisher URL
+    in their ``url`` query param. That is unwrapped synchronously at parse time
+    (``rss._resolve_bing_news_url``, zero-network), so no *async* HTTP resolution
+    is needed — hence ``needs_url_resolution()`` returns False (it gates only the
+    async resolver path, which Bing, unlike Google News, does not require).
+    """
 
     name = "bing_news"
     requires_api_key = False
