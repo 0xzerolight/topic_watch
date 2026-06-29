@@ -1,5 +1,21 @@
 {% extends "base.html" %}
 {% from "_pagination.html" import render_pagination %}
+{% macro feed_status(url, feed_health_map, active_url=None) %}
+  {%- if url in feed_health_map -%}
+    {%- set fh = feed_health_map[url] -%}
+    {%- if fh.consecutive_failures == 0 -%}
+      <span class="status-healthy" title="Healthy ({{ fh.total_fetches }} fetches, {{ fh.total_failures }} failures)">&#9679; Healthy</span>
+    {%- elif fh.consecutive_failures <= 2 -%}
+      <span class="status-degraded" title="Degraded ({{ fh.consecutive_failures }} consecutive failures)">&#9679; Degraded</span>
+    {%- else -%}
+      <span class="status-error" title="Unhealthy ({{ fh.consecutive_failures }} consecutive failures): {{ fh.last_error_message }}">&#9679; Unhealthy</span>
+    {%- endif -%}
+  {%- elif active_url and url != active_url -%}
+    <span class="status-unknown" title="Standby provider — only fetched if the primary fails">&#9679; Standby</span>
+  {%- else -%}
+    <span class="status-unknown" title="No health data yet — pending first check">&#9679; Not yet checked</span>
+  {%- endif -%}
+{% endmacro %}
 {% block title %}{{ topic.name }} - Topic Watch{% endblock %}
 {% block content %}
 <hgroup>
@@ -25,18 +41,8 @@
 <ul>
     {% for url in auto_feed_urls %}
     <li>
-        {% if url in feed_health_map %}
-            {% set fh = feed_health_map[url] %}
-            {% if fh.consecutive_failures == 0 %}
-                <span class="status-healthy" title="Healthy ({{ fh.total_fetches }} fetches, {{ fh.total_failures }} failures)">&#9679; Healthy</span>
-            {% elif fh.consecutive_failures <= 2 %}
-                <span class="status-degraded" title="Degraded ({{ fh.consecutive_failures }} consecutive failures)">&#9679; Degraded</span>
-            {% else %}
-                <span class="status-error" title="Unhealthy ({{ fh.consecutive_failures }} consecutive failures): {{ fh.last_error_message }}">&#9679; Unhealthy</span>
-            {% endif %}
-        {% else %}
-            <span class="status-unknown" title="No health data">&#9679; Unknown</span>
-        {% endif %}
+        {{ feed_status(url, feed_health_map, auto_feed_url) }}
+        <strong>{{ url|feed_source_name }}</strong>
         <a href="{{ url|safe_href }}" target="_blank">{{ url|truncate(80) }}</a>
     </li>
     {% endfor %}
@@ -48,18 +54,8 @@
 <ul>
     {% for url in topic.feed_urls %}
     <li>
-        {% if url in feed_health_map %}
-            {% set fh = feed_health_map[url] %}
-            {% if fh.consecutive_failures == 0 %}
-                <span class="status-healthy" title="Healthy ({{ fh.total_fetches }} fetches, {{ fh.total_failures }} failures)">&#9679; Healthy</span>
-            {% elif fh.consecutive_failures <= 2 %}
-                <span class="status-degraded" title="Degraded ({{ fh.consecutive_failures }} consecutive failures)">&#9679; Degraded</span>
-            {% else %}
-                <span class="status-error" title="Unhealthy ({{ fh.consecutive_failures }} consecutive failures): {{ fh.last_error_message }}">&#9679; Unhealthy</span>
-            {% endif %}
-        {% else %}
-            <span class="status-unknown" title="No health data">&#9679; Unknown</span>
-        {% endif %}
+        {{ feed_status(url, feed_health_map) }}
+        <strong>{{ url|feed_source_name }}</strong>
         <a href="{{ url|safe_href }}" target="_blank">{{ url }}</a>
     </li>
     {% endfor %}
