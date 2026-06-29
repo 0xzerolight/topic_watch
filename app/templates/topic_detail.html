@@ -1,47 +1,121 @@
 {% extends "base.html" %}
 {% from "_pagination.html" import render_pagination %}
-{% macro feed_status(url, feed_health_map, active_url=None) %}
-  {%- if url in feed_health_map -%}
-    {%- set fh = feed_health_map[url] -%}
-    {%- if fh.consecutive_failures == 0 -%}
-      <span class="status-healthy" title="Healthy ({{ fh.total_fetches }} fetches, {{ fh.total_failures }} failures)">&#9679; Healthy</span>
-    {%- elif fh.consecutive_failures <= 2 -%}
-      <span class="status-degraded" title="Degraded ({{ fh.consecutive_failures }} consecutive failures)">&#9679; Degraded</span>
-    {%- else -%}
-      <span class="status-error" title="Unhealthy ({{ fh.consecutive_failures }} consecutive failures): {{ fh.last_error_message }}">&#9679; Unhealthy</span>
-    {%- endif -%}
-  {%- elif active_url and url != active_url -%}
-    <span class="status-unknown" title="Standby provider — only fetched if the primary fails">&#9679; Standby</span>
-  {%- else -%}
-    <span class="status-unknown" title="No health data yet — pending first check">&#9679; Not yet checked</span>
-  {%- endif -%}
-{% endmacro %}
+{% from "_feed_status.html" import feed_status %}
 {% block title %}{{ topic.name }} - Topic Watch{% endblock %}
 {% block content %}
-<hgroup>
-    <h1>{{ topic.name }}</h1>
-    <p>{{ topic.description }}</p>
-    {% if topic.tags %}
-    <p>{% for tag in topic.tags %}<kbd>{{ tag }}</kbd> {% endfor %}</p>
-    {% endif %}
-</hgroup>
-
-{% if not topic.is_active %}
-<p><mark>This topic is currently disabled and will not be checked automatically.</mark></p>
+{# Status -> badge variant. Mirrors the _topic_row.html status labels but adds a
+   hue + shape via the shared .badge component. #}
+{% if topic.status.value == "ready" %}
+    {% set status_variant, status_label = "badge--ok", "Ready" %}
+{% elif topic.status.value == "researching" %}
+    {% set status_variant, status_label = "badge--signal", "Researching" %}
+{% elif topic.status.value == "new" %}
+    {% set status_variant, status_label = "badge--idle", "New" %}
+{% else %}
+    {% set status_variant, status_label = "badge--bad", "Error" %}
 {% endif %}
 
+<nav aria-label="Breadcrumb">
+    <ol class="breadcrumb">
+        <li><a href="/">Dashboard</a></li>
+        <li>{{ topic.name }}</li>
+    </ol>
+</nav>
+
+<div class="page-header masthead">
+    <hgroup>
+        <h1>{{ topic.name }} <span class="badge {{ status_variant }}"><span class="badge-dot"></span>{{ status_label }}</span></h1>
+        <p>{{ topic.description }}</p>
+        {% if topic.tags %}
+        <p>{% for tag in topic.tags %}<span class="chip">{{ tag }}</span> {% endfor %}</p>
+        {% endif %}
+    </hgroup>
+</div>
+
+{% if not topic.is_active %}
+<p><span class="badge badge--idle"><span class="badge-dot"></span>Disabled</span>
+   <small class="quiet">This topic is currently disabled and will not be checked automatically.</small></p>
+{% endif %}
+
+{# At-a-glance metadata. SIBLING of #status-area — never inside it. #}
+<dl class="meta-grid">
+    <div>
+        <dt>Check interval</dt>
+        <dd>
+            {% if formatted_interval %}
+                Every {{ formatted_interval }} <small class="quiet">(custom)</small>
+            {% else %}
+                Every {{ default_interval }} <small class="quiet">(global default)</small>
+            {% endif %}
+        </dd>
+    </div>
+    <div>
+        <dt>Feed mode</dt>
+        <dd>{{ "Automatic" if topic.feed_mode.value == "auto" else "Manual" }}</dd>
+    </div>
+    <div>
+        <dt>Confidence threshold</dt>
+        <dd>
+            {% if topic.confidence_threshold is not none %}
+                {{ "%.2f"|format(topic.confidence_threshold) }}
+            {% else %}
+                {{ "%.2f"|format(global_confidence_threshold) }} <small class="quiet">(default)</small>
+            {% endif %}
+        </dd>
+    </div>
+    <div>
+        <dt>Relevance threshold</dt>
+        <dd>
+            {% if topic.relevance_threshold is not none %}
+                {{ "%.2f"|format(topic.relevance_threshold) }}
+            {% else %}
+                {{ "%.2f"|format(global_relevance_threshold) }} <small class="quiet">(default)</small>
+            {% endif %}
+        </dd>
+    </div>
+    <div>
+        <dt>Created</dt>
+        <dd><span title="{{ topic.created_at.strftime('%Y-%m-%d %H:%M') }}">{{ topic.created_at | timeago }}</span></dd>
+    </div>
+    <div>
+        <dt>Status changed</dt>
+        <dd>
+            {% if topic.status_changed_at %}
+                <span title="{{ topic.status_changed_at.strftime('%Y-%m-%d %H:%M') }}">{{ topic.status_changed_at | timeago }}</span>
+            {% else %}
+                -
+            {% endif %}
+        </dd>
+    </div>
+</dl>
+
+{# CRITICAL: #status-area is a leaf. Its ONLY child is the status include — the
+   researching poll does hx-swap=innerHTML on it every 3s. Headings, breadcrumb,
+   and meta-grid above are SIBLINGS, never children. #}
 <div id="status-area">
     {% include "topic_status.html" %}
 </div>
 
 <h2>Feed Source</h2>
 {% if topic.feed_mode.value == "auto" %}
-<p><strong>Mode:</strong> Automatic</p>
 {% if auto_feed_urls %}
 <ul>
     {% for url in auto_feed_urls %}
     <li>
-        {{ feed_status(url, feed_health_map, auto_feed_url) }}
+        {%- if url in feed_health_map -%}
+            {%- set fh = feed_health_map[url] -%}
+            {%- if fh.consecutive_failures == 0 -%}
+                {{ feed_status("healthy", "Healthy (%d fetches, %d failures)" % (fh.total_fetches, fh.total_failures)) }}
+            {%- elif fh.consecutive_failures <= 2 -%}
+                {{ feed_status("degraded", "Degraded (%d consecutive failures)" % fh.consecutive_failures) }}
+            {%- else -%}
+                {{ feed_status("unhealthy", "Unhealthy (%d consecutive failures): %s" % (fh.consecutive_failures, fh.last_error_message)) }}
+            {%- endif -%}
+        {%- elif auto_feed_url and url != auto_feed_url -%}
+            {{ feed_status("standby", "Standby provider — only fetched if the primary fails") }}
+        {%- else -%}
+            {{ feed_status("not-checked", "No health data yet — pending first check") }}
+        {%- endif -%}
         <strong>{{ url|feed_source_name }}</strong>
         <a href="{{ url|safe_href }}" target="_blank">{{ url|truncate(80) }}</a>
     </li>
@@ -49,12 +123,22 @@
 </ul>
 {% endif %}
 {% else %}
-<p><strong>Mode:</strong> Manual</p>
 {% if topic.feed_urls %}
 <ul>
     {% for url in topic.feed_urls %}
     <li>
-        {{ feed_status(url, feed_health_map) }}
+        {%- if url in feed_health_map -%}
+            {%- set fh = feed_health_map[url] -%}
+            {%- if fh.consecutive_failures == 0 -%}
+                {{ feed_status("healthy", "Healthy (%d fetches, %d failures)" % (fh.total_fetches, fh.total_failures)) }}
+            {%- elif fh.consecutive_failures <= 2 -%}
+                {{ feed_status("degraded", "Degraded (%d consecutive failures)" % fh.consecutive_failures) }}
+            {%- else -%}
+                {{ feed_status("unhealthy", "Unhealthy (%d consecutive failures): %s" % (fh.consecutive_failures, fh.last_error_message)) }}
+            {%- endif -%}
+        {%- else -%}
+            {{ feed_status("not-checked", "No health data yet — pending first check") }}
+        {%- endif -%}
         <strong>{{ url|feed_source_name }}</strong>
         <a href="{{ url|safe_href }}" target="_blank">{{ url }}</a>
     </li>
@@ -65,38 +149,32 @@
 {% endif %}
 {% endif %}
 
-<p><strong>Check Interval:</strong>
-    {% if formatted_interval %}
-        Every {{ formatted_interval }} (custom)
-    {% else %}
-        Every {{ default_interval }} (global default)
-    {% endif %}
-</p>
-
 <h2>Recent Articles</h2>
 {% if articles %}
 <details>
     <summary>{{ article_count }} article{{ "s" if article_count != 1 }} (showing latest {{ articles|length }})</summary>
-    <div style="overflow-x: auto;">
-    <table>
+    <table class="data-table">
         <thead>
             <tr>
                 <th>Title</th>
                 <th>Source</th>
+                <th>Provider</th>
+                <th>Published</th>
                 <th>Fetched</th>
             </tr>
         </thead>
         <tbody>
             {% for article in articles %}
             <tr>
-                <td><a href="{{ article.url|safe_href }}" target="_blank">{{ article.title }}</a></td>
-                <td><small>{{ article.source_feed|feed_source_name }}</small></td>
-                <td>{{ article.fetched_at.strftime("%Y-%m-%d %H:%M") }}</td>
+                <td data-label="Title"><a href="{{ article.url|safe_href }}" target="_blank">{{ article.title }}</a></td>
+                <td data-label="Source"><small>{{ article.source_feed|feed_source_name }}</small></td>
+                <td data-label="Provider"><small>{{ article.source_provider if article.source_provider else "-" }}</small></td>
+                <td data-label="Published">{{ article.published_at.strftime("%Y-%m-%d %H:%M") if article.published_at else "-" }}</td>
+                <td data-label="Fetched">{{ article.fetched_at.strftime("%Y-%m-%d %H:%M") }}</td>
             </tr>
             {% endfor %}
         </tbody>
     </table>
-    </div>
 </details>
 {% else %}
 <div class="empty-state">
@@ -111,8 +189,7 @@
 ({{ total_prompt_tokens }} prompt + {{ total_completion_tokens }} completion)</small></p>
 {% endif %}
 {% if checks %}
-<div style="overflow-x: auto;">
-<table>
+<table class="data-table">
     <thead>
         <tr>
             <th>Time</th>
@@ -127,13 +204,13 @@
     </thead>
     <tbody>
         {% for check in checks %}
-        <tr>
-            <td><span title="{{ check.checked_at.strftime('%Y-%m-%d %H:%M') }}">{{ check.checked_at | timeago }}</span></td>
-            <td>{{ check.articles_found }}</td>
-            <td>{{ check.articles_new }}</td>
-            <td>{{ "Yes" if check.has_new_info else "No" }}</td>
-            <td>{{ check.llm_response | confidence_badge }}</td>
-            <td>
+        <tr{% if check.stage_error %} class="row-problem"{% endif %}>
+            <td data-label="Time"><span title="{{ check.checked_at.strftime('%Y-%m-%d %H:%M') }}">{{ check.checked_at | timeago }}</span></td>
+            <td data-label="Articles Found" class="num">{{ check.articles_found }}</td>
+            <td data-label="New Articles" class="num">{{ check.articles_new }}</td>
+            <td data-label="New Info">{{ "Yes" if check.has_new_info else "No" }}</td>
+            <td data-label="Confidence">{{ check.llm_response | confidence_badge }}</td>
+            <td data-label="Tokens" class="num">
                 {% set check_tokens = check.prompt_tokens + check.completion_tokens %}
                 {% if check_tokens %}
                     <span title="{{ check.prompt_tokens }} prompt + {{ check.completion_tokens }} completion">{{ check_tokens }}</span>
@@ -141,7 +218,7 @@
                     -
                 {% endif %}
             </td>
-            <td>
+            <td class="cell-stack" data-label="Notified">
                 {% if check.notification_sent %}
                     Sent
                 {% elif check.notification_error %}
@@ -150,10 +227,10 @@
                     -
                 {% endif %}
                 {% if check.stage_error %}
-                    <br><small class="stage-error" title="{{ check.stage_error }}">⚠ {{ check.stage_error }}</small>
+                    <small class="row-error" title="{{ check.stage_error }}">{{ check.stage_error }}</small>
                 {% endif %}
             </td>
-            <td>
+            <td data-label="Actions">
                 {% if check.has_new_info %}
                 <span id="notify-result-{{ check.id }}">
                     <button
@@ -161,8 +238,7 @@
                         hx-target="#notify-result-{{ check.id }}"
                         hx-swap="innerHTML"
                         hx-headers='{"X-CSRF-Token": "{{ request.state.csrf_token }}"}'
-                        style="font-size: 0.75rem; padding: 0.25rem 0.5rem;"
-                        class="outline"
+                        class="outline btn-sm"
                     >
                         Notify
                     </button>
@@ -175,7 +251,6 @@
         {% endfor %}
     </tbody>
 </table>
-</div>
 {{ render_pagination(page, total_pages, "/topics/" ~ topic.id) }}
 {% else %}
 <div class="empty-state">
@@ -232,5 +307,5 @@
     </form>
 </div>
 
-<p><small>Total articles: {{ article_count }} | Created: {{ topic.created_at.strftime("%Y-%m-%d %H:%M") }}</small></p>
+<p><small class="quiet">Total articles: {{ article_count }}</small></p>
 {% endblock %}

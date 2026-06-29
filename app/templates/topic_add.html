@@ -1,109 +1,129 @@
 {% extends "base.html" %}
 {% block title %}Add Topic - Topic Watch{% endblock %}
 {% block content %}
-<h1>Add Topic</h1>
+<div class="page-header masthead">
+    <h1>Add Topic</h1>
+</div>
 
 {% if errors %}
-<article aria-label="Validation errors">
-    <header>Validation Errors</header>
-    <ul>
+<div class="alert alert-error" role="alert" aria-label="Validation errors">
+    <strong>Validation Errors</strong>
+    <ul style="margin: 0.5rem 0 0;">
         {% for error in errors %}
         <li>{{ error }}</li>
         {% endfor %}
     </ul>
-</article>
+</div>
 {% endif %}
 
 <form method="post" action="/topics">
     <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
-    <label for="name">
-        Topic Name
-        <input type="text" id="name" name="name" required
-               value="{{ name or '' }}"
-               placeholder="e.g., Elden Ring DLC">
-    </label>
 
-    <label for="description">
-        Description (what you care about)
-        <input type="text" id="description" name="description" required
-               value="{{ description or '' }}"
-               placeholder="e.g., Release date, pricing, and new content">
-        <small>Be specific. The AI only reports on aspects you describe here. "Release date and pricing" works better than "any news."</small>
-    </label>
+    <section class="card">
+        <span class="card-kicker">Topic</span>
 
-    <fieldset>
-        <legend>Feed Source</legend>
-        <label>
-            <input type="radio" name="feed_mode" value="auto"
-                   {{ 'checked' if (feed_mode or 'auto') == 'auto' }}
-                   aria-controls="manual-feeds"
-                   onchange="document.getElementById('manual-feeds').style.display='none'; document.getElementById('manual-feeds').setAttribute('aria-hidden','true')">
-            Automatic (Google News)
-        </label>
-        <label>
-            <input type="radio" name="feed_mode" value="manual"
-                   {{ 'checked' if (feed_mode or 'auto') == 'manual' }}
-                   aria-controls="manual-feeds"
-                   onchange="document.getElementById('manual-feeds').style.display='block'; document.getElementById('manual-feeds').setAttribute('aria-hidden','false')">
-            Manual (provide RSS URLs)
-        </label>
-        <small>Automatic builds a Google News feed from the topic name. Manual lets you supply your own RSS/Atom feed URLs.</small>
-    </fieldset>
+        <div class="field-group">
+            <label for="name">Topic Name</label>
+            <input type="text" id="name" name="name" required
+                   value="{{ name or '' }}"
+                   placeholder="e.g., Elden Ring DLC">
+        </div>
 
-    <div id="manual-feeds" aria-hidden="{{ 'false' if (feed_mode or 'auto') == 'manual' else 'true' }}" style="{{ 'display:block' if (feed_mode or 'auto') == 'manual' else 'display:none' }}">
-        <label for="feed_urls">
-            RSS Feed URLs (one per line)
-            <textarea id="feed_urls" name="feed_urls" rows="4"
-                      placeholder="https://example.com/feed.xml">{{ feed_urls or '' }}</textarea>
-        </label>
-        <button type="button"
-                hx-post="/feeds/validate"
-                hx-include="#feed_urls"
-                hx-target="#feed-validation-results"
-                hx-swap="innerHTML"
-                class="secondary outline"
-                style="margin-top: 0.5em;">
-            Validate URLs
-        </button>
-        <div id="feed-validation-results"></div>
-    </div>
+        <div class="field-group">
+            <label for="description">Description (what you care about)</label>
+            <input type="text" id="description" name="description" required
+                   value="{{ description or '' }}"
+                   placeholder="e.g., Release date, pricing, and new content">
+            <small class="help">Be specific. The AI only reports on aspects you describe here. "Release date and pricing" works better than "any news."</small>
+        </div>
+    </section>
 
-    <label for="check_interval">
-        Check Interval
-        <input type="text" id="check_interval" name="check_interval"
-               value="{{ check_interval or '' }}"
-               placeholder="e.g., 6h, 1d, 2w, 1M, 1w 3d">
-        <small>Leave empty to use the global default. Units: m (minutes), h (hours), d (days), w (weeks), M (months).</small>
-    </label>
+    <section class="card">
+        <span class="card-kicker">Feed Source</span>
 
-    <label for="tags">
-        Tags (comma-separated)
-        <input type="text" id="tags" name="tags"
-               value="{{ tags or '' }}"
-               placeholder="e.g., tech, ai, security">
-        <small>Optional. Use tags to organize and filter topics.</small>
-    </label>
+        <fieldset>
+            <label>
+                <input type="radio" name="feed_mode" value="auto"
+                       {{ 'checked' if (feed_mode or 'auto') == 'auto' }}
+                       aria-controls="manual-feeds"
+                       onchange="document.getElementById('manual-feeds').style.display='none'; document.getElementById('manual-feeds').setAttribute('aria-hidden','true')">
+                Automatic (Google News)
+            </label>
+            <label>
+                <input type="radio" name="feed_mode" value="manual"
+                       {{ 'checked' if (feed_mode or 'auto') == 'manual' }}
+                       aria-controls="manual-feeds"
+                       onchange="document.getElementById('manual-feeds').style.display='block'; document.getElementById('manual-feeds').setAttribute('aria-hidden','false')">
+                Manual (provide RSS URLs)
+            </label>
+            <small class="help">Automatic builds a Google News feed from the topic name. Manual lets you supply your own RSS/Atom feed URLs.</small>
+        </fieldset>
 
-    <fieldset>
-        <legend>Notification Thresholds (optional)</legend>
-        <label for="confidence_threshold">
-            Confidence threshold
+        <div id="manual-feeds" aria-hidden="{{ 'false' if (feed_mode or 'auto') == 'manual' else 'true' }}" style="{{ 'display:block' if (feed_mode or 'auto') == 'manual' else 'display:none' }}">
+            <div class="field-group">
+                <label for="feed_urls">RSS Feed URLs (one per line)</label>
+                <textarea id="feed_urls" name="feed_urls" rows="4"
+                          placeholder="https://example.com/feed.xml">{{ feed_urls or '' }}</textarea>
+            </div>
+            <button type="button"
+                    hx-post="/feeds/validate"
+                    hx-include="#feed_urls"
+                    hx-target="#feed-validation-results"
+                    hx-swap="innerHTML"
+                    class="secondary outline"
+                    style="margin-top: 0.5em;">
+                Validate URLs
+            </button>
+            <div id="feed-validation-results"></div>
+        </div>
+    </section>
+
+    <section class="card">
+        <span class="card-kicker">Schedule &amp; Tags</span>
+
+        <div class="field-group">
+            <label for="check_interval">Check Interval</label>
+            <input type="text" id="check_interval" name="check_interval"
+                   value="{{ check_interval or '' }}"
+                   placeholder="e.g., 6h, 1d, 2w, 1M, 1w 3d">
+            <small class="help">Leave empty to use the global default. Units: m (minutes), h (hours), d (days), w (weeks), M (months).</small>
+            {% if interval_preview %}
+            <small class="schedule-preview">Checks every {{ interval_preview }}.</small>
+            {% endif %}
+        </div>
+
+        <div class="field-group">
+            <label for="tags">Tags (comma-separated)</label>
+            <input type="text" id="tags" name="tags"
+                   value="{{ tags or '' }}"
+                   placeholder="e.g., tech, ai, security">
+            <small class="help">Optional. Use tags to organize and filter topics.</small>
+        </div>
+    </section>
+
+    <section class="card">
+        <span class="card-kicker">Notification Thresholds (optional)</span>
+
+        <div class="field-group">
+            <label for="confidence_threshold">Confidence threshold</label>
             <input type="number" id="confidence_threshold" name="confidence_threshold"
                    min="0" max="1" step="0.01"
                    value="{{ confidence_threshold or '' }}"
                    placeholder="inherit global ({{ '%.2f'|format(global_confidence_threshold) }})">
-            <small>Leave blank to inherit the global default. Higher = fewer, more certain notifications.</small>
-        </label>
-        <label for="relevance_threshold">
-            Relevance threshold
+            <small class="help">Leave blank to inherit the global default. Higher = fewer, more certain notifications.</small>
+        </div>
+        <div class="field-group">
+            <label for="relevance_threshold">Relevance threshold</label>
             <input type="number" id="relevance_threshold" name="relevance_threshold"
                    min="0" max="1" step="0.01"
                    value="{{ relevance_threshold or '' }}"
                    placeholder="inherit global ({{ '%.2f'|format(global_relevance_threshold) }})">
-            <small>Leave blank to inherit the global default. 0.0–1.0.</small>
-        </label>
-    </fieldset>
+            <small class="help">Leave blank to inherit the global default. 0.0–1.0.</small>
+        </div>
+    </section>
 
-    <button type="submit">Create Topic</button>
+    <div class="form-actions">
+        <button type="submit">Create Topic</button>
+    </div>
 </form>
 {% endblock %}

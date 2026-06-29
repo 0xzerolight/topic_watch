@@ -160,11 +160,14 @@ def _safe_href(url: str | None) -> str:
 
 
 def _confidence_value(confidence: float | int | None) -> str:
-    """Render a confidence scalar (already extracted) as a colored badge.
+    """Render a confidence scalar (already extracted) as a status badge.
 
     Used on the dashboard, where the confidence is read via SQL ``json_extract``
     so the full ``llm_response`` blob is never shipped/parsed per topic
     (OVH-052). ``None`` (no check / missing confidence) renders as ``-``.
+
+    Emits classes only — never inline hex. Colors live in ``components.css``
+    (``.badge--conf-{high,mid,low}``) so every theme inherits them.
     """
     if confidence is None:
         return "-"
@@ -174,17 +177,15 @@ def _confidence_value(confidence: float | int | None) -> str:
         return "-"
 
     if score >= 0.8:
-        bg, color = "#2ecc40", "#fff"
+        level = "high"
     elif score >= 0.5:
-        bg, color = "#ffdc00", "#111"
+        level = "mid"
     else:
-        bg, color = "#ff4136", "#fff"
+        level = "low"
 
     score_text = f"{score:.2f}"
     return Markup(  # type: ignore[no-any-return]
-        f'<span style="background:{bg};color:{color};padding:0.15em 0.5em;'
-        f'border-radius:0.25em;font-size:0.85em;font-weight:600;" '
-        f'title="Confidence: {score_text}">{score_text}</span>'
+        f'<span class="badge badge--conf-{level}" title="Confidence: {score_text}">{score_text}</span>'
     )
 
 

@@ -68,12 +68,16 @@ async def create_topic_handler(
     relevance_threshold: str = Form(""),
 ):
     """Create a new topic and kick off initial research in the background."""
+    from app.interval import format_interval
+
     mode, urls, parsed_interval, errors = await validate_topic_form(feed_mode, feed_urls, check_interval)
     tag_list = [t.strip() for t in tags.split(",") if t.strip()]
     conf_threshold = parse_threshold(confidence_threshold, "Confidence threshold", errors)
     rel_threshold = parse_threshold(relevance_threshold, "Relevance threshold", errors)
 
     def _render_errors() -> HTMLResponse:
+        # Reuse the already-parsed interval (no re-parse) for the schedule preview.
+        formatted = format_interval(parsed_interval) if parsed_interval else ""
         return templates.TemplateResponse(
             request,
             "topic_add.html",
@@ -84,6 +88,7 @@ async def create_topic_handler(
                 "feed_urls": feed_urls,
                 "feed_mode": feed_mode,
                 "check_interval": check_interval,
+                "interval_preview": formatted,
                 "tags": tags,
                 "confidence_threshold": confidence_threshold,
                 "relevance_threshold": relevance_threshold,
@@ -194,6 +199,8 @@ async def topic_detail(
             "feed_health_map": feed_health_map,
             "total_prompt_tokens": total_prompt_tokens,
             "total_completion_tokens": total_completion_tokens,
+            "global_confidence_threshold": settings.min_confidence_threshold,
+            "global_relevance_threshold": settings.min_relevance_threshold,
         },
     )
 
@@ -428,12 +435,16 @@ async def edit_topic_handler(
     if topic is None:
         raise HTTPException(status_code=404, detail="Topic not found")
 
+    from app.interval import format_interval
+
     mode, urls, parsed_interval, errors = await validate_topic_form(feed_mode, feed_urls, check_interval)
     tag_list = [t.strip() for t in tags.split(",") if t.strip()]
     conf_threshold = parse_threshold(confidence_threshold, "Confidence threshold", errors)
     rel_threshold = parse_threshold(relevance_threshold, "Relevance threshold", errors)
 
     if errors:
+        # Reuse the already-parsed interval (no re-parse) for the schedule preview.
+        formatted = format_interval(parsed_interval) if parsed_interval else ""
         return templates.TemplateResponse(
             request,
             "topic_edit.html",
@@ -445,6 +456,7 @@ async def edit_topic_handler(
                 "feed_urls": feed_urls,
                 "feed_mode": feed_mode,
                 "check_interval": check_interval,
+                "interval_preview": formatted,
                 "tags": tags,
                 "confidence_threshold": confidence_threshold,
                 "relevance_threshold": relevance_threshold,
