@@ -270,8 +270,13 @@ async def safe_get(
     client: httpx.AsyncClient,
     url: str,
     *,
+    headers: dict[str, str] | None = None,
     max_redirects: int = _MAX_REDIRECTS,
 ) -> httpx.Response:
-    """GET ``url`` with redirect-target SSRF validation on every hop."""
-    request = client.build_request("GET", url)
+    """GET ``url`` with redirect-target SSRF validation on every hop.
+
+    ``headers`` are merged onto the request (e.g. conditional-GET validators);
+    they do not affect host validation, so no SSRF surface is added.
+    """
+    request = client.build_request("GET", url, headers=headers)
     return await safe_send(client, request, max_redirects=max_redirects)

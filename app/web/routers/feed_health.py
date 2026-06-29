@@ -2,13 +2,16 @@
 
 import asyncio
 import sqlite3
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse
 
+from app.config import Settings
 from app.crud import list_all_feed_health
+from app.feed_backoff import feed_backoff_until
 from app.web.csrf import verify_csrf
-from app.web.dependencies import get_db_conn
+from app.web.dependencies import get_db_conn, get_settings
 from app.web.routers.templates import templates
 from app.web.state import _check_rate_limit
 
@@ -19,13 +22,25 @@ router = APIRouter()
 async def feed_health_page(
     request: Request,
     conn: sqlite3.Connection = Depends(get_db_conn),
+    settings: Settings = Depends(get_settings),
 ):
     """Global feed health dashboard."""
     feeds = list_all_feed_health(conn)
+    now = datetime.now(UTC)
+    backoff_map: dict[str, str] = {}
+    for feed in feeds:
+        until = feed_backoff_until(
+            feed,
+            base_minutes=settings.feed_backoff_base_minutes,
+            cap_hours=settings.feed_backoff_cap_hours,
+        )
+        if until is not None and until > now:
+            hours = max(1, round((until - now).total_seconds() / 3600))
+            backoff_map[feed.feed_url] = f"next retry ~{hours}h"
     return templates.TemplateResponse(
         request,
         "feed_health.html",
-        {"feeds": feeds},
+        {"feeds": feeds, "backoff_map": backoff_map},
     )
 
 

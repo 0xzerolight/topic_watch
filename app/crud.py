@@ -759,17 +759,30 @@ def delete_expired_webhooks(conn: sqlite3.Connection) -> list[PendingWebhook]:
 # --- FeedHealth CRUD ---
 
 
-def upsert_feed_health_success(conn: sqlite3.Connection, feed_url: str) -> None:
-    """Record a successful feed fetch."""
+def upsert_feed_health_success(
+    conn: sqlite3.Connection,
+    feed_url: str,
+    etag: str | None = None,
+    last_modified: str | None = None,
+) -> None:
+    """Record a successful feed fetch.
+
+    ``etag`` / ``last_modified`` are the response's conditional-GET validators.
+    A 304 (unchanged) passes ``None`` for both; ``COALESCE`` then preserves the
+    previously stored validators instead of wiping them.
+    """
     now = datetime.now(UTC).isoformat()
     conn.execute(
-        """INSERT INTO feed_health (feed_url, last_success_at, consecutive_failures, total_fetches)
-           VALUES (?, ?, 0, 1)
+        """INSERT INTO feed_health
+               (feed_url, last_success_at, consecutive_failures, total_fetches, etag, last_modified)
+           VALUES (?, ?, 0, 1, ?, ?)
            ON CONFLICT(feed_url) DO UPDATE SET
                last_success_at = ?,
                consecutive_failures = 0,
-               total_fetches = total_fetches + 1""",
-        (feed_url, now, now),
+               total_fetches = total_fetches + 1,
+               etag = COALESCE(?, etag),
+               last_modified = COALESCE(?, last_modified)""",
+        (feed_url, now, etag, last_modified, now, etag, last_modified),
     )
 
 

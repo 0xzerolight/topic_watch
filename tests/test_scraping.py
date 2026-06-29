@@ -9,8 +9,8 @@ import pytest
 import trafilatura
 
 from app.analysis.prompts import _STUB_CONTENT_MIN_CHARS, _content_quality_tag
-from app.crud import create_article, create_topic, list_articles_for_topic
-from app.models import Article, FeedMode, Topic
+from app.crud import create_article, create_topic, list_articles_for_topic, upsert_feed_health_failure
+from app.models import Article, FeedHealth, FeedMode, Topic
 from app.scraping import fetch_new_articles_for_topic
 from app.scraping.content import _truncate, extract_article_content
 from app.scraping.providers import GoogleNewsProvider
@@ -340,7 +340,7 @@ class TestFetchFeed:
         assert entries == []
         assert fetch_ok is False
         callback.assert_called_once()
-        url_arg, ok_arg, reason_arg = callback.call_args[0]
+        url_arg, ok_arg, reason_arg = callback.call_args[0][:3]
         assert url_arg == "https://example.com/feed"
         assert ok_arg is False
         assert reason_arg is not None  # carries the bozo exception text
@@ -422,7 +422,7 @@ class TestFeedBozoHandling:
 
         assert fetch_ok is True
         assert [e.title for e in entries] == ["Recovered & Co"]
-        callback.assert_called_once_with("https://example.com/feed.xml", True, None)
+        callback.assert_called_once_with("https://example.com/feed.xml", True, None, None, None)
 
 
 # ============================================================
@@ -1350,7 +1350,16 @@ class TestFetchNewArticlesForTopic:
 
         topic = self._make_topic(db_conn)
 
-        async def _fake_fetch(topic_arg, *, timeout, max_attempts, health_callback):
+        async def _fake_fetch(
+            topic_arg,
+            *,
+            timeout,
+            max_attempts,
+            health_callback,
+            feed_state_loader=None,
+            backoff_base_minutes=15,
+            backoff_cap_hours=24,
+        ):
             # Simulate a successful feed fetch that triggers a health write.
             if health_callback:
                 health_callback("https://example.com/feed.xml", True, None)
@@ -1938,3 +1947,222 @@ class TestResolveRedirectUrls:
         with patch("app.scraping.resolve_google_news_urls", new_callable=AsyncMock) as mock_resolve:
             await _resolve_redirect_urls(fetch_batch, response, feed_fetch_timeout=5.0)
         mock_resolve.assert_not_called()
+
+
+class TestFeedStateHelpers:
+    """Phase 1: health callback forwards validators; state loader reads the row."""
+
+    def test_health_callback_forwards_validators(self, db_conn: sqlite3.Connection) -> None:
+        from app.crud import get_feed_health
+        from app.scraping import _make_health_callback
+
+        cb = _make_health_callback(db_conn)
+        cb("https://ex.com/feed", True, None, 'W/"v1"', "LM1")
+        db_conn.commit()
+        h = get_feed_health(db_conn, "https://ex.com/feed")
+        assert h is not None and h.etag == 'W/"v1"' and h.last_modified == "LM1"
+
+    def test_feed_state_loader_returns_row(self, db_conn: sqlite3.Connection) -> None:
+        from app.crud import upsert_feed_health_failure
+        from app.scraping import _make_feed_state_loader
+
+        upsert_feed_health_failure(db_conn, "https://ex.com/feed", "boom")
+        db_conn.commit()
+        loader = _make_feed_state_loader(db_conn)
+        h = loader("https://ex.com/feed")
+        assert h is not None and h.consecutive_failures == 1
+        assert loader("https://missing.example/feed") is None
+
+
+class TestConditionalGet:
+    """Phase 1: conditional GET (ETag/Last-Modified) + 304 fast-path."""
+
+    async def test_conditional_get_304_is_empty_but_ok(self) -> None:
+        from app.scraping.rss import fetch_feed_with_status
+
+        sent: dict[str, str] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            sent.update(request.headers)
+            return httpx.Response(304)
+
+        calls: list[tuple] = []
+
+        def cb(url, success, err, etag=None, lm=None):
+            calls.append((url, success, err, etag, lm))
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+            entries, ok = await fetch_feed_with_status(
+                "https://example.com/feed", client, health_callback=cb, etag='W/"v1"', last_modified="LM1"
+            )
+
+        assert entries == [] and ok is True
+        assert sent.get("if-none-match") == 'W/"v1"'
+        assert sent.get("if-modified-since") == "LM1"
+        # success recorded, validators NOT overwritten (None, None preserves them via COALESCE)
+        assert calls == [("https://example.com/feed", True, None, None, None)]
+
+    async def test_conditional_get_200_forwards_validators(self) -> None:
+        from app.scraping.rss import fetch_feed_with_status
+
+        rss = (
+            '<?xml version="1.0"?><rss version="2.0"><channel><title>T</title>'
+            "<item><title>A</title><link>https://example.com/a</link></item></channel></rss>"
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, text=rss, headers={"ETag": 'W/"v2"', "Last-Modified": "LM2"})
+
+        calls: list[tuple] = []
+
+        def cb(url, success, err, etag=None, lm=None):
+            calls.append((url, success, err, etag, lm))
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+            entries, ok = await fetch_feed_with_status("https://example.com/feed", client, health_callback=cb)
+
+        assert ok is True and len(entries) == 1
+        assert calls == [("https://example.com/feed", True, None, 'W/"v2"', "LM2")]
+
+
+def _dead_feed_health(url: str) -> FeedHealth:
+    return FeedHealth(feed_url=url, consecutive_failures=10, last_error_at=datetime.now(UTC))
+
+
+class TestManualBackoffAndValidators:
+    """Phase 1: MANUAL backoff-skip + validator threading (both modes)."""
+
+    async def test_manual_skips_backed_off_feed(self) -> None:
+        topic = Topic(
+            name="T",
+            description="d",
+            feed_urls=["https://live.example/feed", "https://dead.example/feed"],
+            feed_mode=FeedMode.MANUAL,
+        )
+        attempted: list[str] = []
+
+        async def fake_fetch(
+            url, client, *, timeout, max_attempts, health_callback=None, etag=None, last_modified=None
+        ):
+            attempted.append(url)
+            return ([FeedEntry(title="A", url="https://live.example/a", source_feed=url)], True)
+
+        def loader(url):
+            return _dead_feed_health(url) if url == "https://dead.example/feed" else None
+
+        with patch("app.scraping.rss.fetch_feed_with_status", side_effect=fake_fetch):
+            resp = await fetch_feeds_for_topic(
+                topic, feed_state_loader=loader, backoff_base_minutes=15, backoff_cap_hours=24
+            )
+
+        assert attempted == ["https://live.example/feed"]  # dead feed never fetched
+        assert resp.feeds_skipped == 1
+        assert resp.feeds_total == 1  # only the attempted feed counts
+
+    async def test_manual_all_backed_off_returns_empty(self) -> None:
+        topic = Topic(name="T", description="d", feed_urls=["https://dead.example/feed"], feed_mode=FeedMode.MANUAL)
+
+        async def fake_fetch(*a, **k):  # must never be called
+            raise AssertionError("backed-off feed must not be fetched")
+
+        with patch("app.scraping.rss.fetch_feed_with_status", side_effect=fake_fetch):
+            resp = await fetch_feeds_for_topic(
+                topic, feed_state_loader=_dead_feed_health, backoff_base_minutes=15, backoff_cap_hours=24
+            )
+
+        assert resp.feeds_skipped == 1
+        assert resp.feeds_total == 0
+        assert resp.entries == []
+
+    async def test_auto_sends_stored_validators(self) -> None:
+        topic = Topic(name="T", description="d", feed_urls=[], feed_mode=FeedMode.AUTO)
+        seen: list[tuple[str | None, str | None]] = []
+
+        async def fake_fetch(
+            url, client, *, timeout, max_attempts, health_callback=None, etag=None, last_modified=None
+        ):
+            seen.append((etag, last_modified))
+            return ([FeedEntry(title="A", url="https://x/a", source_feed=url)], True)
+
+        def loader(url):
+            return FeedHealth(feed_url=url, etag='W/"auto"', last_modified="LM")
+
+        with patch("app.scraping.rss.fetch_feed_with_status", side_effect=fake_fetch):
+            await fetch_feeds_for_topic(topic, feed_state_loader=loader)
+
+        assert seen and seen[0] == ('W/"auto"', "LM")  # AUTO threaded the stored validators
+
+    async def test_auto_cascade_sends_fallback_validators(self) -> None:
+        # Forced cascade: primary fails, fallback yields entries — assert the FALLBACK
+        # fetch received the fallback URL's own stored validators (the cascade branch).
+        from app.scraping.routing import ProviderRouter
+
+        topic = Topic(name="T", description="d", feed_urls=[], feed_mode=FeedMode.AUTO)
+        calls: list[tuple[str, str | None]] = []  # (url, etag)
+
+        async def fake_fetch(
+            url, client, *, timeout, max_attempts, health_callback=None, etag=None, last_modified=None
+        ):
+            calls.append((url, etag))
+            if len(calls) == 1:  # primary: fetch failed, no entries -> cascade
+                return ([], False)
+            return ([FeedEntry(title="A", url="https://x/a", source_feed=url)], True)
+
+        def loader(url):
+            return FeedHealth(feed_url=url, etag=f"etag::{url[:20]}", last_modified="LM")
+
+        with patch("app.scraping.rss.fetch_feed_with_status", side_effect=fake_fetch):
+            # Fresh router so global provider-health state is not mutated.
+            await fetch_feeds_for_topic(topic, router=ProviderRouter(), feed_state_loader=loader)
+
+        assert len(calls) == 2  # primary + cascade fallback
+        fb_url, fb_etag = calls[1]
+        assert fb_etag == f"etag::{fb_url[:20]}"  # fallback got ITS url's stored validator
+
+
+class TestOrchestratorBackoff:
+    """Phase 1: feeds_skipped propagates through the orchestrator + checker wiring."""
+
+    async def test_orchestrator_skips_backed_off_manual_feed(self, db_conn: sqlite3.Connection) -> None:
+        # Pre-seed a dead feed with enough failures to be deep in backoff.
+        for _ in range(10):
+            upsert_feed_health_failure(db_conn, "https://dead.example/feed", "boom")
+        db_conn.commit()
+
+        topic = create_topic(
+            db_conn,
+            Topic(name="T", description="d", feed_urls=["https://dead.example/feed"], feed_mode=FeedMode.MANUAL),
+        )
+        db_conn.commit()
+
+        result = await fetch_new_articles_for_topic(topic, db_conn)
+
+        assert result.feeds_skipped == 1
+        assert result.feeds_total == 0
+        assert result.articles == []
+
+    async def test_orchestrator_feeds_skipped_survives_final_return(self, db_conn: sqlite3.Connection) -> None:
+        # A live feed yields one entry AND one feed was skipped — feeds_skipped must
+        # survive on the final FetchResult return, not just the early-empty path.
+        topic = create_topic(
+            db_conn,
+            Topic(name="T2", description="d", feed_urls=["https://live.example/feed"], feed_mode=FeedMode.MANUAL),
+        )
+        db_conn.commit()
+
+        response = FeedResponse(
+            entries=[FeedEntry(title="A", url="https://live.example/a", source_feed="https://live.example/feed")],
+            feeds_total=1,
+            feeds_failed=0,
+            feeds_skipped=1,
+        )
+        with (
+            patch("app.scraping.fetch_feeds_for_topic", return_value=response),
+            patch("app.scraping.extract_article_content", return_value="body text"),
+        ):
+            result = await fetch_new_articles_for_topic(topic, db_conn)
+
+        assert result.feeds_skipped == 1
+        assert len(result.articles) == 1
