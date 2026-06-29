@@ -1,22 +1,47 @@
-# Topic Watch
+<h1 align="center">Topic Watch</h1>
 
-[![CI](https://github.com/0xzerolight/topic_watch/actions/workflows/ci.yml/badge.svg)](https://github.com/0xzerolight/topic_watch/actions/workflows/ci.yml)
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Coverage](https://img.shields.io/badge/coverage-94%25-brightgreen.svg)](https://github.com/0xzerolight/topic_watch)
+<p align="center">
+  <a href="https://github.com/0xzerolight/topic_watch/actions/workflows/ci.yml"><img src="https://github.com/0xzerolight/topic_watch/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://www.gnu.org/licenses/gpl-3.0"><img src="https://img.shields.io/badge/License-GPLv3-blue.svg" alt="License: GPL v3"></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.11+-blue.svg" alt="Python 3.11+"></a>
+  <a href="https://github.com/0xzerolight/topic_watch"><img src="https://img.shields.io/badge/coverage-94%25-brightgreen.svg" alt="Coverage"></a>
+  <a href="https://github.com/0xzerolight/topic_watch/stargazers"><img src="https://img.shields.io/github/stars/0xzerolight/topic_watch?style=social" alt="GitHub stars"></a>
+</p>
 
-Self-hosted news monitoring with LLM-powered novelty detection. Watches topics via RSS feeds, notifies you only when genuinely new information appears. BYOK (bring your own key).
+<p align="center">
+  <strong>Self-hosted news monitor that pings you only on genuinely new info.</strong>
+</p>
+
+<p align="center">
+  Like Google Alerts — but it knows the difference between <em>new</em> and <em>rehashed</em>.
+  An LLM tracks what's already known about each topic and stays silent until something
+  actually changes. Bring your own key, or run it free against a local model.
+</p>
+
+<p align="center">
+  ⭐ Star if Topic Watch is useful — it helps others find it.
+</p>
 
 <p align="center">
   <img src="assets/themes-showcase.gif" alt="Topic Watch — theme showcase" width="720">
 </p>
 
+<!-- TODO: a short workflow GIF (add topic → novelty detected → notification) converts
+     better than this theme loop. Swap the hero image once recorded. -->
+
 ## How It Works
 
-1. Define topics with RSS feed URLs, or let it auto-generate a news-search feed (Bing News first, Google News as fallback)
+1. Define a topic with RSS feed URLs, or let it auto-generate a news-search feed (Bing News first, Google News as fallback)
 2. On a schedule, articles are fetched and compared against a **knowledge state** (a rolling summary of what's already known)
 3. An LLM decides if anything is actually new
-4. New info: notification with summary + sources. Nothing new: silence.
+4. New info → notification with summary + sources. Nothing new → silence.
+
+## Why Topic Watch
+
+- **Novelty, not keywords** — it maintains a per-topic knowledge state and ignores the 10th article rehashing the same story. Not keyword matching, not summarization.
+- **Private and self-hosted** — your data stays on your machine. Outbound traffic only goes to RSS feeds, your LLM provider, and your notifier.
+- **Any LLM** — OpenAI, Anthropic, Gemini, Groq, and more via [LiteLLM](https://docs.litellm.ai/docs/providers). BYOK, or run free and local with Ollama.
+- **Simple to run** — SQLite (no database server), one Docker command, no JavaScript build step.
 
 ## Features
 
@@ -27,7 +52,7 @@ Self-hosted news monitoring with LLM-powered novelty detection. Watches topics v
 - Custom JSON webhooks
 - Notification retry queue
 - Feed health dashboard
-- Data export (JSON, CSV)
+- Data export (JSON, CSV) and OPML import/export
 - Bulk check/delete
 - 5 color themes (Nord, Dracula, Solarized Dark, High Contrast, Tokyo Night)
 - In-app settings page
@@ -35,17 +60,7 @@ Self-hosted news monitoring with LLM-powered novelty detection. Watches topics v
 
 ## Quick Start
 
-### Installing Docker
-
-Topic Watch runs in Docker. If you don't have it yet:
-
-- **Linux:** `curl -fsSL https://get.docker.com | sh`
-- **macOS:** Download [Docker Desktop](https://www.docker.com/products/docker-desktop/) and run the installer
-- **Windows:** Download [Docker Desktop](https://www.docker.com/products/docker-desktop/) and run the installer. WSL 2 backend is recommended.
-
-Make sure Docker is running before continuing.
-
-### One-line install
+Topic Watch runs in Docker. Don't have it? Get it at [get.docker.com](https://get.docker.com) (or install [Docker Desktop](https://www.docker.com/products/docker-desktop/) on macOS/Windows), and make sure it's running.
 
 **Linux / macOS:**
 
@@ -59,11 +74,9 @@ curl -fsSL https://raw.githubusercontent.com/0xzerolight/topic_watch/main/script
 irm https://raw.githubusercontent.com/0xzerolight/topic_watch/main/scripts/install.ps1 | iex
 ```
 
-Pulls the image, starts the container, creates a desktop/Start Menu shortcut, and opens the setup wizard. Set your LLM API key in the wizard.
+Pulls the image, starts the container, creates a desktop/Start Menu shortcut, and opens the setup wizard. Set your LLM API key there. Boot/login autostart is opt-in — the installer asks (or pass `TOPIC_WATCH_AUTOSTART=yes` for a non-interactive run).
 
-The installer asks before setting up boot/login autostart (systemd user service + linger on Linux, a Startup shortcut on Windows) — it is opt-in, not silent. A piped `curl | bash` / `irm | iex` run cannot prompt, so it defaults to **no autostart**; pass `TOPIC_WATCH_AUTOSTART=yes` to enable it non-interactively.
-
-> **Before you pipe a script to a shell:** `curl | bash` and `irm | iex` run whatever the URL returns. By default these scripts fetch from the mutable `main` branch with no pin or checksum. For a verifiable install, review the script first (or download and run it), and pin a release tag or commit with `TOPIC_WATCH_REF` — this also pins the `docker-compose` file the installer downloads. See [SECURITY.md](SECURITY.md#install-script-trust).
+> ⚠️ **Piping a script to a shell runs whatever the URL returns.** These scripts fetch from the mutable `main` branch by default. For a verifiable install, review the script first and pin a release with `TOPIC_WATCH_REF` — see [SECURITY.md](SECURITY.md#install-script-trust).
 
 Override install location, port, ref, and autostart:
 
@@ -77,8 +90,10 @@ $env:TOPIC_WATCH_DIR="C:\TopicWatch"; $env:TOPIC_WATCH_PORT="9000"; $env:TOPIC_W
 irm https://raw.githubusercontent.com/0xzerolight/topic_watch/v1.1.2/scripts/install.ps1 | iex
 ```
 
+Then visit [http://localhost:8000](http://localhost:8000) to configure.
+
 <details>
-<summary><strong>Manual setup</strong></summary>
+<summary><strong>Manual setup (with or without Docker)</strong></summary>
 
 #### With Docker
 
@@ -99,23 +114,23 @@ mkdir -p data && cp config.example.yml data/config.yml
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-> **Run a single worker.** The scheduler, the in-memory dashboard stats cache,
-> and the "already checking" guard all live in-process. Do not pass `--workers N`
-> (or run multiple replicas) — extra workers each start their own scheduler and
-> keep separate state. The default Docker image runs one worker.
+> **Run a single worker.** The scheduler, the in-memory dashboard stats cache, and the
+> "already checking" guard all live in-process. Do not pass `--workers N` (or run multiple
+> replicas) — extra workers each start their own scheduler and keep separate state. The
+> default Docker image runs one worker.
 
 </details>
 
-#### File permissions (PUID / PGID)
+<details>
+<summary><strong>File permissions (PUID / PGID)</strong></summary>
 
-Topic Watch stores its database and config in the bind-mounted `./data`
-directory. Docker keeps your host's file ownership on bind mounts, so the
-container has to write `./data` as *your* user. The image defaults to UID/GID
-`1000` (the first user on most Linux hosts), and the container entrypoint
-chowns `./data` to match `PUID`/`PGID` on startup.
+Topic Watch stores its database and config in the bind-mounted `./data` directory. Docker
+keeps your host's file ownership on bind mounts, so the container has to write `./data` as
+*your* user. The image defaults to UID/GID `1000` (the first user on most Linux hosts), and
+the container entrypoint chowns `./data` to match `PUID`/`PGID` on startup.
 
-If your host user is not `1000`, set `PUID`/`PGID` so the container writes as
-you. The one-line installer handles this automatically and is safe to re-run.
+If your host user is not `1000`, set `PUID`/`PGID` so the container writes as you. The
+one-line installer handles this automatically and is safe to re-run.
 
 For manual installs, use `grep -q` to avoid duplicating lines on re-run:
 
@@ -130,12 +145,13 @@ done
 docker compose up -d
 ```
 
-macOS and Windows (Docker Desktop) handle ownership transparently, so
-`PUID`/`PGID` are only relevant on native Linux hosts.
+macOS and Windows (Docker Desktop) handle ownership transparently, so `PUID`/`PGID` are
+only relevant on native Linux hosts.
 
-Then visit [http://localhost:8000](http://localhost:8000) to configure.
+</details>
 
-### Running with Ollama (no API key needed)
+<details>
+<summary><strong>Run with Ollama (no API key needed)</strong></summary>
 
 If you run [Ollama](https://ollama.ai) locally, Topic Watch can use it for free LLM-powered novelty detection:
 
@@ -150,35 +166,30 @@ docker compose up -d
 
 The override file sets `ollama/llama3.3` as the model and points to your local Ollama instance. No API key required.
 
-**Linux note:** On native Linux Docker Engine, `host.docker.internal` does not
-resolve on its own. The override file maps it via `extra_hosts:
-["host.docker.internal:host-gateway"]` so the container can reach Ollama on the
-host. macOS and Windows Docker Desktop resolve `host.docker.internal`
-automatically.
+**Linux note:** On native Linux Docker Engine, `host.docker.internal` does not resolve on
+its own. The override file maps it via `extra_hosts: ["host.docker.internal:host-gateway"]`
+so the container can reach Ollama on the host. macOS and Windows Docker Desktop resolve
+`host.docker.internal` automatically.
 
 **Model recommendations:** Models with 8B+ parameters and 8K+ context windows work best. Tested with `llama3.3` (8B), `mistral` (7B), and `qwen2.5` (7B). Smaller models may miss subtle novelty signals.
 
+</details>
+
 ## Setup Wizard
 
-On first launch with no valid configuration, Topic Watch redirects to a setup
-wizard at `/setup`. Enter your LLM model string (LiteLLM `provider/model-name`
-format) and API key; a base URL field appears for self-hosted providers like
-Ollama. On submit, the wizard runs a quick pre-flight check against your
-provider — if the key, model, or base URL is wrong, it tells you what failed
-instead of saving a broken config. Once it passes, settings are written to
-`data/config.yml` and the app starts checking.
-
-You can re-edit everything later from the web UI **Settings** page or by editing
-`data/config.yml` directly.
+On first launch with no valid configuration, Topic Watch redirects to a setup wizard at
+`/setup`. Enter your LLM model string (LiteLLM `provider/model-name` format) and API key; a
+base URL field appears for self-hosted providers like Ollama. On submit, it runs a quick
+pre-flight check against your provider and tells you what failed instead of saving a broken
+config. Everything is editable later from the **Settings** page or in `data/config.yml`.
 
 ## Configuration
 
-Settings live in `data/config.yml`. First run auto-copies `config.example.yml`
-(or run `mkdir -p data && cp config.example.yml data/config.yml` yourself).
-Editable via the web UI Settings page or directly in the file.
+Settings live in `data/config.yml`. First run auto-copies `config.example.yml` (or run
+`mkdir -p data && cp config.example.yml data/config.yml` yourself). Editable via the web UI
+Settings page or directly in the file.
 
-**Priority (highest to lowest):** environment variables (`TOPIC_WATCH_` prefix)
-> `data/config.yml` > built-in defaults.
+**Priority (highest to lowest):** environment variables (`TOPIC_WATCH_` prefix) > `data/config.yml` > built-in defaults.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -186,8 +197,8 @@ Editable via the web UI Settings page or directly in the file.
 | `llm.api_key` | string | - | API key for your LLM provider |
 | `llm.base_url` | string | - | Base URL for self-hosted providers (Ollama, etc.) |
 | `notifications.urls` | list | `[]` | [Apprise](https://github.com/caronc/apprise/wiki) notification URLs |
-| `notifications.webhook_urls` | list | `[]` | Webhook endpoints for JSON POST (see [Webhooks](#webhooks)) |
-| `check_interval` | string | `"6h"` | Default check interval. Units: m (minutes), h (hours), d (days), w (weeks), M (months). Combine: `1w 3d`, `2h 30m`. Min 10m, max 6M. |
+| `notifications.webhook_urls` | list | `[]` | Webhook endpoints for JSON POST (see [Webhooks](#notifications)) |
+| `check_interval` | string | `"6h"` | Default check interval. Units: m, h, d, w, M. Combine: `1w 3d`, `2h 30m`. Min 10m, max 6M. |
 | `max_articles_per_check` | int | `10` | Articles to process per check per topic (1-100) |
 | `knowledge_state_max_tokens` | int | `2000` | Token budget for knowledge state (500-10,000) |
 | `article_retention_days` | int | `90` | Days to keep articles before cleanup (1-3,650) |
@@ -216,9 +227,10 @@ Editable via the web UI Settings page or directly in the file.
 
 </details>
 
-### Environment Variables
+<details>
+<summary><strong>Environment variables</strong></summary>
 
-All settings can be overridden with `TOPIC_WATCH_` prefix. Double underscores for nested keys:
+All settings can be overridden with the `TOPIC_WATCH_` prefix. Double underscores for nested keys:
 
 ```bash
 TOPIC_WATCH_LLM__API_KEY=sk-abc123
@@ -234,15 +246,17 @@ Environment-only settings:
 | `TOPIC_WATCH_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `TOPIC_WATCH_LOG_FORMAT` | `text` | `text` or `json` |
 
+</details>
+
 ## Adding Topics
 
-1. Dashboard > **Add Topic**
+1. Dashboard → **Add Topic**
 2. Fill in: **Name**, **Description** (what you care about in plain English), **Feed Source** (Automatic/Manual), **Feed URLs** (if Manual, one per line), **Check Interval**, **Tags**
 3. **Save**
 
 The topic enters a "Researching" phase where it fetches articles and builds an initial knowledge state. This takes under a minute. After that, it enters the normal check cycle.
 
-### Finding RSS Feeds
+**Finding RSS feeds:**
 
 - Try appending `/rss`, `/feed`, or `/atom.xml` to a site URL
 - Reddit: `https://www.reddit.com/r/SUBREDDIT/search.rss?q=QUERY&sort=new`
@@ -264,7 +278,7 @@ Uses [LiteLLM](https://docs.litellm.ai/docs/providers). Anything LiteLLM support
 | Cohere | `cohere_chat/command-a-03-2025` | |
 | Together AI | `together_ai/meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8` | |
 
-### Ollama
+Ollama config:
 
 ```yaml
 llm:
@@ -295,7 +309,8 @@ notifications:
     - "discord://webhook_id/webhook_token"
 ```
 
-### Webhooks
+<details>
+<summary><strong>Custom JSON webhooks</strong></summary>
 
 POST a JSON payload to any endpoint when new info is found:
 
@@ -322,7 +337,10 @@ Payload:
 
 10-second timeout per endpoint, concurrent delivery, failures logged but non-blocking.
 
-## JSON API
+</details>
+
+<details>
+<summary><strong>JSON API</strong></summary>
 
 A read-only JSON API lives under `/api/v1`, plus one endpoint to trigger a check.
 Interactive docs are at `/docs` (OpenAPI/Swagger).
@@ -337,7 +355,10 @@ Interactive docs are at `/docs` (OpenAPI/Swagger).
 
 The check endpoint returns `{"status": "checked", "has_new_info": <bool>, "check_result_id": <int>}`.
 
-## Data Export
+</details>
+
+<details>
+<summary><strong>Data export & OPML</strong></summary>
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -346,12 +367,12 @@ The check endpoint returns `{"status": "checked", "has_new_info": <bool>, "check
 | `GET` | `/topics/{id}/export/json` | Single topic with articles, checks, knowledge state |
 | `GET` | `/topics/{id}/export/csv` | Check history as CSV |
 
-### OPML import/export
+Move feeds in and out of RSS readers (FreshRSS, Miniflux, Tiny Tiny RSS) via OPML:
 
-Move feeds in and out of RSS readers (FreshRSS, Miniflux, Tiny Tiny RSS) via OPML.
+- **Export:** `GET /export/opml` downloads all topics as an OPML file.
+- **Import:** `POST /import/opml` accepts an OPML upload (`opml_file` form field, 1 MB max, UTF-8). Imported topics start as `new` and initialize gradually (~1/min). Same-named topics are skipped.
 
-- Export: `GET /export/opml` downloads all topics as an OPML file.
-- Import: `POST /import/opml` accepts an OPML upload (`opml_file` form field, 1 MB max, UTF-8). Imported topics start as `new` and initialize gradually (~1/min). Same-named topics are skipped.
+</details>
 
 ## CLI
 
@@ -363,10 +384,9 @@ python -m app.cli init "Topic Name"   # Re-initialize knowledge state
 ```
 
 > **Run the CLI only when the server is stopped.** The in-flight check guards are
-> process-local, so `check`, `check-all`, and `init` do not coordinate with a
-> running server's scheduler or UI. Pointing them at the same database as a live
-> server can double-check a topic, double-spend the LLM, and send duplicate
-> notifications. Stop the server first, or use a separate/offline database.
+> process-local, so the CLI does not coordinate with a running server's scheduler. Pointing
+> it at a live server's database can double-check a topic, double-spend the LLM, and send
+> duplicate notifications. Stop the server first, or use a separate/offline database.
 
 ## Updating
 
@@ -405,6 +425,8 @@ Check the [CHANGELOG](CHANGELOG.md) before upgrading for breaking changes.
 
 - **Localhost:** safe as-is
 - **Remote:** put it behind a reverse proxy with auth ([Authelia](https://www.authelia.com/), [Authentik](https://goauthentik.io/), Nginx basic auth, Caddy `basicauth`)
+
+API keys are stored in `data/config.yml` (gitignored) or env vars. All data stays on your machine; outbound connections only go to RSS feeds, your LLM provider, and notification services. See [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
 <details>
 <summary>Caddy example</summary>
@@ -445,37 +467,27 @@ server {
 Create credentials: `htpasswd -c /etc/nginx/.htpasswd admin`
 </details>
 
-API keys stored in `data/config.yml` (gitignored) or env vars. All data stays on your machine; outbound connections only go to RSS feeds, your LLM provider, and notification services.
-
-See [SECURITY.md](SECURITY.md) for vulnerability reporting.
-
 ## Troubleshooting
 
-**Config file not found** - Run `mkdir -p data && cp config.example.yml data/config.yml`.
-
-**LLM errors / checks failing** - Check your API key, make sure the model string has the provider prefix (`openai/gpt-5.4-nano`, not `gpt-5.4-nano`), check logs with `docker compose logs -f`.
-
-**No notifications** - Check `notifications.urls` in config. Use the Test Notification button on the Settings page. Verify the [Apprise URL format](https://github.com/caronc/apprise/wiki).
-
-**0 articles found** - Verify the RSS URL works in a browser. Check the Feed Health page. Some sites block bots.
-
-**Topic stuck in "Researching"** - Auto-recovers after 15 minutes (set to Error). Retry from the topic page. Usually an LLM connectivity issue.
-
-**Docker container exits** - `docker compose logs` for details. Check that `data/config.yml` exists and `data/` is writable. "Permission denied" writing `data/` on a native Linux host usually means your UID isn't 1000 — set `PUID`/`PGID` (see [File permissions](#file-permissions-puid--pgid)).
-
-**High memory** - Lower `max_articles_per_check` or `content_fetch_concurrency`. Increase check intervals.
+| Issue | Fix |
+|-------|-----|
+| **Config file not found** | Run `mkdir -p data && cp config.example.yml data/config.yml`. |
+| **LLM errors / checks failing** | Check your API key. Make sure the model string has the provider prefix (`openai/gpt-5.4-nano`, not `gpt-5.4-nano`). Check logs: `docker compose logs -f`. |
+| **No notifications** | Check `notifications.urls` in config. Use the Test Notification button on Settings. Verify the [Apprise URL format](https://github.com/caronc/apprise/wiki). |
+| **0 articles found** | Verify the RSS URL works in a browser. Check the Feed Health page. Some sites block bots. |
+| **Topic stuck in "Researching"** | Auto-recovers after 15 minutes (set to Error). Retry from the topic page. Usually an LLM connectivity issue. |
+| **Docker container exits** | `docker compose logs` for details. Check that `data/config.yml` exists and `data/` is writable. "Permission denied" on `data/` on native Linux usually means your UID isn't 1000 — set `PUID`/`PGID` (see [File permissions](#quick-start)). |
+| **High memory** | Lower `max_articles_per_check` or `content_fetch_concurrency`. Increase check intervals. |
 
 ## FAQ
 
-**Cost?** ~1,700 tokens per check. GPT-5.4 Nano: ~$0.0003/check. 5 topics, 4x/day = under $0.20/month. Ollama: free.
+**Cost?** ~1,700 tokens per check. GPT-5.4 Nano: ~$0.0003/check. 5 topics, 4×/day = under $0.20/month. Ollama: free.
 
-**Why not Google Alerts?** Google Alerts sends every mention. Topic Watch only notifies when something is *actually* new.
-
-**Data privacy?** Everything runs locally. Only outbound traffic is to your LLM provider and notification services.
+**Data privacy?** Everything runs locally. The only outbound traffic is to your LLM provider and notification services.
 
 **No API key?** Use Ollama or any local LLM. Set `llm.base_url` and put any string for `llm.api_key`.
 
-**No RSS feeds?** Pick "Automatic" when adding a topic. Builds a news-search RSS feed, using Bing News first and falling back to Google News if Bing is unhealthy.
+**No RSS feeds?** Pick "Automatic" when adding a topic. It builds a news-search RSS feed, using Bing News first and falling back to Google News if Bing is unhealthy.
 
 ## Contributing
 
