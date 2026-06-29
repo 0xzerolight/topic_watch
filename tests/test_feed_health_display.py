@@ -144,6 +144,21 @@ class TestFeedHealthPage:
         assert 'href="/feeds"' in response.text
         assert "Feed Health" in response.text
 
+    async def test_feed_health_page_shows_backing_off(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """A persistently-failing feed shows a 'Backing off' note alongside its status."""
+        url = "https://dead.example.com/feed.xml"
+        for _ in range(10):
+            upsert_feed_health_failure(db_conn, url, "boom")
+        db_conn.commit()
+
+        response = await client.get("/feeds")
+        assert response.status_code == 200
+        assert "Backing off" in response.text
+        # Status label is preserved (additive badge), not replaced.
+        assert "Unhealthy" in response.text
+
 
 # --- Topic detail page feed health indicators tests ---
 
