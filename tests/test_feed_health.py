@@ -303,3 +303,19 @@ class TestFetchFeedCallback:
             entries = await fetch_feed("https://example.com/feed.xml", client=client)
 
         assert entries == []
+
+
+class TestFeedValidators:
+    """Conditional-GET validator storage on feed_health (Phase 1)."""
+
+    def test_feed_health_persists_validators(self, db_conn: sqlite3.Connection) -> None:
+        """etag / last_modified round-trip through the feed_health row."""
+        db_conn.execute(
+            "INSERT INTO feed_health (feed_url, etag, last_modified) VALUES (?, ?, ?)",
+            ("https://ex.com/feed", 'W/"abc"', "Wed, 21 Oct 2025 07:28:00 GMT"),
+        )
+        db_conn.commit()
+        health = get_feed_health(db_conn, "https://ex.com/feed")
+        assert health is not None
+        assert health.etag == 'W/"abc"'
+        assert health.last_modified == "Wed, 21 Oct 2025 07:28:00 GMT"

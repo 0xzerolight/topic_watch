@@ -373,6 +373,8 @@ class FeedHealth(SQLiteModel):
     consecutive_failures: int = 0
     total_fetches: int = 0
     total_failures: int = 0
+    etag: str | None = None
+    last_modified: str | None = None
 
 
 class DashboardStats(BaseModel):
