@@ -503,6 +503,24 @@ class TestBuildKnowledgeInitMessages:
 
         assert "resolve it to an absolute date" in _KNOWLEDGE_INIT_SYSTEM
 
+    def test_stub_rule_forbids_confirmed_facts_placement(self) -> None:
+        """STUB/NO-CONTENT claims must be barred from Confirmed Facts unless corroborated."""
+        from app.analysis.prompts import _KNOWLEDGE_INIT_SYSTEM
+
+        assert "NEVER under **Confirmed Facts**" in _KNOWLEDGE_INIT_SYSTEM
+
+    def test_stub_rule_requires_reported_claimed_for_stub_only_claims(self) -> None:
+        """STUB-only claims must be directed to Reported/Claimed category."""
+        from app.analysis.prompts import _KNOWLEDGE_INIT_SYSTEM
+
+        assert "must go under **Reported/Claimed**" in _KNOWLEDGE_INIT_SYSTEM
+
+    def test_stub_rule_still_contains_weigh_lower_phrasing(self) -> None:
+        """The original weigh-lower phrasing must still be present (appended, not replaced)."""
+        from app.analysis.prompts import _KNOWLEDGE_INIT_SYSTEM
+
+        assert "weigh them lower and rely primarily on their titles" in _KNOWLEDGE_INIT_SYSTEM
+
 
 # ============================================================
 # TestBuildKnowledgeUpdateMessages
