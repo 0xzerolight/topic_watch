@@ -1,7 +1,9 @@
 {% extends "base.html" %}
 {% block title %}Settings - Topic Watch{% endblock %}
 {% block content %}
-<h1>Settings</h1>
+<div class="page-header masthead">
+    <h1>Settings</h1>
+</div>
 
 {% if request.query_params.get("saved") %}
 <div class="alert alert-success" role="status">
@@ -21,231 +23,240 @@
 </div>
 {% endif %}
 
-<article>
-    <p>Configuration file: <code>{{ config_path }}</code></p>
-    <p><small>Settings overridden by environment variables (<code>TOPIC_WATCH_*</code>) cannot be changed here.</small></p>
-</article>
+<p class="help">
+    Configuration file: <code>{{ config_path }}</code>.
+    Settings overridden by environment variables (<code>TOPIC_WATCH_*</code>) cannot be changed here.
+</p>
 
 <form method="post" action="/settings">
     <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
 
-    <h2>LLM Configuration</h2>
+    <section class="card">
+        <span class="card-kicker">LLM</span>
 
-    <label for="llm_model">
-        Model
-        <input type="text" id="llm_model" name="llm_model" required
-               value="{{ form.llm_model if form else settings.llm.model }}"
-               placeholder="e.g., openai/gpt-5.4-nano">
-    </label>
-
-    {% if api_key_env_sourced %}
-    <label for="llm_api_key">
-        API Key <small>(set via environment — read-only)</small>
-        <input type="text" id="llm_api_key" value="(set via environment variable TOPIC_WATCH_LLM__API_KEY)" disabled>
-        <small>The API key is supplied by an environment variable and cannot be changed here. Edits to this field are ignored and the key is never written to the config file.</small>
-    </label>
-    {% else %}
-    <label for="llm_api_key">
-        API Key <small>(leave blank to keep current key)</small>
-        <div style="display: flex; gap: 0.5rem; align-items: center;">
-            <input type="password" id="llm_api_key" name="llm_api_key"
-                   value="{{ form.llm_api_key if form else '' }}"
-                   placeholder="{{ settings.llm.api_key[:4] }}...{{ settings.llm.api_key[-4:] if settings.llm.api_key|length > 8 else '****' }}"
-                   style="flex: 1; margin: 0;">
-            <button type="button" onclick="toggleApiKey()" style="white-space: nowrap; margin: 0;">Show</button>
+        <div class="field-group">
+            <label for="llm_model">Model</label>
+            <input type="text" id="llm_model" name="llm_model" required
+                   value="{{ form.llm_model if form else settings.llm.model }}"
+                   placeholder="e.g., openai/gpt-5.4-nano">
         </div>
-    </label>
-    {% endif %}
 
-    <div id="base-url-group">
-        <label for="llm_base_url">
-            Base URL <small>(optional)</small>
+        {% if api_key_env_sourced %}
+        <div class="field-group">
+            <label for="llm_api_key">API Key <small>(set via environment — read-only)</small></label>
+            <input type="text" id="llm_api_key" value="(set via environment variable TOPIC_WATCH_LLM__API_KEY)" disabled>
+            <small class="help">The API key is supplied by an environment variable and cannot be changed here. Edits to this field are ignored and the key is never written to the config file.</small>
+        </div>
+        {% else %}
+        <div class="field-group">
+            <label for="llm_api_key">API Key <small>(leave blank to keep current key)</small></label>
+            <div style="display: flex; gap: 0.5rem; align-items: center;">
+                <input type="password" id="llm_api_key" name="llm_api_key"
+                       value="{{ form.llm_api_key if form else '' }}"
+                       placeholder="{{ settings.llm.api_key[:4] }}...{{ settings.llm.api_key[-4:] if settings.llm.api_key|length > 8 else '****' }}"
+                       style="flex: 1; margin: 0;">
+                <button type="button" onclick="toggleApiKey()" style="white-space: nowrap; margin: 0;">Show</button>
+            </div>
+        </div>
+        {% endif %}
+
+        <div class="field-group" id="base-url-group">
+            <label for="llm_base_url">Base URL <small>(optional)</small></label>
             <input type="text" id="llm_base_url" name="llm_base_url"
                    value="{{ form.llm_base_url if form else (settings.llm.base_url or '') }}"
                    placeholder="e.g., http://localhost:11434 for Ollama">
-            <small id="base-url-hint">Required for self-hosted providers like Ollama. Cloud providers (OpenAI, Anthropic, etc.) don't need this.</small>
-        </label>
-    </div>
+            <small class="help" id="base-url-hint">Required for self-hosted providers like Ollama. Cloud providers (OpenAI, Anthropic, etc.) don't need this.</small>
+        </div>
+    </section>
 
-    <h2>Notifications</h2>
+    <section class="card">
+        <span class="card-kicker">Notifications</span>
 
-    <label for="notification_urls">
-        Notification URLs <small>(one per line, Apprise format)</small>
-        <textarea id="notification_urls" name="notification_urls" rows="4"
-                  placeholder="ntfy://my-topic&#10;discord://webhook-id/token">{{ form.notification_urls if form else (settings.notifications.urls | join('\n')) }}</textarea>
-    </label>
+        <div class="field-group">
+            <label for="notification_urls">Notification URLs <small>(one per line, Apprise format)</small></label>
+            <textarea id="notification_urls" name="notification_urls" rows="4"
+                      placeholder="ntfy://my-topic&#10;discord://webhook-id/token">{{ form.notification_urls if form else (settings.notifications.urls | join('\n')) }}</textarea>
+        </div>
 
-    <label for="webhook_urls">
-        Webhook URLs <small>(one per line, JSON POST)</small>
-        <textarea id="webhook_urls" name="webhook_urls" rows="3"
-                  placeholder="https://example.com/webhook">{{ form.webhook_urls if form else (settings.notifications.webhook_urls | join('\n')) }}</textarea>
-    </label>
+        <div class="field-group">
+            <label for="webhook_urls">Webhook URLs <small>(one per line, JSON POST)</small></label>
+            <textarea id="webhook_urls" name="webhook_urls" rows="3"
+                      placeholder="https://example.com/webhook">{{ form.webhook_urls if form else (settings.notifications.webhook_urls | join('\n')) }}</textarea>
+        </div>
+    </section>
 
-    <h2>Checking</h2>
+    <section class="card">
+        <span class="card-kicker">Checking</span>
 
-    <div class="settings-grid">
-        <label for="check_interval">
-            Default Check Interval
-            <input type="text" id="check_interval" name="check_interval" required
-                   placeholder="e.g., 6h, 1d, 2w, 1M"
-                   value="{{ form.check_interval if form else settings.check_interval }}">
-            <small>Units: m (minutes), h (hours), d (days), w (weeks), M (months). Combine: 1w 3d</small>
-        </label>
+        <div class="settings-grid">
+            <div class="field-group">
+                <label for="check_interval">Default Check Interval</label>
+                <input type="text" id="check_interval" name="check_interval" required
+                       placeholder="e.g., 6h, 1d, 2w, 1M"
+                       value="{{ form.check_interval if form else settings.check_interval }}">
+                <small class="help">Units: m (minutes), h (hours), d (days), w (weeks), M (months). Combine: 1w 3d</small>
+                {% if interval_preview %}
+                <small class="schedule-preview">Checks every {{ interval_preview }}.</small>
+                {% endif %}
+            </div>
 
-        <label for="max_articles_per_check">
-            Max Articles per Check
-            <input type="number" id="max_articles_per_check" name="max_articles_per_check" required
-                   min="1" max="100"
-                   value="{{ form.max_articles_per_check if form else settings.max_articles_per_check }}">
-        </label>
-    </div>
+            <div class="field-group">
+                <label for="max_articles_per_check">Max Articles per Check</label>
+                <input type="number" id="max_articles_per_check" name="max_articles_per_check" required
+                       min="1" max="100"
+                       value="{{ form.max_articles_per_check if form else settings.max_articles_per_check }}">
+            </div>
+        </div>
+    </section>
 
-    <details>
+    <details class="card">
         <summary><strong>Advanced Settings</strong></summary>
         <div style="padding-top: 1rem;">
 
+            <span class="card-kicker">Tuning</span>
             <div class="settings-grid">
-                <label for="knowledge_state_max_tokens">
-                    Knowledge State Max Tokens
+                <div class="field-group">
+                    <label for="knowledge_state_max_tokens">Knowledge State Max Tokens</label>
                     <input type="number" id="knowledge_state_max_tokens" name="knowledge_state_max_tokens"
                            min="500" max="10000"
                            value="{{ form.knowledge_state_max_tokens if form else settings.knowledge_state_max_tokens }}">
-                </label>
+                </div>
 
-                <label for="article_retention_days">
-                    Article Retention Days
+                <div class="field-group">
+                    <label for="article_retention_days">Article Retention Days</label>
                     <input type="number" id="article_retention_days" name="article_retention_days"
                            min="1" max="3650"
                            value="{{ form.article_retention_days if form else settings.article_retention_days }}">
-                </label>
+                </div>
 
-                <label for="feed_fetch_timeout">
-                    Feed Fetch Timeout (seconds)
+                <div class="field-group">
+                    <label for="feed_fetch_timeout">Feed Fetch Timeout (seconds)</label>
                     <input type="number" id="feed_fetch_timeout" name="feed_fetch_timeout"
                            min="1" step="0.5"
                            value="{{ form.feed_fetch_timeout if form else settings.feed_fetch_timeout }}">
-                </label>
+                </div>
 
-                <label for="article_fetch_timeout">
-                    Article Fetch Timeout (seconds)
+                <div class="field-group">
+                    <label for="article_fetch_timeout">Article Fetch Timeout (seconds)</label>
                     <input type="number" id="article_fetch_timeout" name="article_fetch_timeout"
                            min="1" step="0.5"
                            value="{{ form.article_fetch_timeout if form else settings.article_fetch_timeout }}">
-                </label>
+                </div>
 
-                <label for="llm_analysis_timeout">
-                    LLM Analysis Timeout (seconds)
+                <div class="field-group">
+                    <label for="llm_analysis_timeout">LLM Analysis Timeout (seconds)</label>
                     <input type="number" id="llm_analysis_timeout" name="llm_analysis_timeout"
                            min="10"
                            value="{{ form.llm_analysis_timeout if form else settings.llm_analysis_timeout }}">
-                </label>
+                </div>
 
-                <label for="llm_knowledge_timeout">
-                    LLM Knowledge Timeout (seconds)
+                <div class="field-group">
+                    <label for="llm_knowledge_timeout">LLM Knowledge Timeout (seconds)</label>
                     <input type="number" id="llm_knowledge_timeout" name="llm_knowledge_timeout"
                            min="10"
                            value="{{ form.llm_knowledge_timeout if form else settings.llm_knowledge_timeout }}">
-                </label>
+                </div>
 
-                <label for="web_page_size">
-                    Web Page Size
+                <div class="field-group">
+                    <label for="web_page_size">Web Page Size</label>
                     <input type="number" id="web_page_size" name="web_page_size"
                            min="5" max="200"
                            value="{{ form.web_page_size if form else settings.web_page_size }}">
-                </label>
+                </div>
 
-                <label for="min_confidence_threshold">
-                    Min Confidence Threshold
+                <div class="field-group">
+                    <label for="min_confidence_threshold">Min Confidence Threshold</label>
                     <input type="number" id="min_confidence_threshold" name="min_confidence_threshold"
                            min="0" max="1" step="0.05"
                            value="{{ form.min_confidence_threshold if form else settings.min_confidence_threshold }}">
-                    <small>Below this confidence, new info is logged but not notified (0.0-1.0)</small>
-                </label>
+                    <small class="help">Below this confidence, new info is logged but not notified (0.0-1.0)</small>
+                </div>
 
-                <label for="min_relevance_threshold">
-                    Min Relevance Threshold
+                <div class="field-group">
+                    <label for="min_relevance_threshold">Min Relevance Threshold</label>
                     <input type="number" id="min_relevance_threshold" name="min_relevance_threshold"
                            min="0" max="1" step="0.05"
                            value="{{ form.min_relevance_threshold if form else settings.min_relevance_threshold }}">
-                    <small>Below this relevance to the topic, new info is logged but not notified (0.0-1.0)</small>
-                </label>
+                    <small class="help">Below this relevance to the topic, new info is logged but not notified (0.0-1.0)</small>
+                </div>
 
-                <label for="apprise_timeout_seconds">
-                    Apprise Timeout (seconds)
+                <div class="field-group">
+                    <label for="apprise_timeout_seconds">Apprise Timeout (seconds)</label>
                     <input type="number" id="apprise_timeout_seconds" name="apprise_timeout_seconds"
                            min="1"
                            value="{{ form.apprise_timeout_seconds if form else settings.apprise_timeout_seconds }}">
-                    <small>Max time to wait for a single notification send before giving up.</small>
-                </label>
+                    <small class="help">Max time to wait for a single notification send before giving up.</small>
+                </div>
 
-                <label for="feed_max_retries">
-                    Feed Max Retries
+                <div class="field-group">
+                    <label for="feed_max_retries">Feed Max Retries</label>
                     <input type="number" id="feed_max_retries" name="feed_max_retries"
                            min="1" max="10"
                            value="{{ form.feed_max_retries if form else settings.feed_max_retries }}">
-                </label>
+                </div>
 
-                <label for="content_fetch_concurrency">
-                    Content Fetch Concurrency
+                <div class="field-group">
+                    <label for="content_fetch_concurrency">Content Fetch Concurrency</label>
                     <input type="number" id="content_fetch_concurrency" name="content_fetch_concurrency"
                            min="1" max="20"
                            value="{{ form.content_fetch_concurrency if form else settings.content_fetch_concurrency }}">
-                </label>
+                </div>
 
-                <label for="scheduler_misfire_grace_time">
-                    Scheduler Misfire Grace Time (seconds)
+                <div class="field-group">
+                    <label for="scheduler_misfire_grace_time">Scheduler Misfire Grace Time (seconds)</label>
                     <input type="number" id="scheduler_misfire_grace_time" name="scheduler_misfire_grace_time"
                            min="30" max="3600"
                            value="{{ form.scheduler_misfire_grace_time if form else settings.scheduler_misfire_grace_time }}">
-                </label>
+                </div>
 
-                <label for="scheduler_jitter_seconds">
-                    Scheduler Jitter (seconds)
+                <div class="field-group">
+                    <label for="scheduler_jitter_seconds">Scheduler Jitter (seconds)</label>
                     <input type="number" id="scheduler_jitter_seconds" name="scheduler_jitter_seconds"
                            min="0" max="120"
                            value="{{ form.scheduler_jitter_seconds if form else settings.scheduler_jitter_seconds }}">
-                </label>
+                </div>
 
-                <label for="llm_max_retries">
-                    LLM Max Retries
+                <div class="field-group">
+                    <label for="llm_max_retries">LLM Max Retries</label>
                     <input type="number" id="llm_max_retries" name="llm_max_retries"
                            min="0" max="10"
                            value="{{ form.llm_max_retries if form else settings.llm_max_retries }}">
-                </label>
+                </div>
 
-                <label for="llm_temperature">
-                    LLM Temperature
+                <div class="field-group">
+                    <label for="llm_temperature">LLM Temperature</label>
                     <input type="number" id="llm_temperature" name="llm_temperature"
                            min="0" max="2" step="0.05"
                            value="{{ form.llm_temperature if form else settings.llm_temperature }}">
-                    <small>Lower is more factual (0.0-2.0)</small>
-                </label>
+                    <small class="help">Lower is more factual (0.0-2.0)</small>
+                </div>
             </div>
+
+            <hr>
+            <span class="card-kicker">Security &amp; Storage</span>
 
             <label style="margin-top: 1rem;">
                 <input type="checkbox" name="secure_cookies" value="true" role="switch"
                        {% if (form.secure_cookies if form is defined and form else settings.secure_cookies) %}checked{% endif %}>
                 Secure Cookies
-                <small>Set the Secure flag on cookies. Enable when TLS is terminated at your reverse proxy.</small>
             </label>
+            <small class="help">Set the Secure flag on cookies. Enable when TLS is terminated at your reverse proxy.</small>
 
-            <label style="margin-top: 1rem;">
-                Database Path <small>(read-only — set via config/env)</small>
-                <input type="text" value="{{ settings.db_path }}" disabled>
-            </label>
+            <div class="field-group" style="margin-top: 1rem;">
+                <label for="db_path_display">Database Path <small>(read-only — set via config/env)</small></label>
+                <input type="text" id="db_path_display" value="{{ settings.db_path }}" disabled>
+            </div>
 
         </div>
     </details>
 
-    <div style="margin-top: 1.5rem;">
+    <div class="form-actions">
         <button type="submit">Save Settings</button>
     </div>
 </form>
 
-<hr>
-
-<h2>Test Notifications</h2>
-<div>
+<section class="card">
+    <span class="card-kicker">Test Notifications</span>
     <p>Send a test notification to verify your notification configuration works.</p>
     <button
         hx-post="/notifications/test"
@@ -260,9 +271,10 @@
         <span class="spinner"></span> Sending...
     </span>
     <div id="notification-test-result" style="margin-top: 1rem;"></div>
-</div>
+</section>
 
-<h2>Browser Notifications</h2>
+<section class="card">
+    <span class="card-kicker">Browser Notifications</span>
 <div id="browser-notif-section">
     <p>Get desktop notifications in your browser when Topic Watch finds new information.</p>
     <div style="display: flex; gap: 1rem; align-items: center; flex-wrap: wrap;">
@@ -279,6 +291,7 @@
         </small>
     </div>
 </div>
+</section>
 
 <script>
 function toggleApiKey() {

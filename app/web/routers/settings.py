@@ -52,6 +52,23 @@ _SCALAR_FORM_FIELDS: tuple[str, ...] = (
 )
 
 
+def _interval_preview(raw: str) -> str | None:
+    """Human-readable schedule preview for a default-interval string.
+
+    ``parse_interval`` RAISES on invalid/out-of-range input, so guard it and return
+    ``None`` when the interval can't be rendered (the template then omits the preview).
+    """
+    from app.interval import format_interval, parse_interval
+
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        return format_interval(parse_interval(text))
+    except ValueError:
+        return None
+
+
 def _settings_template_ctx(request: Request, **extra: object) -> dict:
     """Shared template context for the settings page (provider lists + env-key state)."""
     ctx: dict = {
@@ -60,6 +77,17 @@ def _settings_template_ctx(request: Request, **extra: object) -> dict:
         "local_provider_defaults": LOCAL_PROVIDER_DEFAULTS,
         "api_key_env_sourced": is_api_key_env_sourced(),
     }
+    # Server-side schedule preview for the default interval. Use the submitted form value
+    # on a re-render (the 422 path passes form=), else the persisted setting.
+    form = extra.get("form")
+    settings = extra.get("settings")
+    if isinstance(form, dict) and "check_interval" in form:
+        raw_interval = str(form.get("check_interval", ""))
+    elif settings is not None:
+        raw_interval = str(getattr(settings, "check_interval", ""))
+    else:
+        raw_interval = ""
+    ctx["interval_preview"] = _interval_preview(raw_interval)
     ctx.update(extra)
     return ctx
 
