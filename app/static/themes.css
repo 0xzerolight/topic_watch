@@ -283,12 +283,6 @@ details.knowledge-state > article > div.knowledge-text :is(h1, h2, h3, h4, h5, h
 }
 
 
-/* --- Table horizontal scroll --- */
-.table-scroll {
-  overflow-x: auto;
-}
-
-
 /* --- Danger button --- */
 .btn-danger {
   color: var(--pico-del-color, #c62828);
