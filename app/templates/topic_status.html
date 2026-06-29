@@ -26,10 +26,9 @@
 
 {% elif topic.status.value == "error" %}
 <article>
-    <header>Error</header>
+    <header><span class="badge badge--bad"><span class="badge-dot"></span>Error</span></header>
     <p>
-        <mark>Error</mark>
-        {% if topic.error_message %}: {{ topic.error_message | sanitize_error }}{% endif %}
+        {% if topic.error_message %}{{ topic.error_message | sanitize_error }}{% else %}Research failed.{% endif %}
     </p>
     <form method="post" action="/topics/{{ topic.id }}/init" style="display:inline">
         <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
@@ -48,8 +47,11 @@
     </summary>
     <article>
         {% set usage_pct = (knowledge.token_count / knowledge_state_max_tokens * 100) | int if knowledge_state_max_tokens > 0 else 0 %}
-        <div style="margin-bottom: 1em;">
-            <small>Token budget: {{ usage_pct }}% used</small>
+        <div class="token-meter" style="margin-bottom: 1em;">
+            <span class="token-meter-label">
+                <span>Token budget</span>
+                <span class="num">{{ usage_pct }}% used</span>
+            </span>
             <progress value="{{ knowledge.token_count }}" max="{{ knowledge_state_max_tokens }}" style="width: 100%;"></progress>
         </div>
         <div class="knowledge-text">{{ knowledge.summary_text | markdown }}</div>
