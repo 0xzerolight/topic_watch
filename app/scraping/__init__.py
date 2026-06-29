@@ -16,10 +16,11 @@ from app.crud import (
     article_hash_exists,
     create_article,
     find_article_by_hash,
+    get_feed_health,
     upsert_feed_health_failure,
     upsert_feed_health_success,
 )
-from app.models import Article, Topic
+from app.models import Article, FeedHealth, Topic
 from app.scraping.content import extract_article_content
 from app.scraping.google_news import is_google_news_url, resolve_google_news_urls
 from app.scraping.rss import FeedEntry, compute_article_hash, fetch_feeds_for_topic
@@ -83,19 +84,41 @@ def _make_health_callback(conn: sqlite3.Connection):
     The callback writes feed_health rows on ``conn``; a swallowed write is
     surfaced at WARNING because feed_health is the ONLY persisted record of
     per-feed failures, so silently losing it would leave the dashboard showing
-    stale health while feeds break (OVH-132).
+    stale health while feeds break (OVH-132). On success it also persists the
+    response's conditional-GET validators; a 304 passes ``None`` for both, which
+    ``upsert_feed_health_success`` preserves via COALESCE.
     """
 
-    def callback(feed_url: str, success: bool, error_msg: str | None) -> None:
+    def callback(
+        feed_url: str,
+        success: bool,
+        error_msg: str | None,
+        etag: str | None = None,
+        last_modified: str | None = None,
+    ) -> None:
         try:
             if success:
-                upsert_feed_health_success(conn, feed_url)
+                upsert_feed_health_success(conn, feed_url, etag, last_modified)
             else:
                 upsert_feed_health_failure(conn, feed_url, error_msg or "Unknown error")
         except Exception:
             logger.warning("Failed to record feed health for %s", feed_url, exc_info=True)
 
     return callback
+
+
+def _make_feed_state_loader(conn: sqlite3.Connection):
+    """Build a per-feed health-row loader (one SELECT, reused for validators + backoff).
+
+    Returns the stored ``FeedHealth`` for a URL (or ``None`` if untracked), so the
+    fetch layer can both send conditional-GET validators and decide backoff skips
+    from a single lookup.
+    """
+
+    def loader(feed_url: str) -> FeedHealth | None:
+        return get_feed_health(conn, feed_url)
+
+    return loader
 
 
 def _log_feed_coverage(topic: Topic, feeds_total: int, feeds_failed: int) -> None:

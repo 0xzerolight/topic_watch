@@ -1938,3 +1938,28 @@ class TestResolveRedirectUrls:
         with patch("app.scraping.resolve_google_news_urls", new_callable=AsyncMock) as mock_resolve:
             await _resolve_redirect_urls(fetch_batch, response, feed_fetch_timeout=5.0)
         mock_resolve.assert_not_called()
+
+
+class TestFeedStateHelpers:
+    """Phase 1: health callback forwards validators; state loader reads the row."""
+
+    def test_health_callback_forwards_validators(self, db_conn: sqlite3.Connection) -> None:
+        from app.crud import get_feed_health
+        from app.scraping import _make_health_callback
+
+        cb = _make_health_callback(db_conn)
+        cb("https://ex.com/feed", True, None, 'W/"v1"', "LM1")
+        db_conn.commit()
+        h = get_feed_health(db_conn, "https://ex.com/feed")
+        assert h is not None and h.etag == 'W/"v1"' and h.last_modified == "LM1"
+
+    def test_feed_state_loader_returns_row(self, db_conn: sqlite3.Connection) -> None:
+        from app.crud import upsert_feed_health_failure
+        from app.scraping import _make_feed_state_loader
+
+        upsert_feed_health_failure(db_conn, "https://ex.com/feed", "boom")
+        db_conn.commit()
+        loader = _make_feed_state_loader(db_conn)
+        h = loader("https://ex.com/feed")
+        assert h is not None and h.consecutive_failures == 1
+        assert loader("https://missing.example/feed") is None
