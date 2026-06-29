@@ -494,3 +494,87 @@ async def test_run_live_freeze_writes_replayable_scenario(tmp_path, monkeypatch)
     assert sc.topic.name == "Acme Corp"
     assert sc.articles[0].title == "fetched"
     assert sc.articles[0].content == "live body"
+
+
+# --- __main__: rendering, nonce normalization, replay diff ---
+
+
+def test_normalize_nonce_collapses_fence_hex() -> None:
+    from evals.__main__ import normalize_nonce
+
+    a = "--- BEGIN UNTRUSTED ARTICLE CONTENT a1b2c3d4e5f60718\nbody\n--- END UNTRUSTED ARTICLE CONTENT a1b2c3d4e5f60718"
+    b = "--- BEGIN UNTRUSTED ARTICLE CONTENT 99aa88bb77cc66dd\nbody\n--- END UNTRUSTED ARTICLE CONTENT 99aa88bb77cc66dd"
+    assert normalize_nonce(a) == normalize_nonce(b)
+    assert "<nonce>" in normalize_nonce(a)
+
+
+def _artifact_with_nonce(final: dict, nonce: str):
+    from evals.scenario import CapturedCall, RunArtifact, Scenario, ScenarioTopic
+
+    fenced = f"--- BEGIN UNTRUSTED ARTICLE CONTENT {nonce}\nx\n--- END UNTRUSTED ARTICLE CONTENT {nonce}"
+    return RunArtifact(
+        name="s",
+        kind="novelty",
+        final=final,
+        calls=[
+            CapturedCall(
+                response_model="NoveltyResult",
+                messages=[{"role": "user", "content": fenced}],
+                raw_parsed={},
+            )
+        ],
+        scenario=Scenario(topic=ScenarioTopic(name="T", description="d")),
+    )
+
+
+def test_diff_runs_ignores_nonce_and_reports_final_change() -> None:
+    from evals.__main__ import diff_runs
+
+    a = _artifact_with_nonce({"has_new_info": True, "confidence": 0.9}, "aaaa1111bbbb2222")
+    a2 = _artifact_with_nonce({"has_new_info": True, "confidence": 0.9}, "cccc3333dddd4444")
+    assert diff_runs(a, a2) == []  # only the per-call nonce differs -> no spurious diff
+
+    b = _artifact_with_nonce({"has_new_info": False, "confidence": 0.9}, "cccc3333dddd4444")
+    diff = diff_runs(a, b)
+    assert any("has_new_info" in line for line in diff)
+
+
+def test_render_artifact_surfaces_error_and_kind() -> None:
+    from evals.__main__ import render_artifact
+    from evals.scenario import CapturedCall, RunArtifact, Scenario, ScenarioTopic
+
+    art = RunArtifact(
+        name="s",
+        kind="novelty",
+        final={"has_new_info": False},
+        final_error="RuntimeError: boom",
+        calls=[
+            CapturedCall(response_model="NoveltyResult", messages=[{"role": "system", "content": "sys"}], raw_parsed={})
+        ],
+        scenario=Scenario(topic=ScenarioTopic(name="T", description="d")),
+    )
+    out = render_artifact(art)
+    assert "boom" in out
+    assert "novelty" in out
+
+
+async def test_replay_reruns_scenario_and_diffs(tmp_path) -> None:
+    from evals.__main__ import replay
+    from evals.runner import run_scenario
+    from evals.scenario import Scenario, ScenarioArticle, ScenarioTopic, save_run
+
+    sc = Scenario(
+        kind="novelty",
+        topic=ScenarioTopic(name="T", description="d"),
+        articles=[ScenarioArticle(title="a", url="http://x", content="c", source_feed="http://f")],
+        name="s",
+    )
+    old = await run_scenario(sc, _settings(), inner=_mock_inner(novelty=_novelty(has_new_info=True, confidence=0.9)))
+    run_path = save_run(old, tmp_path / "runs")
+
+    new, diff = await replay(
+        run_path, _settings(), inner=_mock_inner(novelty=_novelty(has_new_info=False, confidence=0.2))
+    )
+    assert new.final is not None
+    assert new.final["has_new_info"] is False
+    assert any("has_new_info" in line for line in diff)
