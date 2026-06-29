@@ -232,6 +232,66 @@ class TestTopicDetailFeedHealthIndicators:
         assert response.status_code == 200
         assert "No health data" in response.text
 
+    async def test_topic_detail_auto_mode_shows_source_names_and_standby(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """Auto mode shows friendly source names; the non-active provider reads 'Standby', not 'Unknown'."""
+        from app.scraping.routing import router as provider_router
+
+        topic = _make_topic(db_conn, name="Auto Names", feed_mode=FeedMode.AUTO, feed_urls=[])
+        active_url = provider_router.get_provider().build_feed_url(topic)
+        upsert_feed_health_success(db_conn, active_url)
+        db_conn.commit()
+
+        response = await client.get(f"/topics/{topic.id}")
+        assert response.status_code == 200
+        # Friendly source names render for both providers (filter applied to the list).
+        assert "Bing News" in response.text
+        assert "Google News" in response.text
+        # Active provider shows its real health.
+        assert "status-healthy" in response.text
+        # The never-fetched standby provider reads 'Standby' exactly once (visible label,
+        # not the tooltip occurrence), and the alarming visible 'Unknown' is gone.
+        assert response.text.count("&#9679; Standby") == 1
+        assert "Unknown" not in response.text
+
+    async def test_topic_detail_auto_mode_active_reads_not_yet_checked(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """A fresh auto topic with no health rows shows 'Not yet checked' for the active provider."""
+        topic = _make_topic(db_conn, name="Auto Pending", feed_mode=FeedMode.AUTO, feed_urls=[])
+
+        response = await client.get(f"/topics/{topic.id}")
+        assert response.status_code == 200
+        assert "Not yet checked" in response.text
+        assert "Unknown" not in response.text
+
+    async def test_topic_detail_manual_shows_source_name(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """Manual mode renders the cleaned-hostname source name next to the feed."""
+        url = "https://example.com/feed.xml"
+        topic = _make_topic(db_conn, feed_urls=[url])
+        upsert_feed_health_success(db_conn, url)
+        db_conn.commit()
+
+        response = await client.get(f"/topics/{topic.id}")
+        assert response.status_code == 200
+        assert "<strong>example.com</strong>" in response.text
+        assert "Healthy" in response.text
+
+    async def test_topic_detail_manual_no_health_reads_not_yet_checked(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """Manual feed with no health row reads 'Not yet checked' (gray), not 'Unknown'."""
+        topic = _make_topic(db_conn, feed_urls=["https://example.com/feed.xml"])
+
+        response = await client.get(f"/topics/{topic.id}")
+        assert response.status_code == 200
+        assert "Not yet checked" in response.text
+        assert "status-unknown" in response.text
+        assert "Unknown" not in response.text
+
 
 # --- Navigation tests ---
 
