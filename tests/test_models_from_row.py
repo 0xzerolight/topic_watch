@@ -190,6 +190,41 @@ class TestArticleFromRow:
         article = Article.from_row(row)
         assert isinstance(article.fetched_at, datetime)
 
+    def test_published_at_iso_string_round_trips(self) -> None:
+        """published_at ISO string deserializes and re-serializes correctly."""
+        row = self._base_row()
+        row["published_at"] = "2025-01-15T12:00:00+00:00"
+        article = Article.from_row(row)
+        assert article.published_at is not None
+        assert article.published_at.year == 2025
+        assert article.published_at.month == 1
+        d = article.to_insert_dict()
+        assert "published_at" in d
+        assert d["published_at"] == "2025-01-15T12:00:00+00:00"
+
+    def test_published_at_null_coerces_to_none(self) -> None:
+        """published_at NULL in DB row becomes None on the model."""
+        row = self._base_row()
+        row["published_at"] = None
+        article = Article.from_row(row)
+        assert article.published_at is None
+
+    def test_published_at_empty_string_coerces_to_none(self) -> None:
+        """published_at empty string in DB row becomes None (legacy rows)."""
+        row = self._base_row()
+        row["published_at"] = ""
+        article = Article.from_row(row)
+        assert article.published_at is None
+
+    def test_to_insert_dict_includes_published_at_key(self) -> None:
+        """to_insert_dict() always includes published_at (None -> None)."""
+        row = self._base_row()
+        row["published_at"] = None
+        article = Article.from_row(row)
+        d = article.to_insert_dict()
+        assert "published_at" in d
+        assert d["published_at"] is None
+
 
 class TestCheckResultFromRow:
     """CheckResult.from_row defensive handling of checked_at."""

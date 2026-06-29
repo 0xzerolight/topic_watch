@@ -8,7 +8,7 @@ import httpx
 import pytest
 import trafilatura
 
-from app.crud import create_topic, list_articles_for_topic
+from app.crud import create_article, create_topic, list_articles_for_topic
 from app.models import Article, FeedMode, Topic
 from app.scraping import fetch_new_articles_for_topic
 from app.scraping.content import _truncate, extract_article_content
@@ -1351,6 +1351,106 @@ class TestFetchNewArticlesForTopic:
         assert stored[0].raw_content == "Reused body"
         # Nothing to fetch → no extraction client constructed.
         assert clients_constructed == 0
+
+
+# ============================================================
+# TestPublishedAtPersistence
+# ============================================================
+
+
+class TestPublishedAtPersistence:
+    """published_at flows from FeedEntry through _store_articles into the DB."""
+
+    def _make_topic(self, conn: sqlite3.Connection) -> Topic:
+        topic = create_topic(conn, Topic(name="PubAtTopic", description="d"))
+        conn.commit()
+        return topic
+
+    async def test_fresh_fetch_carries_published_at(self, db_conn: sqlite3.Connection) -> None:
+        """Fresh-fetch path: published datetime on FeedEntry lands on stored Article."""
+        topic = self._make_topic(db_conn)
+        pub = datetime(2025, 6, 1, 8, 0, 0, tzinfo=UTC)
+        entry = FeedEntry(
+            title="Dated Article",
+            url="https://example.com/dated",
+            summary="Summary",
+            source_feed="https://feed.example.com/rss",
+            published=pub,
+        )
+        with (
+            patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=[entry])),
+            patch("app.scraping.extract_article_content", return_value="Body"),
+        ):
+            stored = (await fetch_new_articles_for_topic(topic, db_conn)).articles
+
+        assert len(stored) == 1
+        assert stored[0].published_at == pub
+
+        # Confirm it survived the DB round-trip.
+        loaded = list_articles_for_topic(db_conn, topic.id)
+        assert loaded[0].published_at == pub
+
+    async def test_fresh_fetch_none_published_stores_none(self, db_conn: sqlite3.Connection) -> None:
+        """FeedEntry with published=None stores published_at=None without error."""
+        topic = self._make_topic(db_conn)
+        entry = FeedEntry(
+            title="Undated Article",
+            url="https://example.com/undated",
+            summary="Summary",
+            source_feed="https://feed.example.com/rss",
+            published=None,
+        )
+        with (
+            patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=[entry])),
+            patch("app.scraping.extract_article_content", return_value="Body"),
+        ):
+            stored = (await fetch_new_articles_for_topic(topic, db_conn)).articles
+
+        assert len(stored) == 1
+        assert stored[0].published_at is None
+
+    async def test_cross_topic_reuse_carries_published_at(self, db_conn: sqlite3.Connection) -> None:
+        """Cross-topic reuse path: published_at from the new FeedEntry is stored."""
+        topic_a = create_topic(db_conn, Topic(name="PubAtA", description="d"))
+        topic_b = create_topic(db_conn, Topic(name="PubAtB", description="d"))
+        db_conn.commit()
+
+        url = "https://example.com/shared-pub"
+        title = "Shared Published Article"
+        content_hash = compute_article_hash(url, title)
+        pub = datetime(2025, 4, 20, 14, 0, 0, tzinfo=UTC)
+
+        # Pre-store the article under topic A (the originating source).
+        create_article(
+            db_conn,
+            Article(
+                topic_id=topic_a.id,
+                title=title,
+                url=url,
+                content_hash=content_hash,
+                raw_content="Shared body",
+                source_feed="https://feed-a.example.com/rss",
+            ),
+        )
+        db_conn.commit()
+
+        # Topic B sees the same URL in its feed — entry carries a published date.
+        entry = FeedEntry(
+            title=title,
+            url=url,
+            summary="Summary",
+            source_feed="https://feed-b.example.com/rss",
+            published=pub,
+        )
+        with (
+            patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=[entry])),
+        ):
+            stored = (await fetch_new_articles_for_topic(topic_b, db_conn)).articles
+
+        assert len(stored) == 1
+        reused = stored[0]
+        assert reused.topic_id == topic_b.id
+        assert reused.published_at == pub
 
 
 # ============================================================

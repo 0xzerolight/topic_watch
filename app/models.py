@@ -242,6 +242,7 @@ class Article(SQLiteModel):
 
     _bool_fields = ("processed",)
     _required_dt_fields = ("fetched_at",)
+    _optional_dt_fields = ("published_at",)
 
     id: int | None = None
     topic_id: int
@@ -251,6 +252,7 @@ class Article(SQLiteModel):
     raw_content: str | None = None
     source_feed: str
     source_provider: str | None = None
+    published_at: datetime | None = None
     fetched_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     processed: bool = False
 
