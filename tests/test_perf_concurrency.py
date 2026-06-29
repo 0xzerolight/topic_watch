@@ -84,9 +84,9 @@ class TestDashboardConfidenceExtract:
     def test_confidence_value_filter_renders_badge(self) -> None:
         from app.web.routers.templates import _confidence_value
 
-        assert "#2ecc40" in _confidence_value(0.9)
-        assert "#ffdc00" in _confidence_value(0.6)
-        assert "#ff4136" in _confidence_value(0.2)
+        assert "badge--conf-high" in _confidence_value(0.9)
+        assert "badge--conf-mid" in _confidence_value(0.6)
+        assert "badge--conf-low" in _confidence_value(0.2)
         assert _confidence_value(None) == "-"
 
 
