@@ -204,9 +204,13 @@ def _unwrap_rate_limit(exc: BaseException) -> litellm.RateLimitError | None:
     """Return the underlying ``RateLimitError`` if ``exc`` represents a 429.
 
     Belt-and-suspenders for the rate-limit backoff: a bare ``RateLimitError`` is
-    returned as-is, and an ``InstructorRetryException`` is inspected (its first
-    arg and its ``failed_attempts``) for an underlying ``RateLimitError`` in case
-    a provider/instructor path still wraps it despite ``_instructor_retries``.
+    returned as-is, and an ``InstructorRetryException`` is inspected (its args and
+    ``failed_attempts``) for an underlying ``RateLimitError`` in case a
+    provider/instructor path still wraps it despite ``_instructor_retries``.
+    Instructor's v2 retry path (1.15.x) populates neither of those — it stringifies
+    the error into ``args`` and leaves ``failed_attempts`` empty — but chains the
+    real ``RateLimitError`` onto ``__cause__``, so the final fallback walks the
+    ``__cause__``/``__context__`` chain (cycle-guarded) to find it.
     """
     if isinstance(exc, litellm.RateLimitError):
         return exc
@@ -218,6 +222,14 @@ def _unwrap_rate_limit(exc: BaseException) -> litellm.RateLimitError | None:
             attempt_exc = getattr(attempt, "exception", None)
             if isinstance(attempt_exc, litellm.RateLimitError):
                 return attempt_exc
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        nxt = cur.__cause__ or cur.__context__
+        if isinstance(nxt, litellm.RateLimitError):
+            return nxt
+        cur = nxt
     return None
 
 
