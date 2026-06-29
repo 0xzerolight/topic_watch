@@ -340,7 +340,7 @@ class TestFetchFeed:
         assert entries == []
         assert fetch_ok is False
         callback.assert_called_once()
-        url_arg, ok_arg, reason_arg = callback.call_args[0]
+        url_arg, ok_arg, reason_arg = callback.call_args[0][:3]
         assert url_arg == "https://example.com/feed"
         assert ok_arg is False
         assert reason_arg is not None  # carries the bozo exception text
@@ -422,7 +422,7 @@ class TestFeedBozoHandling:
 
         assert fetch_ok is True
         assert [e.title for e in entries] == ["Recovered & Co"]
-        callback.assert_called_once_with("https://example.com/feed.xml", True, None)
+        callback.assert_called_once_with("https://example.com/feed.xml", True, None, None, None)
 
 
 # ============================================================
@@ -1963,3 +1963,56 @@ class TestFeedStateHelpers:
         h = loader("https://ex.com/feed")
         assert h is not None and h.consecutive_failures == 1
         assert loader("https://missing.example/feed") is None
+
+
+class TestConditionalGet:
+    """Phase 1: conditional GET (ETag/Last-Modified) + 304 fast-path."""
+
+    async def test_conditional_get_304_is_empty_but_ok(self) -> None:
+        from app.scraping.rss import fetch_feed_with_status
+
+        sent: dict[str, str] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            sent.update(request.headers)
+            return httpx.Response(304)
+
+        calls: list[tuple] = []
+
+        def cb(url, success, err, etag=None, lm=None):
+            calls.append((url, success, err, etag, lm))
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+            entries, ok = await fetch_feed_with_status(
+                "https://example.com/feed", client, health_callback=cb, etag='W/"v1"', last_modified="LM1"
+            )
+
+        assert entries == [] and ok is True
+        assert sent.get("if-none-match") == 'W/"v1"'
+        assert sent.get("if-modified-since") == "LM1"
+        # success recorded, validators NOT overwritten (None, None preserves them via COALESCE)
+        assert calls == [("https://example.com/feed", True, None, None, None)]
+
+    async def test_conditional_get_200_forwards_validators(self) -> None:
+        from app.scraping.rss import fetch_feed_with_status
+
+        rss = (
+            '<?xml version="1.0"?><rss version="2.0"><channel><title>T</title>'
+            "<item><title>A</title><link>https://example.com/a</link></item></channel></rss>"
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, text=rss, headers={"ETag": 'W/"v2"', "Last-Modified": "LM2"})
+
+        calls: list[tuple] = []
+
+        def cb(url, success, err, etag=None, lm=None):
+            calls.append((url, success, err, etag, lm))
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+            entries, ok = await fetch_feed_with_status("https://example.com/feed", client, health_callback=cb)
+
+        assert ok is True and len(entries) == 1
+        assert calls == [("https://example.com/feed", True, None, 'W/"v2"', "LM2")]
