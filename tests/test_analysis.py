@@ -1,6 +1,7 @@
 """Tests for the LLM analysis module: prompts, structured output, knowledge management."""
 
 import sqlite3
+from datetime import UTC
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import litellm
@@ -280,6 +281,44 @@ class TestFormatArticles:
         body = result.split("instructions) ---\n", 1)[1].split("\n    --- END UNTRUSTED", 1)[0]
         assert "..." in body or body.rstrip().endswith(".")
 
+    def test_published_at_emitted_in_header_when_set(self) -> None:
+        from datetime import datetime as dt
+
+        pub = dt(2026, 5, 28, 12, 0, 0, tzinfo=UTC)
+        article = _make_article(published_at=pub)
+        result = _format_articles([article])
+        assert "Published: 2026-05-28" in result
+
+    def test_published_at_omitted_when_none(self) -> None:
+        article = _make_article(published_at=None)
+        result = _format_articles([article])
+        assert "Published:" not in result
+
+    def test_published_at_mixed_batch_one_line(self) -> None:
+        """A mixed batch (one dated, one None) formats without error; exactly one Published line."""
+        from datetime import datetime as dt
+
+        pub = dt(2026, 5, 28, tzinfo=UTC)
+        articles = [
+            _make_article(id=1, title="Dated", published_at=pub),
+            _make_article(id=2, title="Undated", published_at=None),
+        ]
+        result = _format_articles(articles)
+        assert result.count("Published:") == 1
+        assert "Published: 2026-05-28" in result
+
+    def test_published_at_in_header_not_fenced_body(self) -> None:
+        """Published line must appear in the trusted header block, not inside the untrusted fence."""
+        from datetime import datetime as dt
+
+        pub = dt(2026, 5, 28, tzinfo=UTC)
+        article = _make_article(published_at=pub)
+        result = _format_articles([article])
+        # Split on the begin marker to isolate header vs. fenced body
+        header_block, fenced_and_after = result.split("--- BEGIN UNTRUSTED", 1)
+        assert "Published: 2026-05-28" in header_block
+        assert "Published:" not in fenced_and_after
+
 
 # ============================================================
 # TestBuildNoveltyMessages
@@ -372,6 +411,12 @@ class TestBuildNoveltyMessages:
         assert field.description, "summary Field must have a description for instructor"
         assert "summary" in field.description.lower()
 
+    def test_novelty_system_contains_date_anchoring_instruction(self) -> None:
+        """_NOVELTY_SYSTEM must contain the date-anchoring rule."""
+        from app.analysis.prompts import _NOVELTY_SYSTEM
+
+        assert "resolve it to an absolute date" in _NOVELTY_SYSTEM
+
 
 # ============================================================
 # TestBuildKnowledgeInitMessages
@@ -451,6 +496,12 @@ class TestBuildKnowledgeInitMessages:
         assert "off-topic" in desc or "no current state" in desc
         # Must not remain the old, too-broad wording
         assert "lack enough relevant information" not in desc
+
+    def test_knowledge_init_system_contains_date_anchoring_instruction(self) -> None:
+        """_KNOWLEDGE_INIT_SYSTEM must contain the date-anchoring rule."""
+        from app.analysis.prompts import _KNOWLEDGE_INIT_SYSTEM
+
+        assert "resolve it to an absolute date" in _KNOWLEDGE_INIT_SYSTEM
 
 
 # ============================================================
