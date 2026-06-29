@@ -1,0 +1,19 @@
+{# Shared feed-status badge. `state` is one of: healthy | degraded | unhealthy |
+   standby | not-checked. Renders a .badge (variant by state) with a .badge-dot
+   and a visible label; keeps the legacy .status-* class for string assertions.
+   `tooltip` is the (raw/escaped) title attribute; `label` overrides the default
+   visible text. Presentation only — call sites resolve `state`. #}
+{%- macro feed_status(state, tooltip="", label=None) -%}
+  {%- if state == "healthy" -%}
+    {%- set variant, status_cls, text = "badge--ok", "status-healthy", "Healthy" -%}
+  {%- elif state == "degraded" -%}
+    {%- set variant, status_cls, text = "badge--warn", "status-degraded", "Degraded" -%}
+  {%- elif state == "unhealthy" -%}
+    {%- set variant, status_cls, text = "badge--bad", "status-error", "Unhealthy" -%}
+  {%- elif state == "standby" -%}
+    {%- set variant, status_cls, text = "badge--idle", "status-unknown", "Standby" -%}
+  {%- else -%}
+    {%- set variant, status_cls, text = "badge--idle", "status-unknown", "Not yet checked" -%}
+  {%- endif -%}
+  <span class="badge {{ variant }} {{ status_cls }}"{% if tooltip %} title="{{ tooltip }}"{% endif %}><span class="badge-dot"></span>{{ label if label is not none else text }}</span>
+{%- endmacro -%}
