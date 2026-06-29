@@ -36,7 +36,10 @@ jobs:
         run: ruff format --check .
 
       - name: Type check with mypy
-        run: mypy app/ --ignore-missing-imports
+        run: mypy app/ evals/ --ignore-missing-imports
+
+      - name: Verify evals harness imports
+        run: python -c "import evals"
 
   test:
     runs-on: ubuntu-latest

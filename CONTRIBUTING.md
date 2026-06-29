@@ -88,6 +88,37 @@ pipeline.
 - Tests must not make live API calls. Mock all LLM interactions using the patterns already in `tests/`.
 - The minimum coverage threshold is 85%. CI will fail if coverage drops below this.
 
+### Real-LLM eval harness (on-demand)
+
+The automated suite never calls a real model, so it cannot catch bugs that only
+show up in real LLM output — wrong novelty calls, odd structured output, bad
+knowledge-state builds. The `evals/` package fills that gap for manual,
+on-demand use (it makes real, billed API calls, so it never runs in CI). It adds
+input control and full observability — captured prompt, raw parsed result,
+post-filter result, token usage — around the LLM stages, with no changes to
+`app/`.
+
+```bash
+# Print the exact prompt a scenario would send — no API call, free:
+python -m evals scenario evals/scenarios/dup_event.yml --dry-run
+
+# Run a controlled scenario against the real model (uses data/config.yml):
+python -m evals scenario evals/scenarios/dup_event.yml
+
+# Fetch a topic's feeds live and run a stage. The production DB is opened
+# read-only; all fetch bookkeeping goes to a throwaway scratch DB. --freeze
+# writes the fetched inputs to a reusable scenario file:
+python -m evals live "My Topic" --freeze /tmp/frozen.yml
+
+# Re-run a saved run against the current prompt/code and diff the result:
+python -m evals replay data/eval/runs/<name>-<stamp>.json
+```
+
+Scenario files live in `evals/scenarios/`; run artifacts are written under
+`data/eval/runs/` (gitignored). The harness itself is dev-only — it is not in the
+shipped wheel — but its offline logic is tested in `tests/test_evals.py` and
+type-checked as part of `make ci`.
+
 ## Commit Messages
 
 Use [Conventional Commits](https://www.conventionalcommits.org/):

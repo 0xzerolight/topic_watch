@@ -2,6 +2,7 @@
 data/config.yml
 data/*.db*
 data/backups/
+data/eval/
 *.bak
 
 # Environment variables (may contain API keys)

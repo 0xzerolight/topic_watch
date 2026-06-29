@@ -21,14 +21,14 @@ smoke: ## Run hermetic end-to-end smoke tests
 
 lint: ## Run Ruff linter and mypy type checker
 	ruff check .
-	mypy app/ --ignore-missing-imports
+	mypy app/ evals/ --ignore-missing-imports
 
 format: ## Format code with Ruff
 	ruff format .
 	ruff check --fix .
 
 typecheck: ## Run mypy type checker
-	mypy app/ --ignore-missing-imports
+	mypy app/ evals/ --ignore-missing-imports
 
 coverage: ## Run tests with detailed coverage report
 	pytest --cov=app --cov-report=term-missing --cov-report=html --tb=short
