@@ -8,6 +8,7 @@ import httpx
 import pytest
 import trafilatura
 
+from app.analysis.prompts import _STUB_CONTENT_MIN_CHARS, _content_quality_tag
 from app.crud import create_article, create_topic, list_articles_for_topic
 from app.models import Article, FeedMode, Topic
 from app.scraping import fetch_new_articles_for_topic
@@ -18,6 +19,7 @@ from app.scraping.rss import (
     FeedResponse,
     _parse_entry,
     _parse_feed_date,
+    _resolve_bing_news_url,
     _resolve_google_news_url,
     compute_article_hash,
     fetch_feed,
@@ -516,6 +518,115 @@ class TestResolveGoogleNewsUrl:
         entry = _parse_entry(raw_entry, "https://news.google.com/rss/search?q=test")
         assert entry is not None
         assert entry.url == "https://animenews.com/solo-leveling-s3"
+
+
+class TestResolveBingNewsUrl:
+    # Real Bing RSS link: an apiclick redirect with the publisher URL fully
+    # percent-encoded in the ``url=`` query param (host is NOT encoded).
+    _APICLICK = (
+        "http://www.bing.com/news/apiclick.aspx?ref=FexRss&aid=&tid=ABC"
+        "&url=https%3a%2f%2fpublisher.example%2fstory&c=123&mkt=es-es"
+    )
+
+    def test_unwraps_apiclick_to_real_url(self) -> None:
+        assert _resolve_bing_news_url(self._APICLICK) == "https://publisher.example/story"
+
+    def test_http_wrapper_keeps_https_target(self) -> None:
+        # The http:// wrapper must not downgrade the decoded https:// target.
+        assert _resolve_bing_news_url(self._APICLICK).startswith("https://")
+
+    def test_non_bing_url_unchanged(self) -> None:
+        url = "https://example.com/article"
+        assert _resolve_bing_news_url(url) == url
+
+    def test_google_news_url_unchanged(self) -> None:
+        # The two resolvers run back-to-back in _parse_entry; a Google URL must
+        # pass through the Bing resolver untouched.
+        url = "https://news.google.com/rss/articles/CBMiQ2h0dHBz..."
+        assert _resolve_bing_news_url(url) == url
+
+    def test_apiclick_without_url_param_unchanged(self) -> None:
+        link = "http://www.bing.com/news/apiclick.aspx?ref=FexRss&tid=ABC&c=1"
+        assert _resolve_bing_news_url(link) == link
+
+    def test_apiclick_empty_url_param_falls_back(self) -> None:
+        # parse_qs drops blank values, so an empty url= yields no target.
+        link = "http://www.bing.com/news/apiclick.aspx?url=&c=1"
+        assert _resolve_bing_news_url(link) == link
+
+    def test_non_http_target_rejected(self) -> None:
+        link = "http://www.bing.com/news/apiclick.aspx?url=javascript%3aalert(1)&c=1"
+        assert _resolve_bing_news_url(link) == link
+
+    def test_self_referential_target_rejected(self) -> None:
+        # A url= that decodes to another bing apiclick must not be adopted (loop guard).
+        link = (
+            "http://www.bing.com/news/apiclick.aspx?url=https%3a%2f%2fwww.bing.com%2fnews%2fapiclick.aspx%3furl%3dx&c=1"
+        )
+        assert _resolve_bing_news_url(link) == link
+
+    def test_double_encoded_target_rejected(self) -> None:
+        # parse_qs decodes exactly once; a double-encoded target stays scheme-less
+        # ("https%3a%2f...") and is rejected, pinning the single-decode assumption.
+        link = "http://www.bing.com/news/apiclick.aspx?url=https%253a%252f%252fa.test%252fx&c=1"
+        assert _resolve_bing_news_url(link) == link
+
+    def test_multiple_url_params_takes_first(self) -> None:
+        link = (
+            "http://www.bing.com/news/apiclick.aspx?url=https%3a%2f%2fa.test%2fone&url=https%3a%2f%2fb.test%2ftwo&c=1"
+        )
+        assert _resolve_bing_news_url(link) == "https://a.test/one"
+
+    def test_uppercase_host_and_path_still_unwraps(self) -> None:
+        link = "http://WWW.BING.COM/news/APICLICK.ASPX?url=https%3a%2f%2fa.test%2fx&c=1"
+        assert _resolve_bing_news_url(link) == "https://a.test/x"
+
+    def test_host_with_port_still_unwraps(self) -> None:
+        # .hostname strips the port; a .netloc-based check would fail this.
+        link = "http://www.bing.com:80/news/apiclick.aspx?url=https%3a%2f%2fa.test%2fx&c=1"
+        assert _resolve_bing_news_url(link) == "https://a.test/x"
+
+
+class TestBingStubRegression:
+    """Locks the [STUB] fix end-to-end: a Bing apiclick entry must unwrap to the
+    real publisher URL so extraction yields real content (>=200 chars, no STUB
+    tag) instead of the short RSS-summary fallback the redirect forces."""
+
+    _REAL_URL = "https://publisher.example/bing-real-article"
+    _APICLICK = (
+        "http://www.bing.com/news/apiclick.aspx?ref=FexRss&aid=&tid=ABC"
+        "&url=https%3a%2f%2fpublisher.example%2fbing-real-article&c=123&mkt=es-es"
+    )
+
+    def test_parse_entry_unwraps_and_keys_hash_off_real_url(self) -> None:
+        entry = _parse_entry(
+            {"title": "Wrapped headline", "link": self._APICLICK, "summary": "short"},
+            "https://www.bing.com/news/search?q=test&format=rss",
+        )
+        assert entry is not None
+        assert entry.url == self._REAL_URL
+        # Dedup now keys off the real URL, not the apiclick redirect.
+        assert compute_article_hash(entry.url, entry.title) == compute_article_hash(self._REAL_URL, "Wrapped headline")
+        assert compute_article_hash(entry.url, entry.title) != compute_article_hash(self._APICLICK, "Wrapped headline")
+
+    async def test_unwrapped_url_clears_stub_tag(self) -> None:
+        entry = _parse_entry(
+            {"title": "Wrapped headline", "link": self._APICLICK, "summary": "short"},
+            "https://www.bing.com/news/search?q=test&format=rss",
+        )
+        assert entry is not None
+        # Mock keyed on the DECODED path ("/bing-real-article" with a real slash);
+        # the apiclick URL carries it percent-encoded (%2f), so before the fix the
+        # fetch would hit apiclick, miss the mock, and fall back to the short summary.
+        transport = _mock_transport({"publisher.example/bing-real-article": (200, _SAMPLE_HTML)})
+        with (
+            patch("app.scraping.content.is_private_url", return_value=False),
+            patch("app.url_validation.is_private_url", return_value=False),
+        ):
+            async with httpx.AsyncClient(transport=transport) as client:
+                content = await extract_article_content(entry.url, fallback_summary=entry.summary, client=client)
+        assert len(content) >= _STUB_CONTENT_MIN_CHARS
+        assert _content_quality_tag(content) == ""
 
 
 class TestFetchFeedsForTopic:
