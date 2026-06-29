@@ -599,6 +599,30 @@ class TestTopicStatus:
         assert "Summary here." in response.text
         assert "hx-trigger" not in response.text
 
+    async def test_status_renders_markdown_summary(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """The knowledge summary's markdown renders to HTML, not literal asterisks.
+
+        Guards against the ``| markdown`` filter being dropped from the template or
+        the result being double-escaped — neither of which a unit test would catch.
+        """
+        topic = _make_topic(db_conn, status=TopicStatus.READY)
+        create_knowledge_state(
+            db_conn,
+            KnowledgeState(
+                topic_id=topic.id,
+                summary_text="**Current Status:** ongoing\n- fact a",
+                token_count=20,
+            ),
+        )
+        db_conn.commit()
+
+        response = await client.get(f"/topics/{topic.id}/status")
+        assert "<strong>Current Status:</strong>" in response.text
+        assert "<li>fact a</li>" in response.text
+        assert "**Current Status:**" not in response.text
+
     async def test_status_error_shows_retry(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
         """ERROR status fragment shows error and retry button."""
         topic = _make_topic(db_conn, status=TopicStatus.ERROR, error_message="Init failed")

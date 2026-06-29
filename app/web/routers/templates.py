@@ -7,11 +7,13 @@ directly.
 """
 
 import json as json_mod
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
 from fastapi.templating import Jinja2Templates
+from markdown_it import MarkdownIt
 from markupsafe import Markup, escape
 
 from app import __version__
@@ -21,6 +23,17 @@ _TEMPLATE_DIR = Path(__file__).resolve().parent.parent.parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATE_DIR))
 
 templates.env.globals["version"] = __version__
+
+# Markdown renderer for LLM-generated knowledge summaries. ``html=False`` escapes
+# any raw HTML in the (article-derived) source and rejects unsafe link schemes
+# (javascript:/data:), so no separate HTML sanitizer is needed. Images are
+# disabled and hard breaks are off — list structure is restored by
+# ``_normalize_markdown`` instead. Built once and shared; ``render()`` is
+# stateless per call, so it is safe across concurrent requests.
+_MD = MarkdownIt("commonmark", {"html": False, "linkify": False, "breaks": False})
+_MD.disable("image")
+_MD_LABEL_RE = re.compile(r"^\s*\*\*[^*]+\*\*")
+_MD_LIST_RE = re.compile(r"^\s*([-*+]|\d+\.)\s+")
 
 
 def _timeago(dt: datetime) -> str:
@@ -73,6 +86,43 @@ def _sanitize_error(error_message: str | None) -> Markup:
         f"<details><summary><small>Show full error</small></summary>"
         f"<pre><code>{escaped_full}</code></pre></details>"
     )
+
+
+def _normalize_markdown(text: str) -> str:
+    """Insert blank lines so the LLM's label+bullet markdown parses correctly.
+
+    The knowledge prompt emits ``**Label:**`` headers immediately followed by
+    ``-`` bullets with no blank line between them. Raw CommonMark then merges
+    adjacent labels into one paragraph and swallows the next label into the
+    preceding list item. Inserting a blank line before each label line and
+    before each list run (but never between consecutive bullets) restores one
+    paragraph per category and a real ``<ul>``. Idempotent on already-spaced
+    input.
+    """
+    out: list[str] = []
+    prev = ""
+    for line in text.splitlines():
+        is_label = bool(_MD_LABEL_RE.match(line))
+        is_item = bool(_MD_LIST_RE.match(line))
+        prev_item = bool(_MD_LIST_RE.match(prev))
+        if prev.strip() and (is_label or (is_item and not prev_item)):
+            out.append("")
+        out.append(line)
+        prev = line
+    return "\n".join(out)
+
+
+def _markdown(text: str | None) -> Markup:
+    """Render an LLM-generated markdown summary to sanitized HTML.
+
+    ``_MD`` is configured ``html=False`` with images disabled, so raw HTML is
+    escaped and unsafe link schemes are rejected at render time — the result is
+    safe to mark as ``Markup`` without a separate sanitizer. ``None``/empty
+    input yields an empty fragment.
+    """
+    if not text:
+        return Markup("")
+    return Markup(_MD.render(_normalize_markdown(text)))
 
 
 def _mask_url(url: str) -> str:
@@ -177,6 +227,7 @@ def _feed_source_name(feed_url: str) -> str:
 
 templates.env.filters["timeago"] = _timeago
 templates.env.filters["sanitize_error"] = _sanitize_error
+templates.env.filters["markdown"] = _markdown
 templates.env.filters["mask_url"] = _mask_url
 templates.env.filters["safe_href"] = _safe_href
 templates.env.filters["confidence_badge"] = _confidence_badge
