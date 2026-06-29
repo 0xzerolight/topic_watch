@@ -269,7 +269,7 @@ class TestFetchFeedCallback:
             )
 
         assert len(entries) == 1
-        callback.assert_called_once_with("https://example.com/feed.xml", True, None)
+        callback.assert_called_once_with("https://example.com/feed.xml", True, None, None, None)
 
     async def test_callback_called_on_http_error(self) -> None:
         """health_callback is called with success=False on HTTP error."""

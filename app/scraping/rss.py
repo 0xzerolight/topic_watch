@@ -32,7 +32,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-FeedHealthCallback = Callable[[str, bool, str | None], None]  # (feed_url, success, error_msg)
+FeedHealthCallback = Callable[
+    [str, bool, str | None, str | None, str | None], None
+]  # (feed_url, success, error_msg, etag, last_modified)
 
 _USER_AGENT = "TopicWatch/1.0.0 (RSS reader)"
 _FEED_FETCH_TIMEOUT = 15.0
@@ -241,6 +243,8 @@ async def fetch_feed(
     timeout: float = _FEED_FETCH_TIMEOUT,
     max_attempts: int = 2,
     health_callback: FeedHealthCallback | None = None,
+    etag: str | None = None,
+    last_modified: str | None = None,
 ) -> list[FeedEntry]:
     """Fetch and parse a single RSS/Atom feed. Returns [] on any error."""
     entries, _ = await fetch_feed_with_status(
@@ -249,6 +253,8 @@ async def fetch_feed(
         timeout=timeout,
         max_attempts=max_attempts,
         health_callback=health_callback,
+        etag=etag,
+        last_modified=last_modified,
     )
     return entries
 
@@ -259,6 +265,8 @@ async def fetch_feed_with_status(
     timeout: float = _FEED_FETCH_TIMEOUT,
     max_attempts: int = 2,
     health_callback: FeedHealthCallback | None = None,
+    etag: str | None = None,
+    last_modified: str | None = None,
 ) -> tuple[list[FeedEntry], bool]:
     """Fetch and parse a single feed, also reporting whether the fetch succeeded.
 
@@ -267,6 +275,10 @@ async def fetch_feed_with_status(
     entries — and False on any error (blocked URL, timeout, HTTP error, etc.).
     This lets callers distinguish "fetched OK but empty" from "fetch failed" so
     an empty-but-valid feed does not get treated as a provider failure.
+
+    ``etag`` / ``last_modified`` are the feed's stored conditional-GET validators;
+    when present they are sent as ``If-None-Match`` / ``If-Modified-Since`` and a
+    304 returns ``([], True)`` (the empty-but-OK bucket) without re-parsing.
     """
     if await asyncio.to_thread(is_private_url, feed_url):
         logger.warning("Blocked fetch to private URL: %s", redact_url(feed_url))
@@ -279,10 +291,23 @@ async def fetch_feed_with_status(
             follow_redirects=False,
         )
     assert client is not None
+    cond_headers: dict[str, str] = {}
+    if etag:
+        cond_headers["If-None-Match"] = etag
+    if last_modified:
+        cond_headers["If-Modified-Since"] = last_modified
     try:
         for attempt in range(max_attempts):
             try:
-                response = await safe_get(client, feed_url)
+                response = await safe_get(client, feed_url, headers=cond_headers or None)
+                # 304 Not Modified: validators still valid. Treat as an empty-but-
+                # successful fetch — the existing "([], True)" bucket that
+                # _fetch_auto/_fetch_manual already handle. Pass (None, None) so the
+                # stored validators are preserved (COALESCE), not wiped.
+                if response.status_code == 304:
+                    if health_callback:
+                        health_callback(feed_url, True, None, None, None)
+                    return [], True
                 response.raise_for_status()
                 parsed = feedparser.parse(response.text)
                 entries = []
@@ -306,13 +331,19 @@ async def fetch_feed_with_status(
                     if not entries:
                         logger.warning("Feed parse error (bozo) with no entries: %s — %s", feed_url, bozo_exc)
                         if health_callback:
-                            health_callback(feed_url, False, f"Feed parse error: {bozo_exc}")
+                            health_callback(feed_url, False, f"Feed parse error: {bozo_exc}", None, None)
                         return [], False
                     logger.debug(
                         "Feed flagged bozo but %d entries recovered: %s — %s", len(entries), feed_url, bozo_exc
                     )
                 if health_callback:
-                    health_callback(feed_url, True, None)
+                    health_callback(
+                        feed_url,
+                        True,
+                        None,
+                        response.headers.get("etag"),
+                        response.headers.get("last-modified"),
+                    )
                 return entries, True
             except httpx.TimeoutException as exc:
                 if attempt < max_attempts - 1:
@@ -321,7 +352,7 @@ async def fetch_feed_with_status(
                     continue
                 logger.warning("Timeout fetching feed after %d attempts: %s", max_attempts, feed_url)
                 if health_callback:
-                    health_callback(feed_url, False, f"Timeout after {max_attempts} attempts: {exc}")
+                    health_callback(feed_url, False, f"Timeout after {max_attempts} attempts: {exc}", None, None)
                 return [], False
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code >= 500 and attempt < max_attempts - 1:
@@ -332,7 +363,7 @@ async def fetch_feed_with_status(
                     continue
                 logger.warning("HTTP %d fetching feed: %s", exc.response.status_code, feed_url)
                 if health_callback:
-                    health_callback(feed_url, False, f"HTTP {exc.response.status_code}")
+                    health_callback(feed_url, False, f"HTTP {exc.response.status_code}", None, None)
                 return [], False
             except httpx.NetworkError as exc:
                 if attempt < max_attempts - 1:
@@ -351,12 +382,12 @@ async def fetch_feed_with_status(
                     type(exc).__name__,
                 )
                 if health_callback:
-                    health_callback(feed_url, False, f"Network error: {type(exc).__name__}: {exc}")
+                    health_callback(feed_url, False, f"Network error: {type(exc).__name__}: {exc}", None, None)
                 return [], False
             except Exception as exc:
                 logger.warning("Error fetching feed: %s", feed_url, exc_info=True)
                 if health_callback:
-                    health_callback(feed_url, False, f"{type(exc).__name__}: {exc}")
+                    health_callback(feed_url, False, f"{type(exc).__name__}: {exc}", None, None)
                 return [], False
         return [], False  # pragma: no cover
     finally:
