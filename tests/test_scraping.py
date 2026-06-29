@@ -10,7 +10,7 @@ import trafilatura
 
 from app.analysis.prompts import _STUB_CONTENT_MIN_CHARS, _content_quality_tag
 from app.crud import create_article, create_topic, list_articles_for_topic
-from app.models import Article, FeedMode, Topic
+from app.models import Article, FeedHealth, FeedMode, Topic
 from app.scraping import fetch_new_articles_for_topic
 from app.scraping.content import _truncate, extract_article_content
 from app.scraping.providers import GoogleNewsProvider
@@ -2016,3 +2016,98 @@ class TestConditionalGet:
 
         assert ok is True and len(entries) == 1
         assert calls == [("https://example.com/feed", True, None, 'W/"v2"', "LM2")]
+
+
+def _dead_feed_health(url: str) -> FeedHealth:
+    return FeedHealth(feed_url=url, consecutive_failures=10, last_error_at=datetime.now(UTC))
+
+
+class TestManualBackoffAndValidators:
+    """Phase 1: MANUAL backoff-skip + validator threading (both modes)."""
+
+    async def test_manual_skips_backed_off_feed(self) -> None:
+        topic = Topic(
+            name="T",
+            description="d",
+            feed_urls=["https://live.example/feed", "https://dead.example/feed"],
+            feed_mode=FeedMode.MANUAL,
+        )
+        attempted: list[str] = []
+
+        async def fake_fetch(
+            url, client, *, timeout, max_attempts, health_callback=None, etag=None, last_modified=None
+        ):
+            attempted.append(url)
+            return ([FeedEntry(title="A", url="https://live.example/a", source_feed=url)], True)
+
+        def loader(url):
+            return _dead_feed_health(url) if url == "https://dead.example/feed" else None
+
+        with patch("app.scraping.rss.fetch_feed_with_status", side_effect=fake_fetch):
+            resp = await fetch_feeds_for_topic(
+                topic, feed_state_loader=loader, backoff_base_minutes=15, backoff_cap_hours=24
+            )
+
+        assert attempted == ["https://live.example/feed"]  # dead feed never fetched
+        assert resp.feeds_skipped == 1
+        assert resp.feeds_total == 1  # only the attempted feed counts
+
+    async def test_manual_all_backed_off_returns_empty(self) -> None:
+        topic = Topic(name="T", description="d", feed_urls=["https://dead.example/feed"], feed_mode=FeedMode.MANUAL)
+
+        async def fake_fetch(*a, **k):  # must never be called
+            raise AssertionError("backed-off feed must not be fetched")
+
+        with patch("app.scraping.rss.fetch_feed_with_status", side_effect=fake_fetch):
+            resp = await fetch_feeds_for_topic(
+                topic, feed_state_loader=_dead_feed_health, backoff_base_minutes=15, backoff_cap_hours=24
+            )
+
+        assert resp.feeds_skipped == 1
+        assert resp.feeds_total == 0
+        assert resp.entries == []
+
+    async def test_auto_sends_stored_validators(self) -> None:
+        topic = Topic(name="T", description="d", feed_urls=[], feed_mode=FeedMode.AUTO)
+        seen: list[tuple[str | None, str | None]] = []
+
+        async def fake_fetch(
+            url, client, *, timeout, max_attempts, health_callback=None, etag=None, last_modified=None
+        ):
+            seen.append((etag, last_modified))
+            return ([FeedEntry(title="A", url="https://x/a", source_feed=url)], True)
+
+        def loader(url):
+            return FeedHealth(feed_url=url, etag='W/"auto"', last_modified="LM")
+
+        with patch("app.scraping.rss.fetch_feed_with_status", side_effect=fake_fetch):
+            await fetch_feeds_for_topic(topic, feed_state_loader=loader)
+
+        assert seen and seen[0] == ('W/"auto"', "LM")  # AUTO threaded the stored validators
+
+    async def test_auto_cascade_sends_fallback_validators(self) -> None:
+        # Forced cascade: primary fails, fallback yields entries — assert the FALLBACK
+        # fetch received the fallback URL's own stored validators (the cascade branch).
+        from app.scraping.routing import ProviderRouter
+
+        topic = Topic(name="T", description="d", feed_urls=[], feed_mode=FeedMode.AUTO)
+        calls: list[tuple[str, str | None]] = []  # (url, etag)
+
+        async def fake_fetch(
+            url, client, *, timeout, max_attempts, health_callback=None, etag=None, last_modified=None
+        ):
+            calls.append((url, etag))
+            if len(calls) == 1:  # primary: fetch failed, no entries -> cascade
+                return ([], False)
+            return ([FeedEntry(title="A", url="https://x/a", source_feed=url)], True)
+
+        def loader(url):
+            return FeedHealth(feed_url=url, etag=f"etag::{url[:20]}", last_modified="LM")
+
+        with patch("app.scraping.rss.fetch_feed_with_status", side_effect=fake_fetch):
+            # Fresh router so global provider-health state is not mutated.
+            await fetch_feeds_for_topic(topic, router=ProviderRouter(), feed_state_loader=loader)
+
+        assert len(calls) == 2  # primary + cascade fallback
+        fb_url, fb_etag = calls[1]
+        assert fb_etag == f"etag::{fb_url[:20]}"  # fallback got ITS url's stored validator
