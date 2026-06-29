@@ -369,3 +369,128 @@ async def test_run_scenario_surfaces_swallowed_llm_error() -> None:
     assert art.final["has_new_info"] is False
     assert art.final_error is not None
     assert "boom" in art.final_error
+
+
+# --- runner: run_live (prod read-only + scratch isolation) ---
+
+
+def test_open_readonly_blocks_writes(tmp_path) -> None:
+    import sqlite3
+
+    from app.database import init_db
+    from evals.runner import _open_readonly
+
+    db = tmp_path / "prod.db"
+    init_db(db)
+    ro = _open_readonly(db)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            ro.execute(
+                "INSERT INTO topics (name, description, feed_urls, feed_mode, created_at, "
+                "is_active, status, init_attempts) VALUES "
+                "('x', 'y', '[]', 'auto', '2025-01-01T00:00:00+00:00', 1, 'ready', 0)"
+            )
+    finally:
+        ro.close()
+
+
+def test_open_readonly_raises_live_error_on_missing_db(tmp_path) -> None:
+    from evals.runner import LiveError, _open_readonly
+
+    with pytest.raises(LiveError):
+        _open_readonly(tmp_path / "does-not-exist.db")
+
+
+async def test_run_live_uses_scratch_topic_and_reads_prod_readonly(tmp_path, monkeypatch) -> None:
+    import evals.runner as runner
+    from app.crud import create_topic
+    from app.database import get_connection, init_db
+    from app.models import Article, Topic, TopicStatus
+    from app.scraping import FetchResult
+
+    # Prod DB: a filler topic (id=1) then the target (id=2) so prod id != scratch id.
+    prod = tmp_path / "prod.db"
+    init_db(prod)
+    conn = get_connection(prod)
+    create_topic(conn, Topic(name="filler", description="f", feed_urls=[]))
+    target = create_topic(
+        conn,
+        Topic(name="Acme", description="track acme", feed_urls=["http://feed"], status=TopicStatus.READY),
+    )
+    conn.commit()
+    conn.close()
+    prod_target_id = target.id
+    assert prod_target_id == 2
+
+    captured: dict[str, object] = {}
+
+    async def fake_fetch(topic: Topic, conn, **_kw: object) -> FetchResult:
+        captured["topic_id"] = topic.id
+        art = Article(
+            topic_id=topic.id,  # type: ignore[arg-type]
+            title="fetched",
+            url="http://x",
+            content_hash="h",
+            source_feed="http://feed",
+            raw_content="live body",
+        )
+        return FetchResult(articles=[art], total_feed_entries=1)
+
+    monkeypatch.setattr(runner, "fetch_new_articles_for_topic", fake_fetch)
+
+    art = await runner.run_live(
+        "Acme", _settings(), kind="novelty", inner=_mock_inner(novelty=_novelty()), prod_db_path=prod
+    )
+
+    # fetch ran against the SCRATCH topic (fresh id=1), not the prod-loaded id=2.
+    assert captured["topic_id"] == 1
+    assert captured["topic_id"] != prod_target_id
+    assert len(art.calls) == 1
+    assert art.scenario.articles[0].title == "fetched"
+
+
+async def test_run_live_freeze_writes_replayable_scenario(tmp_path, monkeypatch) -> None:
+    import evals.runner as runner
+    from app.crud import create_topic
+    from app.database import get_connection, init_db
+    from app.models import Article, Topic, TopicStatus
+    from app.scraping import FetchResult
+    from evals.scenario import load_scenario
+
+    prod = tmp_path / "prod.db"
+    init_db(prod)
+    conn = get_connection(prod)
+    create_topic(
+        conn,
+        Topic(name="Acme Corp", description="track acme", feed_urls=["http://feed"], status=TopicStatus.READY),
+    )
+    conn.commit()
+    conn.close()
+
+    async def fake_fetch(topic: Topic, conn, **_kw: object) -> FetchResult:
+        art = Article(
+            topic_id=topic.id,  # type: ignore[arg-type]
+            title="fetched",
+            url="http://x",
+            content_hash="h",
+            source_feed="http://feed",
+            raw_content="live body",
+        )
+        return FetchResult(articles=[art], total_feed_entries=1)
+
+    monkeypatch.setattr(runner, "fetch_new_articles_for_topic", fake_fetch)
+
+    freeze = tmp_path / "frozen.yml"
+    await runner.run_live(
+        "Acme Corp",
+        _settings(),
+        inner=_mock_inner(novelty=_novelty()),
+        prod_db_path=prod,
+        freeze_path=freeze,
+    )
+
+    assert freeze.exists()
+    sc = load_scenario(freeze)
+    assert sc.topic.name == "Acme Corp"
+    assert sc.articles[0].title == "fetched"
+    assert sc.articles[0].content == "live body"
