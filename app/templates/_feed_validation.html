@@ -1,10 +1,10 @@
-<div style="margin-top: 0.5em;">
+<div style="margin-top: 0.5em; display: flex; flex-direction: column; gap: 0.4em;">
 {% for result in results %}
-<div style="margin-bottom: 0.5em; padding: 0.5em; border-radius: 0.25em; background: var(--pico-card-background-color, #f8f9fa);">
+<div style="display: flex; align-items: baseline; gap: 0.5em;">
     {% if result.valid %}
-    <small class="status-healthy">&#10004;</small>
+    <span class="badge badge--ok">&#10004; OK</span>
     {% else %}
-    <small class="status-error">&#10008;</small>
+    <span class="badge badge--bad">&#10008; Failed</span>
     {% endif %}
     <small>
         {% if result.url %}<code>{{ result.url | truncate(60) }}</code> &mdash; {% endif %}

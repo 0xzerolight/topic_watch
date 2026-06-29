@@ -1,114 +1,133 @@
 {% extends "base.html" %}
 {% block title %}Edit {{ topic.name }} - Topic Watch{% endblock %}
 {% block content %}
-<h1>Edit Topic</h1>
+<div class="page-header masthead">
+    <h1>Edit Topic</h1>
+</div>
 
 {% if errors %}
-<article aria-label="Validation errors">
-    <header>Validation Errors</header>
-    <ul>
+<div class="alert alert-error" role="alert" aria-label="Validation errors">
+    <strong>Validation Errors</strong>
+    <ul style="margin: 0.5rem 0 0;">
         {% for error in errors %}
         <li>{{ error }}</li>
         {% endfor %}
     </ul>
-</article>
+</div>
 {% endif %}
 
 <form method="post" action="/topics/{{ topic.id }}/edit">
     <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
-    <label for="name">
-        Topic Name
-        <input type="text" id="name" name="name" required
-               value="{{ name if name is defined else topic.name }}">
-    </label>
 
-    <label for="description">
-        Description (what you care about)
-        <input type="text" id="description" name="description" required
-               value="{{ description if description is defined else topic.description }}">
-        <small>Be specific. The AI only reports on aspects you describe here. "Release date and pricing" works better than "any news."</small>
-    </label>
+    <section class="card">
+        <span class="card-kicker">Topic</span>
+
+        <div class="field-group">
+            <label for="name">Topic Name</label>
+            <input type="text" id="name" name="name" required
+                   value="{{ name if name is defined else topic.name }}">
+        </div>
+
+        <div class="field-group">
+            <label for="description">Description (what you care about)</label>
+            <input type="text" id="description" name="description" required
+                   value="{{ description if description is defined else topic.description }}">
+            <small class="help">Be specific. The AI only reports on aspects you describe here. "Release date and pricing" works better than "any news."</small>
+        </div>
+    </section>
 
     {% set current_mode = feed_mode if feed_mode is defined else topic.feed_mode.value %}
-    <fieldset>
-        <legend>Feed Source</legend>
-        <label>
-            <input type="radio" name="feed_mode" value="auto"
-                   {{ 'checked' if current_mode == 'auto' }}
-                   aria-controls="manual-feeds"
-                   onchange="document.getElementById('manual-feeds').style.display='none'; document.getElementById('manual-feeds').setAttribute('aria-hidden','true')">
-            Automatic (Google News)
-        </label>
-        <label>
-            <input type="radio" name="feed_mode" value="manual"
-                   {{ 'checked' if current_mode == 'manual' }}
-                   aria-controls="manual-feeds"
-                   onchange="document.getElementById('manual-feeds').style.display='block'; document.getElementById('manual-feeds').setAttribute('aria-hidden','false')">
-            Manual (provide RSS URLs)
-        </label>
-        <small>Automatic builds a Google News feed from the topic name. Manual lets you supply your own RSS/Atom feed URLs.</small>
-    </fieldset>
+    <section class="card">
+        <span class="card-kicker">Feed Source</span>
 
-    <div id="manual-feeds" aria-hidden="{{ 'false' if current_mode == 'manual' else 'true' }}" style="{{ 'display:block' if current_mode == 'manual' else 'display:none' }}">
-        <label for="feed_urls">
-            RSS Feed URLs (one per line)
-            <textarea id="feed_urls" name="feed_urls" rows="4">{{ feed_urls if feed_urls is defined else topic.feed_urls | join('\n') }}</textarea>
-        </label>
-        <button type="button"
-                hx-post="/feeds/validate"
-                hx-include="#feed_urls"
-                hx-target="#feed-validation-results"
-                hx-swap="innerHTML"
-                class="secondary outline"
-                style="margin-top: 0.5em;">
-            Validate URLs
-        </button>
-        <div id="feed-validation-results"></div>
-    </div>
+        <fieldset>
+            <label>
+                <input type="radio" name="feed_mode" value="auto"
+                       {{ 'checked' if current_mode == 'auto' }}
+                       aria-controls="manual-feeds"
+                       onchange="document.getElementById('manual-feeds').style.display='none'; document.getElementById('manual-feeds').setAttribute('aria-hidden','true')">
+                Automatic (Google News)
+            </label>
+            <label>
+                <input type="radio" name="feed_mode" value="manual"
+                       {{ 'checked' if current_mode == 'manual' }}
+                       aria-controls="manual-feeds"
+                       onchange="document.getElementById('manual-feeds').style.display='block'; document.getElementById('manual-feeds').setAttribute('aria-hidden','false')">
+                Manual (provide RSS URLs)
+            </label>
+            <small class="help">Automatic builds a Google News feed from the topic name. Manual lets you supply your own RSS/Atom feed URLs.</small>
+        </fieldset>
 
-    {% set current_interval = check_interval if check_interval is defined else (formatted_interval or '') %}
-    <label for="check_interval">
-        Check Interval
-        <input type="text" id="check_interval" name="check_interval"
-               value="{{ current_interval }}"
-               placeholder="e.g., 6h, 1d, 2w, 1M, 1w 3d">
-        <small>Leave empty to use the global default. Units: m (minutes), h (hours), d (days), w (weeks), M (months).</small>
-    </label>
+        <div id="manual-feeds" aria-hidden="{{ 'false' if current_mode == 'manual' else 'true' }}" style="{{ 'display:block' if current_mode == 'manual' else 'display:none' }}">
+            <div class="field-group">
+                <label for="feed_urls">RSS Feed URLs (one per line)</label>
+                <textarea id="feed_urls" name="feed_urls" rows="4">{{ feed_urls if feed_urls is defined else topic.feed_urls | join('\n') }}</textarea>
+            </div>
+            <button type="button"
+                    hx-post="/feeds/validate"
+                    hx-include="#feed_urls"
+                    hx-target="#feed-validation-results"
+                    hx-swap="innerHTML"
+                    class="secondary outline"
+                    style="margin-top: 0.5em;">
+                Validate URLs
+            </button>
+            <div id="feed-validation-results"></div>
+        </div>
+    </section>
 
-    {% set current_tags = tags if tags is defined else tags_string %}
-    <label for="tags">
-        Tags (comma-separated)
-        <input type="text" id="tags" name="tags"
-               value="{{ current_tags or '' }}"
-               placeholder="e.g., tech, ai, security">
-        <small>Optional. Use tags to organize and filter topics.</small>
-    </label>
+    <section class="card">
+        <span class="card-kicker">Schedule &amp; Tags</span>
+
+        {% set current_interval = check_interval if check_interval is defined else (formatted_interval or '') %}
+        {% set preview = interval_preview if interval_preview is defined else formatted_interval %}
+        <div class="field-group">
+            <label for="check_interval">Check Interval</label>
+            <input type="text" id="check_interval" name="check_interval"
+                   value="{{ current_interval }}"
+                   placeholder="e.g., 6h, 1d, 2w, 1M, 1w 3d">
+            <small class="help">Leave empty to use the global default. Units: m (minutes), h (hours), d (days), w (weeks), M (months).</small>
+            {% if preview %}
+            <small class="schedule-preview">Checks every {{ preview }}.</small>
+            {% endif %}
+        </div>
+
+        {% set current_tags = tags if tags is defined else tags_string %}
+        <div class="field-group">
+            <label for="tags">Tags (comma-separated)</label>
+            <input type="text" id="tags" name="tags"
+                   value="{{ current_tags or '' }}"
+                   placeholder="e.g., tech, ai, security">
+            <small class="help">Optional. Use tags to organize and filter topics.</small>
+        </div>
+    </section>
 
     {% set current_conf = confidence_threshold if confidence_threshold is defined
         else (topic.confidence_threshold if topic.confidence_threshold is not none else '') %}
     {% set current_rel = relevance_threshold if relevance_threshold is defined
         else (topic.relevance_threshold if topic.relevance_threshold is not none else '') %}
-    <fieldset>
-        <legend>Notification Thresholds (optional)</legend>
-        <label for="confidence_threshold">
-            Confidence threshold
+    <section class="card">
+        <span class="card-kicker">Notification Thresholds (optional)</span>
+
+        <div class="field-group">
+            <label for="confidence_threshold">Confidence threshold</label>
             <input type="number" id="confidence_threshold" name="confidence_threshold"
                    min="0" max="1" step="0.01"
                    value="{{ current_conf }}"
                    placeholder="inherit global ({{ '%.2f'|format(global_confidence_threshold) }})">
-            <small>Leave blank to inherit the global default. Higher = fewer, more certain notifications.</small>
-        </label>
-        <label for="relevance_threshold">
-            Relevance threshold
+            <small class="help">Leave blank to inherit the global default. Higher = fewer, more certain notifications.</small>
+        </div>
+        <div class="field-group">
+            <label for="relevance_threshold">Relevance threshold</label>
             <input type="number" id="relevance_threshold" name="relevance_threshold"
                    min="0" max="1" step="0.01"
                    value="{{ current_rel }}"
                    placeholder="inherit global ({{ '%.2f'|format(global_relevance_threshold) }})">
-            <small>Leave blank to inherit the global default. 0.0–1.0.</small>
-        </label>
-    </fieldset>
+            <small class="help">Leave blank to inherit the global default. 0.0–1.0.</small>
+        </div>
+    </section>
 
-    <div role="group">
+    <div class="form-actions">
         <button type="submit">Save Changes</button>
         <a href="/topics/{{ topic.id }}" role="button" class="secondary">Cancel</a>
     </div>
