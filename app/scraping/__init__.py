@@ -274,6 +274,7 @@ def _store_articles(
             # OVH-114: reused rows keep the originating provider; fresh rows (None)
             # are attributed to the provider that produced this topic's feed.
             source_provider=origin_provider if origin_provider is not None else provider_name,
+            published_at=entry.published,
         )
         if not _insert_or_count_dup(conn, article, topic.name, stored):
             dropped_duplicates += 1

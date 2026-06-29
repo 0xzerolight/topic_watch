@@ -15,6 +15,7 @@ from app.crud import (
     delete_expired_notifications,
     delete_pending_notification,
     delete_topic,
+    get_article,
     get_check_result,
     get_dashboard_data,
     get_knowledge_state,
@@ -706,6 +707,57 @@ class TestMigrations:
         detail = " ".join(str(row[-1]) for row in plan)
         assert "USING INDEX" in detail
         assert "USE TEMP B-TREE" not in detail
+
+    def test_article_published_at_column_exists(self, db_conn: sqlite3.Connection) -> None:
+        """Migration m018 adds nullable published_at column to articles."""
+        columns = {row[1]: row for row in db_conn.execute("PRAGMA table_info(articles)").fetchall()}
+        assert "published_at" in columns, "articles missing published_at"
+        # Column is nullable (notnull flag, index 3, is 0).
+        assert columns["published_at"][3] == 0
+
+    def test_article_published_at_roundtrip(self, db_conn: sqlite3.Connection) -> None:
+        """published_at persists and loads back (None and an ISO timestamp)."""
+        topic = create_topic(db_conn, Topic(name="PubAt", description="d"))
+        db_conn.commit()
+
+        ts = datetime(2025, 3, 10, 9, 0, 0, tzinfo=UTC)
+        with_pub = create_article(
+            db_conn,
+            Article(
+                topic_id=topic.id,
+                title="With date",
+                url="https://example.com/with-date",
+                content_hash="hash-with",
+                source_feed="https://feed.example.com/rss",
+                published_at=ts,
+            ),
+        )
+        without_pub = create_article(
+            db_conn,
+            Article(
+                topic_id=topic.id,
+                title="No date",
+                url="https://example.com/no-date",
+                content_hash="hash-none",
+                source_feed="https://feed.example.com/rss",
+            ),
+        )
+        db_conn.commit()
+
+        loaded_with = get_article(db_conn, with_pub.id)
+        loaded_without = get_article(db_conn, without_pub.id)
+        assert loaded_with is not None
+        assert loaded_with.published_at == ts
+        assert loaded_without is not None
+        assert loaded_without.published_at is None
+
+    def test_m018_registered_in_migrations_list(self) -> None:
+        """Version 18 is registered with the expected description."""
+        from app.migrations import MIGRATIONS
+
+        entry = next((m for m in MIGRATIONS if m[0] == 18), None)
+        assert entry is not None, "m018 not found in MIGRATIONS"
+        assert "published_at" in entry[1]
 
     def test_perf_indexes_idempotent(self, db_conn: sqlite3.Connection) -> None:
         """Re-running migrations does not error and keeps the indexes present."""
