@@ -265,9 +265,10 @@ class TestTopicDetailFeedHealthIndicators:
         assert "Google News" in response.text
         # Active provider shows its real health.
         assert "status-healthy" in response.text
-        # The never-fetched standby provider reads 'Standby' exactly once (visible label,
-        # not the tooltip occurrence), and the alarming visible 'Unknown' is gone.
-        assert response.text.count("&#9679; Standby") == 1
+        # The never-fetched standby provider reads 'Standby' exactly once as the visible
+        # badge label (anchored on the >Standby< structure, not the title= tooltip which
+        # also contains the word), and the alarming visible 'Unknown' is gone.
+        assert response.text.count(">Standby<") == 1
         assert "Unknown" not in response.text
 
     async def test_topic_detail_auto_mode_active_reads_not_yet_checked(

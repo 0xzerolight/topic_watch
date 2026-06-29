@@ -10,6 +10,7 @@
     <!-- Pico CSS v2 (vendored) -->
     <link rel="stylesheet" href="/static/vendor/pico.min.css?v=2">
     <link rel="stylesheet" href="/static/themes.css?v=4">
+    <link rel="stylesheet" href="/static/components.css?v=1">
     <script src="/static/theme.js?v=2"></script>
     <script src="/static/notifications.js?v=3"></script>
     <!-- HTMX v2.0.4 (vendored) -->
@@ -40,20 +41,45 @@
             opacity: 0.6;
             cursor: not-allowed;
         }
+        @media (prefers-reduced-motion: reduce) {
+            .spinner { animation: none; }
+            .htmx-indicator { transition: none; }
+        }
+        .skip-link {
+            position: absolute;
+            left: -9999px;
+            top: 0;
+            z-index: 1000;
+            padding: 0.5rem 1rem;
+            background: var(--pico-card-background-color);
+            color: var(--pico-color);
+            border: 1px solid var(--pico-muted-border-color);
+        }
+        .skip-link:focus {
+            left: 0;
+        }
     </style>
 </head>
 <body hx-headers='{"X-CSRF-Token": "{{ request.state.csrf_token }}"}'>
+    <a href="#main" class="skip-link">Skip to main content</a>
     <header class="container">
         <nav>
             <ul>
                 <li><strong>Topic Watch</strong></li>
             </ul>
             {% if not setup_mode %}
+            {% set path = request.url.path %}
+            {% if path == "/" or path.startswith("/topics") %}
+                {% set active = "dashboard" %}
+            {% elif path.startswith("/settings") %}
+                {% set active = "settings" %}
+            {% elif path.startswith("/feeds") %}
+                {% set active = "feeds" %}
+            {% endif %}
             <ul>
-                <li><a href="/">Dashboard</a></li>
-                <li><a href="/topics/new">Add Topic</a></li>
-                <li><a href="/settings">Settings</a></li>
-                <li><a href="/feeds">Feed Health</a></li>
+                <li><a class="nav-link" href="/"{% if active == "dashboard" %} aria-current="page"{% endif %}>Dashboard</a></li>
+                <li><a class="nav-link" href="/settings"{% if active == "settings" %} aria-current="page"{% endif %}>Settings</a></li>
+                <li><a class="nav-link" href="/feeds"{% if active == "feeds" %} aria-current="page"{% endif %}>Feed Health</a></li>
                 <li>
                     <select id="theme-select" aria-label="Theme"></select>
                 </li>
@@ -61,7 +87,7 @@
             {% endif %}
         </nav>
     </header>
-    <main class="container">
+    <main id="main" class="container">
         {% block content %}{% endblock %}
     </main>
     <footer class="container site-footer">

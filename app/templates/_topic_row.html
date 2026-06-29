@@ -1,36 +1,50 @@
-<tr id="topic-{{ topic.id }}"{% if not topic.is_active %} style="opacity: 0.5"{% endif %}
+<tr id="topic-{{ topic.id }}"
+    {%- set row_classes = [] -%}
+    {%- if not topic.is_active %}{% set _ = row_classes.append("row-inactive") %}{% endif -%}
+    {%- if topic.status.value == "error" %}{% set _ = row_classes.append("row-problem") %}{% endif -%}
+    {% if row_classes %} class="{{ row_classes | join(' ') }}"{% endif %}
     data-topic-name="{{ topic.name }}"
     {% if last_check and last_check.has_new_info %}data-new-info="true"{% endif %}
     {% if just_checked %}data-just-checked="true"{% endif %}>
-    <td>
+    <td data-label="">
         <input type="checkbox" name="topic_ids" value="{{ topic.id }}"
                class="topic-select" aria-label="Select {{ topic.name }}" onchange="updateBulkBar()">
     </td>
-    <td>
-        <a href="/topics/{{ topic.id }}">{{ topic.name }}</a>
-        {% for tag in topic.tags %}<kbd style="font-size:0.75em; margin-left:0.25em;">{{ tag }}</kbd>{% endfor %}
-    </td>
-    <td>
-        {% if topic.status.value == "ready" %}
-            Ready
-        {% elif topic.status.value == "researching" %}
-            <span aria-busy="true">Researching</span>
-        {% elif topic.status.value == "new" %}
-            New
-        {% else %}
-            Error
+    <td class="cell-stack" data-label="Topic">
+        <span>
+            <a href="/topics/{{ topic.id }}">{{ topic.name }}</a>
+            {% for tag in topic.tags %}<kbd style="font-size:0.75em; margin-left:0.25em;">{{ tag }}</kbd>{% endfor %}
+        </span>
+        {% if topic.description %}<small class="quiet">{{ topic.description | truncate(80) }}</small>{% endif %}
+        {% if topic.status.value == "error" and topic.error_message %}
+        <small class="row-error" title="{{ topic.error_message }}">{{ topic.error_message | truncate(140) }}</small>
         {% endif %}
     </td>
-    <td>
+    <td data-label="Status">
+        {% if topic.status.value == "ready" %}
+            {% if last_check and last_check.has_new_info %}
+                <span class="badge badge--signal"><span class="badge-dot"></span>Ready &middot; new info</span>
+            {% else %}
+                <span class="badge badge--ok"><span class="badge-dot"></span>Ready</span>
+            {% endif %}
+        {% elif topic.status.value == "researching" %}
+            <span class="badge badge--idle"><span class="badge-dot"></span>Researching</span>
+        {% elif topic.status.value == "new" %}
+            <span class="badge badge--idle"><span class="badge-dot"></span>New</span>
+        {% else %}
+            <span class="badge badge--bad"><span class="badge-dot"></span>Error</span>
+        {% endif %}
+    </td>
+    <td class="cell-stack" data-label="Last Check">
         {% if last_check %}
-            <span title="{{ last_check.checked_at.strftime('%Y-%m-%d %H:%M') }}">{{ last_check.checked_at | timeago }}</span>
-            <br><small>{{ last_check.confidence | confidence_value }}</small>
+            <span class="num" title="{{ last_check.checked_at.strftime('%Y-%m-%d %H:%M') }}">{{ last_check.checked_at | timeago }}</span>
+            {{ last_check.confidence | confidence_value }}
         {% else %}
             Never
         {% endif %}
     </td>
-    <td>{{ article_count }}</td>
-    <td>
+    <td data-label="Articles" class="num">{{ article_count }}</td>
+    <td data-label="">
         <div class="action-row">
         {% if topic.is_active and topic.status.value == "ready" %}
         <button
@@ -38,7 +52,7 @@
             hx-target="#topic-{{ topic.id }}"
             hx-swap="outerHTML"
             hx-disabled-elt="this"
-            style="padding: 0.25rem 0.75rem; font-size: 0.875rem; margin: 0;"
+            class="btn-sm"
         >
             Check Now <span class="htmx-indicator spinner"></span>
         </button>
@@ -47,8 +61,7 @@
             hx-post="/topics/{{ topic.id }}/toggle-active"
             hx-target="#topic-{{ topic.id }}"
             hx-swap="outerHTML"
-            class="secondary"
-            style="padding: 0.25rem 0.75rem; font-size: 0.875rem; margin: 0;"
+            class="secondary btn-sm"
         >
             {% if topic.is_active %}Disable{% else %}Enable{% endif %}
         </button>
