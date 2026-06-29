@@ -5,9 +5,9 @@
     {% include "_topic_row.html" %}
 {% endfor %}
 {% if not topic_data %}
-<tr><td colspan="6">
+<tr><td colspan="6" data-label="">
     <div class="empty-state">
-        <p><em>No topics match your search.</em></p>
+        <p class="empty-title">No topics match your search.</p>
         <p class="empty-state-hint">Try a different search term or clear the status filter.</p>
     </div>
 </td></tr>
