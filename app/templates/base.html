@@ -69,10 +69,8 @@
             </ul>
             {% if not setup_mode %}
             {% set path = request.url.path %}
-            {% if path == "/" or (path.startswith("/topics") and not path.startswith("/topics/new")) %}
+            {% if path == "/" or path.startswith("/topics") %}
                 {% set active = "dashboard" %}
-            {% elif path.startswith("/topics/new") %}
-                {% set active = "add" %}
             {% elif path.startswith("/settings") %}
                 {% set active = "settings" %}
             {% elif path.startswith("/feeds") %}
@@ -80,7 +78,6 @@
             {% endif %}
             <ul>
                 <li><a class="nav-link" href="/"{% if active == "dashboard" %} aria-current="page"{% endif %}>Dashboard</a></li>
-                <li><a class="nav-link" href="/topics/new"{% if active == "add" %} aria-current="page"{% endif %}>Add Topic</a></li>
                 <li><a class="nav-link" href="/settings"{% if active == "settings" %} aria-current="page"{% endif %}>Settings</a></li>
                 <li><a class="nav-link" href="/feeds"{% if active == "feeds" %} aria-current="page"{% endif %}>Feed Health</a></li>
                 <li>
