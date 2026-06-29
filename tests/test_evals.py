@@ -9,6 +9,8 @@ test failure rather than a billed network round-trip.
 
 from __future__ import annotations
 
+import textwrap
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -101,3 +103,123 @@ def test_recording_client_builds_real_inner_when_none_injected(monkeypatch: pyte
     # Injecting an inner avoids the real build entirely.
     with recorder.recording_client(inner=MagicMock()):
         pass
+
+
+# --- scenario + RunArtifact ---
+
+
+def test_scenario_yaml_round_trip_preserves_published(tmp_path) -> None:
+    from evals.scenario import (
+        Scenario,
+        ScenarioArticle,
+        ScenarioTopic,
+        dump_scenario,
+        load_scenario,
+    )
+
+    sc = Scenario(
+        kind="novelty",
+        topic=ScenarioTopic(name="Acme", description="track acme", confidence_threshold=0.7),
+        knowledge_summary="known state",
+        articles=[
+            ScenarioArticle(
+                title="t1",
+                url="http://a",
+                content="body one",
+                published=datetime(2025, 1, 15, 12, 0, tzinfo=UTC),
+                source_feed="http://feed",
+            )
+        ],
+        name="myscen",
+    )
+    p = tmp_path / "myscen.yml"
+    dump_scenario(sc, p)
+    loaded = load_scenario(p)
+
+    assert loaded.kind == "novelty"
+    assert loaded.topic.name == "Acme"
+    assert loaded.topic.confidence_threshold == 0.7
+    assert loaded.knowledge_summary == "known state"
+    assert len(loaded.articles) == 1
+    assert loaded.articles[0].content == "body one"
+    assert loaded.articles[0].published == datetime(2025, 1, 15, 12, 0, tzinfo=UTC)
+    assert loaded.name == "myscen"  # derived from filename stem
+
+
+def test_load_scenario_parses_handauthored_yaml(tmp_path) -> None:
+    from evals.scenario import load_scenario
+
+    p = tmp_path / "dup_event.yml"
+    p.write_text(
+        textwrap.dedent(
+            """
+            kind: novelty
+            topic:
+              name: "Acme"
+              description: "track acme funding"
+            knowledge_summary: "Acme raised a $5M Series A."
+            articles:
+              - title: "dup"
+                url: "http://a"
+                content: "Acme closed a $5M round."
+                published: "2025-01-15T12:00:00Z"
+                source_feed: "http://feed"
+            expect:
+              has_new_info: false
+              min_confidence: 0.6
+              summary_contains: "no new"
+            """
+        )
+    )
+    sc = load_scenario(p)
+
+    assert sc.name == "dup_event"
+    assert sc.kind == "novelty"
+    assert sc.expect is not None
+    assert sc.expect.has_new_info is False
+    assert sc.expect.min_confidence == 0.6
+    assert sc.expect.summary_contains == "no new"
+    assert sc.articles[0].published is not None
+    assert sc.articles[0].published.year == 2025
+
+
+def test_run_artifact_save_load_round_trip(tmp_path) -> None:
+    from evals.scenario import (
+        CapturedCall,
+        RunArtifact,
+        Scenario,
+        ScenarioTopic,
+        load_run,
+        save_run,
+    )
+
+    art = RunArtifact(
+        name="s",
+        kind="novelty",
+        model="some/model",
+        temperature=0.2,
+        created_at="2025-01-01T00:00:00+00:00",
+        calls=[
+            CapturedCall(
+                response_model="NoveltyResult",
+                messages=[{"role": "user", "content": "hi"}],
+                raw_parsed={"has_new_info": True, "key_facts": ["x"]},
+                prompt_tokens=5,
+                completion_tokens=3,
+            )
+        ],
+        final={"has_new_info": True, "key_facts": []},
+        final_error=None,
+        scenario=Scenario(topic=ScenarioTopic(name="T", description="d")),
+    )
+    runs = tmp_path / "runs"
+    path = save_run(art, runs)
+
+    assert path.exists()
+    assert path.parent == runs
+    loaded = load_run(path)
+    assert loaded.name == "s"
+    assert loaded.model == "some/model"
+    assert loaded.calls[0].raw_parsed == {"has_new_info": True, "key_facts": ["x"]}
+    assert loaded.final == {"has_new_info": True, "key_facts": []}
+    assert loaded.scenario.topic.name == "T"
