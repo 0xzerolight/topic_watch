@@ -9,7 +9,7 @@ import pytest
 import trafilatura
 
 from app.analysis.prompts import _STUB_CONTENT_MIN_CHARS, _content_quality_tag
-from app.crud import create_article, create_topic, list_articles_for_topic
+from app.crud import create_article, create_topic, list_articles_for_topic, upsert_feed_health_failure
 from app.models import Article, FeedHealth, FeedMode, Topic
 from app.scraping import fetch_new_articles_for_topic
 from app.scraping.content import _truncate, extract_article_content
@@ -1350,7 +1350,16 @@ class TestFetchNewArticlesForTopic:
 
         topic = self._make_topic(db_conn)
 
-        async def _fake_fetch(topic_arg, *, timeout, max_attempts, health_callback):
+        async def _fake_fetch(
+            topic_arg,
+            *,
+            timeout,
+            max_attempts,
+            health_callback,
+            feed_state_loader=None,
+            backoff_base_minutes=15,
+            backoff_cap_hours=24,
+        ):
             # Simulate a successful feed fetch that triggers a health write.
             if health_callback:
                 health_callback("https://example.com/feed.xml", True, None)
@@ -2111,3 +2120,49 @@ class TestManualBackoffAndValidators:
         assert len(calls) == 2  # primary + cascade fallback
         fb_url, fb_etag = calls[1]
         assert fb_etag == f"etag::{fb_url[:20]}"  # fallback got ITS url's stored validator
+
+
+class TestOrchestratorBackoff:
+    """Phase 1: feeds_skipped propagates through the orchestrator + checker wiring."""
+
+    async def test_orchestrator_skips_backed_off_manual_feed(self, db_conn: sqlite3.Connection) -> None:
+        # Pre-seed a dead feed with enough failures to be deep in backoff.
+        for _ in range(10):
+            upsert_feed_health_failure(db_conn, "https://dead.example/feed", "boom")
+        db_conn.commit()
+
+        topic = create_topic(
+            db_conn,
+            Topic(name="T", description="d", feed_urls=["https://dead.example/feed"], feed_mode=FeedMode.MANUAL),
+        )
+        db_conn.commit()
+
+        result = await fetch_new_articles_for_topic(topic, db_conn)
+
+        assert result.feeds_skipped == 1
+        assert result.feeds_total == 0
+        assert result.articles == []
+
+    async def test_orchestrator_feeds_skipped_survives_final_return(self, db_conn: sqlite3.Connection) -> None:
+        # A live feed yields one entry AND one feed was skipped — feeds_skipped must
+        # survive on the final FetchResult return, not just the early-empty path.
+        topic = create_topic(
+            db_conn,
+            Topic(name="T2", description="d", feed_urls=["https://live.example/feed"], feed_mode=FeedMode.MANUAL),
+        )
+        db_conn.commit()
+
+        response = FeedResponse(
+            entries=[FeedEntry(title="A", url="https://live.example/a", source_feed="https://live.example/feed")],
+            feeds_total=1,
+            feeds_failed=0,
+            feeds_skipped=1,
+        )
+        with (
+            patch("app.scraping.fetch_feeds_for_topic", return_value=response),
+            patch("app.scraping.extract_article_content", return_value="body text"),
+        ):
+            result = await fetch_new_articles_for_topic(topic, db_conn)
+
+        assert result.feeds_skipped == 1
+        assert len(result.articles) == 1
