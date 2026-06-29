@@ -4,9 +4,10 @@
 {% if error %}
 <article class="error-banner" role="alert">{{ error }}</article>
 {% endif %}
-<div class="page-header">
+<div class="page-header masthead">
     <h1>Topics</h1>
     <div class="action-row">
+        <a href="/topics/new" role="button">Add Topic</a>
         {% if topic_data %}
         <form method="post" action="/check-all" style="display:inline">
             <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
@@ -25,11 +26,27 @@
 </div>
 
 {% if stats and stats.total_topics > 0 %}
-<div class="stats-bar">
-    <div><small><strong>{{ stats.active_topics }}</strong>/{{ stats.total_topics }} active</small></div>
-    <div><small><strong>{{ stats.checks_24h }}</strong> checks (24h) / {{ stats.checks_total }} total</small></div>
-    <div><small><strong>{{ stats.new_info_24h }}</strong> new info (24h) / {{ stats.new_info_total }} total</small></div>
-    {% if stats.last_notification_at %}<div><small>Last notified {{ stats.last_notification_at | timeago }}</small></div>{% endif %}
+<div class="stat-grid">
+    <div class="stat-card">
+        <span class="card-kicker">Active</span>
+        <span class="stat-value"><span class="num">{{ stats.active_topics }}</span></span>
+        <span class="stat-sub">of {{ stats.total_topics }} topics</span>
+    </div>
+    <div class="stat-card">
+        <span class="card-kicker">Checks &middot; 24h</span>
+        <span class="stat-value"><span class="num">{{ stats.checks_24h }}</span></span>
+        <span class="stat-sub">{{ stats.checks_total }} total</span>
+    </div>
+    <div class="stat-card signal">
+        <span class="card-kicker">New info &middot; 24h</span>
+        <span class="stat-value"><span class="num">{{ stats.new_info_24h }}</span></span>
+        <span class="stat-sub">{{ stats.new_info_total }} total</span>
+    </div>
+    <div class="stat-card">
+        <span class="card-kicker">Last notified</span>
+        <span class="stat-value">{% if stats.last_notification_at %}{{ stats.last_notification_at | timeago }}{% else %}&mdash;{% endif %}</span>
+        <span class="stat-sub">most recent alert</span>
+    </div>
 </div>
 {% endif %}
 
@@ -43,21 +60,19 @@
 {% endif %}
 
 {% if all_tags %}
-<div class="tag-filter">
-    <small>
-        Filter by tag:
-        {% for t in all_tags %}
-        <a href="/?tag={{ t }}" role="button" class="{% if active_tag == t %}{% else %}secondary {% endif %}outline">{{ t }}</a>
-        {% endfor %}
-        {% if active_tag %}
-        <a href="/" role="button" class="secondary outline">&#x2715; Clear</a>
-        {% endif %}
-    </small>
+<div class="toolbar tag-filter">
+    <span class="card-kicker">Filter by tag</span>
+    {% for t in all_tags %}
+    <a href="/?tag={{ t }}" class="chip{% if active_tag == t %} chip--active{% endif %}">{{ t }}</a>
+    {% endfor %}
+    {% if active_tag %}
+    <a href="/" class="chip">&#x2715; Clear</a>
+    {% endif %}
 </div>
 {% endif %}
 
-<div class="search-row">
-    <input type="search" name="q" placeholder="Search topics..."
+<div class="toolbar search-row">
+    <input type="search" name="q" placeholder="Search topics..." class="toolbar-grow"
            aria-label="Search topics by name or description"
            hx-get="/topics/search"
            hx-trigger="keyup changed delay:300ms, search"
@@ -92,11 +107,11 @@
 </div>
 
 <div class="table-scroll">
-<table>
+<table class="data-table">
     <thead>
         <tr>
             <th><input type="checkbox" id="select-all" aria-label="Select all topics" onchange="toggleAll(this)"></th>
-            <th>Name</th>
+            <th>Topic</th>
             <th>Status</th>
             <th>Last Check</th>
             <th>Articles</th>
@@ -111,12 +126,14 @@
 {% else %}
 {% if active_tag %}
 <div class="empty-state">
-    <p>No topics found with tag <kbd>{{ active_tag }}</kbd>.</p>
+    <span class="empty-icon" aria-hidden="true">&#127991;</span>
+    <p class="empty-title">No topics found with tag <kbd>{{ active_tag }}</kbd>.</p>
     <p class="empty-state-hint"><a href="/">Clear filter</a> to see all topics.</p>
 </div>
 {% else %}
 <div class="empty-state">
-    <p><strong>No topics yet — add one to start watching.</strong></p>
+    <span class="empty-icon" aria-hidden="true">&#128240;</span>
+    <p class="empty-title">No topics yet — add one to start watching.</p>
     <p class="empty-state-hint">Get started by <a href="/topics/new">adding your first topic</a>. Topic Watch monitors RSS feeds and notifies you only when there's genuinely new information.</p>
 </div>
 {% endif %}
