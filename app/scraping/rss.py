@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 from html.parser import HTMLParser
 from time import struct_time
 from typing import TYPE_CHECKING
-from urllib.parse import urlparse
+from urllib.parse import ParseResult, parse_qs, urlparse
 
 import feedparser
 import httpx
@@ -118,6 +118,43 @@ def _resolve_google_news_url(link: str, description: str) -> str:
     return link
 
 
+def _is_bing_apiclick(parsed: ParseResult) -> bool:
+    """True if a parsed URL is a Bing News ``apiclick.aspx`` redirect.
+
+    Matches on ``hostname`` (urlparse lowercases it and strips any port/userinfo,
+    so a ``www.bing.com:80`` netloc still matches) and the case-folded path.
+    """
+    host = (parsed.hostname or "").lower()
+    return (host == "bing.com" or host.endswith(".bing.com")) and parsed.path.lower() == "/news/apiclick.aspx"
+
+
+def _resolve_bing_news_url(link: str) -> str:
+    """Extract the real article URL from a Bing News apiclick redirect (fast path).
+
+    Bing News RSS <link>s are ``www.bing.com/news/apiclick.aspx`` redirects that
+    carry the real publisher URL, fully percent-encoded, in the ``url`` query
+    param. Unlike Google News this needs no HTTP round-trip — the target decodes
+    from the query string alone. Returns the decoded target, or the original
+    ``link`` when it is not such a redirect, has no usable ``url`` value, or that
+    value is non-http(s) or itself a Bing apiclick link (loop guard). Mirrors the
+    OVH-014 scheme guard in ``_resolve_google_news_url``.
+
+    Relies on Bing fully percent-encoding the target (true in all observed data);
+    a target carrying an unencoded ``&`` would be truncated by ``parse_qs``.
+    """
+    parsed = urlparse(link)
+    if not _is_bing_apiclick(parsed):
+        return link
+    targets = parse_qs(parsed.query).get("url")
+    if not targets:
+        return link
+    real_url = targets[0]
+    target = urlparse(real_url)
+    if target.scheme.lower() in ("http", "https") and not _is_bing_apiclick(target):
+        return real_url
+    return link
+
+
 class _HTMLTextExtractor(HTMLParser):
     """Collect only the text nodes of an HTML fragment, discarding all markup."""
 
@@ -173,6 +210,10 @@ def _parse_entry(raw_entry: dict, source_feed: str) -> FeedEntry | None:
     # Google News RSS uses redirect URLs — resolve to actual article URLs.
     # Done on the RAW summary because the resolver regex-extracts <a href>.
     url = _resolve_google_news_url(url, summary)
+    # Bing News RSS uses apiclick.aspx redirects carrying the real URL in the
+    # ``url`` query param — unwrap it (zero-network). Mutually exclusive with the
+    # Google path by host, so the order is irrelevant.
+    url = _resolve_bing_news_url(url)
 
     # OVH-112: strip HTML AFTER url resolution so the STORED summary (which becomes
     # raw_content when extraction fails) is plain text, not tag/href noise. The
