@@ -222,7 +222,10 @@ the contradiction.
 6. Do NOT speculate, infer, or fill gaps. If the articles don't mention something, \
 leave it out entirely.
 7. Articles marked [STUB] or [NO CONTENT] have unreliable or missing text — weigh \
-them lower and rely primarily on their titles.
+them lower and rely primarily on their titles. A claim drawn SOLELY from a \
+[STUB]/[NO CONTENT] article must go under **Reported/Claimed** (attributed, e.g. \
+"reportedly", "according to [source]"), NEVER under **Confirmed Facts**, unless \
+corroborated by at least one non-stub article.
 8. When in doubt about relevance, EXCLUDE. A tight summary with 3 on-topic facts \
 is better than a broad summary with 15 tangential ones.
 9. Each article may include a `Published:` date (its publication date). When an \
