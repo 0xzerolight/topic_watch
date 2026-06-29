@@ -257,7 +257,18 @@ html[data-custom-theme="tokyo-night"] {
 details.knowledge-state > article > div.knowledge-text {
   max-height: 24rem;
   overflow-y: auto;
-  white-space: pre-wrap;
+}
+
+/* Rendered-markdown spacing: tight blocks, indented lists, modest headings so a
+   stray heading does not blow out the card. */
+details.knowledge-state > article > div.knowledge-text > :first-child { margin-top: 0; }
+details.knowledge-state > article > div.knowledge-text > :last-child { margin-bottom: 0; }
+details.knowledge-state > article > div.knowledge-text :is(p, ul, ol) { margin: 0.4rem 0; }
+details.knowledge-state > article > div.knowledge-text :is(ul, ol) { padding-left: 1.25rem; }
+details.knowledge-state > article > div.knowledge-text li { margin: 0.15rem 0; }
+details.knowledge-state > article > div.knowledge-text :is(h1, h2, h3, h4, h5, h6) {
+  font-size: 1rem;
+  margin: 0.6rem 0 0.2rem;
 }
 
 

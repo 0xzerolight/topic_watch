@@ -52,7 +52,7 @@
             <small>Token budget: {{ usage_pct }}% used</small>
             <progress value="{{ knowledge.token_count }}" max="{{ knowledge_state_max_tokens }}" style="width: 100%;"></progress>
         </div>
-        <div class="knowledge-text">{{ knowledge.summary_text }}</div>
+        <div class="knowledge-text">{{ knowledge.summary_text | markdown }}</div>
     </article>
 </details>
 
