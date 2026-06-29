@@ -23,16 +23,20 @@ import feedparser
 import httpx
 from pydantic import BaseModel
 
+from app.feed_backoff import BACKOFF_BASE_MINUTES, BACKOFF_CAP_HOURS, feed_backoff_until
 from app.log_redaction import redact_url
 from app.models import FeedMode, Topic
 from app.url_validation import is_private_url, safe_get
 
 if TYPE_CHECKING:
+    from app.models import FeedHealth
     from app.scraping.routing import ProviderRouter
 
 logger = logging.getLogger(__name__)
 
-FeedHealthCallback = Callable[[str, bool, str | None], None]  # (feed_url, success, error_msg)
+FeedHealthCallback = Callable[
+    [str, bool, str | None, str | None, str | None], None
+]  # (feed_url, success, error_msg, etag, last_modified)
 
 _USER_AGENT = "TopicWatch/1.0.0 (RSS reader)"
 _FEED_FETCH_TIMEOUT = 15.0
@@ -68,12 +72,24 @@ class FeedResponse:
     needs_url_resolution: bool = False
     feeds_total: int = 0
     feeds_failed: int = 0
+    feeds_skipped: int = 0
+    """MANUAL mode: feeds skipped this cycle because they are in a backoff window
+    (persistently failing). For MANUAL mode ``feeds_total`` counts feeds ATTEMPTED
+    (skipped feeds are excluded and surface here), so a backed-off feed is never
+    miscounted as a partial failure."""
 
 
 def compute_article_hash(url: str, title: str) -> str:
     """Compute a deterministic, case-insensitive content hash."""
     raw = f"{url}|{title}".lower()
     return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _validators(state: FeedHealth | None) -> tuple[str | None, str | None]:
+    """Return ``(etag, last_modified)`` for a feed-health row, or ``(None, None)``."""
+    if state is None:
+        return None, None
+    return state.etag, state.last_modified
 
 
 def _parse_feed_date(entry: dict) -> datetime | None:
@@ -241,6 +257,8 @@ async def fetch_feed(
     timeout: float = _FEED_FETCH_TIMEOUT,
     max_attempts: int = 2,
     health_callback: FeedHealthCallback | None = None,
+    etag: str | None = None,
+    last_modified: str | None = None,
 ) -> list[FeedEntry]:
     """Fetch and parse a single RSS/Atom feed. Returns [] on any error."""
     entries, _ = await fetch_feed_with_status(
@@ -249,6 +267,8 @@ async def fetch_feed(
         timeout=timeout,
         max_attempts=max_attempts,
         health_callback=health_callback,
+        etag=etag,
+        last_modified=last_modified,
     )
     return entries
 
@@ -259,6 +279,8 @@ async def fetch_feed_with_status(
     timeout: float = _FEED_FETCH_TIMEOUT,
     max_attempts: int = 2,
     health_callback: FeedHealthCallback | None = None,
+    etag: str | None = None,
+    last_modified: str | None = None,
 ) -> tuple[list[FeedEntry], bool]:
     """Fetch and parse a single feed, also reporting whether the fetch succeeded.
 
@@ -267,6 +289,10 @@ async def fetch_feed_with_status(
     entries — and False on any error (blocked URL, timeout, HTTP error, etc.).
     This lets callers distinguish "fetched OK but empty" from "fetch failed" so
     an empty-but-valid feed does not get treated as a provider failure.
+
+    ``etag`` / ``last_modified`` are the feed's stored conditional-GET validators;
+    when present they are sent as ``If-None-Match`` / ``If-Modified-Since`` and a
+    304 returns ``([], True)`` (the empty-but-OK bucket) without re-parsing.
     """
     if await asyncio.to_thread(is_private_url, feed_url):
         logger.warning("Blocked fetch to private URL: %s", redact_url(feed_url))
@@ -279,10 +305,23 @@ async def fetch_feed_with_status(
             follow_redirects=False,
         )
     assert client is not None
+    cond_headers: dict[str, str] = {}
+    if etag:
+        cond_headers["If-None-Match"] = etag
+    if last_modified:
+        cond_headers["If-Modified-Since"] = last_modified
     try:
         for attempt in range(max_attempts):
             try:
-                response = await safe_get(client, feed_url)
+                response = await safe_get(client, feed_url, headers=cond_headers or None)
+                # 304 Not Modified: validators still valid. Treat as an empty-but-
+                # successful fetch — the existing "([], True)" bucket that
+                # _fetch_auto/_fetch_manual already handle. Pass (None, None) so the
+                # stored validators are preserved (COALESCE), not wiped.
+                if response.status_code == 304:
+                    if health_callback:
+                        health_callback(feed_url, True, None, None, None)
+                    return [], True
                 response.raise_for_status()
                 parsed = feedparser.parse(response.text)
                 entries = []
@@ -306,13 +345,19 @@ async def fetch_feed_with_status(
                     if not entries:
                         logger.warning("Feed parse error (bozo) with no entries: %s — %s", feed_url, bozo_exc)
                         if health_callback:
-                            health_callback(feed_url, False, f"Feed parse error: {bozo_exc}")
+                            health_callback(feed_url, False, f"Feed parse error: {bozo_exc}", None, None)
                         return [], False
                     logger.debug(
                         "Feed flagged bozo but %d entries recovered: %s — %s", len(entries), feed_url, bozo_exc
                     )
                 if health_callback:
-                    health_callback(feed_url, True, None)
+                    health_callback(
+                        feed_url,
+                        True,
+                        None,
+                        response.headers.get("etag"),
+                        response.headers.get("last-modified"),
+                    )
                 return entries, True
             except httpx.TimeoutException as exc:
                 if attempt < max_attempts - 1:
@@ -321,7 +366,7 @@ async def fetch_feed_with_status(
                     continue
                 logger.warning("Timeout fetching feed after %d attempts: %s", max_attempts, feed_url)
                 if health_callback:
-                    health_callback(feed_url, False, f"Timeout after {max_attempts} attempts: {exc}")
+                    health_callback(feed_url, False, f"Timeout after {max_attempts} attempts: {exc}", None, None)
                 return [], False
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code >= 500 and attempt < max_attempts - 1:
@@ -332,7 +377,7 @@ async def fetch_feed_with_status(
                     continue
                 logger.warning("HTTP %d fetching feed: %s", exc.response.status_code, feed_url)
                 if health_callback:
-                    health_callback(feed_url, False, f"HTTP {exc.response.status_code}")
+                    health_callback(feed_url, False, f"HTTP {exc.response.status_code}", None, None)
                 return [], False
             except httpx.NetworkError as exc:
                 if attempt < max_attempts - 1:
@@ -351,12 +396,12 @@ async def fetch_feed_with_status(
                     type(exc).__name__,
                 )
                 if health_callback:
-                    health_callback(feed_url, False, f"Network error: {type(exc).__name__}: {exc}")
+                    health_callback(feed_url, False, f"Network error: {type(exc).__name__}: {exc}", None, None)
                 return [], False
             except Exception as exc:
                 logger.warning("Error fetching feed: %s", feed_url, exc_info=True)
                 if health_callback:
-                    health_callback(feed_url, False, f"{type(exc).__name__}: {exc}")
+                    health_callback(feed_url, False, f"{type(exc).__name__}: {exc}", None, None)
                 return [], False
         return [], False  # pragma: no cover
     finally:
@@ -370,16 +415,25 @@ async def fetch_feeds_for_topic(
     max_attempts: int = 2,
     health_callback: FeedHealthCallback | None = None,
     router: ProviderRouter | None = None,
+    feed_state_loader: Callable[[str], FeedHealth | None] | None = None,
+    backoff_base_minutes: int = BACKOFF_BASE_MINUTES,
+    backoff_cap_hours: int = BACKOFF_CAP_HOURS,
 ) -> FeedResponse:
     """Fetch all feeds for a topic, deduplicated by URL.
 
-    For AUTO mode: uses the router to select a provider, with
-    within-cycle fallback (max 1 retry with the next provider).
-    For MANUAL mode: fetches all explicit feed URLs concurrently.
+    For AUTO mode: uses the router to select a provider, with within-cycle
+    fallback (max 1 retry with the next provider). For MANUAL mode: fetches all
+    explicit feed URLs concurrently, skipping any in a backoff window.
+
+    ``feed_state_loader`` supplies the stored ``FeedHealth`` per URL — used to
+    send conditional-GET validators (both modes) and to skip backed-off feeds
+    (MANUAL only; AUTO provider backoff is owned by ``ProviderRouter``).
     """
     if topic.feed_mode == FeedMode.AUTO:
-        return await _fetch_auto(topic, timeout, max_attempts, health_callback, router)
-    return await _fetch_manual(topic, timeout, max_attempts, health_callback)
+        return await _fetch_auto(topic, timeout, max_attempts, health_callback, router, feed_state_loader)
+    return await _fetch_manual(
+        topic, timeout, max_attempts, health_callback, feed_state_loader, backoff_base_minutes, backoff_cap_hours
+    )
 
 
 async def _fetch_auto(
@@ -388,6 +442,7 @@ async def _fetch_auto(
     max_attempts: int,
     health_callback: FeedHealthCallback | None,
     router: ProviderRouter | None,
+    feed_state_loader: Callable[[str], FeedHealth | None] | None = None,
 ) -> FeedResponse:
     """AUTO mode: try provider, fallback to next on empty/error."""
     if router is None:
@@ -406,8 +461,15 @@ async def _fetch_auto(
         # Capture the health epoch before the fetch await so a success that races
         # with a concurrent failure is recognised as stale (OVH-127).
         provider_epoch = router.health_epoch(provider.name)
+        p_etag, p_last_modified = _validators(feed_state_loader(feed_url) if feed_state_loader else None)
         entries, fetch_ok = await fetch_feed_with_status(
-            feed_url, client, timeout=timeout, max_attempts=max_attempts, health_callback=health_callback
+            feed_url,
+            client,
+            timeout=timeout,
+            max_attempts=max_attempts,
+            health_callback=health_callback,
+            etag=p_etag,
+            last_modified=p_last_modified,
         )
 
         if entries:
@@ -442,8 +504,15 @@ async def _fetch_auto(
         logger.info("Provider %s %s, cascading to %s", provider.name, reason, next_provider.name)
         feed_url = next_provider.build_feed_url(topic)
         next_epoch = router.health_epoch(next_provider.name)
+        f_etag, f_last_modified = _validators(feed_state_loader(feed_url) if feed_state_loader else None)
         entries, next_fetch_ok = await fetch_feed_with_status(
-            feed_url, client, timeout=timeout, max_attempts=max_attempts, health_callback=health_callback
+            feed_url,
+            client,
+            timeout=timeout,
+            max_attempts=max_attempts,
+            health_callback=health_callback,
+            etag=f_etag,
+            last_modified=f_last_modified,
         )
         first_failed = 1 if not fetch_ok else 0
 
@@ -482,10 +551,32 @@ async def _fetch_manual(
     timeout: float,
     max_attempts: int,
     health_callback: FeedHealthCallback | None,
+    feed_state_loader: Callable[[str], FeedHealth | None] | None = None,
+    backoff_base_minutes: int = BACKOFF_BASE_MINUTES,
+    backoff_cap_hours: int = BACKOFF_CAP_HOURS,
 ) -> FeedResponse:
-    """MANUAL mode: fetch all explicit feed URLs concurrently."""
+    """MANUAL mode: fetch explicit feed URLs concurrently, skipping backed-off ones."""
     if not topic.feed_urls:
         return FeedResponse()
+
+    # Decide skips and load validators from ONE health lookup per URL.
+    now = datetime.now(UTC)
+    attempted: list[tuple[str, str | None, str | None]] = []  # (url, etag, last_modified)
+    feeds_skipped = 0
+    for url in topic.feed_urls:
+        state = feed_state_loader(url) if feed_state_loader else None
+        until = feed_backoff_until(state, base_minutes=backoff_base_minutes, cap_hours=backoff_cap_hours)
+        if until is not None and until > now:
+            feeds_skipped += 1
+            logger.debug("Skipping backed-off feed %s (next retry %s)", url, until.isoformat())
+            continue
+        etag, last_modified = _validators(state)
+        attempted.append((url, etag, last_modified))
+
+    # Build the client only when something is actually attempted (the all-skipped
+    # case returns here without opening a connection).
+    if not attempted:
+        return FeedResponse(feeds_total=0, feeds_failed=0, feeds_skipped=feeds_skipped)
 
     async with httpx.AsyncClient(
         headers={"User-Agent": _USER_AGENT},
@@ -497,15 +588,21 @@ async def _fetch_manual(
         # entry list (OVH-130).
         tasks = [
             fetch_feed_with_status(
-                url, client, timeout=timeout, max_attempts=max_attempts, health_callback=health_callback
+                url,
+                client,
+                timeout=timeout,
+                max_attempts=max_attempts,
+                health_callback=health_callback,
+                etag=etag,
+                last_modified=last_modified,
             )
-            for url in topic.feed_urls
+            for (url, etag, last_modified) in attempted
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
     seen_urls: set[str] = set()
     entries: list[FeedEntry] = []
-    feeds_total = len(topic.feed_urls)
+    feeds_total = len(attempted)
     feeds_failed = 0
     for result in results:
         if isinstance(result, BaseException):
@@ -520,4 +617,6 @@ async def _fetch_manual(
                 seen_urls.add(entry.url)
                 entries.append(entry)
 
-    return FeedResponse(entries=entries, feeds_total=feeds_total, feeds_failed=feeds_failed)
+    return FeedResponse(
+        entries=entries, feeds_total=feeds_total, feeds_failed=feeds_failed, feeds_skipped=feeds_skipped
+    )

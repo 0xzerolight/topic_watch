@@ -269,7 +269,7 @@ class TestFetchFeedCallback:
             )
 
         assert len(entries) == 1
-        callback.assert_called_once_with("https://example.com/feed.xml", True, None)
+        callback.assert_called_once_with("https://example.com/feed.xml", True, None, None, None)
 
     async def test_callback_called_on_http_error(self) -> None:
         """health_callback is called with success=False on HTTP error."""
@@ -303,3 +303,39 @@ class TestFetchFeedCallback:
             entries = await fetch_feed("https://example.com/feed.xml", client=client)
 
         assert entries == []
+
+
+class TestFeedValidators:
+    """Conditional-GET validator storage on feed_health (Phase 1)."""
+
+    def test_feed_health_persists_validators(self, db_conn: sqlite3.Connection) -> None:
+        """etag / last_modified round-trip through the feed_health row."""
+        db_conn.execute(
+            "INSERT INTO feed_health (feed_url, etag, last_modified) VALUES (?, ?, ?)",
+            ("https://ex.com/feed", 'W/"abc"', "Wed, 21 Oct 2025 07:28:00 GMT"),
+        )
+        db_conn.commit()
+        health = get_feed_health(db_conn, "https://ex.com/feed")
+        assert health is not None
+        assert health.etag == 'W/"abc"'
+        assert health.last_modified == "Wed, 21 Oct 2025 07:28:00 GMT"
+
+    def test_success_stores_and_preserves_validators(self, db_conn: sqlite3.Connection) -> None:
+        """Validators persist on success; a 304 (None,None) preserves them via COALESCE."""
+        upsert_feed_health_success(db_conn, "https://ex.com/feed", etag='W/"v1"', last_modified="LM1")
+        db_conn.commit()
+        h = get_feed_health(db_conn, "https://ex.com/feed")
+        assert h is not None and h.etag == 'W/"v1"' and h.last_modified == "LM1"
+
+        # A 304 success passes None, None — existing validators must be preserved.
+        upsert_feed_health_success(db_conn, "https://ex.com/feed", etag=None, last_modified=None)
+        db_conn.commit()
+        h = get_feed_health(db_conn, "https://ex.com/feed")
+        assert h is not None and h.etag == 'W/"v1"' and h.last_modified == "LM1"
+        assert h.total_fetches == 2 and h.consecutive_failures == 0
+
+        # A fresh 200 with a new validator overwrites.
+        upsert_feed_health_success(db_conn, "https://ex.com/feed", etag='W/"v2"', last_modified="LM2")
+        db_conn.commit()
+        h = get_feed_health(db_conn, "https://ex.com/feed")
+        assert h is not None and h.etag == 'W/"v2"' and h.last_modified == "LM2"

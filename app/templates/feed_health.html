@@ -28,6 +28,10 @@
                 {% else %}
                     <span class="status-error" title="Unhealthy">&#9679; Unhealthy</span>
                 {% endif %}
+                {% set backoff = backoff_map.get(feed.feed_url) %}
+                {% if backoff %}
+                    <br><small title="Persistently failing — automatically backing off, then retried">Backing off ({{ backoff }})</small>
+                {% endif %}
             </td>
             <td><a href="{{ feed.feed_url }}" target="_blank" class="feed-url" title="{{ feed.feed_url }}"><small>{{ feed.feed_url|truncate(45) }}</small></a></td>
             <td>{{ feed.last_success_at|timeago if feed.last_success_at else "Never" }}</td>

@@ -157,6 +157,12 @@ class Settings(BaseSettings):
     )
     web_page_size: int = Field(default=20, ge=5, le=200, description="Number of items per page in web UI")
     feed_max_retries: int = Field(default=2, ge=1, le=10, description="Maximum retry attempts for feed fetching")
+    feed_backoff_base_minutes: int = Field(
+        default=15, ge=1, le=1440, description="Base delay (minutes) for backing off a persistently-failing feed"
+    )
+    feed_backoff_cap_hours: int = Field(
+        default=24, ge=1, le=168, description="Maximum backoff delay (hours) for a persistently-failing feed"
+    )
     content_fetch_concurrency: int = Field(default=3, ge=1, le=20, description="Max concurrent article content fetches")
     topic_check_concurrency: int = Field(
         default=3, ge=1, le=20, description="Max concurrent per-topic checks within one scheduler tick"

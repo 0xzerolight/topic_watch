@@ -347,3 +347,23 @@ class TestSafeSendInitialUrl:
 
         assert response.status_code == 200
         assert response.text == "ok"
+
+    async def test_safe_get_sends_custom_headers(self, monkeypatch) -> None:
+        """Custom request headers (e.g. conditional-GET validators) reach the request."""
+
+        def _public(*_args, **_kwargs):
+            return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", 0))]
+
+        monkeypatch.setattr(socket, "getaddrinfo", _public)
+
+        captured: dict[str, str] = {}
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            captured.update(request.headers)
+            return httpx.Response(200, text="ok")
+
+        transport = httpx.MockTransport(_handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+            await safe_get(client, "https://example.com/feed.xml", headers={"If-None-Match": 'W/"abc"'})
+
+        assert captured.get("if-none-match") == 'W/"abc"'
