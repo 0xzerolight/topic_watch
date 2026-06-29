@@ -51,6 +51,9 @@ class FetchResult:
     *degraded* check — some sources silently dropped out — which is logged at
     WARNING so it is not indistinguishable from a healthy partial yield (OVH-130).
     """
+    feeds_skipped: int = 0
+    """Manual feeds skipped this cycle because they are in a backoff window
+    (persistently failing). Not a failure — excluded from feeds_total/failed."""
 
 
 def _insert_or_count_dup(
@@ -315,6 +318,8 @@ async def fetch_new_articles_for_topic(
     article_fetch_timeout: float = 20.0,
     feed_max_retries: int = 2,
     concurrency: int = _CONTENT_FETCH_CONCURRENCY,
+    feed_backoff_base_minutes: int = 15,
+    feed_backoff_cap_hours: int = 24,
 ) -> FetchResult:
     """Fetch feeds, dedup against DB, extract content, and store new articles.
 
@@ -343,6 +348,9 @@ async def fetch_new_articles_for_topic(
         timeout=feed_fetch_timeout,
         max_attempts=feed_max_retries,
         health_callback=_make_health_callback(conn),
+        feed_state_loader=_make_feed_state_loader(conn),
+        backoff_base_minutes=feed_backoff_base_minutes,
+        backoff_cap_hours=feed_backoff_cap_hours,
     )
     conn.commit()
     entries = response.entries
@@ -357,6 +365,7 @@ async def fetch_new_articles_for_topic(
             total_feed_entries=0,
             feeds_total=feeds_total,
             feeds_failed=feeds_failed,
+            feeds_skipped=response.feeds_skipped,
         )
 
     # 2. Dedup against the DB and split into reuse vs. fetch-needed.
@@ -367,6 +376,7 @@ async def fetch_new_articles_for_topic(
             total_feed_entries=len(entries),
             feeds_total=feeds_total,
             feeds_failed=feeds_failed,
+            feeds_skipped=response.feeds_skipped,
         )
 
     # 3. Combine, sort recency-first, and apply the limit.
@@ -402,4 +412,5 @@ async def fetch_new_articles_for_topic(
         dropped_duplicates=dropped_duplicates,
         feeds_total=feeds_total,
         feeds_failed=feeds_failed,
+        feeds_skipped=response.feeds_skipped,
     )
