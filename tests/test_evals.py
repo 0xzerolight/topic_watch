@@ -16,7 +16,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from app.analysis import llm as llm_mod
-from app.analysis.llm import NoveltyResult
+from app.analysis.llm import CompressedKnowledge, KnowledgeStateUpdate, NoveltyResult
+from app.config import LLMSettings, Settings
 from tests.helpers.stub_llm import _StubCompletion, _StubUsage
 
 
@@ -24,6 +25,34 @@ def _novelty(**kw: object) -> NoveltyResult:
     base: dict[str, object] = {"has_new_info": True, "summary": "s", "confidence": 0.9}
     base.update(kw)
     return NoveltyResult(**base)  # type: ignore[arg-type]
+
+
+def _settings() -> Settings:
+    """An offline-safe Settings (no file read, no real key)."""
+    return Settings(llm=LLMSettings(model="openai/gpt-4o-mini", api_key="test-key-not-real"))
+
+
+def _mock_inner(
+    *,
+    novelty: NoveltyResult | None = None,
+    knowledge: KnowledgeStateUpdate | None = None,
+    compressed: CompressedKnowledge | None = None,
+) -> MagicMock:
+    """A mock inner client that dispatches canned results on response_model."""
+
+    async def _cwc(**kwargs: object) -> tuple[object, object]:
+        rm = kwargs.get("response_model")
+        if rm is NoveltyResult:
+            parsed: object = novelty
+        elif rm is CompressedKnowledge:
+            parsed = compressed
+        else:
+            parsed = knowledge
+        return parsed, _StubCompletion()
+
+    inner = MagicMock()
+    inner.chat.completions.create_with_completion = AsyncMock(side_effect=_cwc)
+    return inner
 
 
 # --- recorder ---
@@ -223,3 +252,120 @@ def test_run_artifact_save_load_round_trip(tmp_path) -> None:
     assert loaded.calls[0].raw_parsed == {"has_new_info": True, "key_facts": ["x"]}
     assert loaded.final == {"has_new_info": True, "key_facts": []}
     assert loaded.scenario.topic.name == "T"
+
+
+# --- runner: run_scenario ---
+
+
+@pytest.mark.parametrize("kind", ["novelty", "knowledge_init", "knowledge_update", "compress"])
+async def test_run_scenario_dispatches_all_kinds(kind: str) -> None:
+    from evals.runner import run_scenario
+    from evals.scenario import Scenario, ScenarioArticle, ScenarioTopic
+
+    inner = _mock_inner(
+        novelty=_novelty(),
+        knowledge=KnowledgeStateUpdate(sufficient_data=True, confidence=0.9, updated_summary="us"),
+        compressed=CompressedKnowledge(compressed_summary="cs"),
+    )
+    sc = Scenario(
+        kind=kind,  # type: ignore[arg-type]
+        topic=ScenarioTopic(name="T", description="d"),
+        knowledge_summary="known state here",
+        novelty_summary="a new finding",
+        key_facts=["kf one"],
+        articles=[ScenarioArticle(title="a", url="http://x", content="body", source_feed="http://f")],
+        name="s",
+    )
+    art = await run_scenario(sc, _settings(), inner=inner)
+
+    assert art.kind == kind
+    assert len(art.calls) == 1
+    assert art.calls[0].messages  # real built prompt captured
+    assert art.final is not None
+    assert art.model == "openai/gpt-4o-mini"
+    assert art.temperature == 0.2
+
+
+async def test_run_scenario_novelty_evaluates_expectations() -> None:
+    from evals.runner import run_scenario
+    from evals.scenario import Expectation, Scenario, ScenarioArticle, ScenarioTopic
+
+    inner = _mock_inner(
+        novelty=_novelty(has_new_info=False, summary="nothing new here", confidence=0.85, relevance=0.6)
+    )
+    sc = Scenario(
+        kind="novelty",
+        topic=ScenarioTopic(name="T", description="d"),
+        knowledge_summary="ks",
+        articles=[ScenarioArticle(title="a", url="http://x", content="c", source_feed="http://f")],
+        expect=Expectation(has_new_info=False, min_confidence=0.7, summary_contains="nothing"),
+        name="s",
+    )
+    art = await run_scenario(sc, _settings(), inner=inner)
+
+    oks = {c.check: c.ok for c in art.expect_results}
+    assert oks["has_new_info"] is True
+    assert oks["min_confidence"] is True  # 0.85 >= 0.7
+    assert oks["summary_contains"] is True
+
+
+async def test_run_scenario_expectation_mismatch_is_reported_not_raised() -> None:
+    from evals.runner import run_scenario
+    from evals.scenario import Expectation, Scenario, ScenarioArticle, ScenarioTopic
+
+    inner = _mock_inner(novelty=_novelty(has_new_info=True, summary="big news", confidence=0.4))
+    sc = Scenario(
+        kind="novelty",
+        topic=ScenarioTopic(name="T", description="d"),
+        articles=[ScenarioArticle(title="a", url="http://x", content="c", source_feed="http://f")],
+        expect=Expectation(has_new_info=False, min_confidence=0.7),
+        name="s",
+    )
+    art = await run_scenario(sc, _settings(), inner=inner)  # must not raise
+
+    oks = {c.check: c.ok for c in art.expect_results}
+    assert oks["has_new_info"] is False  # expected False, got True
+    assert oks["min_confidence"] is False  # 0.4 < 0.7
+
+
+async def test_run_scenario_captures_raw_vs_final_divergence() -> None:
+    """The recorder snapshots the raw parsed result; the final reflects
+    analyze_articles' post-filtering. A smuggled source_url is dropped from final
+    but visible in the raw capture."""
+    from evals.runner import run_scenario
+    from evals.scenario import Scenario, ScenarioArticle, ScenarioTopic
+
+    inner = _mock_inner(novelty=_novelty(source_urls=["http://evil", "http://x"]))
+    sc = Scenario(
+        kind="novelty",
+        topic=ScenarioTopic(name="T", description="d"),
+        articles=[ScenarioArticle(title="a", url="http://x", content="c", source_feed="http://f")],
+        name="s",
+    )
+    art = await run_scenario(sc, _settings(), inner=inner)
+
+    assert art.calls[0].raw_parsed["source_urls"] == ["http://evil", "http://x"]
+    assert art.final is not None
+    assert art.final["source_urls"] == ["http://x"]  # injected URL filtered out
+
+
+async def test_run_scenario_surfaces_swallowed_llm_error() -> None:
+    """analyze_articles swallows LLM failures into NoveltyResult.error; the
+    artifact must surface it so a failure isn't mistaken for 'nothing new'."""
+    from evals.runner import run_scenario
+    from evals.scenario import Scenario, ScenarioArticle, ScenarioTopic
+
+    inner = MagicMock()
+    inner.chat.completions.create_with_completion = AsyncMock(side_effect=RuntimeError("boom"))
+    sc = Scenario(
+        kind="novelty",
+        topic=ScenarioTopic(name="T", description="d"),
+        articles=[ScenarioArticle(title="a", url="http://x", content="c", source_feed="http://f")],
+        name="s",
+    )
+    art = await run_scenario(sc, _settings(), inner=inner)  # safe default, no raise
+
+    assert art.final is not None
+    assert art.final["has_new_info"] is False
+    assert art.final_error is not None
+    assert "boom" in art.final_error
