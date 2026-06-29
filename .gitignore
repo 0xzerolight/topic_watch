@@ -49,3 +49,7 @@ personal-docs/
 # Private development docs (public docs live in repo root)
 docs/
 .superpowers
+
+# uv lockfile: artifact of the local uv runner; deps are locked via pip-compile
+# (requirements*.txt). Ignore so `uv run` doesn't add a redundant, drifting lock.
+uv.lock
