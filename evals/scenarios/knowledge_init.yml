@@ -1,0 +1,23 @@
+# Controlled knowledge-init scenario: build an initial knowledge state from
+# two articles. Expectation: the model has enough to summarize (sufficient_data).
+kind: knowledge_init
+topic:
+  name: "Project Helios launch"
+  description: "Track the launch status, dates, and milestones of Project Helios."
+articles:
+  - title: "Project Helios slips to Q3"
+    url: "https://example.com/helios-q3"
+    content: >
+      Project Helios, originally slated for Q2, has slipped to Q3 after an
+      integration delay. The team confirmed the new target at a press briefing.
+    published: "2025-03-01T09:00:00Z"
+    source_feed: "https://example.com/rss"
+  - title: "Helios beta opens to partners"
+    url: "https://example.com/helios-beta"
+    content: >
+      A closed beta of Project Helios has opened to a small group of launch
+      partners ahead of the Q3 general availability date.
+    published: "2025-03-10T09:00:00Z"
+    source_feed: "https://example.com/rss"
+expect:
+  sufficient_data: true

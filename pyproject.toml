@@ -97,10 +97,11 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["B011", "S101", "S105"]  # allow asserts and test secrets in tests
 "app/cli.py" = ["T201"]  # CLI is supposed to print output
+"evals/__main__.py" = ["T201"]  # the eval harness CLI prints its output too
 "app/migrations/**/*.py" = ["E501"]  # migrations can have long lines
 
 [tool.ruff.lint.isort]
-known-first-party = ["app"]
+known-first-party = ["app", "evals"]
 
 [tool.ruff.format]
 quote-style = "double"

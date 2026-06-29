@@ -1,0 +1,21 @@
+# Controlled novelty scenario: a duplicate report of an already-known event.
+# Expectation: the model should NOT flag new info (it restates the knowledge state).
+kind: novelty
+topic:
+  name: "Acme funding"
+  description: "Track Acme Corp funding rounds, investors, and amounts."
+  confidence_threshold: 0.7
+knowledge_summary: |
+  Acme Corp raised a $5M Series A led by Foo Ventures, announced in January 2025.
+articles:
+  - title: "Acme closes $5M Series A"
+    url: "https://example.com/acme-series-a"
+    content: >
+      Acme Corp has closed a $5 million Series A funding round led by Foo
+      Ventures. The round was announced in January 2025 and will be used to
+      expand the engineering team.
+    published: "2025-01-15T12:00:00Z"
+    source_feed: "https://example.com/rss"
+expect:
+  has_new_info: false
+  min_confidence: 0.6
