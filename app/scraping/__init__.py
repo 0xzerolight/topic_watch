@@ -274,6 +274,9 @@ def _store_articles(
             # OVH-114: reused rows keep the originating provider; fresh rows (None)
             # are attributed to the provider that produced this topic's feed.
             source_provider=origin_provider if origin_provider is not None else provider_name,
+            # Publication date is a property of the article itself, so even reused
+            # rows take THIS feed entry's parsed date (not the originating row's) —
+            # unlike source_provider above, which is about the origin fetch.
             published_at=entry.published,
         )
         if not _insert_or_count_dup(conn, article, topic.name, stored):
