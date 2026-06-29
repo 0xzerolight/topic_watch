@@ -194,6 +194,8 @@ async def topic_detail(
             "feed_health_map": feed_health_map,
             "total_prompt_tokens": total_prompt_tokens,
             "total_completion_tokens": total_completion_tokens,
+            "global_confidence_threshold": settings.min_confidence_threshold,
+            "global_relevance_threshold": settings.min_relevance_threshold,
         },
     )
 
