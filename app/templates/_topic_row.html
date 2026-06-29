@@ -17,7 +17,7 @@
         </span>
         {% if topic.description %}<small class="quiet">{{ topic.description | truncate(80) }}</small>{% endif %}
         {% if topic.status.value == "error" and topic.error_message %}
-        <small class="row-error">{{ topic.error_message | sanitize_error }}</small>
+        <small class="row-error" title="{{ topic.error_message }}">{{ topic.error_message | truncate(140) }}</small>
         {% endif %}
     </td>
     <td data-label="Status">
@@ -28,7 +28,7 @@
                 <span class="badge badge--ok"><span class="badge-dot"></span>Ready</span>
             {% endif %}
         {% elif topic.status.value == "researching" %}
-            <span class="badge badge--signal" aria-busy="true"><span class="badge-dot"></span>Researching</span>
+            <span class="badge badge--idle"><span class="badge-dot"></span>Researching</span>
         {% elif topic.status.value == "new" %}
             <span class="badge badge--idle"><span class="badge-dot"></span>New</span>
         {% else %}
