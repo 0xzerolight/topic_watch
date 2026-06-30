@@ -1,10 +1,8 @@
 <h1 align="center">Topic Watch</h1>
 
 <p align="center">
-  <a href="https://github.com/0xzerolight/topic_watch/actions/workflows/ci.yml"><img src="https://github.com/0xzerolight/topic_watch/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://www.gnu.org/licenses/gpl-3.0"><img src="https://img.shields.io/badge/License-GPLv3-blue.svg" alt="License: GPL v3"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.11+-blue.svg" alt="Python 3.11+"></a>
-  <a href="https://github.com/0xzerolight/topic_watch"><img src="https://img.shields.io/badge/coverage-94%25-brightgreen.svg" alt="Coverage"></a>
   <a href="https://github.com/0xzerolight/topic_watch/stargazers"><img src="https://img.shields.io/github/stars/0xzerolight/topic_watch?style=social" alt="GitHub stars"></a>
 </p>
 
@@ -20,7 +18,7 @@ Please leave a ⭐ star if Topic Watch is useful — it helps others find it :).
   <img src="assets/themes-showcase.gif" alt="Topic Watch — theme showcase" width="720">
 </p>
 
-An LLM tracks a per-topic knowledge state and stays silent until something actually changes. Not keyword matching, not summarization. Bring your own key, or run free against a local model.
+An LLM tracks a per-topic knowledge state and stays silent until something actually changes. Bring your own key, or run free against a local model.
 
 <details>
 <summary><strong>How It Works</strong></summary>
@@ -32,7 +30,7 @@ An LLM tracks a per-topic knowledge state and stays silent until something actua
 
 </details>
 
-## Quick Start
+## Install
 
 Runs in Docker. Get it at [get.docker.com](https://get.docker.com) (or install [Docker Desktop](https://www.docker.com/products/docker-desktop/) on macOS/Windows), and make sure it's running.
 
