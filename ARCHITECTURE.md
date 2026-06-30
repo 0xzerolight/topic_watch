@@ -51,7 +51,7 @@ All application code lives under `app/`.
 | Module | Responsibility |
 |--------|---------------|
 | `checker.py` | Orchestrates the full check pipeline: fetch → analyze → notify → record. `check_topic()` is the primary entry point. `check_all_topics()` iterates due topics. `retry_pending_notifications()` handles failed deliveries. `initialize_new_topic()` builds initial knowledge for NEW topics. |
-| `scheduler.py` | APScheduler 3.x `AsyncIOScheduler`. Four jobs: the every-minute tick (`_scheduled_check` — runs the check cycle then initializes one NEW topic per tick), stuck topic recovery (every 5 min, 15-min stuck timeout), weekly VACUUM (Sunday 3 AM), daily article cleanup (4 AM). The minute tick runs with jitter; all jobs coalesce and are single-instance. The check cycle itself (`_run_check_cycle`) also retries pending notifications and pending webhooks before querying due topics. |
+| `scheduler.py` | APScheduler 3.x `AsyncIOScheduler`, four jobs: every-minute tick (`_scheduled_check` — runs the check cycle, then initializes one NEW topic), stuck-topic recovery (every 5 min, 15-min timeout), weekly VACUUM (Sun 3 AM), daily article cleanup (4 AM). Only the minute tick has jitter; all jobs coalesce and are single-instance. The check cycle (`_run_check_cycle`) retries pending notifications and webhooks before querying due topics. |
 
 ### LLM Analysis
 
@@ -61,6 +61,7 @@ All application code lives under `app/`.
 | `analysis/prompts.py` | System and user prompt builders for novelty detection and knowledge init/update/compress. Articles truncated to 1500 chars in prompts. |
 | `analysis/knowledge.py` | Knowledge state initialization and updates with DB persistence. Token budget enforcement via summary compression. |
 | `analysis/restatement.py` | Pure phrase-matching filter (`filter_restated_key_facts`, re-exported by `llm.py`). Drops a key fact only when it is a clear restatement of the existing knowledge summary (normalized verbatim or long contiguous n-gram match), so already-known facts aren't re-flagged as new. Conservative by design. |
+| `analysis/citations.py` | `strip_index_citations()` removes ephemeral `(Article [N])`-style citations from LLM output before it's persisted — they reference one run's article list and cause coherence drift if stored. |
 
 ### Scraping
 
@@ -78,9 +79,9 @@ All application code lives under `app/`.
 | Module | Responsibility |
 |--------|---------------|
 | `models.py` | Pydantic models: `Topic`, `Article`, `KnowledgeState`, `CheckResult`, `FeedHealth`, `DashboardStats`, `PendingNotification`, `PendingWebhook`. Enums: `TopicStatus` (new/researching/ready/error), `FeedMode` (auto/manual). Each model has `from_row()` and `to_insert_dict()` for SQLite interop; datetime cells are coerced defensively. |
-| `crud.py` | All database operations grouped by model. Topic/Article/KnowledgeState/CheckResult CRUD, feed health upserts, pending notification + pending webhook queues, dashboard aggregation, article retention cleanup, stuck topic recovery. |
-| `database.py` | SQLite connection factory (WAL mode, foreign keys, busy timeout). Schema initialization (`init_db`). Migration runner (`run_migrations`) — backs up the DB before applying pending migrations. |
-| `migrations/` | 17 sequential migrations registered in `__init__.py` as `(version, description, up_function)` tuples. Tracked in `schema_version` table. Migrations are append-only. |
+| `crud.py` | All SQL (parameterized), grouped by model: CRUD, feed-health upserts, notification + webhook retry queues, dashboard aggregation, article retention cleanup, stuck-topic recovery. |
+| `database.py` | SQLite connection factory (WAL mode, foreign keys, busy timeout). Schema init (`init_db`). Migration runner (`run_migrations`) — backs up the DB before applying pending migrations. |
+| `migrations/` | 19 sequential migrations (`m001`–`m019`) registered in `__init__.py` as `(version, description, up_function)` tuples. Tracked in `schema_version`. Append-only. |
 | `interval.py` | Human-readable interval parsing/formatting (`m`/`h`/`d`/`w`/`M`, combined syntax like `"1w 3d 2h"`). Enforces min/max interval bounds. |
 | `opml.py` | OPML import/export. Parses feeds from RSS readers (FreshRSS, Miniflux, TT-RSS), validates feed URLs, and exports topics as OPML. |
 
@@ -116,6 +117,7 @@ The route handlers were split out of `routes.py` into the `web/routers/` package
 | `logging_config.py` | Plain text or JSON structured logging. Controlled by `TOPIC_WATCH_LOG_FORMAT` and `TOPIC_WATCH_LOG_LEVEL` env vars. |
 | `check_context.py` | Correlation IDs via `contextvars.ContextVar`. `CheckIdFilter` injects check ID into all log records. |
 | `url_validation.py` | SSRF protection. Blocks private/reserved IPs (localhost, 10.x, 172.16-31.x, 192.168.x, link-local, CGNAT 100.64.0.0/10, IPv6 ULA). |
+| `feed_backoff.py` | `feed_backoff_until()` — stateless exponential backoff for persistently-failing feeds, computed from `feed_health` consecutive failures. Bounded by `feed_backoff_base_minutes` / `feed_backoff_cap_hours`. |
 | `notifications.py` | Apprise wrapper. Formats `NoveltyResult` into title/body. Sync Apprise send wrapped in `asyncio.to_thread()`. Re-exports `redact_url` from `log_redaction.py`. |
 | `log_redaction.py` | Log-hygiene helper. `redact_url` strips userinfo, query strings, fragments, and long (likely-secret) path segments from notification/webhook URLs, keeping scheme + host + a short path prefix for diagnostics. |
 | `webhooks.py` | JSON POST to configured webhook endpoints. Concurrent delivery via `asyncio.gather()`. Failed deliveries are queued in `pending_webhooks` and retried via `retry_pending_webhooks()` at the start of each check cycle. |
@@ -123,11 +125,12 @@ The route handlers were split out of `routes.py` into the `web/routers/` package
 
 ### Frontend
 
-- `templates/` - 14 Jinja2 templates. Base layout with Pico CSS + HTMX. HTMX partials for dynamic updates.
-- `static/themes.css` - Custom color themes (Nord, Dracula, Solarized, High Contrast, Tokyo Night).
+- `templates/` - 16 Jinja2 templates. Pico CSS + HTMX base layout; partials for dynamic updates.
+- `static/themes.css` - Color themes (Nord, Dracula, Solarized, High Contrast, Tokyo Night).
+- `static/components.css` - Component styles (cards, badges, tables) layered on Pico.
 - `static/theme.js` - Theme switcher with localStorage persistence.
 - `static/notifications.js` - Browser push notification wrapper.
-- `static/vendor/` - Vendored Pico CSS and HTMX. No build tooling.
+- `static/vendor/` - Vendored Pico CSS + HTMX. No build tooling.
 
 ## Key Design Decisions
 
@@ -158,12 +161,12 @@ The route handlers were split out of `routes.py` into the `web/routers/` package
 | Table | Purpose |
 |-------|---------|
 | `topics` | Core entity. Name, description, `feed_urls` (JSON array), `feed_mode` (auto/manual), `status`, `is_active`, `status_changed_at`, `check_interval_minutes`, `tags` (JSON array), per-topic `confidence_threshold` / `relevance_threshold` (m011, nullable overrides), `init_attempts` (m013). |
-| `articles` | Fetched articles linked to a topic. Deduped by `content_hash` (unique per topic). `source_provider` records the news provider (m009). `processed` flag tracks analysis completion. |
+| `articles` | Fetched articles linked to a topic. Deduped by `content_hash` (unique per topic). `source_provider` records the news provider (m009), `published_at` the feed entry's date (m018). `processed` flag tracks analysis completion. |
 | `knowledge_states` | One per topic. Rolling LLM-generated summary. `token_count` tracks budget usage. |
-| `check_results` | Audit log of every check cycle. Stores articles found/new, `has_new_info`, full LLM response JSON, notification outcome, and `prompt_tokens` / `completion_tokens` (m012). |
+| `check_results` | Audit log of every check cycle. Stores articles found/new, `has_new_info`, full LLM response JSON, notification outcome, `prompt_tokens` / `completion_tokens` (m012), and `stage_error` recording which pipeline stage failed (m015). |
 | `pending_notifications` | Failed notifications queued for retry. Retried at the start of each check cycle. Deleted after `max_retries`. |
 | `pending_webhooks` | Failed webhook deliveries queued for retry (m010). Stores `url`, `payload`, `retry_count`/`max_retries`. Retried at the start of each check cycle; expired entries pruned. |
-| `feed_health` | Per-feed-URL health. Consecutive failures, total fetches/failures, last success/error timestamps. |
+| `feed_health` | Per-feed-URL health. Consecutive failures, total fetches/failures, last success/error timestamps, and `etag` / `last_modified` for HTTP conditional requests (m019). |
 | `schema_version` | Migration tracking. Single `version` column. |
 
 ### Topic Lifecycle
@@ -230,8 +233,6 @@ On first run, `config.example.yml` is auto-copied to `data/config.yml`.
 
 ### Configuration Key Reference
 
-Priority (highest to lowest): environment variables (`TOPIC_WATCH_` prefix) > `data/config.yml` > built-in defaults.
-
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `llm.model` | string | - | LiteLLM model string (e.g. `openai/gpt-5.4-nano`) |
@@ -251,7 +252,10 @@ Priority (highest to lowest): environment variables (`TOPIC_WATCH_` prefix) > `d
 | `apprise_timeout_seconds` | int | `30` | Timeout for a single Apprise notification send (seconds) |
 | `web_page_size` | int | `20` | Items per page in the web UI (5-200) |
 | `feed_max_retries` | int | `2` | RSS feed fetch retries (1-10) |
+| `feed_backoff_base_minutes` | int | `15` | Base backoff delay for a persistently-failing feed (minutes, 1-1,440). Env/YAML only. |
+| `feed_backoff_cap_hours` | int | `24` | Max backoff delay for a failing feed (hours, 1-168). Env/YAML only. |
 | `content_fetch_concurrency` | int | `3` | Concurrent article content fetches (1-20) |
+| `topic_check_concurrency` | int | `3` | Concurrent per-topic checks within one scheduler tick (1-20) |
 | `scheduler_misfire_grace_time` | int | `300` | APScheduler misfire grace time (seconds, 30-3,600) |
 | `scheduler_jitter_seconds` | int | `30` | Random jitter per scheduler tick (seconds, 0-120) |
 | `llm_max_retries` | int | `2` | LLM API call retries (0-10) |
