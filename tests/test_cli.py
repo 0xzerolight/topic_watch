@@ -7,10 +7,17 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from app.cli import _cmd_check, _cmd_init, _cmd_list
-from app.config import LLMSettings, Settings
-from app.crud import create_topic, get_topic, get_topic_by_name
-from app.database import get_connection, get_db, init_db
+from app.cli import _cmd_check, _cmd_doctor, _cmd_init, _cmd_list
+from app.config import LLMSettings, NotificationSettings, Settings
+from app.crud import (
+    create_topic,
+    get_topic,
+    get_topic_by_name,
+    upsert_feed_health_failure,
+    upsert_feed_health_success,
+)
+from app.database import get_connection, get_db, get_schema_version, init_db
+from app.migrations import MIGRATIONS
 from app.models import Article, Topic, TopicStatus
 from app.scraping import FetchResult
 from app.scraping.rss import FeedResponse
@@ -34,6 +41,164 @@ def _real_db(tmp_path: Path) -> Path:
     db_path = tmp_path / "cli.db"
     init_db(db_path)
     return db_path
+
+
+class TestCmdDoctor:
+    """Tests for the 'doctor' diagnostic command.
+
+    doctor must be secret-safe (no api_key/token ever printed) and read-only
+    against the database (never creating or migrating it).
+    """
+
+    def _run(
+        self,
+        settings: Settings,
+        capsys: pytest.CaptureFixture[str],
+        *,
+        in_docker: bool = False,
+        env_sourced: bool = False,
+    ) -> str:
+        with (
+            patch("app.cli.load_settings", return_value=settings),
+            patch("app.cli._in_docker", return_value=in_docker),
+            patch("app.cli.is_api_key_env_sourced", return_value=env_sourced),
+        ):
+            _cmd_doctor()
+        return capsys.readouterr().out
+
+    def test_version_line_present(self, capsys: pytest.CaptureFixture[str]) -> None:
+        from app import __version__
+
+        out = self._run(_make_settings(db_path="/nonexistent/x.db"), capsys)
+        assert f"version: {__version__}" in out
+        assert "python:" in out and "os:" in out
+
+    def test_api_key_rendered_as_boolean_not_value(self, capsys: pytest.CaptureFixture[str]) -> None:
+        s = _make_settings(
+            llm=LLMSettings(model="openai/gpt-4o-mini", api_key="SECRETVALUE"),
+            db_path="/nonexistent/x.db",
+        )
+        out = self._run(s, capsys)
+        assert "llm.api_key: set" in out
+        assert "SECRETVALUE" not in out
+
+    def test_env_sourced_key_marked_and_not_leaked(self, capsys: pytest.CaptureFixture[str]) -> None:
+        s = _make_settings(
+            llm=LLMSettings(model="openai/gpt-4o-mini", api_key="SECRETVALUE"),
+            db_path="/nonexistent/x.db",
+        )
+        out = self._run(s, capsys, env_sourced=True)
+        assert "(from env)" in out
+        assert "SECRETVALUE" not in out
+
+    def test_notification_urls_scheme_count_only_no_leak(self, capsys: pytest.CaptureFixture[str]) -> None:
+        urls = ["slack://TokenA/TokenB/TokenC", "pover://USERKEY@APPTOKEN", "https://ntfy.sh/shh"]
+        s = _make_settings(notifications=NotificationSettings(urls=urls), db_path="/nonexistent/x.db")
+        out = self._run(s, capsys)
+        for secret in ("TokenA", "TokenB", "TokenC", "USERKEY", "APPTOKEN", "/shh"):
+            assert secret not in out
+        assert "notifications.urls: 3" in out
+        assert "slack x1" in out and "pover x1" in out and "https x1" in out
+
+    def test_base_url_redacted_keeps_host_drops_creds(self, capsys: pytest.CaptureFixture[str]) -> None:
+        s = _make_settings(
+            llm=LLMSettings(
+                model="ollama/llama3",
+                api_key="k",
+                base_url="https://user:k3y@ollama.internal/v1?api-key=SEKRET",
+            ),
+            db_path="/nonexistent/x.db",
+        )
+        out = self._run(s, capsys)
+        assert "k3y" not in out
+        assert "SEKRET" not in out
+        assert "user:" not in out
+        assert "ollama.internal" in out
+
+    def test_failing_feed_url_redacted(self, capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+        db_path = _real_db(tmp_path)
+        with get_db(db_path) as conn:
+            upsert_feed_health_failure(conn, "https://example.com/feed?key=SECRETTOKEN", "boom")
+            upsert_feed_health_failure(conn, "https://example.com/feed?key=SECRETTOKEN", "boom")
+        out = self._run(_make_settings(db_path=str(db_path)), capsys)
+        assert "SECRETTOKEN" not in out
+        assert "feeds: 0 OK / 1 failing" in out
+        assert "(x2)" in out
+
+    def test_topic_and_feed_counts(self, capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+        db_path = _real_db(tmp_path)
+        with get_db(db_path) as conn:
+            create_topic(conn, Topic(name="A", description="d", status=TopicStatus.READY))
+            create_topic(conn, Topic(name="B", description="d", status=TopicStatus.READY))
+            create_topic(conn, Topic(name="C", description="d", status=TopicStatus.ERROR))
+            upsert_feed_health_success(conn, "https://ok.example/feed")
+            upsert_feed_health_failure(conn, "https://bad.example/feed", "boom")
+        out = self._run(_make_settings(db_path=str(db_path)), capsys)
+        assert "ready 2" in out
+        assert "error 1" in out
+        assert "feeds: 1 OK / 1 failing" in out
+
+    def test_not_configured_renders_no(self, capsys: pytest.CaptureFixture[str]) -> None:
+        s = _make_settings(llm=LLMSettings(model="", api_key=""), db_path="/nonexistent/x.db")
+        out = self._run(s, capsys)
+        assert "is_configured: no" in out
+
+    def test_config_load_failure_still_prints_version(self, capsys: pytest.CaptureFixture[str]) -> None:
+        from app import __version__
+
+        with (
+            patch("app.cli.load_settings", side_effect=RuntimeError("bad yaml")),
+            patch("app.cli._in_docker", return_value=False),
+        ):
+            _cmd_doctor()
+        out = capsys.readouterr().out
+        assert "configuration: unavailable" in out
+        assert f"version: {__version__}" in out
+
+    def test_database_path_and_schema_version(self, capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+        db_path = _real_db(tmp_path)
+        out = self._run(_make_settings(db_path=str(db_path)), capsys)
+        assert f"database: {db_path}" in out
+        latest = max(v for v, _, _ in MIGRATIONS)
+        assert f"schema: {latest}" in out
+
+    def test_missing_db_creates_nothing(self, capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+        absent_dir = tmp_path / "absent"
+        db_path = absent_dir / "x.db"
+        out = self._run(_make_settings(db_path=str(db_path)), capsys)
+        assert "unavailable (file not found)" in out
+        assert not absent_dir.exists()
+        assert not db_path.exists()
+
+    def test_deployment_docker(self, capsys: pytest.CaptureFixture[str]) -> None:
+        out = self._run(_make_settings(db_path="/nonexistent/x.db"), capsys, in_docker=True)
+        assert "deployment: docker" in out
+
+    def test_deployment_local(self, capsys: pytest.CaptureFixture[str]) -> None:
+        out = self._run(_make_settings(db_path="/nonexistent/x.db"), capsys, in_docker=False)
+        assert "deployment: local" in out
+
+    def test_corrupt_db_degrades_without_raising(self, capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+        db_path = tmp_path / "corrupt.db"
+        db_path.write_bytes(b"not a database")
+        out = self._run(_make_settings(db_path=str(db_path)), capsys)
+        assert "unavailable" in out  # never raises, never exits
+
+    def test_get_schema_version_tableless_returns_zero(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "empty.db"
+        conn = sqlite3.connect(str(db_path))
+        try:
+            assert get_schema_version(conn) == 0
+        finally:
+            conn.close()
+
+    def test_get_schema_version_populated(self, tmp_path: Path) -> None:
+        db_path = _real_db(tmp_path)
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            assert get_schema_version(conn) == max(v for v, _, _ in MIGRATIONS)
+        finally:
+            conn.close()
 
 
 class TestCmdCheck:

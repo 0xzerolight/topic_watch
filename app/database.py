@@ -222,6 +222,23 @@ def run_migrations(conn: sqlite3.Connection, db_path: Path | None = None) -> Non
         logger.info("Applied migration %d: %s", version, description)
 
 
+def get_schema_version(conn: sqlite3.Connection) -> int:
+    """Return the current schema version (0 if no migrations recorded).
+
+    Read-only, unlike ``run_migrations``: this never creates the
+    ``schema_version`` table. The ``sqlite_master`` existence guard is
+    load-bearing — a bare ``SELECT MAX(version) FROM schema_version`` raises
+    ``OperationalError`` on a read-only (``mode=ro``) connection when the table
+    is absent, so the ``doctor`` CLI command relies on this guard to degrade
+    cleanly instead of raising.
+    """
+    exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'").fetchone()
+    if exists is None:
+        return 0
+    row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+    return (row[0] if row else 0) or 0
+
+
 def init_db(db_path: Path | None = None) -> None:
     """Create all tables if they don't exist, then run migrations.
 
