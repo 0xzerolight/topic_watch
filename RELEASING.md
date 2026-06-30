@@ -67,8 +67,7 @@ The DB is auto-backed-up before any schema migration.
 
 ## Notes
 
-- Pushing to `main` without a tag also publishes an image, but only the `main`
-  tag, NOT `latest`. `latest` only moves on a `v*` tag. Always tag for a real
-  release.
+- Pushing to `main` runs CI only and publishes no image. Images are published
+  solely by a `v*` tag (`latest`, `X.Y.Z`, `X.Y`). Always tag for a real release.
 - The gstack `/ship` skill assumes a 4-digit VERSION file and won't bump this
   project correctly. Use this runbook, not `/ship`'s auto-bump, for versioning.
