@@ -87,5 +87,6 @@ fix: handle empty RSS feed without crashing
 ## Reporting
 
 Bugs and feature requests → [GitHub Issues](https://github.com/0xzerolight/topic_watch/issues).
-For bugs, include repro steps, expected vs. actual behavior, relevant logs, and
-your Python version + OS.
+For bugs, include repro steps, expected vs. actual behavior, relevant logs, and the
+output of `python -m app.cli doctor` (Docker: `docker compose exec topic-watch python -m app.cli doctor`) —
+a secret-safe snapshot of version, runtime, redacted config, schema, and feed health.

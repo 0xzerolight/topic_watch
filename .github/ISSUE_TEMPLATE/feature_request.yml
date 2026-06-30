@@ -7,6 +7,8 @@ body:
     attributes:
       value: |
         Thanks for suggesting an improvement. Please describe your idea as clearly as possible.
+        It helps to skim existing [issues](https://github.com/0xzerolight/topic_watch/issues) and
+        [discussions](https://github.com/0xzerolight/topic_watch/discussions) first in case it's already been raised.
 
   - type: textarea
     id: description

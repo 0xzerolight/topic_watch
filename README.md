@@ -192,12 +192,15 @@ The database is automatically backed up before any schema migration.
 | **Docker container exits** | `docker compose logs` for details. Check that `data/` is writable. The installer sets `PUID`/`PGID` automatically; see [SECURITY.md](SECURITY.md). |
 | **High memory** | Lower `max_articles_per_check` or `content_fetch_concurrency`. Increase check intervals. |
 
+Still stuck? Run `python -m app.cli doctor` (Docker: `docker compose exec topic-watch python -m app.cli doctor`) for a secret-safe diagnostic snapshot — version, runtime, redacted config, schema, and feed health — and paste it into a bug report. Update to the latest release first.
+
 ## Contributing
 
 Contributions of any kind are welcome.
 
 - New here? Start with [CONTRIBUTING.md](CONTRIBUTING.md).
 - Architecture overview: [ARCHITECTURE.md](ARCHITECTURE.md).
+- Getting help: [SUPPORT.md](SUPPORT.md).
 - Security: [SECURITY.md](SECURITY.md).
 
 Bug reports and feature requests → [Issues](https://github.com/0xzerolight/topic_watch/issues).
