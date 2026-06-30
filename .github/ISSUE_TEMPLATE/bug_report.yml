@@ -8,6 +8,14 @@ body:
       value: |
         Thanks for taking the time to report a bug. Please fill out the fields below as completely as possible.
 
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I'm on the latest release and have searched existing issues and discussions.
+          required: true
+
   - type: textarea
     id: description
     attributes:
@@ -39,7 +47,9 @@ body:
       description: How are you running Topic Watch?
       options:
         - Docker
+        - Docker Compose
         - Local (pip install)
+        - Source checkout
         - Other
     validations:
       required: true
@@ -48,28 +58,31 @@ body:
     id: version
     attributes:
       label: Version
-      description: App version or commit hash (visible in the UI footer or via `git rev-parse --short HEAD`).
+      description: App version or commit hash (UI footer, or `python -m app.cli --version`). Please update to the latest release first to check it's not already fixed.
       placeholder: "e.g. 1.2.0 or b325d7a"
     validations:
       required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: |
+        Paste the output of `python -m app.cli doctor`
+        (Docker: `docker compose exec topic-watch python -m app.cli doctor`).
+        It is secret-safe — the API key shows as set/not set and notification URLs
+        as scheme + count only. If you can't run it, note your OS, Python version,
+        and how you installed Topic Watch.
+      render: shell
+    validations:
+      required: false
 
   - type: textarea
     id: logs
     attributes:
       label: Relevant log output
       description: Paste any relevant log lines here. Use `docker compose logs` or check your terminal output.
-      render: text
-    validations:
-      required: false
-
-  - type: textarea
-    id: config
-    attributes:
-      label: Relevant configuration
-      description: |
-        Paste relevant sections of your `config.yml` here.
-        **Redact API keys, passwords, and notification URLs before posting.**
-      render: yaml
+      render: shell
     validations:
       required: false
 

@@ -16,18 +16,24 @@ a separate/offline database.
 import argparse
 import asyncio
 import logging
+import os
+import platform
 import sqlite3
 import sys
+from collections import Counter
 from datetime import UTC, datetime
+from urllib.parse import urlparse
 
-from app.config import Settings, load_settings
+from app.config import Settings, is_api_key_env_sourced, load_settings, resolve_db_path
 from app.crud import (
     get_topic_by_name,
+    list_all_feed_health,
     list_topics,
     mark_articles_processed,
     update_topic,
 )
-from app.database import get_db, init_db
+from app.database import get_db, get_schema_version, init_db
+from app.log_redaction import redact_url
 from app.logging_config import setup_logging
 from app.models import Topic, TopicStatus
 
@@ -191,6 +197,143 @@ async def _run_init(topic: Topic, topic_name: str, conn: sqlite3.Connection, set
     return False
 
 
+def _in_docker() -> bool:
+    """Best-effort container detection for the diagnostic report."""
+    return os.path.exists("/.dockerenv")
+
+
+# Config keys that carry secrets (or are rendered specially); never dumped raw.
+_SECRET_CONFIG_KEYS = frozenset({"api_key", "base_url", "urls", "webhook_urls"})
+
+
+def _render_config(settings: Settings) -> list[str]:
+    """Build secret-safe configuration lines for ``doctor``.
+
+    Secrets are never emitted: ``api_key`` is shown as a boolean, ``base_url``
+    is redacted to scheme+host, and notification/webhook URLs are reduced to
+    per-scheme counts (no host or path). All remaining settings are dumped by
+    key via a *denylist* (``_SECRET_CONFIG_KEYS``), so a newly-added setting is
+    surfaced automatically rather than silently dropped from bug reports.
+    """
+    lines: list[str] = []
+    llm = settings.llm
+    lines.append(f"  llm.model: {llm.model or '(unset)'}")
+    key_state = "set" if llm.api_key else "not set"
+    if is_api_key_env_sourced():
+        key_state += " (from env)"
+    lines.append(f"  llm.api_key: {key_state}")
+    if llm.base_url:
+        lines.append(f"  llm.base_url: {redact_url(llm.base_url)}")
+
+    for label, urls in (
+        ("notifications.urls", settings.notifications.urls),
+        ("notifications.webhook_urls", settings.notifications.webhook_urls),
+    ):
+        if urls:
+            counts = Counter(urlparse(u).scheme or "?" for u in urls)
+            summary = ", ".join(f"{scheme} x{n}" for scheme, n in sorted(counts.items()))
+            lines.append(f"  {label}: {len(urls)} ({summary})")
+        else:
+            lines.append(f"  {label}: none")
+
+    lines.append(f"  is_configured: {'yes' if settings.is_configured() else 'no'}")
+
+    dumped = settings.model_dump()
+    for key, value in dumped.items():
+        if key in ("llm", "notifications"):
+            continue  # sub-models rendered above
+        if isinstance(value, (str, int, float, bool)):
+            lines.append(f"  {key}: {value}")
+    # Nested llm.* scalars beyond the three handled above (forward-compatible).
+    for key, value in (dumped.get("llm") or {}).items():
+        if key in _SECRET_CONFIG_KEYS or key == "model":
+            continue
+        if isinstance(value, (str, int, float, bool)):
+            lines.append(f"  llm.{key}: {value}")
+    return lines
+
+
+def _render_topics(conn: sqlite3.Connection) -> list[str]:
+    """Per-status topic counts; degrades to 'unavailable' if the table is absent."""
+    try:
+        topics = list_topics(conn)
+    except sqlite3.Error:
+        return ["  topics: unavailable"]
+    counts = Counter(t.status.value for t in topics)
+    summary = ", ".join(f"{status.value} {counts.get(status.value, 0)}" for status in TopicStatus)
+    return [f"  topics: {summary}"]
+
+
+def _render_feeds(conn: sqlite3.Connection) -> list[str]:
+    """Feed-health summary with redacted failing-feed URLs; degrades cleanly."""
+    try:
+        feeds = list_all_feed_health(conn)
+    except sqlite3.Error:
+        return ["  feeds: unavailable"]
+    failing = [f for f in feeds if f.consecutive_failures > 0]
+    ok = len(feeds) - len(failing)
+    lines = [f"  feeds: {ok} OK / {len(failing)} failing"]
+    for feed in failing:
+        lines.append(f"    failing: {redact_url(feed.feed_url)} (x{feed.consecutive_failures})")
+    return lines
+
+
+def _render_database(settings: Settings) -> list[str]:
+    """Build read-only database diagnostics.
+
+    Opens the DB ``mode=ro`` and never creates or migrates it (no ``get_db`` /
+    ``init_db``). Reading an *existing* WAL database via ``mode=ro`` may create
+    transient ``-wal`` / ``-shm`` sidecars — acceptable and unavoidable for a
+    live-correct read — but this never creates the primary ``.db`` or its parent
+    directory, nor mutates existing content.
+    """
+    db_path = resolve_db_path(settings)
+    lines = [f"database: {db_path}"]
+    if not db_path.exists():
+        lines.append("  unavailable (file not found)")
+        return lines
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        lines.append(f"  schema: {get_schema_version(conn)}")
+        lines.extend(_render_topics(conn))
+        lines.extend(_render_feeds(conn))
+    except sqlite3.Error as exc:
+        lines.append(f"  unavailable ({exc})")
+    finally:
+        if conn is not None:
+            conn.close()
+    return lines
+
+
+def _cmd_doctor() -> None:
+    """Print a secret-safe diagnostic report for bug reports.
+
+    Read-only with respect to the primary database: never calls
+    ``init_db`` / ``get_db`` / ``run_migrations`` (each would ``mkdir`` ``data/``
+    and create a WAL ``.db``). Safe to run against a live server.
+    """
+    from app import __version__
+
+    print(f"version: {__version__}")
+    print(f"python: {platform.python_version()}")
+    print(f"os: {platform.platform()}")
+    print(f"deployment: {'docker' if _in_docker() else 'local'}")
+
+    try:
+        settings = load_settings()
+    except Exception as exc:  # noqa: BLE001 - diagnostics must never crash
+        print(f"configuration: unavailable ({exc})")
+        return
+
+    print("configuration:")
+    for line in _render_config(settings):
+        print(line)
+    for line in _render_database(settings):
+        print(line)
+
+
 def _cmd_list() -> None:
     """List all topics with their status."""
     init_db()
@@ -240,6 +383,9 @@ def main() -> None:
     # list
     subparsers.add_parser("list", help="List all topics and their status")
 
+    # doctor
+    subparsers.add_parser("doctor", help="Print a secret-safe diagnostic report for bug reports")
+
     args = parser.parse_args()
     setup_logging()
 
@@ -251,6 +397,8 @@ def main() -> None:
         asyncio.run(_cmd_init(args.topic_name))
     elif args.command == "list":
         _cmd_list()
+    elif args.command == "doctor":
+        _cmd_doctor()
 
 
 if __name__ == "__main__":
