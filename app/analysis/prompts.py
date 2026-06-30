@@ -71,6 +71,34 @@ def _neutralize_framing(text: str) -> str:
     return "\n".join(out)
 
 
+# --- Shared output rules (one source of truth, interpolated into the prompts) ---
+#
+# These two rules are injected into the novelty + knowledge-init + knowledge-update
+# system prompts. They cut the two output defects from the OVH citation/value audit:
+# ephemeral article-index citations and "X was announced" without the value X.
+
+_RULE_NO_INDEX_CITATIONS = """\
+=== NO ARTICLE-INDEX CITATIONS ===
+Never write article-index citations in any form — parenthetical ("(Article [1])", \
+"(Articles [3], [5])"), inline or subject position ("Articles [5] through [9] cover…", \
+"Article [7] restates…"), connector ("reported in articles [2], [5]", "According to \
+article [8]"), or bare ("[2]"). The article numbers are assigned per run and are \
+meaningless once stored. Attribute facts by SOURCE NAME instead (named-source qualifiers \
+like "according to [the publisher]" stay). Do NOT add article-reliability bookkeeping to \
+the summary (e.g. "Note: Article [N] is marked [STUB]"); stub-weighting is internal, not a \
+monitored fact."""
+
+_RULE_STATE_THE_VALUE = """\
+=== STATE THE VALUE, OR FLAG ITS ABSENCE ===
+When the description seeks a specific value (a date, release window, number, name, \
+decision, or status) and an article reports it was announced/confirmed/revealed, state the \
+ACTUAL value. If the source reports the event but does not give the value, say so \
+explicitly (e.g. "a release window was announced but the specific window is not stated in \
+available sources") — never present an announcement or confirmation as if the value were \
+given when it was not. If your output has both a summary and a key_facts list, put the \
+value in both so it survives downstream merging."""
+
+
 # --- Novelty detection ---
 
 _NOVELTY_SYSTEM = """\
@@ -159,7 +187,11 @@ Set confidence using this scale:
 - 0.1-0.2: Speculative, rumored, or only marginally related to description
 Do NOT default to 0.7-0.8. Calibrate deliberately using the criteria above.
 Set relevance to indicate how directly the new information addresses the topic \
-description (0.0 = tangentially related, 1.0 = exactly what the user asked about)."""
+description (0.0 = tangentially related, 1.0 = exactly what the user asked about).
+
+{rule_no_citations}
+
+{rule_state_value}"""
 
 _NOVELTY_USER = """\
 Topic: {topic_name}
@@ -246,7 +278,11 @@ independently confirmed
 - **Contradictions:** Where articles disagree (include both versions)
 - **Timeline:** Only dates/events explicitly mentioned in the articles
 
-Keep the summary under {max_tokens} tokens. Be concise — fact density over prose."""
+Keep the summary under {max_tokens} tokens. Be concise — fact density over prose.
+
+{rule_no_citations}
+
+{rule_state_value}"""
 
 _KNOWLEDGE_INIT_USER = """\
 Topic: {topic_name}
@@ -278,7 +314,11 @@ this test. The summary must stay tightly focused on exactly what the user asked 
 to monitor — not the broader subject area.
 
 Stay under {max_tokens} tokens. Set sufficient_data=false only if the new \
-findings are too vague or contradictory to incorporate meaningfully."""
+findings are too vague or contradictory to incorporate meaningfully.
+
+{rule_no_citations}
+
+{rule_state_value}"""
 
 _KNOWLEDGE_UPDATE_USER = """\
 Topic: {topic_name}
@@ -400,7 +440,13 @@ def build_novelty_messages(articles: list[Article], knowledge_summary: str, topi
     """Build chat messages for novelty detection."""
     effective_summary = knowledge_summary or "No existing knowledge state."
     return [
-        {"role": "system", "content": _NOVELTY_SYSTEM},
+        {
+            "role": "system",
+            "content": _NOVELTY_SYSTEM.format(
+                rule_no_citations=_RULE_NO_INDEX_CITATIONS,
+                rule_state_value=_RULE_STATE_THE_VALUE,
+            ),
+        },
         {
             "role": "user",
             "content": _NOVELTY_USER.format(
@@ -418,7 +464,11 @@ def build_knowledge_init_messages(articles: list[Article], topic: Topic, max_tok
     return [
         {
             "role": "system",
-            "content": _KNOWLEDGE_INIT_SYSTEM.format(max_tokens=max_tokens),
+            "content": _KNOWLEDGE_INIT_SYSTEM.format(
+                max_tokens=max_tokens,
+                rule_no_citations=_RULE_NO_INDEX_CITATIONS,
+                rule_state_value=_RULE_STATE_THE_VALUE,
+            ),
         },
         {
             "role": "user",
@@ -465,7 +515,11 @@ def build_knowledge_update_messages(
     return [
         {
             "role": "system",
-            "content": _KNOWLEDGE_UPDATE_SYSTEM.format(max_tokens=max_tokens),
+            "content": _KNOWLEDGE_UPDATE_SYSTEM.format(
+                max_tokens=max_tokens,
+                rule_no_citations=_RULE_NO_INDEX_CITATIONS,
+                rule_state_value=_RULE_STATE_THE_VALUE,
+            ),
         },
         {
             "role": "user",
