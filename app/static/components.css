@@ -14,6 +14,13 @@
  */
 
 :root {
+  /* Flatten Pico's responsive root-font ramp (100% → 131.25% on wide screens),
+     which inflated the whole rem-based UI on desktop. Pins a flat 16px base, so
+     text and chrome scale down together. This non-media :root declaration loads
+     last (after pico.min.css) and so overrides every breakpoint redeclaration.
+     Tuning knob: lower (e.g. 93.75%) for tighter everywhere, raise toward
+     106.25% for ~15% on a ≥1280px screen. */
+  --pico-font-size: 100%;
   /* Surfaces */
   --app-surface: var(--pico-background-color);
   --app-surface-raised: var(--pico-card-background-color);
