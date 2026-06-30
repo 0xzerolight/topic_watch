@@ -32,6 +32,30 @@ def _make_settings(**overrides) -> Settings:
     return Settings(**defaults)
 
 
+# --- example/placeholder URL guard (example-URL leak guard) ---
+
+
+class TestPlaceholderGuard:
+    """A copied-but-unedited example URL must be dropped, never delivered."""
+
+    async def test_placeholder_url_skipped_real_url_delivered(self) -> None:
+        settings = _make_settings(
+            notifications=NotificationSettings(urls=["ntfy://your-topic-name", "json://localhost"])
+        )
+        with patch("app.notifications.apprise.Apprise") as mock_ap:
+            inst = mock_ap.return_value
+            inst.add.return_value = True
+            inst.notify.return_value = True
+            results = await send_notification_per_url("T", "B", settings)
+
+        by_url = {r.url: r for r in results}
+        assert by_url["ntfy://your-topic-name"].ok is False
+        assert "placeholder" in (by_url["ntfy://your-topic-name"].error or "")
+        assert by_url["json://localhost"].ok is True
+        # The placeholder never reached Apprise; the real URL did.
+        inst.add.assert_called_once_with("json://localhost")
+
+
 # --- format_notification ---
 
 
