@@ -25,7 +25,7 @@ Please include: steps to reproduce, potential impact, and any suggested fix.
 
 Topic Watch is designed as a personal, self-hosted tool. Adding authentication would mean managing users, passwords, and sessions - complexity that doesn't make sense for a single-user application.
 
-If you deploy on a remote server, place Topic Watch behind a reverse proxy with your preferred auth layer (Authelia, Caddy basicauth, Nginx basic auth, etc.). See the [README](README.md#security) for examples.
+If you deploy on a remote server, place Topic Watch behind a reverse proxy with your preferred auth layer (Authelia, Caddy basicauth, Nginx basic auth, etc.). See [Reverse Proxy Auth Examples](#reverse-proxy-auth-examples) for Caddy and Nginx configs.
 
 Your `data/config.yml` contains sensitive values (API keys, notification URLs). Ensure it is not world-readable.
 
@@ -39,6 +39,43 @@ When deploying Topic Watch on a public network:
 - **Protect `data/config.yml`.** This file contains your LLM API key. Ensure it is not world-readable (`chmod 600 data/config.yml`).
 - **Keep dependencies updated.** `requirements.txt` is a hash-pinned lockfile (exact `==` versions plus `--hash` entries), so `pip install --upgrade -r requirements.txt` cannot raise versions — it is a no-op for upgrades. Updates land through the configured Dependabot PRs; to bump versions locally, regenerate the lockfile with `make lock` and reinstall.
 - **Use the Docker image.** It runs as a non-root user with resource limits.
+
+### Reverse Proxy Auth Examples
+
+#### Caddy
+
+```
+topic-watch.example.com {
+    basicauth {
+        admin $2a$14$YOUR_HASHED_PASSWORD
+    }
+    reverse_proxy localhost:8000
+}
+```
+
+Generate hash: `caddy hash-password`
+
+#### Nginx
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name topic-watch.example.com;
+
+    auth_basic "Topic Watch";
+    auth_basic_user_file /etc/nginx/.htpasswd;
+
+    location / {
+        proxy_pass http://localhost:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+Create credentials: `htpasswd -c /etc/nginx/.htpasswd admin`
 
 ## Install Script Trust
 
