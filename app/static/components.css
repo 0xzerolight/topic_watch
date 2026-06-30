@@ -378,6 +378,9 @@ a.chip:hover { background: var(--app-surface-sunken); }
   color: var(--app-accent);
   box-shadow: inset 0 -2px 0 var(--app-accent);
 }
+/* Pico underlines anchors on hover; nav links use box-shadow as their
+   indicator, so suppress the hover underline. */
+.nav-link:hover { text-decoration: none; }
 
 /* ============================================================
  * Form helpers
