@@ -20,9 +20,12 @@ llm:
 
 # Notification settings
 # Uses Apprise URL format. See: https://github.com/caronc/apprise/wiki
+# No notifications are sent until you add at least one URL (here or on the
+# Settings page). Uncomment an example below and replace the placeholder with
+# your own — placeholder values are ignored, so leaving one as-is sends nothing.
 notifications:
-  urls:
-    - "ntfy://your-topic-name"
+  urls: []
+    # - "ntfy://your-topic-name"
     # - "discord://webhook_id/webhook_token"
     # - "tgram://bot_token/chat_id"
     # - "slack://token_a/token_b/token_c/channel"

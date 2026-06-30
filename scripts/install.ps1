@@ -58,7 +58,15 @@ Push-Location $InstallDir
 try {
     Write-Info "Pulling Docker image..."
     & docker compose pull
-    if ($LASTEXITCODE -ne 0) { throw "docker compose pull failed" }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Err "Could not pull the Docker image (ghcr.io/$Repo)."
+        Write-Host ""
+        Write-Host "  Most likely the image is not publicly accessible, or ghcr.io is unreachable."
+        Write-Host "  - Check your network and that https://ghcr.io is reachable."
+        Write-Host "  - Maintainers: confirm the GHCR package visibility is set to Public."
+        Write-Host "  - Pin a known release instead of latest: set TOPIC_WATCH_REF=<tag> and re-run."
+        throw "docker compose pull failed"
+    }
 
     Write-Info "Starting Topic Watch..."
     & docker compose up -d
