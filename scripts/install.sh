@@ -74,8 +74,8 @@ curl -fsSL "$COMPOSE_URL" -o "$INSTALL_DIR/docker-compose.yml"
 # files read PUID/PGID from this .env; the entrypoint applies them at startup.
 #
 # Upsert: replace existing PUID=/PGID= lines in-place so a re-run never
-# truncates user-added vars (e.g. TOPIC_WATCH_LLM__API_KEY). If the key is
-# absent it is appended; if the file doesn't exist it is created.
+# truncates user-added vars (e.g. a TZ or TOPIC_WATCH_PORT override). If the key
+# is absent it is appended; if the file doesn't exist it is created.
 HOST_UID="$(id -u)"
 HOST_GID="$(id -g)"
 ENV_FILE="$INSTALL_DIR/.env"
@@ -84,8 +84,8 @@ upsert_env() {
     local key="$1"
     local value="$2"
     local file="$3"
-    # Owner-only on every write path so the .env (LLM API key) is never even
-    # briefly group/world-readable, not just after the trailing chmod (OVH-063).
+    # Owner-only on every write path so any secret a user adds to .env is never
+    # even briefly group/world-readable, not just after the trailing chmod (OVH-063).
     if [ ! -f "$file" ]; then
         (umask 077; echo "${key}=${value}" > "$file")
     elif grep -q "^${key}=" "$file"; then
@@ -107,9 +107,9 @@ upsert_env() {
 upsert_env "PUID" "${HOST_UID}" "${ENV_FILE}"
 upsert_env "PGID" "${HOST_GID}" "${ENV_FILE}"
 
-# Restrict the .env to the owner: it holds the LLM API key (and any user-added
-# secrets). Without this it is created world/group-readable by the default umask,
-# leaking the key to other users on a shared host (OVH-063).
+# Restrict the .env to the owner: it holds PUID/PGID and any secrets a user adds
+# (proxy creds, etc.). Without this it is created world/group-readable by the
+# default umask, leaking those to other users on a shared host (OVH-063).
 chmod 600 "${ENV_FILE}"
 
 if [ "$HOST_UID" != "1000" ] || [ "$HOST_GID" != "1000" ]; then
@@ -121,7 +121,18 @@ fi
 # --- Pull and start ---
 cd "$INSTALL_DIR"
 info "Pulling Docker image..."
-docker compose pull
+# Fail fast with an actionable hint: the most common failure here is the image
+# not being publicly pullable. set -e would abort anyway, but with only Docker's
+# raw "denied"/network error and no pointer to the fix.
+if ! docker compose pull; then
+    error "Could not pull the Docker image (ghcr.io/${REPO})."
+    echo ""
+    echo "  Most likely the image is not publicly accessible, or ghcr.io is unreachable."
+    echo "  - Check your network and that https://ghcr.io is reachable."
+    echo "  - Maintainers: confirm the GHCR package visibility is set to Public."
+    echo "  - Pin a known release instead of latest: TOPIC_WATCH_REF=<tag> re-run this installer."
+    exit 1
+fi
 
 info "Starting Topic Watch..."
 docker compose up -d
