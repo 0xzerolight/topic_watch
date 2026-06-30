@@ -163,6 +163,7 @@ async def complete_setup(
     llm_model: str = Form(...),
     llm_api_key: str = Form(...),
     llm_base_url: str = Form(""),
+    skip_validation: str = Form(""),
 ):
     """Process setup form and start the application."""
     from pydantic import ValidationError
@@ -197,7 +198,14 @@ async def complete_setup(
         )
         # Pre-flight: confirm the credentials actually work before completing setup,
         # so a bad key/model/base_url is caught here instead of failing silently later.
-        await verify_llm_credentials(model=llm_model, api_key=llm_api_key, base_url=effective_base_url)
+        # The "Save anyway" escape hatch (skip_validation) bypasses this so a transient
+        # provider error or a stale default model string can't trap a brand-new user at
+        # /setup. It is safe: is_configured() only needs a non-placeholder key, and a bad
+        # key then degrades gracefully — analyze_articles() returns has_new_info=False on
+        # any LLM failure (no crash, no spurious notification). The user fixes it later in
+        # Settings, and Feed Health / `doctor` surface the failing checks.
+        if skip_validation != "true":
+            await verify_llm_credentials(model=llm_model, api_key=llm_api_key, base_url=effective_base_url)
         save_settings_to_yaml(new_settings, request.app.state.config_path)
         request.app.state.settings = new_settings
         request.app.state.setup_required = False
@@ -376,7 +384,7 @@ async def test_notification(
             "<p><small>Supported services include: Ntfy, Discord, Telegram, Slack, Email, Pushover, Gotify, "
             "and <a href='https://github.com/caronc/apprise/wiki#notification-services' target='_blank'>"
             "90+ more via Apprise</a>.</small></p>"
-            "<p><small>Example: <code>ntfy://your-topic-name</code></small></p>"
+            "<p><small>Example: <code>ntfy://YOUR_NTFY_TOPIC</code> (replace with your own topic)</small></p>"
             "</article>",
             status_code=200,
         )
