@@ -2,9 +2,9 @@
 
 ## Reporting a Vulnerability
 
-If you find a security vulnerability, please open a [GitHub Issue](https://github.com/0xzerolight/topic_watch/issues/new) with the label `security`. If you prefer to report privately, include your contact information and I'll follow up directly.
+Report privately via GitHub's [Report a vulnerability](https://github.com/0xzerolight/topic_watch/security/advisories/new) (the repo's **Security** tab → **Report a vulnerability**). The report stays private until a fix ships. For non-sensitive issues, open a [GitHub Issue](https://github.com/0xzerolight/topic_watch/issues/new) labeled `security`.
 
-Please include: steps to reproduce, potential impact, and any suggested fix.
+Include: steps to reproduce, potential impact, and any suggested fix.
 
 ## Scope
 
@@ -23,11 +23,9 @@ Please include: steps to reproduce, potential impact, and any suggested fix.
 
 ## Why No Built-in Authentication?
 
-Topic Watch is designed as a personal, self-hosted tool. Adding authentication would mean managing users, passwords, and sessions - complexity that doesn't make sense for a single-user application.
+Topic Watch is a single-user, self-hosted tool. Built-in auth would mean managing users, passwords, and sessions — complexity that doesn't fit one user. Safe as-is on localhost.
 
-If you deploy on a remote server, place Topic Watch behind a reverse proxy with your preferred auth layer (Authelia, Caddy basicauth, Nginx basic auth, etc.). See [Reverse Proxy Auth Examples](#reverse-proxy-auth-examples) for Caddy and Nginx configs.
-
-Your `data/config.yml` contains sensitive values (API keys, notification URLs). Ensure it is not world-readable.
+For remote deployment, put it behind a reverse proxy with your auth layer (Authelia, Caddy basicauth, Nginx basic auth) — see [Reverse Proxy Auth Examples](#reverse-proxy-auth-examples) below.
 
 ## Deployment Security
 
