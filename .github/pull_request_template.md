@@ -17,7 +17,5 @@
 ## Checklist
 
 - [ ] Tests added or updated
-- [ ] `ruff check .` passes
-- [ ] `ruff format --check .` passes
-- [ ] `pytest` passes
+- [ ] `make ci` passes (lint, format, type-check, tests)
 - [ ] Documentation updated (if applicable)
