@@ -1,7 +1,8 @@
 # Releasing
 
-topic_watch ships as a Docker image on GHCR. A release is a git tag; CI does the
-rest. There is no PyPI package and no manual image build.
+topic_watch ships as a Docker image on GHCR. A release is a git tag: CI builds
+and publishes the image, then you cut a GitHub Release to hold the notes. There
+is no PyPI package and no manual image build.
 
 ## Versioning
 
@@ -48,6 +49,16 @@ All on `main`, fully merged and green (`make ci` passes).
    and pushes to `ghcr.io/0xzerolight/topic_watch` with tags `latest`, `X.Y.Z`,
    and `X.Y`.
 
+8. Cut the GitHub Release for the tag — this is where users read the notes:
+
+       gh release create vX.Y.Z --title "vX.Y.Z" --notes ""
+
+   Then write the notes in the web UI (Releases → `vX.Y.Z` → Edit), pasting
+   this version's `## [X.Y.Z]` section from CHANGELOG.md (the source of truth).
+   To set the notes from the CLI instead, pass `--notes-file notes.md`. The
+   GitHub Release carries notes and visibility only; it does not affect the
+   image publish, which already happened on the tag push in step 6.
+
 ## Verify
 
 - Watch the run: `gh run watch` (or the Actions tab).
@@ -56,6 +67,8 @@ All on `main`, fully merged and green (`make ci` passes).
       docker pull ghcr.io/0xzerolight/topic_watch:X.Y.Z
 
 - Confirm the GitHub tag exists and `latest` moved to the new digest.
+- Confirm the GitHub Release is live on the repo's `/releases` page and its
+  notes read correctly.
 
 ## Upgrading a deployment (for users / your own box)
 
