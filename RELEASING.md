@@ -62,12 +62,10 @@ All on `main`, fully merged and green (`make ci` passes).
     cd ~/topic-watch
     docker compose pull && docker compose up -d
 
-Pin a specific release with `TOPIC_WATCH_REF=vX.Y.Z` (see README Quick Start).
-The DB is auto-backed-up before any schema migration.
+Pin a specific release with `TOPIC_WATCH_REF=vX.Y.Z` — the install scripts honor
+it. The DB is auto-backed-up before any schema migration.
 
 ## Notes
 
 - Pushing to `main` runs CI only and publishes no image. Images are published
   solely by a `v*` tag (`latest`, `X.Y.Z`, `X.Y`). Always tag for a real release.
-- The gstack `/ship` skill assumes a 4-digit VERSION file and won't bump this
-  project correctly. Use this runbook, not `/ship`'s auto-bump, for versioning.
