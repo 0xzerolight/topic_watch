@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-06-30
+
 ### Added
 
 - Per-topic confidence and relevance thresholds (override global defaults; high-stakes topics can demand stricter novelty)
