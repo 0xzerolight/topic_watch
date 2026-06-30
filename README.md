@@ -49,9 +49,38 @@ irm https://raw.githubusercontent.com/0xzerolight/topic_watch/main/scripts/insta
 
 This pulls the image, starts the container, and opens the setup wizard at [http://localhost:8000](http://localhost:8000) — set your LLM API key there.
 
-> ⚠️ Piping a script to a shell runs whatever the URL returns. These scripts fetch from the mutable `main` branch; pin a release with `TOPIC_WATCH_REF` — see [SECURITY.md](SECURITY.md#install-script-trust).
+<details>
+<summary><strong>Manual install (without the script)</strong></summary>
 
-Build from source: `git clone https://github.com/0xzerolight/topic_watch.git && cd topic_watch && docker compose up -d`.
+**Docker, prebuilt image** — same image the script uses, you just supply the compose file:
+
+```bash
+mkdir -p topic-watch/data && cd topic-watch
+curl -fsSL https://raw.githubusercontent.com/0xzerolight/topic_watch/main/docker-compose.prod.yml -o docker-compose.yml
+printf 'PUID=%s\nPGID=%s\n' "$(id -u)" "$(id -g)" > .env   # only if your host UID isn't 1000
+docker compose up -d
+```
+
+**Build from source** — no prebuilt image, builds from the Dockerfile:
+
+```bash
+git clone https://github.com/0xzerolight/topic_watch.git
+cd topic_watch
+docker compose up -d
+```
+
+**Without Docker** (Python 3.11+):
+
+```bash
+git clone https://github.com/0xzerolight/topic_watch.git
+cd topic_watch
+python -m venv .venv && source .venv/bin/activate
+pip install .
+mkdir -p data && cp config.example.yml data/config.yml
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+</details>
 
 ## Features
 
