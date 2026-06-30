@@ -8,6 +8,7 @@ import litellm
 import pytest
 from pydantic import ValidationError
 
+from app.analysis.citations import strip_index_citations
 from app.analysis.knowledge import initialize_knowledge, update_knowledge
 from app.analysis.llm import (
     CompressedKnowledge,
@@ -1632,3 +1633,170 @@ class TestClientCaching:
         first = llm_module._get_client(settings)
         second = llm_module._get_client(settings)
         assert first is second
+
+
+# ============================================================
+# TestStripIndexCitations (pure helper)
+# ============================================================
+
+
+class TestStripIndexCitations:
+    """Fixtures are real citation strings observed in data/topic_watch.db."""
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            # whole-paren citation -> paren dropped, surrounding spacing tidied
+            ("13 episodes (Article [4]) - next", "13 episodes - next"),
+            ("fans (Articles [3], [5]) **Timeline:**", "fans **Timeline:**"),
+            ("round (Articles [5], [8], [9]) - Valuation", "round - Valuation"),
+            ("arc (reported in articles [2], [5], [9]). Note", "arc. Note"),
+            # leading segment removed, named attribution kept
+            ("deal (Article [7], reported by Bloomberg News)", "deal (reported by Bloomberg News)"),
+            ("(per article [7], published June 19, 2026)", "(published June 19, 2026)"),
+            # trailing segment (separator- or connector-joined); internal-comma date survives
+            ("(per D&C Media report, June 10; Article [1])", "(per D&C Media report, June 10)"),
+            ("12 episodes (November 2024; Article [4]) - S", "12 episodes (November 2024) - S"),
+            ("Opus 4.8 (announced May 28, 2026 per Article [10]) - C", "Opus 4.8 (announced May 28, 2026) - C"),
+        ],
+    )
+    def test_removes_parenthetical_citations(self, text: str, expected: str) -> None:
+        assert strip_index_citations(text) == expected
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            # non-parenthetical / subject-position prose is the prompt rule's domain —
+            # stripping the cite would yield subjectless grammar, so leave it intact
+            "Note: Articles [1], [2], [3], [4], [10] are marked [STUB] with minimal content",
+            "Articles [5] through [9] cover the same $65 billion round",
+            "According to article [8] (Polygon, June 19, 2026): a sequel is planned",
+            "except articles [4] and [8] which lack the [STUB] designation",
+            # false positives that must never be touched (non-digit brackets / markdown)
+            "Source [STUB] tag and [NO CONTENT] marker remain",
+            "see [the report](https://example.com/x) for details",
+            "attributed to [the publisher] without an index",
+        ],
+    )
+    def test_leaves_out_of_scope_text_unchanged(self, text: str) -> None:
+        assert strip_index_citations(text) == text
+
+    def test_combined_real_string_strips_paren_keeps_prose(self) -> None:
+        # The dominant stored shape: a parenthetical cite adjacent to a prose Note
+        # cite in the same field. The paren is removed; the prose cite is left for
+        # the prompt rule (the strip must not mangle subject-position prose).
+        text = "capabilities (Article [10]) - Note: Article [10] is marked [STUB]"
+        assert strip_index_citations(text) == "capabilities - Note: Article [10] is marked [STUB]"
+
+    def test_preserves_newlines_and_trims_line_ends(self) -> None:
+        text = "Line one (Article [1])\nLine two (Article [2])"
+        assert strip_index_citations(text) == "Line one\nLine two"
+
+    def test_empty_and_no_brackets_are_noops(self) -> None:
+        assert strip_index_citations("") == ""
+        assert strip_index_citations("no citations here") == "no citations here"
+
+
+# ============================================================
+# TestCitationStripEgress (strip applied at the LLM boundary)
+# ============================================================
+
+
+class TestCitationStripEgress:
+    """The deterministic strip runs on every fact field as it leaves llm.py."""
+
+    async def test_analyze_articles_strips_summary_and_key_facts(self) -> None:
+        expected = NoveltyResult(
+            has_new_info=True,
+            summary="Season 3 confirmed (Article [1]).",
+            key_facts=["Window is 2027-2028 (per D&C Media report; Article [1])"],
+            reasoning="Article [1] states the window.",
+            confidence=0.9,
+        )
+        mock_client, _ = _mock_instructor_client(expected)
+        settings = _make_settings()
+
+        with patch("app.analysis.llm._get_client", return_value=mock_client):
+            result = await analyze_articles([_make_article()], "Known.", _make_topic(), settings)
+
+        assert result.summary == "Season 3 confirmed."
+        assert result.key_facts == ["Window is 2027-2028 (per D&C Media report)"]
+        # reasoning is intentionally left untouched (subject-position prose; webhook/audit only)
+        assert result.reasoning == "Article [1] states the window."
+
+    async def test_generate_initial_knowledge_strips_summary(self) -> None:
+        expected = KnowledgeStateUpdate(
+            sufficient_data=True,
+            confidence=0.9,
+            updated_summary="Season 1 aired in 2024 (Article [4]).",
+            token_count=0,
+        )
+        mock_client, _ = _mock_instructor_client(expected)
+        settings = _make_settings()
+
+        with patch("app.analysis.llm._get_client", return_value=mock_client):
+            result = await generate_initial_knowledge([_make_article()], _make_topic(), settings)
+
+        assert "[4]" not in result.updated_summary
+        assert result.updated_summary == "Season 1 aired in 2024."
+
+    async def test_generate_knowledge_update_strips_and_preserves_value(self) -> None:
+        # The update LLM grafts citations onto clean input; the strip removes them
+        # while the concrete value survives the merge.
+        expected = KnowledgeStateUpdate(
+            sufficient_data=True,
+            confidence=0.9,
+            updated_summary="Release window is 2027-2028 (per D&C Media report; Article [1]).",
+            token_count=0,
+        )
+        mock_client, _ = _mock_instructor_client(expected)
+        settings = _make_settings()
+        novelty = NoveltyResult(has_new_info=True, summary="window", key_facts=["2027-2028"], confidence=0.9)
+
+        with patch("app.analysis.llm._get_client", return_value=mock_client):
+            result = await generate_knowledge_update("Current.", novelty, _make_topic(), settings)
+
+        assert "2027-2028" in result.updated_summary  # value preserved
+        assert "Article [1]" not in result.updated_summary  # citation stripped
+        assert result.updated_summary == "Release window is 2027-2028 (per D&C Media report)."
+
+    async def test_compress_knowledge_summary_strips_summary(self) -> None:
+        expected = CompressedKnowledge(
+            compressed_summary="Confirmed for 2027 (Articles [3], [5]).",
+            token_count=0,
+        )
+        mock_client, _ = _mock_instructor_client(expected)
+        settings = _make_settings()
+
+        with patch("app.analysis.llm._get_client", return_value=mock_client):
+            result = await compress_knowledge_summary("Verbose.", _make_topic(), settings)
+
+        assert "[3]" not in result.compressed_summary and "[5]" not in result.compressed_summary
+        assert result.compressed_summary == "Confirmed for 2027."
+
+
+# ============================================================
+# TestPromptOutputRules (the two shared rules are injected)
+# ============================================================
+
+
+class TestPromptOutputRules:
+    def test_novelty_prompt_has_both_rules(self) -> None:
+        system = build_novelty_messages([_make_article()], "", _make_topic())[0]["content"]
+        assert "NO ARTICLE-INDEX CITATIONS" in system
+        assert "STATE THE VALUE" in system
+
+    def test_init_prompt_has_both_rules(self) -> None:
+        system = build_knowledge_init_messages([_make_article()], _make_topic(), 500)[0]["content"]
+        assert "NO ARTICLE-INDEX CITATIONS" in system
+        assert "STATE THE VALUE" in system
+
+    def test_update_prompt_has_both_rules(self) -> None:
+        system = build_knowledge_update_messages("cur", "sum", ["f"], _make_topic(), 500)[0]["content"]
+        assert "NO ARTICLE-INDEX CITATIONS" in system
+        assert "STATE THE VALUE" in system
+
+    def test_compress_prompt_has_no_value_rule(self) -> None:
+        # Compression must not invent values, so the value rule is deliberately absent.
+        system = build_knowledge_compress_messages("cur", _make_topic(), 500)[0]["content"]
+        assert "STATE THE VALUE" not in system

@@ -15,6 +15,7 @@ from instructor.core import InstructorRetryException
 from pydantic import BaseModel, Field
 from tenacity import AsyncRetrying, retry_if_not_exception_type, stop_after_attempt
 
+from app.analysis.citations import strip_index_citations
 from app.analysis.prompts import (
     build_knowledge_compress_messages,
     build_knowledge_init_messages,
@@ -405,6 +406,12 @@ async def analyze_articles(
     novelty.prompt_tokens = usage.prompt_tokens
     novelty.completion_tokens = usage.completion_tokens
     novelty.key_facts = _filter_restated_key_facts(novelty.key_facts, knowledge_summary)
+    # Strip ephemeral article-index citations ("(Article [1])") from the fact fields
+    # before they reach the knowledge-update merge, notifications, and webhooks. Not
+    # reasoning — its cites are subject-position prose that would mangle if stripped.
+    if novelty.summary:
+        novelty.summary = strip_index_citations(novelty.summary)
+    novelty.key_facts = [strip_index_citations(fact) for fact in novelty.key_facts]
     # Drop any source_url not in the input set so an injected completion cannot
     # smuggle an attacker-chosen URL into notifications/webhooks (OVH-058).
     novelty.source_urls = _filter_source_urls(novelty.source_urls, articles)
@@ -437,6 +444,8 @@ async def generate_initial_knowledge(
 
     raw_result, completion = await _call_with_rate_limit_retry(_do_call, max_retries=settings.llm_max_retries)
     result: KnowledgeStateUpdate = raw_result
+    # Strip article-index citations before counting tokens so the freed budget is real.
+    result.updated_summary = strip_index_citations(result.updated_summary)
     result.token_count = count_tokens(result.updated_summary, settings.llm.model)
     usage = _extract_usage(completion)
     result.prompt_tokens = usage.prompt_tokens
@@ -477,6 +486,8 @@ async def compress_knowledge_summary(
 
     raw_result, completion = await _call_with_rate_limit_retry(_do_call, max_retries=settings.llm_max_retries)
     result: CompressedKnowledge = raw_result
+    # Strip article-index citations before counting tokens so the freed budget is real.
+    result.compressed_summary = strip_index_citations(result.compressed_summary)
     result.token_count = count_tokens(result.compressed_summary, settings.llm.model)
     usage = _extract_usage(completion)
     result.prompt_tokens = usage.prompt_tokens
@@ -517,6 +528,9 @@ async def generate_knowledge_update(
 
     raw_result, completion = await _call_with_rate_limit_retry(_do_call, max_retries=settings.llm_max_retries)
     result: KnowledgeStateUpdate = raw_result
+    # Strip article-index citations (the update LLM grafts them onto clean input by
+    # mimicking the existing cited style) before counting tokens so the budget is real.
+    result.updated_summary = strip_index_citations(result.updated_summary)
     result.token_count = count_tokens(result.updated_summary, settings.llm.model)
     usage = _extract_usage(completion)
     result.prompt_tokens = usage.prompt_tokens
