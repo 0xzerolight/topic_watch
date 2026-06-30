@@ -228,6 +228,102 @@ On first run, `config.example.yml` is auto-copied to `data/config.yml`.
 - CLI / scheduler: `load_settings()`
 - Settings page: writes back to YAML via `save_settings_to_yaml()`
 
+### Configuration Key Reference
+
+Priority (highest to lowest): environment variables (`TOPIC_WATCH_` prefix) > `data/config.yml` > built-in defaults.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `llm.model` | string | - | LiteLLM model string (e.g. `openai/gpt-5.4-nano`) |
+| `llm.api_key` | string | - | API key for your LLM provider |
+| `llm.base_url` | string | - | Base URL for self-hosted providers (Ollama, etc.) |
+| `notifications.urls` | list | `[]` | [Apprise](https://github.com/caronc/apprise/wiki) notification URLs |
+| `notifications.webhook_urls` | list | `[]` | Webhook endpoints for JSON POST (see [HTTP API](#http-api)) |
+| `check_interval` | string | `"6h"` | Default check interval. Units: m, h, d, w, M. Combine: `1w 3d`, `2h 30m`. Min 10m, max 6M. |
+| `max_articles_per_check` | int | `10` | Articles to process per check per topic (1-100) |
+| `knowledge_state_max_tokens` | int | `2000` | Token budget for knowledge state (500-10,000) |
+| `article_retention_days` | int | `90` | Days to keep articles before cleanup (1-3,650) |
+| `db_path` | string | `data/topic_watch.db` | SQLite database path (relative or absolute) |
+| `feed_fetch_timeout` | float | `15.0` | RSS feed fetch timeout (seconds) |
+| `article_fetch_timeout` | float | `20.0` | Article content fetch timeout (seconds) |
+| `llm_analysis_timeout` | int | `60` | LLM novelty analysis timeout (seconds) |
+| `llm_knowledge_timeout` | int | `120` | LLM knowledge generation timeout (seconds) |
+| `apprise_timeout_seconds` | int | `30` | Timeout for a single Apprise notification send (seconds) |
+| `web_page_size` | int | `20` | Items per page in the web UI (5-200) |
+| `feed_max_retries` | int | `2` | RSS feed fetch retries (1-10) |
+| `content_fetch_concurrency` | int | `3` | Concurrent article content fetches (1-20) |
+| `scheduler_misfire_grace_time` | int | `300` | APScheduler misfire grace time (seconds, 30-3,600) |
+| `scheduler_jitter_seconds` | int | `30` | Random jitter per scheduler tick (seconds, 0-120) |
+| `llm_max_retries` | int | `2` | LLM API call retries (0-10) |
+| `llm_temperature` | float | `0.2` | LLM sampling temperature (0.0-2.0, lower = more factual) |
+| `min_confidence_threshold` | float | `0.7` | Minimum LLM confidence to send notifications (0.0-1.0) |
+| `min_relevance_threshold` | float | `0.5` | Minimum relevance to topic description to send notifications (0.0-1.0) |
+| `secure_cookies` | bool | `false` | Set the Secure flag on cookies (enable when TLS terminates at a reverse proxy) |
+
+Environment-only settings (no YAML equivalent):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TOPIC_WATCH_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `TOPIC_WATCH_LOG_FORMAT` | `text` | `text` or `json` |
+
+## HTTP API
+
+### JSON API v1
+
+A read-only JSON API lives under `/api/v1`, plus one endpoint to trigger a check. Interactive docs are at `/docs` (OpenAPI/Swagger).
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/v1/topics` | List topics. Optional query params: `active` (bool), `tag` (string) |
+| `GET` | `/api/v1/topics/{id}` | One topic plus its knowledge state |
+| `GET` | `/api/v1/topics/{id}/checks` | Check history, paginated (`page`, `per_page`; `per_page` capped at 100) |
+| `GET` | `/api/v1/topics/{id}/knowledge` | Current knowledge state |
+| `POST` | `/api/v1/topics/{id}/check` | Trigger a check. Runs synchronously; requires `X-CSRF-Token`. Returns `409` unless the topic status is `ready` |
+
+The check endpoint returns `{"status": "checked", "has_new_info": <bool>, "check_result_id": <int>}`.
+
+### Data Export & OPML
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/export/topics/json` | All topics as JSON |
+| `GET` | `/export/opml` | All topics as OPML XML |
+| `GET` | `/topics/{id}/export/json` | Single topic with articles, checks, knowledge state |
+| `GET` | `/topics/{id}/export/csv` | Check history as CSV |
+
+Move feeds in and out of RSS readers (FreshRSS, Miniflux, Tiny Tiny RSS) via OPML:
+
+- **Export:** `GET /export/opml` downloads all topics as an OPML file.
+- **Import:** `POST /import/opml` accepts an OPML upload (`opml_file` form field, 1 MB max, UTF-8). Imported topics start as `new` and initialize gradually (~1/min). Same-named topics are skipped.
+
+### Webhook Payload
+
+POST a JSON payload to any endpoint when new info is found:
+
+```yaml
+notifications:
+  webhook_urls:
+    - "https://your-server.com/webhook/topic-watch"
+```
+
+Payload:
+
+```json
+{
+  "topic": "Topic Name",
+  "reasoning": "Brief explanation of why this was flagged as new...",
+  "summary": "...",
+  "key_facts": ["...", "..."],
+  "source_urls": ["https://..."],
+  "confidence": 0.92,
+  "relevance": 0.88,
+  "timestamp": "2026-04-01T12:00:00+00:00"
+}
+```
+
+10-second timeout per endpoint, concurrent delivery, failures logged but non-blocking.
+
 ## Error Handling
 
 **Fail safe on notifications.** LLM analysis failure returns `has_new_info=False`. Users miss an update rather than receive a false alert.
