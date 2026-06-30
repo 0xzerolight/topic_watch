@@ -155,7 +155,7 @@ Open an issue on [GitHub Issues](https://github.com/0xzerolight/topic_watch/issu
 - Steps to reproduce
 - Expected vs. actual behavior
 - Relevant logs or error messages
-- Python version and OS
+- The output of `python -m app.cli doctor` (Docker: `docker compose exec topic-watch python -m app.cli doctor`) — a secret-safe snapshot of version, runtime, redacted config, schema, and feed health
 
 ## Suggesting Features
 

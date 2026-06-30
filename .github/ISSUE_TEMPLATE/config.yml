@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions & Ideas (Discussions)
+    url: https://github.com/0xzerolight/topic_watch/discussions
+    about: Ask questions, share your setup, or discuss ideas here.
+  - name: Report a security vulnerability
+    url: https://github.com/0xzerolight/topic_watch/security/advisories/new
+    about: Report security issues privately (see SECURITY.md). Do not open a public issue for sensitive vulnerabilities.
