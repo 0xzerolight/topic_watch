@@ -22,6 +22,34 @@ from app.models import NotificationDelivery
 
 logger = logging.getLogger(__name__)
 
+# Literal placeholder tokens that appear ONLY in documentation/example URLs
+# (config.example.yml, README, the setup UI). A real notification URL carries
+# concrete credentials and never these words, so an unedited example is dropped
+# instead of silently delivering — e.g. the shipped ``ntfy://your-topic-name``
+# would otherwise POST to the public ntfy.sh topic "your-topic-name". Kept
+# deliberately narrow (whole placeholder tokens, case-insensitive) so it never
+# drops a real URL (OVH: example-URL leak guard).
+_PLACEHOLDER_URL_MARKERS = (
+    "your-topic-name",
+    "your_ntfy_topic",
+    "webhook_id",
+    "webhook_token",
+    "bot_token",
+    "chat_id",
+    "token_a",
+    "token_b",
+    "token_c",
+    "user_key",
+    "api_token",
+    "your-api-key",
+)
+
+
+def _is_placeholder_url(url: str) -> bool:
+    """True if ``url`` is an unedited documentation/example placeholder."""
+    lowered = url.lower()
+    return any(marker in lowered for marker in _PLACEHOLDER_URL_MARKERS)
+
 
 def format_notification(topic_name: str, novelty_result: NoveltyResult) -> tuple[str, str]:
     """Format a NoveltyResult into a notification title and body.
@@ -68,6 +96,12 @@ def _deliver_one(title: str, body: str, url: str) -> NotificationDelivery:
     attributable to that URL alone and can be re-queued individually, instead
     of collapsing the whole batch to one bool (OVH-027/OVH-039). Never raises.
     """
+    if _is_placeholder_url(url):
+        # An unedited example URL (e.g. the shipped ntfy://your-topic-name) would
+        # deliver to a real public target. Drop it rather than leak (OVH guard).
+        logger.warning("Skipping placeholder/example notification URL: %s", redact_url(url))
+        return NotificationDelivery(url=url, ok=False, error="placeholder notification URL")
+
     ap = apprise.Apprise()
     if not ap.add(url):
         # OVH-027: a typo'd/unsupported URL is dropped by Apprise at add() time.
