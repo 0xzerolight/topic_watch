@@ -75,10 +75,13 @@ docker compose up -d
 git clone https://github.com/0xzerolight/topic_watch.git
 cd topic_watch
 python -m venv .venv && source .venv/bin/activate
-pip install .
-mkdir -p data && cp config.example.yml data/config.yml
+pip install -e .
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
+
+Then open [http://localhost:8000](http://localhost:8000) and set your LLM key in the
+setup wizard — no manual config step. Use the editable install (`-e`) so config and
+the SQLite database land in the project's `data/` directory.
 
 </details>
 
@@ -130,6 +133,13 @@ Uses [LiteLLM](https://docs.litellm.ai/docs/providers). Anything LiteLLM support
 | Cohere | `cohere_chat/command-a-03-2025` |
 | Together AI | `together_ai/meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8` |
 
+**Get an API key:** [OpenAI](https://platform.openai.com/api-keys) ·
+[Anthropic](https://console.anthropic.com/settings/keys) ·
+[Gemini](https://aistudio.google.com/apikey) ·
+[Groq](https://console.groq.com/keys) ·
+[DeepSeek](https://platform.deepseek.com/api_keys). Or skip keys entirely and run
+free + local with [Ollama](https://ollama.com/download).
+
 Ollama config:
 
 ```yaml
@@ -142,6 +152,10 @@ llm:
 Running Ollama in Docker needs the override file: `cp docker-compose.override.example.yml docker-compose.override.yml`.
 
 ## Notifications
+
+Notifications are **off by default** — Topic Watch tracks topics silently until you
+add at least one URL (here or on the **Settings** page; use **Test Notification** to
+verify it works).
 
 100+ services via [Apprise](https://github.com/caronc/apprise/wiki) URL format:
 
