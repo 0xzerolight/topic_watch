@@ -301,6 +301,27 @@ class TestSetupPreflight:
         assert secret not in response.text
         assert "could not be reached" in response.text
 
+    def test_skip_validation_completes_despite_failing_preflight(self, unconfigured_app: TestClient) -> None:
+        """The 'Save anyway' escape hatch bypasses the pre-flight so a transient
+        provider error or stale default model can't dead-end a brand-new user at /setup."""
+        from app.web.routers.settings import LLMValidationError
+
+        with (
+            patch("app.scheduler.start_scheduler") as mock_sched,
+            patch(
+                "app.web.routers.settings.verify_llm_credentials",
+                side_effect=LLMValidationError("would have failed"),
+            ) as mock_check,
+        ):
+            response = self._post(unconfigured_app, llm_api_key="sk-unverified", skip_validation="true")
+
+        assert response.status_code == 303
+        assert response.headers["location"] == "/"
+        assert app.state.setup_required is False
+        # The pre-flight was skipped, and setup still completed and started the scheduler.
+        mock_check.assert_not_awaited()
+        mock_sched.assert_called_once()
+
     def test_preflight_called_with_submitted_values(self, unconfigured_app: TestClient) -> None:
         """The preflight receives the submitted model / key / base_url."""
         with (
