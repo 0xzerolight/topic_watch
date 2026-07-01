@@ -124,15 +124,13 @@
 {% else %}
 {% if active_tag %}
 <div class="empty-state">
-    <span class="empty-icon" aria-hidden="true">&#127991;</span>
     <p class="empty-title">No topics found with tag <kbd>{{ active_tag }}</kbd>.</p>
     <p class="empty-state-hint"><a href="/">Clear filter</a> to see all topics.</p>
 </div>
 {% else %}
 <div class="empty-state">
-    <span class="empty-icon" aria-hidden="true">&#128240;</span>
-    <p class="empty-title">No topics yet — add one to start watching.</p>
-    <p class="empty-state-hint">Get started by <a href="/topics/new">adding your first topic</a>. Topic Watch monitors RSS feeds and notifies you only when there's genuinely new information.</p>
+    <p class="empty-title">No topics yet</p>
+    <p class="empty-state-hint"><a href="/topics/new">Add your first topic</a> to start watching.</p>
 </div>
 {% endif %}
 {% endif %}

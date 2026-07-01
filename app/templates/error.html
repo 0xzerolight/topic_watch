@@ -2,13 +2,6 @@
 {% block title %}{{ status_code }} — Topic Watch{% endblock %}
 {% block content %}
 <div class="empty-state">
-    {% if status_code == 404 %}
-    <span class="empty-icon" aria-hidden="true">&#128269;</span>
-    {% elif status_code == 403 %}
-    <span class="empty-icon" aria-hidden="true">&#128274;</span>
-    {% else %}
-    <span class="empty-icon" aria-hidden="true">&#9888;&#65039;</span>
-    {% endif %}
     <p class="empty-title">{{ status_code }}</p>
     <p>{{ detail }}</p>
     {% if status_code == 404 %}
