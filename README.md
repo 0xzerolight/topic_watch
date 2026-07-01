@@ -3,6 +3,8 @@
 <p align="center">
   <a href="https://www.gnu.org/licenses/gpl-3.0"><img src="https://img.shields.io/badge/License-GPLv3-blue.svg" alt="License: GPL v3"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.11+-blue.svg" alt="Python 3.11+"></a>
+  <a href="https://github.com/0xzerolight/topic_watch/releases"><img src="https://img.shields.io/github/v/release/0xzerolight/topic_watch" alt="Latest release"></a>
+  <a href="https://github.com/0xzerolight/topic_watch/commits/main"><img src="https://img.shields.io/github/last-commit/0xzerolight/topic_watch" alt="Last commit"></a>
   <a href="https://github.com/0xzerolight/topic_watch/stargazers"><img src="https://img.shields.io/github/stars/0xzerolight/topic_watch?style=social" alt="GitHub stars"></a>
 </p>
 
