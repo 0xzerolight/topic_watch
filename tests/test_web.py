@@ -1,6 +1,7 @@
 """Tests for the web UI: routes, templates, and HTMX interactions."""
 
 import logging
+import re
 import sqlite3
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
@@ -47,6 +48,23 @@ def _make_topic(conn: sqlite3.Connection, **overrides) -> Topic:
     topic = create_topic(conn, Topic(**defaults))
     conn.commit()
     return topic
+
+
+# Scope assertions to the dashboard's "Active" stat card. The bare ``num`` markup is
+# shared by the Checks/New-info cards, so match the card by its "Active" kicker and read
+# both its active count and the "of N topics" total together (dashboard.html:31-33).
+_ACTIVE_CARD_RE = re.compile(
+    r'card-kicker">Active</span>\s*'
+    r'<span class="stat-value"><span class="num">(\d+)</span></span>\s*'
+    r'<span class="stat-sub">of (\d+) topics'
+)
+
+
+def _active_card_counts(html: str) -> tuple[int, int]:
+    """Return (active_topics, total_topics) rendered in the dashboard Active card."""
+    match = _ACTIVE_CARD_RE.search(html)
+    assert match is not None, "Active stat card not found in dashboard HTML"
+    return int(match.group(1)), int(match.group(2))
 
 
 CSRF_TEST_TOKEN = "test-csrf-token-for-tests"
@@ -199,6 +217,49 @@ class TestDashboard:
 
         response = await client.get("/")
         assert "Check Now" not in response.text
+
+
+class TestDashboardStatsFreshness:
+    """The Active/Total stat cards must reflect mutations on the very next load.
+
+    Regression guard for the stale-dashboard-stats bug: the stats were served from a
+    60s TTL cache that no mutation invalidated, so the count lagged while the topic
+    list (queried fresh) already updated. Each test issues a second ``GET /`` after a
+    mutation in the SAME request session; if a stale, uninvalidated cache is ever
+    reintroduced, the second read returns the old counts and these fail.
+    """
+
+    async def test_active_count_drops_after_delete(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """Deleting a topic decrements both active and total on the next dashboard load."""
+        topics = [_make_topic(db_conn, name=f"Topic {i}") for i in range(3)]
+
+        before = await client.get("/")
+        assert _active_card_counts(before.text) == (3, 3)
+
+        deleted = await client.post(f"/topics/{topics[0].id}/delete", follow_redirects=False)
+        assert deleted.status_code == 303  # assert on the redirect, not its body
+
+        after = await client.get("/")  # a fresh load, not the redirect target
+        assert _active_card_counts(after.text) == (2, 2)
+
+    async def test_active_count_drops_after_toggle_inactive(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """Toggling a topic inactive decrements active but leaves total unchanged."""
+        topics = [_make_topic(db_conn, name=f"Topic {i}") for i in range(2)]
+
+        before = await client.get("/")
+        assert _active_card_counts(before.text) == (2, 2)
+
+        # Plain POST (no HX-Request header) -> 303 redirect; an HX request would return
+        # the _topic_row.html partial instead of the dashboard.
+        toggled = await client.post(f"/topics/{topics[0].id}/toggle-active", follow_redirects=False)
+        assert toggled.status_code == 303
+
+        after = await client.get("/")
+        assert _active_card_counts(after.text) == (1, 2)
 
 
 class TestNewInfoSeenBadge:

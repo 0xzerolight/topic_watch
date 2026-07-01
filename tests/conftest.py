@@ -76,16 +76,6 @@ def _safe_lifespan_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture(autouse=True)
-def _reset_stats_cache():
-    """Reset the dashboard stats cache between tests to prevent bleed."""
-    from app.web import state
-
-    state._stats_cache.reset()
-    yield
-    state._stats_cache.reset()
-
-
-@pytest.fixture(autouse=True)
 def _reset_checking_state():
     """Reset the in-progress check tracker between tests to prevent bleed.
 
@@ -93,8 +83,7 @@ def _reset_checking_state():
     check via BackgroundTasks can leave the per-topic or whole-cycle flag set if
     the task hasn't drained by the time the test ends; that leaks into a later
     test, where ``check_all_topics`` then short-circuits (returns ``[]``) and
-    ``check_topic`` dedupes. Clear it around every test (mirrors
-    ``_reset_stats_cache``).
+    ``check_topic`` dedupes. Clear it around every test.
     """
     from app.web.state import _checking_state
 
