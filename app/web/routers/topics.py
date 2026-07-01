@@ -134,6 +134,37 @@ async def create_topic_handler(
     return RedirectResponse(url=f"/topics/{created.id}", status_code=303)
 
 
+def _feed_source_context(conn: sqlite3.Connection, topic: Topic) -> dict:
+    """Feed Source section context, shared by the detail page and its poll endpoint.
+
+    Single source for auto_feed_url / auto_feed_urls / feed_health_map so the full-page
+    render (topic_detail) and the /feed-source HTMX fragment can never drift. Mirrors the
+    _topic_row_context anti-drift helper (OVH-154).
+    """
+    auto_feed_url = None
+    auto_feed_urls: list[str] = []
+    feed_health_map = {}
+    if topic.feed_mode == FeedMode.AUTO:
+        auto_feed_url = provider_router.get_provider().build_feed_url(topic)
+        auto_feed_urls = [p.build_feed_url(topic) for p in provider_router.providers]
+        # Show health for all provider URLs, not just the active one.
+        for url in auto_feed_urls:
+            health = get_feed_health(conn, url)
+            if health:
+                feed_health_map[url] = health
+    else:
+        for url in topic.feed_urls:
+            health = get_feed_health(conn, url)
+            if health:
+                feed_health_map[url] = health
+
+    return {
+        "auto_feed_url": auto_feed_url,
+        "auto_feed_urls": auto_feed_urls,
+        "feed_health_map": feed_health_map,
+    }
+
+
 @router.get("/topics/{topic_id}", response_class=HTMLResponse)
 async def topic_detail(
     request: Request,
@@ -156,12 +187,6 @@ async def topic_detail(
     mark_latest_check_seen(conn, topic_id)
     conn.commit()
 
-    auto_feed_url = None
-    auto_feed_urls: list[str] = []
-    if topic.feed_mode == FeedMode.AUTO:
-        auto_feed_url = provider_router.get_provider().build_feed_url(topic)
-        auto_feed_urls = [p.build_feed_url(topic) for p in provider_router.providers]
-
     per_page = settings.web_page_size
     offset = (max(1, page) - 1) * per_page
 
@@ -172,20 +197,6 @@ async def topic_detail(
     articles = list_articles_for_topic(conn, topic_id, limit=per_page)
     article_count = count_articles_for_topic(conn, topic_id)
     total_pages = max(1, (total_checks + per_page - 1) // per_page)
-
-    feed_health_map = {}
-    if topic.feed_mode == FeedMode.AUTO:
-        # Show health for all provider URLs, not just the active one
-        for provider in provider_router.providers:
-            url = provider.build_feed_url(topic)
-            health = get_feed_health(conn, url)
-            if health:
-                feed_health_map[url] = health
-    else:
-        for url in topic.feed_urls:
-            health = get_feed_health(conn, url)
-            if health:
-                feed_health_map[url] = health
 
     formatted = format_interval(topic.check_interval_minutes) if topic.check_interval_minutes else ""
     return templates.TemplateResponse(
@@ -199,16 +210,14 @@ async def topic_detail(
             "article_count": article_count,
             "page": page,
             "total_pages": total_pages,
-            "auto_feed_url": auto_feed_url,
-            "auto_feed_urls": auto_feed_urls,
             "formatted_interval": formatted,
             "default_interval": settings.check_interval,
             "knowledge_state_max_tokens": settings.knowledge_state_max_tokens,
-            "feed_health_map": feed_health_map,
             "total_prompt_tokens": total_prompt_tokens,
             "total_completion_tokens": total_completion_tokens,
             "global_confidence_threshold": settings.min_confidence_threshold,
             "global_relevance_threshold": settings.min_relevance_threshold,
+            **_feed_source_context(conn, topic),
         },
     )
 
@@ -245,6 +254,31 @@ async def topic_status(
             "knowledge": knowledge,
             "knowledge_state_max_tokens": settings.knowledge_state_max_tokens,
         },
+    )
+
+
+@router.get("/topics/{topic_id}/feed-source", response_class=HTMLResponse)
+async def topic_feed_source(
+    request: Request,
+    topic_id: int,
+    conn: sqlite3.Connection = Depends(get_db_conn),
+):
+    """HTMX partial: feed-source health fragment, polled every 30s from the detail page.
+
+    Feed health is written by the background scheduler with no client-side event, so the
+    detail page polls this fragment to refresh the badges live (mirrors the #status-area
+    self-terminating poll, OVH-048). GET only — no CSRF needed (web.md).
+    """
+    topic = get_topic(conn, topic_id)
+    if topic is None:
+        # Topic deleted mid-poll: return a 200 terminal fragment (no poll trigger) so the
+        # every-30s HTMX poll swaps it in and stops, matching topic_status()'s handling.
+        return templates.TemplateResponse(request, "_feed_source.html", {"topic": None})
+
+    return templates.TemplateResponse(
+        request,
+        "_feed_source.html",
+        {"topic": topic, **_feed_source_context(conn, topic)},
     )
 
 

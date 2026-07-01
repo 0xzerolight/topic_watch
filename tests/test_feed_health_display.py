@@ -309,6 +309,116 @@ class TestTopicDetailFeedHealthIndicators:
         assert "Unknown" not in response.text
 
 
+class TestFeedSourceFragment:
+    """Tests for GET /topics/{id}/feed-source (HTMX poll fragment).
+
+    The fragment refreshes the Feed Source badges live (every 30s) without a page
+    reload; these tests prove the endpoint contract and the self-re-arm loop. The
+    no-reload behaviour itself is verified manually in a browser (see the plan's DoD).
+    """
+
+    async def test_fragment_re_arms(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        """The fragment response re-emits all four HTMX attrs so the poll re-arms each cycle."""
+        topic = _make_topic(db_conn)
+        response = await client.get(f"/topics/{topic.id}/feed-source")
+        assert response.status_code == 200
+        # Anchored on the self-referential hx-get target, proven from the endpoint body
+        # (not the page) so a fragment that drops the trigger on the poll response fails here.
+        assert f'hx-get="/topics/{topic.id}/feed-source"' in response.text
+        assert 'hx-trigger="every 30s"' in response.text
+        assert 'hx-target="#feed-source-area"' in response.text
+        assert 'hx-swap="innerHTML"' in response.text
+
+    async def test_fragment_is_inner_only(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        """The fragment must NOT re-emit id="feed-source-area" (else innerHTML nests it every 30s)."""
+        topic = _make_topic(db_conn)
+        response = await client.get(f"/topics/{topic.id}/feed-source")
+        assert response.status_code == 200
+        assert response.text.count('id="feed-source-area"') == 0
+        assert response.text.count("hx-get=") == 1
+
+    async def test_fragment_auto_standby(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        """Auto mode: the never-fetched non-active provider reads 'Standby' exactly once."""
+        from app.scraping.routing import router as provider_router
+
+        topic = _make_topic(db_conn, name="Auto Frag", feed_mode=FeedMode.AUTO, feed_urls=[])
+        # Derive the active URL at runtime — provider_router is a process-global singleton
+        # (routing.py) that other test modules mutate; never hardcode which provider is primary.
+        active_url = provider_router.get_provider().build_feed_url(topic)
+        upsert_feed_health_success(db_conn, active_url)
+        db_conn.commit()
+
+        response = await client.get(f"/topics/{topic.id}/feed-source")
+        assert response.status_code == 200
+        assert "status-healthy" in response.text
+        assert response.text.count(">Standby<") == 1
+        assert "Unknown" not in response.text
+
+    async def test_fragment_manual_healthy(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        """Manual mode: a healthy feed shows the source name and Healthy badge, live from the DB."""
+        url = "https://example.com/feed.xml"
+        topic = _make_topic(db_conn, feed_urls=[url])
+        upsert_feed_health_success(db_conn, url)
+        db_conn.commit()
+
+        response = await client.get(f"/topics/{topic.id}/feed-source")
+        assert response.status_code == 200
+        assert "<strong>example.com</strong>" in response.text
+        assert "status-healthy" in response.text
+        assert "Healthy" in response.text
+
+    async def test_fragment_manual_degraded(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        """Manual mode: 1-2 consecutive failures render Degraded."""
+        url = "https://flaky.example.com/feed.xml"
+        topic = _make_topic(db_conn, feed_urls=[url])
+        upsert_feed_health_success(db_conn, url)
+        upsert_feed_health_failure(db_conn, url, "timeout")
+        db_conn.commit()
+
+        response = await client.get(f"/topics/{topic.id}/feed-source")
+        assert response.status_code == 200
+        assert "status-degraded" in response.text
+        assert "Degraded" in response.text
+
+    async def test_fragment_manual_unhealthy(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        """Manual mode: 3+ consecutive failures render Unhealthy."""
+        url = "https://broken.example.com/feed.xml"
+        topic = _make_topic(db_conn, feed_urls=[url])
+        upsert_feed_health_failure(db_conn, url, "err1")
+        upsert_feed_health_failure(db_conn, url, "err2")
+        upsert_feed_health_failure(db_conn, url, "err3")
+        db_conn.commit()
+
+        response = await client.get(f"/topics/{topic.id}/feed-source")
+        assert response.status_code == 200
+        assert "status-error" in response.text
+        assert "Unhealthy" in response.text
+
+    async def test_fragment_manual_not_checked(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        """Manual mode: a feed with no health row reads 'Not yet checked', not 'Unknown'."""
+        topic = _make_topic(db_conn, feed_urls=["https://example.com/feed.xml"])
+        response = await client.get(f"/topics/{topic.id}/feed-source")
+        assert response.status_code == 200
+        assert "Not yet checked" in response.text
+        assert "Unknown" not in response.text
+
+    async def test_fragment_manual_empty(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        """Manual mode with no feed URLs renders the 'No feed URLs configured' branch."""
+        topic = _make_topic(db_conn, name="Empty Feeds", feed_urls=[])
+        response = await client.get(f"/topics/{topic.id}/feed-source")
+        assert response.status_code == 200
+        assert "No feed URLs configured" in response.text
+
+    async def test_fragment_deleted_topic_stops_poll(self, client: httpx.AsyncClient) -> None:
+        """A deleted/nonexistent topic returns a 200 terminal fragment that stops the poll."""
+        response = await client.get("/topics/9999/feed-source")
+        # 200 so HTMX swaps the fragment in rather than leaving a stale section polling forever.
+        assert response.status_code == 200
+        assert "no longer exists" in response.text.lower()
+        # No trigger remains, so the every-30s poll stops.
+        assert "hx-trigger" not in response.text
+
+
 # --- Navigation tests ---
 
 

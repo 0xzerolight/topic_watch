@@ -1,0 +1,67 @@
+{% from "_feed_status.html" import feed_status %}
+{# file-scoped import: needed when this fragment renders standalone via /feed-source #}
+{% if topic is none %}
+<h2>Feed Source</h2>
+<p>This topic no longer exists — it may have been deleted in another tab.</p>
+{% else %}
+{# Inner wrapper re-emits the poll attrs so an innerHTML swap into #feed-source-area
+   self-re-arms every 30s (mirrors topic_status.html). MUST NOT carry id="feed-source-area";
+   that id lives on the page div, else the swap would nest it every cycle. #}
+<div hx-get="/topics/{{ topic.id }}/feed-source"
+     hx-trigger="every 30s"
+     hx-target="#feed-source-area"
+     hx-swap="innerHTML">
+    <h2>Feed Source</h2>
+    {% if topic.feed_mode.value == "auto" %}
+    {% if auto_feed_urls %}
+    <ul>
+        {% for url in auto_feed_urls %}
+        <li>
+            {%- if url in feed_health_map -%}
+                {%- set fh = feed_health_map[url] -%}
+                {%- if fh.consecutive_failures == 0 -%}
+                    {{ feed_status("healthy", "Healthy (%d fetches, %d failures)" % (fh.total_fetches, fh.total_failures)) }}
+                {%- elif fh.consecutive_failures <= 2 -%}
+                    {{ feed_status("degraded", "Degraded (%d consecutive failures)" % fh.consecutive_failures) }}
+                {%- else -%}
+                    {{ feed_status("unhealthy", "Unhealthy (%d consecutive failures): %s" % (fh.consecutive_failures, fh.last_error_message)) }}
+                {%- endif -%}
+            {%- elif auto_feed_url and url != auto_feed_url -%}
+                {{ feed_status("standby", "Standby provider — only fetched if the primary fails") }}
+            {%- else -%}
+                {{ feed_status("not-checked", "No health data yet — pending first check") }}
+            {%- endif -%}
+            <strong>{{ url|feed_source_name }}</strong>
+            <a href="{{ url|safe_href }}" target="_blank">{{ url|truncate(80) }}</a>
+        </li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+    {% else %}
+    {% if topic.feed_urls %}
+    <ul>
+        {% for url in topic.feed_urls %}
+        <li>
+            {%- if url in feed_health_map -%}
+                {%- set fh = feed_health_map[url] -%}
+                {%- if fh.consecutive_failures == 0 -%}
+                    {{ feed_status("healthy", "Healthy (%d fetches, %d failures)" % (fh.total_fetches, fh.total_failures)) }}
+                {%- elif fh.consecutive_failures <= 2 -%}
+                    {{ feed_status("degraded", "Degraded (%d consecutive failures)" % fh.consecutive_failures) }}
+                {%- else -%}
+                    {{ feed_status("unhealthy", "Unhealthy (%d consecutive failures): %s" % (fh.consecutive_failures, fh.last_error_message)) }}
+                {%- endif -%}
+            {%- else -%}
+                {{ feed_status("not-checked", "No health data yet — pending first check") }}
+            {%- endif -%}
+            <strong>{{ url|feed_source_name }}</strong>
+            <a href="{{ url|safe_href }}" target="_blank">{{ url }}</a>
+        </li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <p>No feed URLs configured. <a href="/topics/{{ topic.id }}/edit">Edit this topic</a> to add one.</p>
+    {% endif %}
+    {% endif %}
+</div>
+{% endif %}
