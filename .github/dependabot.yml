@@ -42,3 +42,11 @@ updates:
       docker:
         patterns:
           - "*"
+    # litellm (a core dep) currently caps Requires-Python <3.14, so a minor/major
+    # base-image jump (e.g. 3.13 -> 3.14) fails the build. Take digest/patch bumps
+    # only; lift this once litellm ships a >=3.14 release.
+    ignore:
+      - dependency-name: "python"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
