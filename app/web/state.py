@@ -1,16 +1,13 @@
 """Process-global mutable state for the web layer.
 
 Centralizes the in-memory state that used to live as module globals in
-the original web routes module: the in-progress check tracker, the
-dashboard stats cache, and the feed-validation rate limiter. Mutations
-are guarded with ``asyncio.Lock`` where concurrent access is possible.
+the original web routes module: the in-progress check tracker and the
+feed-validation rate limiter. Mutations are guarded with ``asyncio.Lock``
+where concurrent access is possible.
 """
 
 import asyncio
-import inspect
 import time
-from collections.abc import Awaitable, Callable
-from typing import TypeVar
 
 # --- In-progress check tracker ---
 
@@ -74,55 +71,6 @@ class CheckingState:
 
 
 _checking_state = CheckingState()
-
-
-# --- Dashboard stats cache ---
-
-_STATS_CACHE_TTL = 60  # seconds
-
-_T = TypeVar("_T")
-
-
-class DashboardStatsCache:
-    """Async-safe TTL cache for the (expensive) dashboard stats query.
-
-    The check-then-populate is guarded by an ``asyncio.Lock`` (mirroring
-    :class:`CheckingState`) so the read-decision and the write are atomic: even
-    if the ``loader`` awaits, only one coroutine recomputes a stale/empty entry
-    while the rest reuse the freshly-populated value. The lock makes the populate
-    path safe if a future change introduces an ``await`` into it (the previous
-    bare dict relied on the populate being synchronous on a single worker).
-    """
-
-    def __init__(self, ttl: float = _STATS_CACHE_TTL) -> None:
-        self._ttl = ttl
-        self._data: object | None = None
-        self._expires: float = 0.0
-        self._lock = asyncio.Lock()
-
-    async def get_or_populate(self, loader: Callable[[], _T | Awaitable[_T]]) -> _T:
-        """Return cached stats, recomputing via ``loader`` if stale/empty.
-
-        ``loader`` may be sync or async; it is invoked at most once per refresh
-        because the whole check-then-set runs under the lock.
-        """
-        async with self._lock:
-            now = time.time()
-            if self._data is None or now > self._expires:
-                result = loader()
-                if inspect.isawaitable(result):
-                    result = await result
-                self._data = result
-                self._expires = now + self._ttl
-            return self._data  # type: ignore[return-value]
-
-    def reset(self) -> None:
-        """Drop the cached value (next read repopulates)."""
-        self._data = None
-        self._expires = 0.0
-
-
-_stats_cache = DashboardStatsCache(_STATS_CACHE_TTL)
 
 
 # --- Feed-validation rate limiter ---

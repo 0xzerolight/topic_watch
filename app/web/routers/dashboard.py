@@ -12,7 +12,6 @@ from app.crud import (
 )
 from app.web.dependencies import get_db_conn
 from app.web.routers.templates import templates
-from app.web.state import _stats_cache
 
 router = APIRouter()
 
@@ -52,8 +51,10 @@ async def dashboard(
     for item in topic_data:
         status_counts[item["topic"].status.value] += 1
 
-    # Dashboard stats with caching (guarded check-then-set; see DashboardStatsCache)
-    stats = await _stats_cache.get_or_populate(lambda: get_dashboard_stats(conn))
+    # Dashboard stats: a handful of COUNT/MAX subqueries over topics + check_results,
+    # run only on this page load. Query directly so the numbers are always fresh
+    # (a TTL cache here lagged every stat card for up to 60s after any mutation).
+    stats = get_dashboard_stats(conn)
 
     return templates.TemplateResponse(
         request,
