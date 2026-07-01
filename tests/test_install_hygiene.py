@@ -7,6 +7,7 @@ These guard the non-Python deliverables of Task 2.3:
   so remote deployers following SECURITY.md find it.
 """
 
+import tomllib
 from pathlib import Path
 
 import yaml
@@ -31,6 +32,20 @@ def test_config_example_ships_no_live_notification_urls() -> None:
     user opts in (example-URL leak guard)."""
     data = yaml.safe_load((_ROOT / "config.example.yml").read_text())
     assert data["notifications"]["urls"] == []
+
+
+def test_readme_release_badge_matches_pyproject_version() -> None:
+    """The README ships a *static* release badge instead of shields'
+    ``github/v/release`` endpoint: that endpoint calls GitHub's API through
+    shields' shared, rate-limited token pool and flaps to ``release: invalid`` when
+    the pool is throttled. Static means it must be bumped with the version, so this
+    guards the drift — a release that forgets to bump the README badge fails CI."""
+    version = tomllib.loads((_ROOT / "pyproject.toml").read_text())["project"]["version"]
+    readme = (_ROOT / "README.md").read_text()
+    assert f"release-v{version}-blue" in readme, (
+        f"README release badge out of sync with pyproject version {version!r}; "
+        f"expected the static badge 'release-v{version}-blue'"
+    )
 
 
 def test_env_example_has_no_uncommented_llm_key() -> None:
