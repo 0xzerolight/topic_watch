@@ -15,8 +15,14 @@ Self-hosted news monitor that pings you only on genuinely new info.
 Please leave a ⭐ star if Topic Watch is useful — it helps others find it :).
 </p>
 
+<h3 align="center">Topic Watch Demo</h3>
+
 <p align="center">
   <img src="assets/topic-watch-demo.gif" alt="Topic Watch — adding a topic" width="720">
+</p>
+
+<p align="center">
+Adding a topic — Topic Watch fetches the latest news and builds a per-topic knowledge baseline.
 </p>
 
 An LLM tracks a per-topic knowledge state and stays silent until something actually changes. Bring your own key, or run free against a local model.
