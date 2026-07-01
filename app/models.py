@@ -274,6 +274,11 @@ class CheckResult(SQLiteModel):
 
     _bool_fields = ("has_new_info", "notification_sent")
     _required_dt_fields = ("checked_at",)
+    # ``seen_at`` is nullable: registering it here makes the shared ``_coerce_row``
+    # populate it on the ``from_row`` path, so BOTH render paths — the dashboard
+    # (``from_dashboard_row``) and the HTMX row re-render (``_topic_row_context`` ->
+    # ``list_check_results`` -> ``from_row``) — honor the badge gate. Do not drop it.
+    _optional_dt_fields = ("seen_at",)
     # ``confidence`` is derived from llm_response, not a real column — never persist it (OVH-052).
     _insert_exclude = frozenset({"confidence"})
 
@@ -293,6 +298,12 @@ class CheckResult(SQLiteModel):
     # exception summary). NULL on clean runs. Distinct from notification_error,
     # which only covers delivery.
     stage_error: str | None = None
+    # When the user first opened a topic whose latest check carried new info. NULL
+    # = unseen. Gates only the dashboard "new info" badge (has_new_info AND
+    # seen_at IS NULL); ``has_new_info`` itself is never mutated, so the detail-page
+    # history column and Notify button are unaffected. Intentionally omitted from
+    # the create_check_result INSERT so new rows are born NULL/unseen.
+    seen_at: datetime | None = None
     # Non-persisted: confidence scalar extracted from llm_response. The dashboard
     # listing populates this via SQL ``json_extract`` so it can render the
     # confidence badge WITHOUT shipping/parsing the full llm_response blob per
@@ -352,6 +363,9 @@ class CheckResult(SQLiteModel):
             confidence=row["cr_confidence"],
             notification_sent=bool(row["cr_notification_sent"]),
             notification_error=row["cr_notification_error"],
+            # Paired with the ``cr.seen_at AS cr_seen_at`` alias in _DASHBOARD_SELECT;
+            # one without the other 500s the dashboard.
+            seen_at=_coerce_dt(row["cr_seen_at"]),
         )
 
 

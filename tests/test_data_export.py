@@ -165,6 +165,10 @@ async def test_export_topic_json_contains_topic_data(
     assert data["topic"]["name"] == "Climate Watch"
     assert len(data["articles"]) == 2
     assert len(data["check_results"]) == 1
+    # seen_at is an additive, nullable audit field on the JSON export (accepted,
+    # not silent): present and null for a never-viewed check.
+    assert "seen_at" in data["check_results"][0]
+    assert data["check_results"][0]["seen_at"] is None
 
 
 async def test_export_topic_json_empty_data(

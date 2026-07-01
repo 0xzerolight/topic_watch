@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 from fastapi.testclient import TestClient
 
 from app.config import LLMSettings, Settings
-from app.crud import create_check_result, create_knowledge_state, create_topic
+from app.crud import create_check_result, create_knowledge_state, create_topic, mark_latest_check_seen
 from app.main import app
 from app.models import CheckResult, KnowledgeState, Topic, TopicStatus
 
@@ -142,6 +142,32 @@ class TestAPIChecksClamp:
                 assert resp.status_code == 200
                 data = resp.json()
                 assert data["per_page"] == 100
+        finally:
+            app.dependency_overrides.pop(get_db_conn, None)
+
+
+class TestAPIChecksSeenAt:
+    def test_marking_seen_does_not_mutate_has_new_info(self, db_conn: sqlite3.Connection):
+        # Seen/acknowledged is a separate field: the API must still report the raw
+        # has_new_info, and expose the new nullable seen_at, after a topic is opened.
+        topic = _seed_topic(db_conn)
+        _seed_check(db_conn, topic.id, has_new_info=True)
+        db_conn.commit()
+
+        mark_latest_check_seen(db_conn, topic.id)
+        db_conn.commit()
+
+        from app.web.dependencies import get_db_conn
+
+        app.dependency_overrides[get_db_conn] = lambda: db_conn
+        try:
+            with TestClient(app) as client:
+                resp = client.get(f"/api/v1/topics/{topic.id}/checks")
+                assert resp.status_code == 200
+                checks = resp.json()["checks"]
+                assert len(checks) == 1
+                assert checks[0]["has_new_info"] is True
+                assert checks[0]["seen_at"] is not None
         finally:
             app.dependency_overrides.pop(get_db_conn, None)
 

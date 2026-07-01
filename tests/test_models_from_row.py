@@ -587,6 +587,7 @@ class TestCheckResultFromDashboardRow:
             "cr_confidence": 0.75,
             "cr_notification_sent": 0,
             "cr_notification_error": None,
+            "cr_seen_at": None,
         }
         row.update(overrides)
         return row
@@ -611,3 +612,17 @@ class TestCheckResultFromDashboardRow:
     def test_null_confidence_stays_none(self) -> None:
         cr = CheckResult.from_dashboard_row(self._dash_row(cr_confidence=None), topic_id=1)
         assert cr.confidence is None
+
+    def test_null_seen_at_stays_none(self) -> None:
+        cr = CheckResult.from_dashboard_row(self._dash_row(cr_seen_at=None), topic_id=1)
+        assert cr.seen_at is None
+
+    def test_seen_at_populates_from_alias(self) -> None:
+        cr = CheckResult.from_dashboard_row(self._dash_row(cr_seen_at="2026-06-14T09:30:00+00:00"), topic_id=1)
+        assert isinstance(cr.seen_at, datetime)
+        assert cr.seen_at.year == 2026
+        assert cr.seen_at.month == 6
+
+    def test_corrupt_seen_at_degrades_to_none(self) -> None:
+        cr = CheckResult.from_dashboard_row(self._dash_row(cr_seen_at="garbage"), topic_id=1)
+        assert cr.seen_at is None
