@@ -16,7 +16,7 @@ Please leave a ⭐ star if Topic Watch is useful — it helps others find it :).
 </p>
 
 <p align="center">
-  <img src="assets/themes-showcase.gif" alt="Topic Watch — theme showcase" width="720">
+  <img src="assets/topic-watch-demo.gif" alt="Topic Watch — adding a topic" width="720">
 </p>
 
 An LLM tracks a per-topic knowledge state and stays silent until something actually changes. Bring your own key, or run free against a local model.
