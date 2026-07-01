@@ -8,7 +8,7 @@ import litellm
 import pytest
 from pydantic import ValidationError
 
-from app.analysis.citations import strip_index_citations
+from app.analysis.citations import strip_index_citations, strip_reliability_notes
 from app.analysis.knowledge import initialize_knowledge, update_knowledge
 from app.analysis.llm import (
     CompressedKnowledge,
@@ -1698,6 +1698,145 @@ class TestStripIndexCitations:
 
 
 # ============================================================
+# TestStripReliabilityNotes (leaked [STUB]/[NO CONTENT] bookkeeping)
+# ============================================================
+
+
+class TestStripReliabilityNotes:
+    """Fixtures are real leak shapes observed in knowledge summaries."""
+
+    # The exact paragraph the user reported: a "Note on Data Quality" block plus an
+    # embedded reliability aside, wrapped around two real facts that must survive.
+    _USER_EXAMPLE = (
+        "Current Status: Claude Sonnet 5 has been released, replacing Sonnet 4.6.\n"
+        "\n"
+        "Confirmed Facts:\n"
+        "Claude Sonnet 5 released on or around June 30, 2026 (per articles published 2026-06-30)\n"
+        "Performance is described as close to Opus 4.8 but at lower prices\n"
+        "\n"
+        "Reported/Claimed:\n"
+        "Claude Fable 5 reportedly released around June 10, 2026, described as a frontier "
+        "model for long-form fiction (source articles marked [STUB] with minimal content; "
+        "details are incomplete)\n"
+        "\n"
+        "Note on Data Quality: Articles [1], [2], [4], and [5] are marked [STUB] with minimal "
+        "or incomplete content. Article [3] provides the most substantive information. Claims "
+        "about Claude Fable 5 are drawn primarily from stub articles with very limited detail."
+    )
+
+    def test_user_example_is_scrubbed_but_keeps_facts(self) -> None:
+        out = strip_reliability_notes(self._USER_EXAMPLE)
+        # every reliability artifact gone
+        assert "[STUB" not in out
+        assert "[NO CONTENT]" not in out
+        assert "Data Quality" not in out
+        assert "stub" not in out.lower()
+        # both real facts survive, published-date paren survives (not reliability)
+        assert "Sonnet 5 released on or around June 30, 2026 (per articles published 2026-06-30)" in out
+        assert "Claude Fable 5 reportedly released around June 10, 2026" in out
+        # the fact keeps its non-reliability tail, cleanly, with no dangling paren/space
+        assert "long-form fiction" in out
+        assert out.rstrip().endswith("long-form fiction")
+
+    def test_drops_trailing_note_on_data_quality_block(self) -> None:
+        text = "**Confirmed Facts:**\n- Season 3 aired 2024.\n\nNote on Data Quality: Article [1] is marked [STUB]."
+        out = strip_reliability_notes(text)
+        assert "Season 3 aired 2024." in out
+        assert "Data Quality" not in out
+        assert "[STUB" not in out
+
+    def test_drops_standalone_note_sentence(self) -> None:
+        text = "Season 3 confirmed for 2027. Article [3] provides the most substantive information."
+        assert strip_reliability_notes(text) == "Season 3 confirmed for 2027."
+
+    def test_strips_embedded_aside_keeps_host_fact(self) -> None:
+        text = "Fable 5 shipped June 10 (source articles marked [STUB] with minimal content)."
+        assert strip_reliability_notes(text) == "Fable 5 shipped June 10."
+
+    def test_strips_bare_tokens_inside_kept_sentence(self) -> None:
+        assert strip_reliability_notes("The launch [STUB] went ahead.") == "The launch went ahead."
+        assert strip_reliability_notes("Details pending [NO CONTENT] review.") == "Details pending review."
+
+    def test_drops_stub_articles_sentence(self) -> None:
+        text = "The claim is drawn primarily from stub articles with very limited detail."
+        assert strip_reliability_notes(text) == ""
+
+    def test_drops_emptied_section_heading(self) -> None:
+        text = "**Reported/Claimed:**\nEverything here is drawn from stub articles.\n"
+        assert strip_reliability_notes(text) == ""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            # weak vocab with no index / tag / Note-label is legit prose — leave it
+            "The merger remains incomplete pending regulatory approval.",
+            "No content has been released about the sequel yet.",
+            "The report was marked confidential by the publisher.",
+            # a real fact with a non-reliability parenthetical
+            "Release window is 2027-2028 (per D&C Media report).",
+            # markdown link + named source qualifier must never be touched
+            "see [the report](https://example.com/x) for details",
+            "attributed to [the publisher] without an index",
+            # plain facts with no signals
+            "Season 3 confirmed for 2027.",
+        ],
+    )
+    def test_leaves_legit_prose_unchanged(self, text: str) -> None:
+        assert strip_reliability_notes(text) == text
+
+    def test_empty_and_plain_are_noops(self) -> None:
+        assert strip_reliability_notes("") == ""
+        assert strip_reliability_notes("no artifacts here") == "no artifacts here"
+
+    def test_idempotent(self) -> None:
+        once = strip_reliability_notes(self._USER_EXAMPLE)
+        assert strip_reliability_notes(once) == once
+
+
+# ============================================================
+# TestScrubStubNotesMigration (m021 cleans persisted summaries)
+# ============================================================
+
+
+class TestScrubStubNotesMigration:
+    """Migration m021 scrubs already-polluted knowledge_states rows in place."""
+
+    def test_scrubs_polluted_row_leaves_clean_row(self, db_conn: sqlite3.Connection) -> None:
+        from app.migrations.m021_scrub_stub_notes import up as m021_up
+
+        polluted = create_topic(db_conn, Topic(name="Polluted", description="d"))
+        clean = create_topic(db_conn, Topic(name="Clean", description="d"))
+        db_conn.commit()
+
+        create_knowledge_state(
+            db_conn,
+            KnowledgeState(
+                topic_id=polluted.id,
+                summary_text="Season 3 aired 2024. Article [2] is marked [STUB] with minimal content.",
+            ),
+        )
+        clean_text = "Season 3 aired 2024 (per D&C Media report)."
+        create_knowledge_state(db_conn, KnowledgeState(topic_id=clean.id, summary_text=clean_text))
+        db_conn.commit()
+
+        m021_up(db_conn)
+        db_conn.commit()
+
+        scrubbed = get_knowledge_state(db_conn, polluted.id)
+        untouched = get_knowledge_state(db_conn, clean.id)
+        assert scrubbed is not None and untouched is not None
+        assert scrubbed.summary_text == "Season 3 aired 2024."
+        assert "[STUB" not in scrubbed.summary_text
+        assert untouched.summary_text == clean_text
+
+    def test_registered_in_migrations_list(self) -> None:
+        from app.migrations import MIGRATIONS
+
+        entry = next((m for m in MIGRATIONS if m[0] == 21), None)
+        assert entry is not None, "m021 not found in MIGRATIONS"
+
+
+# ============================================================
 # TestCitationStripEgress (strip applied at the LLM boundary)
 # ============================================================
 
@@ -1773,6 +1912,24 @@ class TestCitationStripEgress:
 
         assert "[3]" not in result.compressed_summary and "[5]" not in result.compressed_summary
         assert result.compressed_summary == "Confirmed for 2027."
+
+    async def test_generate_initial_knowledge_strips_stub_notes(self) -> None:
+        # A leaked [STUB] note must be scrubbed alongside index citations, while the
+        # real fact survives.
+        expected = KnowledgeStateUpdate(
+            sufficient_data=True,
+            confidence=0.9,
+            updated_summary=("Season 1 aired in 2024. Article [4] is marked [STUB] with minimal content."),
+            token_count=0,
+        )
+        mock_client, _ = _mock_instructor_client(expected)
+        settings = _make_settings()
+
+        with patch("app.analysis.llm._get_client", return_value=mock_client):
+            result = await generate_initial_knowledge([_make_article()], _make_topic(), settings)
+
+        assert result.updated_summary == "Season 1 aired in 2024."
+        assert "[STUB" not in result.updated_summary and "[4]" not in result.updated_summary
 
 
 # ============================================================
