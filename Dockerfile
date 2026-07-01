@@ -2,7 +2,7 @@
 # Pinned by digest for reproducible builds and supply-chain integrity (OVH-061).
 # Dependabot (docker ecosystem) bumps the tag+digest on a schedule. To bump
 # manually: `docker pull python:3.11-slim && docker inspect --format '{{index .RepoDigests 0}}' python:3.11-slim`.
-FROM python:3.11-slim@sha256:ae52c5bef62a6bdd42cd1e8dffef86b9cd284bde9427da79839de7a4b983e7ca AS builder
+FROM python:3.14-slim@sha256:b877e50bd90de10af8d82c57a022fc2e0dc731c5320d762a27986facfc3355c1 AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1
 
@@ -21,7 +21,7 @@ RUN pip install --no-cache-dir --require-hashes -r requirements.txt && pip insta
 
 # === Stage 2: Runtime ===
 # Same digest pin as the builder stage (OVH-061).
-FROM python:3.11-slim@sha256:ae52c5bef62a6bdd42cd1e8dffef86b9cd284bde9427da79839de7a4b983e7ca
+FROM python:3.14-slim@sha256:b877e50bd90de10af8d82c57a022fc2e0dc731c5320d762a27986facfc3355c1
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
