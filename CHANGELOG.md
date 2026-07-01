@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-07-01
+
+### Added
+
+- Live-refresh feed source status on the topic page: the Feed Source badges now poll every 30s (`GET /topics/{id}/feed-source`) instead of updating only when you leave and re-open the page
+
+### Fixed
+
+- Dashboard stat cards (Active / Total / Checks / New-info) no longer show stale counts after create, delete, toggle-active, OPML import, or a check (removed an un-invalidated 60s stats cache)
+- Strip leaked `[STUB]`/`[NO CONTENT]` reliability notes and "Note on Data Quality" blocks from analysis summaries; a one-time migration scrubs already-stored `knowledge_states` summaries
+- The "new info" badge now clears once you open a topic (previously it persisted until a later check happened to find nothing new)
+- Setup wizard offers a "Save anyway (skip the live check)" path, so a transient provider error or a stale default model string no longer dead-ends a new user at `/setup`
+- Comment out the LLM lines in `.env.example` (Docker Compose never injects `.env`, so a key set there was silently dead) and correct install-script comments that claimed `.env` holds the LLM key
+- Install scripts fail fast on a failed `docker compose pull` with a GHCR-visibility/network hint instead of leaving a half-install
+
+### Security
+
+- Never deliver an unedited placeholder notification URL (e.g. `ntfy://your-topic-name`, which would post to public ntfy.sh); the guard blocks known placeholder tokens before send and also covers the CLI path
+- Ship an empty `notifications.urls` in `config.example.yml` so the auto-copied first-run default no longer carries a live `ntfy://your-topic-name` placeholder that would deliver to public ntfy.sh
+- Replace the leaky `ntfy://your-topic-name` example in the setup wizard's notification hint with a non-deliverable placeholder
+
 ## [1.2.0] - 2026-06-30
 
 ### Added
