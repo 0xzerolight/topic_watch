@@ -413,15 +413,8 @@ a.chip:hover { background: var(--app-surface-sunken); }
 }
 
 /* ============================================================
- * Empty-state augmentation (in place — the base lives in themes.css)
+ * Empty-state title (base lives in themes.css)
  * ============================================================ */
-.empty-state .empty-icon {
-  display: block;
-  font-size: 2rem;
-  line-height: 1;
-  margin-bottom: var(--app-2);
-  color: var(--app-ink-quiet);
-}
 .empty-state .empty-title {
   font-weight: 600;
   color: var(--app-ink);

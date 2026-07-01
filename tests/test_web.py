@@ -150,7 +150,7 @@ class TestDashboard:
         """Empty database shows 'no topics' message."""
         response = await client.get("/")
         assert response.status_code == 200
-        assert "adding your first topic" in response.text
+        assert "Add your first topic" in response.text
 
     async def test_dashboard_shows_error_banner(self, client: httpx.AsyncClient) -> None:
         """The ?error= query param (e.g. from a failed OPML import redirect) is surfaced."""
