@@ -211,6 +211,7 @@ _DASHBOARD_SELECT = """
            json_extract(cr.llm_response, '$.confidence') AS cr_confidence,
            cr.notification_sent AS cr_notification_sent,
            cr.notification_error AS cr_notification_error,
+           cr.seen_at AS cr_seen_at,
            (SELECT COUNT(*) FROM articles WHERE articles.topic_id = t.id) AS article_count
     FROM topics t
     LEFT JOIN check_results cr ON cr.id = (
@@ -474,6 +475,10 @@ def update_knowledge_state(conn: sqlite3.Connection, state: KnowledgeState) -> K
 def create_check_result(conn: sqlite3.Connection, result: CheckResult) -> CheckResult:
     """Record a check result for a topic."""
     data = result.to_insert_dict()
+    # ``seen_at`` is intentionally omitted from this column list: new rows are born
+    # NULL/unseen so a freshly-detected "new info" badge shows until the topic is
+    # opened. The surplus ``seen_at`` key in ``data`` is ignored by sqlite3
+    # named-parameter binding.
     cursor = conn.execute(
         """INSERT INTO check_results (topic_id, checked_at, articles_found,
            articles_new, has_new_info, llm_response, notification_sent,
@@ -504,6 +509,32 @@ def update_check_result_delivery(
     conn.execute(
         "UPDATE check_results SET notification_sent = ?, notification_error = ? WHERE id = ?",
         (int(notification_sent), notification_error, check_result_id),
+    )
+
+
+def mark_latest_check_seen(conn: sqlite3.Connection, topic_id: int) -> None:
+    """Stamp ``seen_at`` on a topic's latest check when it carries unseen new info.
+
+    Called when the topic detail page is opened, to clear the dashboard's "new
+    info" badge (gated on ``has_new_info AND seen_at IS NULL``). The WHERE clause
+    scopes the write to the single latest row and guards on ``has_new_info = 1 AND
+    seen_at IS NULL`` so re-views are no-ops (the timestamp never churns) and older
+    rows are never touched. Uses a Python UTC-ISO timestamp for parity with every
+    other datetime column (SQLite ``datetime('now')`` would diverge). The caller
+    commits.
+    """
+    conn.execute(
+        """
+        UPDATE check_results SET seen_at = ?
+        WHERE id = (
+            SELECT id FROM check_results
+            WHERE topic_id = ?
+            ORDER BY checked_at DESC LIMIT 1
+        )
+          AND has_new_info = 1
+          AND seen_at IS NULL
+        """,
+        (datetime.now(UTC).isoformat(), topic_id),
     )
 
 

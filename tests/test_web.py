@@ -3,7 +3,7 @@
 import logging
 import sqlite3
 from collections.abc import AsyncGenerator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -199,6 +199,85 @@ class TestDashboard:
 
         response = await client.get("/")
         assert "Check Now" not in response.text
+
+
+class TestNewInfoSeenBadge:
+    """The 'Ready · new info' badge (``badge--signal``) clears once the topic is opened."""
+
+    async def test_badge_clears_after_open_and_returns_on_new_check(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """Regression (fails pre-fix): badge present -> open topic -> badge gone ->
+        a newer new-info check re-badges."""
+        topic = _make_topic(db_conn, name="Seen Topic", status=TopicStatus.READY)
+        now = datetime.now(UTC)
+        create_check_result(
+            db_conn,
+            CheckResult(topic_id=topic.id, articles_found=2, has_new_info=True, checked_at=now),
+        )
+        db_conn.commit()
+
+        before = await client.get("/")
+        assert before.status_code == 200
+        assert "badge--signal" in before.text
+
+        detail = await client.get(f"/topics/{topic.id}")
+        assert detail.status_code == 200
+
+        after = await client.get("/")
+        assert "badge--signal" not in after.text
+
+        # A strictly-later check that finds new info re-badges (per-row seen_at).
+        create_check_result(
+            db_conn,
+            CheckResult(
+                topic_id=topic.id,
+                articles_found=1,
+                has_new_info=True,
+                checked_at=now + timedelta(hours=1),
+            ),
+        )
+        db_conn.commit()
+        again = await client.get("/")
+        assert "badge--signal" in again.text
+
+    async def test_filtered_search_drops_badge_after_open(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """The filtered search partial (search_dashboard_data) honors the same gate."""
+        topic = _make_topic(db_conn, name="Filter Topic", status=TopicStatus.READY)
+        create_check_result(
+            db_conn,
+            CheckResult(topic_id=topic.id, articles_found=1, has_new_info=True),
+        )
+        db_conn.commit()
+
+        before = await client.get("/topics/search?q=Filter")
+        assert "badge--signal" in before.text
+
+        await client.get(f"/topics/{topic.id}")
+
+        after = await client.get("/topics/search?q=Filter")
+        assert "badge--signal" not in after.text
+
+    async def test_open_preserves_history_and_notify(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """Marking seen must NOT mutate has_new_info: the detail history cell still
+        reads 'Yes' and the Notify button remains."""
+        topic = _make_topic(db_conn, name="History Topic", status=TopicStatus.READY)
+        create_check_result(
+            db_conn,
+            CheckResult(topic_id=topic.id, articles_found=1, has_new_info=True),
+        )
+        db_conn.commit()
+
+        # First open marks seen; second open still shows history + Notify.
+        await client.get(f"/topics/{topic.id}")
+        detail = await client.get(f"/topics/{topic.id}")
+        assert detail.status_code == 200
+        assert "Notify" in detail.text
+        assert ">Yes<" in detail.text
 
 
 # --- Add Topic ---

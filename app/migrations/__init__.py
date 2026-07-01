@@ -26,6 +26,7 @@ from app.migrations.m016_pending_claimed_at import up as m016_up
 from app.migrations.m017_pending_last_error import up as m017_up
 from app.migrations.m018_article_published_at import up as m018_up
 from app.migrations.m019_feed_validators import up as m019_up
+from app.migrations.m020_check_result_seen_at import up as m020_up
 
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "baseline schema version", m001_up),
@@ -47,4 +48,5 @@ MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (17, "add url/last_error columns to pending_notifications", m017_up),
     (18, "add published_at column to articles", m018_up),
     (19, "add etag/last_modified validators to feed_health", m019_up),
+    (20, "add seen_at column to check_results", m020_up),
 ]

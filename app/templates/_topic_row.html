@@ -4,7 +4,7 @@
     {%- if topic.status.value == "error" %}{% set _ = row_classes.append("row-problem") %}{% endif -%}
     {% if row_classes %} class="{{ row_classes | join(' ') }}"{% endif %}
     data-topic-name="{{ topic.name }}"
-    {% if last_check and last_check.has_new_info %}data-new-info="true"{% endif %}
+    {% if last_check and last_check.has_new_info and not last_check.seen_at %}data-new-info="true"{% endif %}
     {% if just_checked %}data-just-checked="true"{% endif %}>
     <td data-label="">
         <input type="checkbox" name="topic_ids" value="{{ topic.id }}"
@@ -22,7 +22,7 @@
     </td>
     <td data-label="Status">
         {% if topic.status.value == "ready" %}
-            {% if last_check and last_check.has_new_info %}
+            {% if last_check and last_check.has_new_info and not last_check.seen_at %}
                 <span class="badge badge--signal"><span class="badge-dot"></span>Ready &middot; new info</span>
             {% else %}
                 <span class="badge badge--ok"><span class="badge-dot"></span>Ready</span>

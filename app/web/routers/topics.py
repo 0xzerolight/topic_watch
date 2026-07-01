@@ -21,6 +21,7 @@ from app.crud import (
     get_topic_by_name,
     list_articles_for_topic,
     list_check_results,
+    mark_latest_check_seen,
     sum_check_tokens,
     update_topic,
 )
@@ -147,6 +148,13 @@ async def topic_detail(
     topic = get_topic(conn, topic_id)
     if topic is None:
         raise HTTPException(status_code=404, detail="Topic not found")
+
+    # Reading the detail page acknowledges the latest check's new info: clear the
+    # dashboard "new info" badge. No-op unless the latest check has unseen new info
+    # (guarded in the query). A GET side-effect is accepted here — single-user, no
+    # auth — and matches "clicking the topic and reading it clears the badge".
+    mark_latest_check_seen(conn, topic_id)
+    conn.commit()
 
     auto_feed_url = None
     auto_feed_urls: list[str] = []
