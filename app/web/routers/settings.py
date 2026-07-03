@@ -17,7 +17,7 @@ from app.config import (
 from app.notifications import send_notification
 from app.web.csrf import verify_csrf
 from app.web.dependencies import get_settings
-from app.web.routers._validation import format_validation_errors, strip_base_url
+from app.web.routers._validation import format_validation_errors, normalize_base_url
 from app.web.routers.templates import templates
 
 logger = logging.getLogger(__name__)
@@ -177,9 +177,9 @@ async def complete_setup(
     if not getattr(request.app.state, "setup_required", False):
         return RedirectResponse(url="/", status_code=303)
 
-    # Strip base_url for cloud providers (e.g. stale Ollama URL when switching to
-    # Anthropic) so the pre-flight check sees the value the model will persist (OVH-153).
-    effective_base_url = strip_base_url(llm_base_url, llm_model)
+    # Normalize blank -> None so the pre-flight check sees the value the model will
+    # persist. base_url is honored for every provider (OVH-104 reversal); OVH-153.
+    effective_base_url = normalize_base_url(llm_base_url)
 
     form_values = {
         "llm_model": llm_model,
@@ -295,10 +295,9 @@ async def update_settings(request: Request):
     # field is read-only in the UI and the on-disk value is preserved on save.
     api_key_env_sourced = is_api_key_env_sourced()
     effective_api_key = llm_api_key.strip() or request.app.state.settings.llm.api_key
-    # Shared normalization (OVH-153): blank -> None and cloud-provider stripping.
-    # The Settings model also enforces the latter (OVH-104); applying it here keeps
-    # setup and settings on the same seam.
-    effective_base_url = strip_base_url(llm_base_url, llm_model)
+    # Shared normalization (OVH-153): blank -> None. base_url is honored for every
+    # provider (OVH-104 reversal); setup and settings share this seam.
+    effective_base_url = normalize_base_url(llm_base_url)
 
     # Scalar fields are passed as strings; Pydantic coerces and validates them.
     scalar_kwargs = {field: form_values[field] for field in _SCALAR_FORM_FIELDS}

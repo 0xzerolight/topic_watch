@@ -29,7 +29,9 @@ DEFAULT_CONFIG_PATH = DATA_DIR / "config.yml"
 # Module-level override for testability
 _yaml_file_override: str | None = None
 
-# Providers that use their own cloud endpoints — base_url should never be set for these.
+# Known cloud providers — used for the unknown-provider warning and the UI base_url
+# hint. base_url is NOT stripped for these: an explicitly-set base_url is honored for
+# every provider (OVH-104 reversal) so OpenAI-compatible gateways work.
 CLOUD_PROVIDERS: frozenset[str] = frozenset(
     {
         "openai",
@@ -54,19 +56,6 @@ LOCAL_PROVIDER_DEFAULTS: dict[str, str] = {
 }
 
 
-def extract_provider(model_str: str) -> str | None:
-    """Extract the provider prefix from a LiteLLM model string (e.g. 'openai/gpt-4' → 'openai')."""
-    if "/" in model_str:
-        return model_str.split("/", 1)[0].lower().strip()
-    return None
-
-
-def is_cloud_provider(model_str: str) -> bool:
-    """Return True if the model string's provider prefix is a known cloud provider."""
-    provider = extract_provider(model_str)
-    return provider in CLOUD_PROVIDERS if provider else False
-
-
 # Env var that supplies the LLM API key (env > YAML; see settings_customise_sources).
 _API_KEY_ENV_VAR = "TOPIC_WATCH_LLM__API_KEY"
 
@@ -87,7 +76,7 @@ class LLMSettings(BaseModel):
     api_key: str = Field(default="", description="API key for the LLM provider")
     base_url: str | None = Field(
         default=None,
-        description="Optional base URL for self-hosted providers like Ollama",
+        description="Optional base URL for a self-hosted (Ollama) or OpenAI-compatible gateway endpoint",
     )
 
 
@@ -220,18 +209,6 @@ class Settings(BaseSettings):
                 if key not in known:
                     logger.warning("Unknown config key '%s' ignored (renamed or removed?)", key)
         return data
-
-    @model_validator(mode="after")
-    def strip_base_url_for_cloud_provider(self) -> Self:
-        """Drop base_url for cloud providers — enforced once on the model (OVH-104).
-
-        A cloud provider uses its own endpoint, so a stale base_url (e.g. left over
-        from a prior Ollama config) is invalid. Stripping here makes save/load
-        symmetric and removes the need to repeat the check at every call site.
-        """
-        if self.llm.base_url and is_cloud_provider(self.llm.model):
-            self.llm.base_url = None
-        return self
 
     @model_validator(mode="after")
     def validate_llm_model_format(self) -> Self:
@@ -380,7 +357,7 @@ def save_settings_to_yaml(settings: "Settings", config_path: Path, preserve_api_
         "secure_cookies": settings.secure_cookies,
     }
 
-    # base_url is already None for cloud providers (stripped on the model, OVH-104).
+    # base_url is written whenever set (honored for every provider); omitted when unset.
     if settings.llm.base_url:
         data["llm"]["base_url"] = settings.llm.base_url
 

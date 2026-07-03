@@ -37,7 +37,7 @@ from app.analysis.restatement import (
 from app.analysis.restatement import (
     filter_restated_key_facts,
 )
-from app.config import Settings, is_cloud_provider
+from app.config import Settings
 from app.models import Article, Topic
 
 logger = logging.getLogger(__name__)
@@ -252,10 +252,14 @@ def _get_client(settings: Settings) -> instructor.AsyncInstructor:
 
 
 def _effective_base_url(settings: Settings) -> str | None:
-    """Return base_url only for non-cloud providers (safety net for misconfigured configs)."""
-    if settings.llm.base_url and not is_cloud_provider(settings.llm.model):
-        return settings.llm.base_url
-    return None
+    """Return the configured LLM base_url, or None when unset.
+
+    An explicitly-set base_url is honored for every provider (OVH-104 reversal):
+    it points litellm at an OpenAI-compatible gateway (e.g. OpenCode Go), a
+    LiteLLM proxy, or a self-hosted server (Ollama). Kept as a thin seam so the
+    four call sites and their tests have one place to patch.
+    """
+    return settings.llm.base_url or None
 
 
 # Models whose tokenizer has already failed once. The char/4 fallback diverges

@@ -168,8 +168,8 @@ class TestSetupWizard:
         assert response.status_code == 303
         assert app.state.settings.llm.base_url == "http://localhost:11434"
 
-    def test_post_setup_cloud_provider_strips_base_url(self, unconfigured_app: TestClient) -> None:
-        """POST /setup with a cloud provider model and stale base_url strips base_url."""
+    def test_post_setup_cloud_provider_keeps_base_url(self, unconfigured_app: TestClient) -> None:
+        """POST /setup with a cloud provider model keeps base_url (OpenAI-compatible gateway)."""
         get_response = unconfigured_app.get("/setup")
         csrf_token = get_response.cookies.get("csrf_token")
 
@@ -180,16 +180,16 @@ class TestSetupWizard:
             response = unconfigured_app.post(
                 "/setup",
                 data={
-                    "llm_model": "anthropic/claude-haiku-4-5",
-                    "llm_api_key": "sk-ant-test",
-                    "llm_base_url": "http://localhost:11434",
+                    "llm_model": "openai/glm-5.2",
+                    "llm_api_key": "sk-opencode-test",
+                    "llm_base_url": "https://opencode.ai/zen/go/v1",
                     "csrf_token": csrf_token,
                 },
                 follow_redirects=False,
             )
 
         assert response.status_code == 303
-        assert app.state.settings.llm.base_url is None
+        assert app.state.settings.llm.base_url == "https://opencode.ai/zen/go/v1"
 
     def test_post_setup_when_configured_is_guarded(self, configured_app: TestClient) -> None:
         """OVH-059/082: re-POSTing /setup once configured redirects without re-running setup.

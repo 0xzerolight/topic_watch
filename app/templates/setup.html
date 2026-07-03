@@ -50,7 +50,7 @@
             <input type="text" id="llm_base_url" name="llm_base_url"
                    value="{{ form.llm_base_url if form else '' }}"
                    placeholder="e.g., http://localhost:11434 for Ollama">
-            <small id="base-url-hint">Required for self-hosted providers like Ollama. Cloud providers (OpenAI, Anthropic, etc.) don't need this.</small>
+            <small id="base-url-hint">Optional. Set for a self-hosted provider or an OpenAI-compatible gateway.</small>
         </label>
     </div>
 
@@ -84,23 +84,25 @@
 
     function update() {
         var p = getProvider(modelInput.value);
+        // Field is always shown; base_url is honored for every provider (OVH-104
+        // reversal). Only the hint text is provider-aware.
+        group.style.display = "";
         if (!p) {
-            group.style.display = "";
-            hint.textContent = "Required for self-hosted providers like Ollama. Cloud providers don't need this.";
+            hint.textContent = "Optional. Set for a self-hosted provider or an OpenAI-compatible gateway.";
+            return;
+        }
+        if (LOCAL_DEFAULTS[p]) {
+            if (!urlInput.value) {
+                urlInput.value = LOCAL_DEFAULTS[p];
+            }
+            hint.textContent = "Make sure your " + p + " server is running at this address.";
             return;
         }
         if (CLOUD.indexOf(p) !== -1) {
-            group.style.display = "none";
-            urlInput.value = "";
+            hint.textContent = "Optional — leave blank for the provider's default endpoint. Set only for an OpenAI-compatible gateway, e.g. OpenCode Go or a LiteLLM proxy.";
             return;
         }
-        group.style.display = "";
-        if (LOCAL_DEFAULTS[p] && !urlInput.value) {
-            urlInput.value = LOCAL_DEFAULTS[p];
-        }
-        hint.textContent = LOCAL_DEFAULTS[p]
-            ? "Make sure your " + p + " server is running at this address."
-            : "Enter the base URL for your self-hosted provider.";
+        hint.textContent = "Enter the base URL for your self-hosted provider.";
     }
 
     modelInput.addEventListener("input", update);
