@@ -4,25 +4,18 @@ import asyncio
 
 from pydantic import ValidationError
 
-from app.config import is_cloud_provider
 from app.models import FeedMode
 from app.url_validation import validate_feed_urls
 
 
-def strip_base_url(raw: str, model: str) -> str | None:
-    """Normalize a submitted LLM base URL (OVH-153).
+def normalize_base_url(raw: str) -> str | None:
+    """Normalize a submitted LLM base URL (OVH-153): blank -> None, else trimmed.
 
-    Blank input becomes ``None``. A base URL set for a cloud provider is dropped
-    (cloud providers use their own endpoints; a stale Ollama URL left over when
-    switching to Anthropic would otherwise be sent). This mirrors the Settings
-    model's ``strip_base_url_for_cloud_provider`` validator (OVH-104) but applies
-    it eagerly so the setup pre-flight credential check sees the same value the
-    model will persist.
+    An explicitly-set base_url is honored for every provider (OVH-104 reversal),
+    so this no longer drops it for cloud providers — it only collapses blank
+    input to ``None`` so the setup pre-flight check and the persisted model agree.
     """
-    stripped = raw.strip() or None
-    if stripped and is_cloud_provider(model):
-        return None
-    return stripped
+    return raw.strip() or None
 
 
 def format_validation_errors(exc: ValidationError) -> list[str]:

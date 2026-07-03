@@ -715,15 +715,15 @@ class TestCountTokens:
 
 
 class TestEffectiveBaseUrl:
-    """Tests for _effective_base_url safety net."""
+    """_effective_base_url honors base_url for every provider (OVH-104 reversal)."""
 
-    def test_cloud_provider_ignores_base_url(self) -> None:
+    def test_cloud_provider_honors_base_url(self) -> None:
         from app.analysis.llm import _effective_base_url
 
         settings = _make_settings(
-            llm=LLMSettings(model="anthropic/claude-haiku-4-5", api_key="k", base_url="http://localhost:11434")
+            llm=LLMSettings(model="openai/glm-5.2", api_key="k", base_url="https://opencode.ai/zen/go/v1")
         )
-        assert _effective_base_url(settings) is None
+        assert _effective_base_url(settings) == "https://opencode.ai/zen/go/v1"
 
     def test_local_provider_preserves_base_url(self) -> None:
         from app.analysis.llm import _effective_base_url
@@ -772,6 +772,25 @@ class TestAnalyzeArticles:
         assert len(messages) == 2
         assert "Known facts." in messages[1]["content"]
         assert "My Topic" in messages[1]["content"]
+
+    async def test_custom_base_url_reaches_llm_for_cloud_provider(self) -> None:
+        """Regression (#51): a base_url set on an openai/ model reaches litellm as api_base.
+
+        OpenAI-compatible gateways (e.g. OpenCode Go) are configured as
+        model=openai/<id> + base_url; the base_url must flow through to the call,
+        not be stripped as a cloud provider (OVH-104 reversal).
+        """
+        expected = NoveltyResult(has_new_info=False, confidence=0.5)
+        mock_client, mock_create = _mock_instructor_client(expected)
+        settings = _make_settings(
+            llm=LLMSettings(model="openai/glm-5.2", api_key="k", base_url="https://opencode.ai/zen/go/v1")
+        )
+
+        with patch("app.analysis.llm._get_client", return_value=mock_client):
+            await analyze_articles([_make_article()], "Known facts.", _make_topic(), settings)
+
+        mock_create.assert_called_once()
+        assert mock_create.call_args.kwargs["api_base"] == "https://opencode.ai/zen/go/v1"
 
     async def test_returns_safe_default_on_error(self) -> None:
         mock_client, mock_create = _mock_instructor_client(None)

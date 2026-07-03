@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from app.config import Settings, extract_provider, is_cloud_provider, load_settings
+from app.config import Settings, load_settings
 
 
 class TestConfigLoading:
@@ -87,8 +87,7 @@ class TestConfigLoading:
             load_settings(config_path=config)
 
     def test_optional_base_url(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        # Clear the env model override so the YAML's local provider (ollama) is used —
-        # otherwise the cloud env model would strip base_url (OVH-104).
+        # Clear the env model override so the YAML's ollama model is used (env > YAML).
         monkeypatch.delenv("TOPIC_WATCH_LLM__MODEL", raising=False)
         monkeypatch.delenv("TOPIC_WATCH_LLM__API_KEY", raising=False)
         config = tmp_path / "config.yml"
@@ -144,63 +143,23 @@ class TestEnvVarOverrides:
         assert settings.check_interval_minutes == 720
 
 
-class TestProviderDetection:
-    """Tests for extract_provider and is_cloud_provider helpers."""
+class TestSaveSettingsBaseUrl:
+    """Test that save_settings_to_yaml persists base_url for every provider (OVH-104 reversal)."""
 
-    def test_extract_provider_with_slash(self) -> None:
-        assert extract_provider("openai/gpt-4") == "openai"
-
-    def test_extract_provider_ollama(self) -> None:
-        assert extract_provider("ollama/llama3") == "ollama"
-
-    def test_extract_provider_no_slash(self) -> None:
-        assert extract_provider("gpt-4") is None
-
-    def test_extract_provider_empty(self) -> None:
-        assert extract_provider("") is None
-
-    def test_extract_provider_case_insensitive(self) -> None:
-        assert extract_provider("Anthropic/claude-3") == "anthropic"
-
-    def test_is_cloud_provider_openai(self) -> None:
-        assert is_cloud_provider("openai/gpt-4o-mini") is True
-
-    def test_is_cloud_provider_anthropic(self) -> None:
-        assert is_cloud_provider("anthropic/claude-haiku-4-5") is True
-
-    def test_is_cloud_provider_ollama(self) -> None:
-        assert is_cloud_provider("ollama/llama3") is False
-
-    def test_is_cloud_provider_groq(self) -> None:
-        assert is_cloud_provider("groq/llama-3.3-70b-versatile") is True
-
-    def test_is_cloud_provider_deepseek(self) -> None:
-        assert is_cloud_provider("deepseek/deepseek-chat") is True
-
-    def test_is_cloud_provider_unknown(self) -> None:
-        assert is_cloud_provider("madeupprovider/model") is False
-
-    def test_is_cloud_provider_no_slash(self) -> None:
-        assert is_cloud_provider("gpt-4") is False
-
-
-class TestSaveSettingsBaseUrlGuard:
-    """Test that save_settings_to_yaml strips base_url for cloud providers."""
-
-    def test_cloud_provider_base_url_omitted(self, tmp_path: Path) -> None:
-        """base_url is NOT written to YAML when model is a cloud provider."""
+    def test_cloud_provider_base_url_written(self, tmp_path: Path) -> None:
+        """base_url IS written to YAML for a cloud provider (OpenAI-compatible gateway)."""
         import yaml
 
         from app.config import LLMSettings, save_settings_to_yaml
 
         settings = Settings(
-            llm=LLMSettings(model="anthropic/claude-haiku-4-5", api_key="sk-test", base_url="http://localhost:11434"),
+            llm=LLMSettings(model="openai/glm-5.2", api_key="sk-test", base_url="https://opencode.ai/zen/go/v1"),
         )  # type: ignore[call-arg]
         config_file = tmp_path / "config.yml"
         save_settings_to_yaml(settings, config_file)
 
         data = yaml.safe_load(config_file.read_text())
-        assert "base_url" not in data.get("llm", {})
+        assert data["llm"]["base_url"] == "https://opencode.ai/zen/go/v1"
 
     def test_local_provider_base_url_preserved(self, tmp_path: Path) -> None:
         """base_url IS written to YAML when model is a local provider."""
@@ -396,15 +355,15 @@ class TestUnknownYamlKey:
         assert not any("Unknown" in r.message and "config key" in r.message for r in caplog.records)
 
 
-class TestBaseUrlModelStripping:
-    """OVH-104: cloud-provider base_url stripping is enforced once on the model."""
+class TestBaseUrlModelHonored:
+    """OVH-104 reversal: an explicitly-set base_url is honored for every provider."""
 
-    def test_model_drops_base_url_for_cloud_provider(self) -> None:
-        """Constructing Settings with a cloud model + base_url drops base_url."""
+    def test_model_keeps_base_url_for_cloud_provider(self) -> None:
+        """Constructing Settings with a cloud model + base_url keeps it (OpenAI-compatible gateway)."""
         settings = Settings(
-            llm={"model": "anthropic/claude-haiku-4-5", "api_key": "sk", "base_url": "http://localhost:11434"},
+            llm={"model": "openai/glm-5.2", "api_key": "sk", "base_url": "https://opencode.ai/zen/go/v1"},
         )  # type: ignore[call-arg]
-        assert settings.llm.base_url is None
+        assert settings.llm.base_url == "https://opencode.ai/zen/go/v1"
 
     def test_model_keeps_base_url_for_local_provider(self) -> None:
         """A self-hosted provider keeps its base_url."""
@@ -413,11 +372,25 @@ class TestBaseUrlModelStripping:
         )  # type: ignore[call-arg]
         assert settings.llm.base_url == "http://localhost:11434"
 
+    def test_base_url_round_trips_for_cloud_provider(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """load(save(x)) preserves base_url for a cloud model (symmetric, OpenAI-compatible gateway)."""
+        from app.config import save_settings_to_yaml
+
+        # Clear the env model override so the reloaded model is the init/YAML one, not CI's.
+        monkeypatch.delenv("TOPIC_WATCH_LLM__MODEL", raising=False)
+        monkeypatch.delenv("TOPIC_WATCH_LLM__API_KEY", raising=False)
+        settings = Settings(
+            llm={"model": "openai/glm-5.2", "api_key": "sk", "base_url": "https://opencode.ai/zen/go/v1"},
+        )  # type: ignore[call-arg]
+        config_file = tmp_path / "config.yml"
+        save_settings_to_yaml(settings, config_file)
+        reloaded = load_settings(config_path=config_file)
+        assert reloaded.llm.base_url == "https://opencode.ai/zen/go/v1"
+
     def test_base_url_round_trips_for_local_provider(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """load(save(x)) preserves base_url for a local provider (symmetric)."""
         from app.config import save_settings_to_yaml
 
-        # Clear the cloud env model so the reloaded model stays a local provider.
         monkeypatch.delenv("TOPIC_WATCH_LLM__MODEL", raising=False)
         monkeypatch.delenv("TOPIC_WATCH_LLM__API_KEY", raising=False)
         settings = Settings(

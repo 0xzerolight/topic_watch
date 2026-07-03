@@ -98,21 +98,22 @@ async def client(
 class TestValidationHelpers:
     """OVH-153: the _validation seam shared by setup and settings handlers."""
 
-    def test_strip_base_url_blank_is_none(self) -> None:
-        from app.web.routers._validation import strip_base_url
+    def test_normalize_base_url_blank_is_none(self) -> None:
+        from app.web.routers._validation import normalize_base_url
 
-        assert strip_base_url("   ", "ollama/llama3") is None
+        assert normalize_base_url("   ") is None
 
-    def test_strip_base_url_kept_for_local_provider(self) -> None:
-        from app.web.routers._validation import strip_base_url
+    def test_normalize_base_url_kept_for_local_provider(self) -> None:
+        from app.web.routers._validation import normalize_base_url
 
-        assert strip_base_url("http://localhost:11434", "ollama/llama3") == "http://localhost:11434"
+        assert normalize_base_url("http://localhost:11434") == "http://localhost:11434"
 
-    def test_strip_base_url_dropped_for_cloud_provider(self) -> None:
-        from app.web.routers._validation import strip_base_url
+    def test_normalize_base_url_kept_for_cloud_provider(self) -> None:
+        from app.web.routers._validation import normalize_base_url
 
-        # A stale base URL for a cloud provider is dropped (OVH-104/OVH-153).
-        assert strip_base_url("http://stale", "openai/gpt-4o-mini") is None
+        # base_url is honored for every provider now (OVH-104 reversal); e.g. an
+        # OpenAI-compatible gateway configured as openai/<model>.
+        assert normalize_base_url("https://opencode.ai/zen/go/v1") == "https://opencode.ai/zen/go/v1"
 
     def test_format_validation_errors_renders_field_path(self) -> None:
         from pydantic import ValidationError
@@ -520,18 +521,18 @@ class TestSettingsPost:
         mock_start.assert_not_called()
         mock_stop.assert_not_called()
 
-    async def test_cloud_provider_base_url_stripped(self, client: httpx.AsyncClient) -> None:
-        """POST /settings with a cloud provider model strips any stale base_url."""
+    async def test_cloud_provider_base_url_kept(self, client: httpx.AsyncClient) -> None:
+        """POST /settings with a cloud provider model keeps base_url (OpenAI-compatible gateway)."""
         with patch("app.web.routers.settings.save_settings_to_yaml"):
             await client.post(
                 "/settings",
                 data=self._valid_form_data(
-                    llm_model="anthropic/claude-haiku-4-5",
-                    llm_base_url="http://localhost:11434",
+                    llm_model="openai/glm-5.2",
+                    llm_base_url="https://opencode.ai/zen/go/v1",
                 ),
                 follow_redirects=False,
             )
-        assert app.state.settings.llm.base_url is None
+        assert app.state.settings.llm.base_url == "https://opencode.ai/zen/go/v1"
 
 
 class TestApiKeyRetention:
