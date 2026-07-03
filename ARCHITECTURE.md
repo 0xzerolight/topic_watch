@@ -113,7 +113,7 @@ The route handlers were split out of `routes.py` into the `web/routers/` package
 | Module | Responsibility |
 |--------|---------------|
 | `main.py` | FastAPI app + lifespan. Runs migrations, starts/stops the scheduler, mounts the web routers, JSON API, CSRF + setup-redirect middleware, and static files. |
-| `config.py` | Pydantic `BaseSettings` with YAML source. Priority: env > YAML > defaults. `load_settings()` / `save_settings_to_yaml()`; cloud/local provider helpers. |
+| `config.py` | Pydantic `BaseSettings` with YAML source. Priority: env > YAML > defaults. `load_settings()` / `save_settings_to_yaml()`; `CLOUD_PROVIDERS` / `LOCAL_PROVIDER_DEFAULTS` provider lists. |
 | `logging_config.py` | Plain text or JSON structured logging. Controlled by `TOPIC_WATCH_LOG_FORMAT` and `TOPIC_WATCH_LOG_LEVEL` env vars. |
 | `check_context.py` | Correlation IDs via `contextvars.ContextVar`. `CheckIdFilter` injects check ID into all log records. |
 | `url_validation.py` | SSRF protection. Blocks private/reserved IPs (localhost, 10.x, 172.16-31.x, 192.168.x, link-local, CGNAT 100.64.0.0/10, IPv6 ULA). |
@@ -237,7 +237,7 @@ On first run, `config.example.yml` is auto-copied to `data/config.yml`.
 |-----|------|---------|-------------|
 | `llm.model` | string | - | LiteLLM model string (e.g. `openai/gpt-5.4-nano`) |
 | `llm.api_key` | string | - | API key for your LLM provider |
-| `llm.base_url` | string | - | Base URL for self-hosted providers (Ollama, etc.) |
+| `llm.base_url` | string | - | Base URL for a self-hosted (Ollama) or OpenAI-compatible gateway endpoint. Honored for any provider. |
 | `notifications.urls` | list | `[]` | [Apprise](https://github.com/caronc/apprise/wiki) notification URLs |
 | `notifications.webhook_urls` | list | `[]` | Webhook endpoints for JSON POST (see [HTTP API](#http-api)) |
 | `check_interval` | string | `"6h"` | Default check interval. Units: m, h, d, w, M. Combine: `1w 3d`, `2h 30m`. Min 10m, max 6M. |

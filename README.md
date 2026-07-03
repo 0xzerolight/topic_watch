@@ -158,6 +158,16 @@ llm:
 
 Running Ollama in Docker needs the override file: `cp docker-compose.override.example.yml docker-compose.override.yml`.
 
+Any OpenAI-compatible gateway (e.g. [OpenCode Go](https://opencode.ai/docs/go/), a
+LiteLLM proxy, LM Studio) works via the `openai/` prefix plus its `base_url`:
+
+```yaml
+llm:
+  model: "openai/<gateway-model-id>"
+  api_key: "your-gateway-key"
+  base_url: "https://opencode.ai/zen/go/v1"
+```
+
 ## Notifications
 
 Notifications are **off by default** - Topic Watch tracks topics silently until you
