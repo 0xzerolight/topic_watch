@@ -59,7 +59,7 @@ body:
     attributes:
       label: Version
       description: App version or commit hash (UI footer, or `python -m app.cli --version`). Please update to the latest release first to check it's not already fixed.
-      placeholder: "e.g. 1.2.1 or b325d7a"
+      placeholder: "e.g. 1.2.2 or b325d7a"
     validations:
       required: true
 
