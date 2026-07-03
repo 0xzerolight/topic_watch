@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-07-03
+
+### Fixed
+
+- Custom LLM `base_url` is now honored for every provider, so OpenAI-compatible gateways (e.g. OpenCode Go, a LiteLLM proxy) work via the `openai/<model>` prefix plus `base_url`. Previously `base_url` was silently dropped for cloud providers, which sent requests to the provider's default endpoint and failed with the gateway's key/model (#51)
+
+### Changed
+
+- Base Docker image updated to `python:3.13-slim`; Python dependency lockfiles refreshed
+
 ## [1.2.1] - 2026-07-01
 
 ### Added
