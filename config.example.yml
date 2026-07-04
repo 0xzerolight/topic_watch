@@ -51,7 +51,10 @@ check_interval: "6h"
 max_articles_per_check: 10
 
 # Maximum token budget for the knowledge state summary
-# The LLM will compress older facts when approaching this limit
+# The LLM will compress older facts when approaching this limit.
+# Note: this is a prompt-level budget. LLM output is separately hard-capped
+# internally (8192 tokens, or the model's own max output if lower) to stay below
+# providers' non-streaming limits, so raising this above ~8000 has no effect.
 knowledge_state_max_tokens: 2000
 
 # Number of days to retain articles before automatic cleanup

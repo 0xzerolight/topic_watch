@@ -291,21 +291,24 @@ def _effective_base_url(settings: Settings) -> str | None:
 # Anthropic path injects the model's FULL max output (64000 for claude-haiku-4-5),
 # which Anthropic rejects for non-streaming requests — the underlying issue #53
 # 400. Capping output well below that avoids it and bounds cost/latency. Not a user
-# setting: it's a safety bound, and the structured outputs here are small.
+# setting: it's a safety bound, and the structured outputs here are small. 8192 is
+# comfortably above the default knowledge-summary budget (2000) yet safely below
+# any provider's non-streaming ceiling.
 _OUTPUT_TOKEN_CAP = 8192
-# Headroom above the knowledge-summary budget for the tool-call JSON envelope, so
-# a large ``knowledge_state_max_tokens`` is never truncated mid-structured-output.
-_OUTPUT_TOKEN_HEADROOM = 1024
 
 
 def _bounded_max_tokens(settings: Settings) -> int:
-    """Explicit ``max_tokens`` for LLM calls: bounded, per-model, budget-aware.
+    """Explicit ``max_tokens`` for LLM calls: a hard, per-model output ceiling.
 
-    Returns ``_OUTPUT_TOKEN_CAP`` in the common case, but:
-    - never exceeds the model's own max output (a flat cap would 400 on models
-      whose ceiling is below it, e.g. 4096-output models), and
-    - rises to cover an enlarged ``knowledge_state_max_tokens`` (plus JSON
-      headroom) so a big summary is not clipped.
+    Returns ``_OUTPUT_TOKEN_CAP``, clamped down to the model's own max output so a
+    model whose ceiling is below the cap (e.g. 4096-output models) is not
+    over-asked — a flat 8192 would 400 there. This is a HARD ceiling: it never
+    rises above ``_OUTPUT_TOKEN_CAP`` even for a large ``knowledge_state_max_tokens``.
+    Letting it exceed the cap would re-expose issue #53 (an oversized non-streaming
+    ``max_tokens`` rejected with a 400) for the exact 64k-output Anthropic models
+    where the bug originated. A summary budget above the cap is therefore bounded
+    to the cap; ``knowledge_state_max_tokens`` remains the *prompt* budget the model
+    is told to stay under, which is the effective control for summary length.
 
     ``litellm.get_max_tokens`` returns max *output* tokens (not the context
     window) and RAISES for unmapped/gateway model strings; the ``or`` handles its
@@ -316,8 +319,7 @@ def _bounded_max_tokens(settings: Settings) -> int:
         model_max = litellm.get_max_tokens(settings.llm.model) or _OUTPUT_TOKEN_CAP
     except Exception:
         model_max = _OUTPUT_TOKEN_CAP
-    floor = settings.knowledge_state_max_tokens + _OUTPUT_TOKEN_HEADROOM
-    return min(max(_OUTPUT_TOKEN_CAP, floor), model_max)
+    return min(_OUTPUT_TOKEN_CAP, model_max)
 
 
 # Models whose tokenizer has already failed once. The char/4 fallback diverges
