@@ -121,9 +121,9 @@ class TestBoundedMaxTokens:
 
     Omitting max_tokens lets litellm inject the model's full max output (64000
     for claude-haiku-4-5), which Anthropic rejects non-streaming — the issue #53
-    400. The cap must default to _OUTPUT_TOKEN_CAP, never exceed the model's own
-    max output, not crash on unmapped/gateway models, and grow to fit a larger
-    knowledge budget so summaries are never truncated.
+    400. The bound is a HARD ceiling: it equals _OUTPUT_TOKEN_CAP, clamped down to
+    the model's own max output, and never rises above the cap even for a large
+    knowledge budget (rising above it would re-expose #53).
     """
 
     def test_default_model_caps_at_output_token_cap(self) -> None:
@@ -147,12 +147,20 @@ class TestBoundedMaxTokens:
         assert isinstance(result, int)
         assert 0 < result <= _OUTPUT_TOKEN_CAP
 
-    def test_large_knowledge_budget_is_not_truncated(self) -> None:
-        # An enlarged summary budget must not be clipped by the output cap.
-        settings = _make_settings(knowledge_state_max_tokens=10000)
-        result = _bounded_max_tokens(settings)
-        assert result >= settings.knowledge_state_max_tokens
-        assert result <= litellm.get_max_tokens(settings.llm.model)
+    def test_large_knowledge_budget_stays_hard_capped(self) -> None:
+        # A large summary budget must NOT push max_tokens above the cap: exceeding
+        # it re-exposes issue #53 on 64k-output Anthropic models. The cap is a hard
+        # ceiling; knowledge_state_max_tokens stays a prompt-level budget.
+        big = _make_settings(knowledge_state_max_tokens=10000)
+        assert _bounded_max_tokens(big) == _OUTPUT_TOKEN_CAP
+        # Exact #53 regression: an Anthropic 64k-output model at max budget must
+        # bound to the cap (8192), never the old floor value (11024).
+        anthropic = _make_settings(
+            llm=LLMSettings(model="anthropic/claude-haiku-4-5", api_key="k"),
+            knowledge_state_max_tokens=10000,
+        )
+        assert litellm.get_max_tokens("anthropic/claude-haiku-4-5") > _OUTPUT_TOKEN_CAP  # precondition
+        assert _bounded_max_tokens(anthropic) == _OUTPUT_TOKEN_CAP
 
 
 # ============================================================
