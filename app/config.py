@@ -58,6 +58,8 @@ LOCAL_PROVIDER_DEFAULTS: dict[str, str] = {
 
 # Env var that supplies the LLM API key (env > YAML; see settings_customise_sources).
 _API_KEY_ENV_VAR = "TOPIC_WATCH_LLM__API_KEY"
+# Env var that supplies the Exa API key (same env > YAML precedence).
+_EXA_API_KEY_ENV_VAR = "TOPIC_WATCH_EXA__API_KEY"
 
 
 def is_api_key_env_sourced() -> bool:
@@ -67,6 +69,14 @@ def is_api_key_env_sourced() -> bool:
     NOT materialize the env-derived secret into plaintext config.yml (OVH-003).
     """
     return bool(os.environ.get(_API_KEY_ENV_VAR))
+
+
+def is_exa_key_env_sourced() -> bool:
+    """Return True if the Exa API key is supplied via environment (env > YAML).
+
+    Same read-only-UI and no-materialize-secret contract as the LLM key (OVH-003).
+    """
+    return bool(os.environ.get(_EXA_API_KEY_ENV_VAR))
 
 
 class LLMSettings(BaseModel):
@@ -93,6 +103,17 @@ class NotificationSettings(BaseModel):
     )
 
 
+class ExaSettings(BaseModel):
+    """Exa AI search-source configuration (optional, opt-in, user-supplied paid key)."""
+
+    enabled: bool = Field(default=False, description="Enable the Exa AI search source for EXA-mode topics")
+    api_key: str = Field(default="", description="Exa API key (https://exa.ai)")
+    base_url: str | None = Field(
+        default=None,
+        description="Optional Exa API base URL override (advanced/proxy; defaults to https://api.exa.ai)",
+    )
+
+
 class Settings(BaseSettings):
     """Application settings loaded from YAML with env var overrides.
 
@@ -112,6 +133,7 @@ class Settings(BaseSettings):
 
     llm: LLMSettings = LLMSettings()
     notifications: NotificationSettings = NotificationSettings()
+    exa: ExaSettings = ExaSettings()
     check_interval: str = Field(default="6h", description="Default check interval, e.g. '6h', '1d', '2w', '1M'")
 
     @field_validator("check_interval")
@@ -304,34 +326,57 @@ def load_settings(config_path: Path | None = None) -> Settings:
         _yaml_file_override = None
 
 
-def save_settings_to_yaml(settings: "Settings", config_path: Path, preserve_api_key: bool = False) -> None:
+def _read_existing_secret(path: Path, section: str, key: str) -> str:
+    """Return the on-disk secret at ``data[section][key]``, or '' if absent/unreadable.
+
+    Used to preserve an env-derived secret across a settings save so it is never
+    materialized into plaintext config.yml (OVH-003). A missing file, corrupt YAML, or
+    absent section all yield '' rather than raising.
+    """
+    if not path.exists():
+        return ""
+    try:
+        existing = yaml.safe_load(path.read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        logger.warning("Could not read existing config to preserve %s.%s; leaving it blank", section, key)
+        return ""
+    return (existing.get(section) or {}).get(key, "") or ""
+
+
+def save_settings_to_yaml(
+    settings: "Settings",
+    config_path: Path,
+    preserve_api_key: bool = False,
+    preserve_exa_key: bool = False,
+) -> None:
     """Write current settings back to the YAML config file.
 
     Args:
         settings: The settings to persist.
         config_path: Destination YAML path.
-        preserve_api_key: When True, keep whatever api_key is already on disk instead
+        preserve_api_key: When True, keep whatever LLM api_key is already on disk instead
             of writing ``settings.llm.api_key``. Used when the key is env-sourced so the
             env secret is not materialized into plaintext config.yml (OVH-003).
+        preserve_exa_key: Same as ``preserve_api_key`` but for ``settings.exa.api_key``.
     """
     effective_path = config_path
 
     api_key_to_write = settings.llm.api_key
     if preserve_api_key:
-        # Read the existing on-disk value so an env-derived secret never lands here.
-        existing_key = ""
-        if effective_path.exists():
-            try:
-                existing = yaml.safe_load(effective_path.read_text()) or {}
-                existing_key = (existing.get("llm") or {}).get("api_key", "") or ""
-            except (OSError, yaml.YAMLError):
-                logger.warning("Could not read existing config to preserve api_key; leaving it blank")
-        api_key_to_write = existing_key
+        api_key_to_write = _read_existing_secret(effective_path, "llm", "api_key")
+
+    exa_key_to_write = settings.exa.api_key
+    if preserve_exa_key:
+        exa_key_to_write = _read_existing_secret(effective_path, "exa", "api_key")
 
     data: dict = {
         "llm": {
             "model": settings.llm.model,
             "api_key": api_key_to_write,
+        },
+        "exa": {
+            "enabled": settings.exa.enabled,
+            "api_key": exa_key_to_write,
         },
         "notifications": {},
         "check_interval": settings.check_interval,
@@ -360,6 +405,10 @@ def save_settings_to_yaml(settings: "Settings", config_path: Path, preserve_api_
     # base_url is written whenever set (honored for every provider); omitted when unset.
     if settings.llm.base_url:
         data["llm"]["base_url"] = settings.llm.base_url
+
+    # Exa base_url mirrors the llm block: written only when set, else omitted.
+    if settings.exa.base_url:
+        data["exa"]["base_url"] = settings.exa.base_url
 
     if settings.notifications.urls:
         data["notifications"]["urls"] = settings.notifications.urls

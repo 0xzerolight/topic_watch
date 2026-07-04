@@ -9,7 +9,7 @@ import httpx
 import pytest
 import yaml
 
-from app.config import LLMSettings, NotificationSettings, Settings
+from app.config import ExaSettings, LLMSettings, NotificationSettings, Settings
 from app.main import app
 from app.web.dependencies import get_db_conn, get_settings
 
@@ -207,6 +207,92 @@ class TestSaveSettingsToYaml:
         data = yaml.safe_load(config_file.read_text())
         assert data["check_interval"] == "12h"
         assert data["max_articles_per_check"] == 25
+
+
+class TestExaSettingsPersistence:
+    """Exa config persists through save_settings_to_yaml (each field asserted independently)."""
+
+    async def test_exa_defaults_written(self, tmp_path: Path) -> None:
+        """A default (unconfigured) Exa block is always present so it never silently drops."""
+        from app.config import save_settings_to_yaml
+
+        settings = _make_settings()
+        config_file = tmp_path / "config.yml"
+        save_settings_to_yaml(settings, config_file)
+
+        data = yaml.safe_load(config_file.read_text())
+        assert data["exa"] == {"enabled": False, "api_key": ""}
+
+    async def test_exa_enabled_persists(self, tmp_path: Path) -> None:
+        from app.config import save_settings_to_yaml
+
+        settings = _make_settings(exa=ExaSettings(enabled=True, api_key="exa-key-123"))
+        config_file = tmp_path / "config.yml"
+        save_settings_to_yaml(settings, config_file)
+
+        data = yaml.safe_load(config_file.read_text())
+        assert data["exa"]["enabled"] is True
+
+    async def test_exa_api_key_persists(self, tmp_path: Path) -> None:
+        from app.config import save_settings_to_yaml
+
+        settings = _make_settings(exa=ExaSettings(enabled=True, api_key="exa-key-123"))
+        config_file = tmp_path / "config.yml"
+        save_settings_to_yaml(settings, config_file)
+
+        data = yaml.safe_load(config_file.read_text())
+        assert data["exa"]["api_key"] == "exa-key-123"
+
+    async def test_exa_base_url_omitted_when_none(self, tmp_path: Path) -> None:
+        from app.config import save_settings_to_yaml
+
+        settings = _make_settings(exa=ExaSettings(enabled=True, api_key="k"))
+        assert settings.exa.base_url is None
+        config_file = tmp_path / "config.yml"
+        save_settings_to_yaml(settings, config_file)
+
+        data = yaml.safe_load(config_file.read_text())
+        assert "base_url" not in data["exa"]
+
+    async def test_exa_base_url_written_when_set(self, tmp_path: Path) -> None:
+        from app.config import save_settings_to_yaml
+
+        settings = _make_settings(exa=ExaSettings(enabled=True, api_key="k", base_url="https://proxy.example/exa"))
+        config_file = tmp_path / "config.yml"
+        save_settings_to_yaml(settings, config_file)
+
+        data = yaml.safe_load(config_file.read_text())
+        assert data["exa"]["base_url"] == "https://proxy.example/exa"
+
+    async def test_preserve_exa_key_keeps_on_disk_value(self, tmp_path: Path) -> None:
+        """preserve_exa_key=True writes the on-disk key, not settings.exa.api_key (OVH-003)."""
+        from app.config import save_settings_to_yaml
+
+        config_file = tmp_path / "config.yml"
+        config_file.write_text('exa:\n  enabled: true\n  api_key: "exa-on-disk"\n')
+        settings = _make_settings(exa=ExaSettings(enabled=True, api_key="exa-env-secret"))
+        save_settings_to_yaml(settings, config_file, preserve_exa_key=True)
+
+        data = yaml.safe_load(config_file.read_text())
+        assert data["exa"]["api_key"] == "exa-on-disk"
+        assert data["exa"]["api_key"] != "exa-env-secret"
+
+    async def test_corrupt_config_preserve_does_not_raise(self, tmp_path: Path) -> None:
+        """_read_existing_secret swallows a corrupt file: both preserved keys blank, no raise."""
+        from app.config import save_settings_to_yaml
+
+        config_file = tmp_path / "config.yml"
+        # Unparseable YAML — the preserve read must degrade to "" for both sections.
+        config_file.write_text("llm: [unterminated\n  exa: :::\n")
+        settings = _make_settings(
+            llm=LLMSettings(model="openai/gpt-4o-mini", api_key="llm-env-secret"),
+            exa=ExaSettings(enabled=True, api_key="exa-env-secret"),
+        )
+        save_settings_to_yaml(settings, config_file, preserve_api_key=True, preserve_exa_key=True)
+
+        data = yaml.safe_load(config_file.read_text())
+        assert data["llm"]["api_key"] == ""
+        assert data["exa"]["api_key"] == ""
 
 
 # ---------------------------------------------------------------------------
