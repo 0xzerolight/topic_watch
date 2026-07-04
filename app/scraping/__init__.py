@@ -251,11 +251,14 @@ async def _extract_contents(
 
         async def _extract(entry: FeedEntry) -> str:
             async with semaphore:
+                # entry.content (Exa prefetched text) short-circuits the fetch; RSS and
+                # empty-text entries carry content=None and fall through to the network path.
                 return await extract_article_content(
                     entry.url,
                     fallback_summary=entry.summary,
                     client=fetch_client,
                     timeout=article_fetch_timeout,
+                    prefetched=entry.content,
                 )
 
         content_tasks = [_extract(entry) for entry, _ in fetch_batch]
