@@ -287,6 +287,39 @@ def _effective_base_url(settings: Settings) -> str | None:
     return settings.llm.base_url or None
 
 
+# Internal output-token ceiling. When a call omits ``max_tokens``, litellm's
+# Anthropic path injects the model's FULL max output (64000 for claude-haiku-4-5),
+# which Anthropic rejects for non-streaming requests — the underlying issue #53
+# 400. Capping output well below that avoids it and bounds cost/latency. Not a user
+# setting: it's a safety bound, and the structured outputs here are small.
+_OUTPUT_TOKEN_CAP = 8192
+# Headroom above the knowledge-summary budget for the tool-call JSON envelope, so
+# a large ``knowledge_state_max_tokens`` is never truncated mid-structured-output.
+_OUTPUT_TOKEN_HEADROOM = 1024
+
+
+def _bounded_max_tokens(settings: Settings) -> int:
+    """Explicit ``max_tokens`` for LLM calls: bounded, per-model, budget-aware.
+
+    Returns ``_OUTPUT_TOKEN_CAP`` in the common case, but:
+    - never exceeds the model's own max output (a flat cap would 400 on models
+      whose ceiling is below it, e.g. 4096-output models), and
+    - rises to cover an enlarged ``knowledge_state_max_tokens`` (plus JSON
+      headroom) so a big summary is not clipped.
+
+    ``litellm.get_max_tokens`` returns max *output* tokens (not the context
+    window) and RAISES for unmapped/gateway model strings; the ``or`` handles its
+    ``None`` return and the ``except`` handles the raise — either way we fall back
+    to the cap rather than crashing every call for gateway users.
+    """
+    try:
+        model_max = litellm.get_max_tokens(settings.llm.model) or _OUTPUT_TOKEN_CAP
+    except Exception:
+        model_max = _OUTPUT_TOKEN_CAP
+    floor = settings.knowledge_state_max_tokens + _OUTPUT_TOKEN_HEADROOM
+    return min(max(_OUTPUT_TOKEN_CAP, floor), model_max)
+
+
 # Models whose tokenizer has already failed once. The char/4 fallback diverges
 # from a real model tokenizer (OVH-136), so budget decisions made on it run on a
 # wrong unit; surface that as a WARNING. Cached per model so a broken tokenizer
@@ -418,6 +451,7 @@ async def analyze_articles(
             api_base=_effective_base_url(settings),
             timeout=settings.llm_analysis_timeout,
             temperature=settings.llm_temperature,
+            max_tokens=_bounded_max_tokens(settings),
         )
 
     try:
@@ -472,6 +506,7 @@ async def generate_initial_knowledge(
             api_base=_effective_base_url(settings),
             timeout=settings.llm_knowledge_timeout,
             temperature=settings.llm_temperature,
+            max_tokens=_bounded_max_tokens(settings),
         )
 
     raw_result, completion = await _call_with_rate_limit_retry(_do_call, max_retries=settings.llm_max_retries)
@@ -515,6 +550,7 @@ async def compress_knowledge_summary(
             api_base=_effective_base_url(settings),
             timeout=settings.llm_knowledge_timeout,
             temperature=settings.llm_temperature,
+            max_tokens=_bounded_max_tokens(settings),
         )
 
     raw_result, completion = await _call_with_rate_limit_retry(_do_call, max_retries=settings.llm_max_retries)
@@ -558,6 +594,7 @@ async def generate_knowledge_update(
             api_base=_effective_base_url(settings),
             timeout=settings.llm_knowledge_timeout,
             temperature=settings.llm_temperature,
+            max_tokens=_bounded_max_tokens(settings),
         )
 
     raw_result, completion = await _call_with_rate_limit_retry(_do_call, max_retries=settings.llm_max_retries)

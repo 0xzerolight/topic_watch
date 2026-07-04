@@ -11,9 +11,11 @@ from pydantic import ValidationError
 from app.analysis.citations import strip_index_citations, strip_reliability_notes
 from app.analysis.knowledge import initialize_knowledge, update_knowledge
 from app.analysis.llm import (
+    _OUTPUT_TOKEN_CAP,
     CompressedKnowledge,
     KnowledgeStateUpdate,
     NoveltyResult,
+    _bounded_max_tokens,
     analyze_articles,
     compress_knowledge_summary,
     count_tokens,
@@ -107,6 +109,50 @@ def _mock_instructor_client(return_value, *, completion=None):
     mock_client = MagicMock()
     mock_client.chat = mock_chat
     return mock_client, mock_create
+
+
+# ============================================================
+# TestBoundedMaxTokens (issue #53)
+# ============================================================
+
+
+class TestBoundedMaxTokens:
+    """_bounded_max_tokens caps LLM output below provider non-streaming limits.
+
+    Omitting max_tokens lets litellm inject the model's full max output (64000
+    for claude-haiku-4-5), which Anthropic rejects non-streaming — the issue #53
+    400. The cap must default to _OUTPUT_TOKEN_CAP, never exceed the model's own
+    max output, not crash on unmapped/gateway models, and grow to fit a larger
+    knowledge budget so summaries are never truncated.
+    """
+
+    def test_default_model_caps_at_output_token_cap(self) -> None:
+        # gpt-4o-mini's max output exceeds the cap and the default budget is small,
+        # so the bound is exactly the cap.
+        assert _bounded_max_tokens(_make_settings()) == _OUTPUT_TOKEN_CAP
+
+    def test_clamps_down_to_small_model_max(self) -> None:
+        # A model whose own max output is below the cap must not be over-asked
+        # (a flat cap would itself trigger a 'max_tokens too large' 400).
+        settings = _make_settings(llm=LLMSettings(model="gpt-3.5-turbo", api_key="k"))
+        model_max = litellm.get_max_tokens("gpt-3.5-turbo")
+        assert model_max < _OUTPUT_TOKEN_CAP  # precondition for this model
+        assert _bounded_max_tokens(settings) == model_max
+
+    def test_unmapped_gateway_model_does_not_crash(self) -> None:
+        # get_max_tokens raises for unmapped strings (openai/<gateway-id>, etc.);
+        # the helper must fall back to the cap, not propagate the exception.
+        settings = _make_settings(llm=LLMSettings(model="openai/custom-gateway-deploy-xyz", api_key="k"))
+        result = _bounded_max_tokens(settings)
+        assert isinstance(result, int)
+        assert 0 < result <= _OUTPUT_TOKEN_CAP
+
+    def test_large_knowledge_budget_is_not_truncated(self) -> None:
+        # An enlarged summary budget must not be clipped by the output cap.
+        settings = _make_settings(knowledge_state_max_tokens=10000)
+        result = _bounded_max_tokens(settings)
+        assert result >= settings.knowledge_state_max_tokens
+        assert result <= litellm.get_max_tokens(settings.llm.model)
 
 
 # ============================================================
@@ -646,6 +692,7 @@ class TestCompressKnowledgeSummary:
         assert call_kwargs["temperature"] == 0.2
         assert "Verbose summary." in call_kwargs["messages"][1]["content"]
         assert "Compress Topic" in call_kwargs["messages"][1]["content"]
+        assert call_kwargs["max_tokens"] == _bounded_max_tokens(settings)
 
     async def test_exposes_completion_usage(self) -> None:
         """OVH-129: compression captures the completion's token usage so its cost
@@ -772,6 +819,7 @@ class TestAnalyzeArticles:
         assert len(messages) == 2
         assert "Known facts." in messages[1]["content"]
         assert "My Topic" in messages[1]["content"]
+        assert call_kwargs["max_tokens"] == _bounded_max_tokens(settings)
 
     async def test_custom_base_url_reaches_llm_for_cloud_provider(self) -> None:
         """Regression (#51): a base_url set on an openai/ model reaches litellm as api_base.
@@ -876,6 +924,7 @@ class TestGenerateInitialKnowledge:
         assert call_kwargs["temperature"] == 0.2
         messages = call_kwargs["messages"]
         assert "Init Topic" in messages[1]["content"]
+        assert call_kwargs["max_tokens"] == _bounded_max_tokens(settings)
 
     async def test_recomputes_token_count(self) -> None:
         expected = KnowledgeStateUpdate(
@@ -946,6 +995,7 @@ class TestGenerateKnowledgeUpdate:
         assert "Old summary." in user_msg
         assert "New price announced" in user_msg
         assert "$39.99" in user_msg
+        assert call_kwargs["max_tokens"] == _bounded_max_tokens(settings)
 
     async def test_recomputes_token_count(self) -> None:
         expected = KnowledgeStateUpdate(sufficient_data=True, confidence=0.9, updated_summary="Text.", token_count=999)
