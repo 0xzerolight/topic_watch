@@ -1436,6 +1436,8 @@ class TestFetchNewArticlesForTopic:
             feed_state_loader=None,
             backoff_base_minutes=15,
             backoff_cap_hours=24,
+            exa_settings=None,
+            max_results=10,
         ):
             # Simulate a successful feed fetch that triggers a health write.
             if health_callback:

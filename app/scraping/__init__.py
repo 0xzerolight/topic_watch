@@ -9,6 +9,7 @@ import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 import httpx
 
@@ -25,6 +26,9 @@ from app.scraping.content import extract_article_content
 from app.scraping.google_news import is_google_news_url, resolve_google_news_urls
 from app.scraping.rss import FeedEntry, compute_article_hash, fetch_feeds_for_topic
 from app.scraping.rss import FeedResponse as FeedResponse
+
+if TYPE_CHECKING:
+    from app.config import ExaSettings
 
 logger = logging.getLogger(__name__)
 
@@ -323,6 +327,7 @@ async def fetch_new_articles_for_topic(
     concurrency: int = _CONTENT_FETCH_CONCURRENCY,
     feed_backoff_base_minutes: int = 15,
     feed_backoff_cap_hours: int = 24,
+    exa_settings: "ExaSettings | None" = None,
 ) -> FetchResult:
     """Fetch feeds, dedup against DB, extract content, and store new articles.
 
@@ -334,6 +339,7 @@ async def fetch_new_articles_for_topic(
         article_fetch_timeout: Timeout in seconds for article content fetches.
         feed_max_retries: Maximum retry attempts for feed fetching.
         concurrency: Maximum number of concurrent article content fetches.
+        exa_settings: Exa configuration, required for EXA-mode topics (ignored otherwise).
 
     Returns:
         FetchResult with stored articles and total feed entry count.
@@ -354,6 +360,8 @@ async def fetch_new_articles_for_topic(
         feed_state_loader=_make_feed_state_loader(conn),
         backoff_base_minutes=feed_backoff_base_minutes,
         backoff_cap_hours=feed_backoff_cap_hours,
+        exa_settings=exa_settings,
+        max_results=max_articles,
     )
     conn.commit()
     entries = response.entries

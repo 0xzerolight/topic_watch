@@ -166,6 +166,7 @@ async def _check_topic_inner(
             concurrency=settings.content_fetch_concurrency,
             feed_backoff_base_minutes=settings.feed_backoff_base_minutes,
             feed_backoff_cap_hours=settings.feed_backoff_cap_hours,
+            exa_settings=settings.exa,
         )
     except Exception as exc:
         logger.warning("Scraping failed for topic '%s'", topic.name, exc_info=True)
@@ -671,6 +672,7 @@ async def initialize_new_topic(
             concurrency=settings.content_fetch_concurrency,
             feed_backoff_base_minutes=settings.feed_backoff_base_minutes,
             feed_backoff_cap_hours=settings.feed_backoff_cap_hours,
+            exa_settings=settings.exa,
         )
         articles = fetch_result.articles
 
