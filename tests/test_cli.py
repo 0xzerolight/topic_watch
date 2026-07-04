@@ -18,7 +18,7 @@ from app.crud import (
 )
 from app.database import get_connection, get_db, get_schema_version, init_db
 from app.migrations import MIGRATIONS
-from app.models import Article, Topic, TopicStatus
+from app.models import Article, FeedMode, Topic, TopicStatus
 from app.scraping import FetchResult
 from app.scraping.rss import FeedResponse
 
@@ -124,6 +124,35 @@ class TestCmdDoctor:
         assert "SECRETTOKEN" not in out
         assert "feeds: 0 OK / 1 failing" in out
         assert "(x2)" in out
+
+    def test_exa_block_rendered_secret_safe(self, capsys: pytest.CaptureFixture[str]) -> None:
+        from app.config import ExaSettings
+
+        s = _make_settings(
+            exa=ExaSettings(enabled=True, api_key="EXASECRET"),
+            db_path="/nonexistent/x.db",
+        )
+        out = self._run(s, capsys)
+        assert "exa.enabled: True" in out
+        assert "exa.api_key: set" in out
+        assert "EXASECRET" not in out
+
+    def test_exa_key_not_set_and_env_marked(self, capsys: pytest.CaptureFixture[str]) -> None:
+        s = _make_settings(db_path="/nonexistent/x.db")
+        out = self._run(s, capsys)
+        assert "exa.enabled: False" in out
+        assert "exa.api_key: not set" in out
+        # env-sourced marker uses the exa-specific helper
+        with (
+            patch("app.cli.load_settings", return_value=s),
+            patch("app.cli._in_docker", return_value=False),
+            patch("app.cli.is_exa_key_env_sourced", return_value=True),
+        ):
+            from app.cli import _cmd_doctor
+
+            _cmd_doctor()
+        out2 = capsys.readouterr().out
+        assert "exa.api_key: not set (from env)" in out2
 
     def test_topic_and_feed_counts(self, capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
         db_path = _real_db(tmp_path)
@@ -367,6 +396,34 @@ class TestCmdInit:
         assert "no articles" in updated.error_message.lower()
         # status_changed_at must be refreshed on the ERROR transition too.
         assert updated.status_changed_at is not None
+
+    async def test_init_all_sources_failed_message(self, db_conn: sqlite3.Connection) -> None:
+        """A total source failure (e.g. bad Exa key) reports credentials, not 'no articles'."""
+        topic = create_topic(
+            db_conn,
+            Topic(name="ExaKeyBad", description="d", feed_mode=FeedMode.EXA, feed_urls=[], status=TopicStatus.NEW),
+        )
+        db_conn.commit()
+        settings = _make_settings()
+
+        with (
+            patch("app.cli.load_settings", return_value=settings),
+            patch("app.cli.init_db"),
+            patch("app.cli.get_db") as mock_get_db,
+            patch(
+                "app.scraping.fetch_feeds_for_topic",
+                new_callable=AsyncMock,
+                return_value=FeedResponse(provider_name="exa", feeds_total=1, feeds_failed=1),
+            ),
+        ):
+            mock_get_db.return_value.__enter__ = lambda s: db_conn
+            mock_get_db.return_value.__exit__ = lambda s, *a: None
+            with pytest.raises(SystemExit, match="1"):
+                await _cmd_init("ExaKeyBad")
+
+        updated = get_topic(db_conn, topic.id)
+        assert updated.status == TopicStatus.ERROR
+        assert updated.error_message.startswith("All feed source(s) failed")
 
     async def test_init_knowledge_failure_sets_error(self, db_conn: sqlite3.Connection) -> None:
         topic = create_topic(

@@ -24,7 +24,7 @@ from collections import Counter
 from datetime import UTC, datetime
 from urllib.parse import urlparse
 
-from app.config import Settings, is_api_key_env_sourced, load_settings, resolve_db_path
+from app.config import Settings, is_api_key_env_sourced, is_exa_key_env_sourced, load_settings, resolve_db_path
 from app.crud import (
     get_topic_by_name,
     list_all_feed_health,
@@ -136,7 +136,7 @@ async def _run_init(topic: Topic, topic_name: str, conn: sqlite3.Connection, set
     Returns True if the init failed (caller should exit 1).
     """
     from app.analysis.knowledge import initialize_knowledge
-    from app.scraping import fetch_new_articles_for_topic
+    from app.scraping import all_sources_failed, fetch_new_articles_for_topic
 
     # Fetch articles
     try:
@@ -154,10 +154,18 @@ async def _run_init(topic: Topic, topic_name: str, conn: sqlite3.Connection, set
         return True
 
     if not articles:
-        logger.error("No articles found for '%s'. Check the feed URLs.", topic_name)
+        # Mode-agnostic message: EXA topics have no feed URLs, so don't tell the operator
+        # to "check the feed URLs" — a total source failure (bad key / feeds down) reads
+        # differently from a genuinely empty result.
+        sources_down = all_sources_failed(fetch_result.feeds_total, fetch_result.feeds_failed)
+        logger.error("No articles found for '%s' (check feed sources / credentials; see logs).", topic_name)
         topic.status = TopicStatus.ERROR
         topic.status_changed_at = datetime.now(UTC)
-        topic.error_message = "No articles found during initialization"
+        topic.error_message = (
+            "All feed source(s) failed during initialization (check credentials/connectivity; see logs)"
+            if sources_down
+            else "No articles found during initialization"
+        )
         update_topic(conn, topic)
         conn.commit()
         return True
@@ -227,6 +235,15 @@ def _render_config(settings: Settings) -> list[str]:
     if llm.base_url:
         lines.append(f"  llm.base_url: {redact_url(llm.base_url)}")
 
+    exa = settings.exa
+    lines.append(f"  exa.enabled: {exa.enabled}")
+    exa_key_state = "set" if exa.api_key else "not set"
+    if is_exa_key_env_sourced():
+        exa_key_state += " (from env)"
+    lines.append(f"  exa.api_key: {exa_key_state}")
+    if exa.base_url:
+        lines.append(f"  exa.base_url: {redact_url(exa.base_url)}")
+
     for label, urls in (
         ("notifications.urls", settings.notifications.urls),
         ("notifications.webhook_urls", settings.notifications.webhook_urls),
@@ -242,7 +259,7 @@ def _render_config(settings: Settings) -> list[str]:
 
     dumped = settings.model_dump()
     for key, value in dumped.items():
-        if key in ("llm", "notifications"):
+        if key in ("llm", "notifications", "exa"):
             continue  # sub-models rendered above
         if isinstance(value, (str, int, float, bool)):
             lines.append(f"  {key}: {value}")

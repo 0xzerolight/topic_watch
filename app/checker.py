@@ -33,7 +33,7 @@ from app.crud import (
 from app.database import get_db, short_conn
 from app.models import CheckResult, NotificationDelivery, PendingNotification, Topic, TopicStatus
 from app.notifications import format_notification, redact_url, send_notification, send_notification_per_url
-from app.scraping import fetch_new_articles_for_topic
+from app.scraping import all_sources_failed, fetch_new_articles_for_topic
 from app.web.state import _checking_state
 from app.webhooks import retry_pending_webhooks, send_webhooks
 
@@ -178,6 +178,11 @@ async def _check_topic_inner(
     result.articles_new = len(new_articles)
 
     if not new_articles:
+        # Distinguish a genuine "nothing new" from a total source failure (e.g. a bad
+        # Exa key going stale, or every RSS feed down) so the detail page/`doctor` show
+        # the real cause instead of a silent empty check. Mode-agnostic by design.
+        if all_sources_failed(fetch_result.feeds_total, fetch_result.feeds_failed):
+            result.stage_error = "sources_failed: all feed source(s) failed (see logs)"
         logger.info("Topic '%s': no new articles found", topic.name)
         return _record_result(conn, result)
 
@@ -690,9 +695,17 @@ async def initialize_new_topic(
                     topic.init_attempts,
                 )
                 return
+            # A total source failure on the first init (e.g. a bad Exa key, or every
+            # RSS feed down) is distinct from a genuinely empty result — surface the
+            # real cause so the operator knows to check credentials/connectivity.
+            init_error = (
+                "All feed source(s) failed during initialization (check credentials/connectivity; see logs)"
+                if all_sources_failed(fetch_result.feeds_total, fetch_result.feeds_failed)
+                else "No articles found during initialization"
+            )
             _set_init_status(
                 TopicStatus.ERROR,
-                error_message="No articles found during initialization",
+                error_message=init_error,
                 init_attempts=topic.init_attempts,
             )
             return

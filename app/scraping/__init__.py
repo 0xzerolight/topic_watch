@@ -128,6 +128,15 @@ def _make_feed_state_loader(conn: sqlite3.Connection):
     return loader
 
 
+def all_sources_failed(feeds_total: int, feeds_failed: int) -> bool:
+    """True when every attempted feed source failed (source-agnostic).
+
+    ``feeds_total == 0`` means nothing was attempted (e.g. an EXA topic with Exa
+    disabled), which is NOT a fetch failure — so this returns False there.
+    """
+    return bool(feeds_total) and feeds_failed >= feeds_total
+
+
 def _log_feed_coverage(topic: Topic, feeds_total: int, feeds_failed: int) -> None:
     """Log a degraded/total feed-fetch failure so partial coverage is visible.
 
@@ -142,7 +151,7 @@ def _log_feed_coverage(topic: Topic, feeds_total: int, feeds_failed: int) -> Non
             feeds_failed,
             feeds_total,
         )
-    elif feeds_total and feeds_failed >= feeds_total:
+    elif all_sources_failed(feeds_total, feeds_failed):
         logger.warning("Topic '%s': all %d feed fetch(es) failed", topic.name, feeds_total)
 
 
