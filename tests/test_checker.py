@@ -21,6 +21,7 @@ from app.crud import (
 )
 from app.models import (
     Article,
+    FeedMode,
     KnowledgeState,
     NotificationDelivery,
     PendingNotification,
@@ -1716,3 +1717,76 @@ class TestRetryPendingNotifications:
         remaining_ids = {r["id"] for r in remaining}
         assert first_id not in remaining_ids
         assert len(remaining_ids) == 1
+
+
+class TestSourcesFailedSurfacing:
+    """Mode-agnostic all-sources-failed surfacing on the check and init paths."""
+
+    async def _check(self, db_conn: sqlite3.Connection, topic: Topic, *, feeds_total: int, feeds_failed: int):
+        settings = _make_settings()
+        with patch(
+            "app.checker.fetch_new_articles_for_topic",
+            new_callable=AsyncMock,
+            return_value=FetchResult(
+                articles=[], total_feed_entries=0, feeds_total=feeds_total, feeds_failed=feeds_failed
+            ),
+        ):
+            return await check_topic(topic, db_conn, settings)
+
+    async def test_check_all_sources_failed_sets_stage_error(self, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn)
+        result = await self._check(db_conn, topic, feeds_total=1, feeds_failed=1)
+        assert result.stage_error is not None
+        assert result.stage_error.startswith("sources_failed")
+        # Persisted on the row so the detail page surfaces it.
+        row = db_conn.execute("SELECT stage_error FROM check_results WHERE id = ?", (result.id,)).fetchone()
+        assert row["stage_error"].startswith("sources_failed")
+
+    async def test_check_healthy_empty_no_stage_error(self, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn)
+        result = await self._check(db_conn, topic, feeds_total=1, feeds_failed=0)
+        assert result.stage_error is None
+
+    async def test_check_nothing_attempted_no_stage_error(self, db_conn: sqlite3.Connection) -> None:
+        """feeds_total=0 (e.g. Exa disabled) is not a fetch failure."""
+        topic = _make_topic(db_conn)
+        result = await self._check(db_conn, topic, feeds_total=0, feeds_failed=0)
+        assert result.stage_error is None
+
+    async def test_check_surfacing_is_mode_agnostic(self, db_conn: sqlite3.Connection) -> None:
+        """An AUTO topic with the all-failed shape ALSO gets sources_failed (no FeedMode coupling)."""
+        topic = _make_topic(db_conn, name="AutoFail", feed_mode=FeedMode.AUTO, feed_urls=[])
+        result = await self._check(db_conn, topic, feeds_total=1, feeds_failed=1)
+        assert result.stage_error is not None
+        assert result.stage_error.startswith("sources_failed")
+
+    async def test_init_all_sources_failed_message(self, db_conn: sqlite3.Connection) -> None:
+        from app.checker import initialize_new_topic
+
+        topic = _make_topic(db_conn, name="ExaInitFail", feed_mode=FeedMode.EXA, feed_urls=[], status=TopicStatus.NEW)
+        settings = _make_settings()
+        with patch(
+            "app.checker.fetch_new_articles_for_topic",
+            new_callable=AsyncMock,
+            return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=1, feeds_failed=1),
+        ):
+            await initialize_new_topic(topic, db_conn, settings)
+        updated = get_topic(db_conn, topic.id)
+        assert updated.status == TopicStatus.ERROR
+        assert updated.error_message.startswith("All feed source(s) failed")
+
+    async def test_init_empty_result_keeps_generic_message(self, db_conn: sqlite3.Connection) -> None:
+        """A genuinely empty first init (feeds_total=0) keeps the generic message."""
+        from app.checker import initialize_new_topic
+
+        topic = _make_topic(db_conn, name="ExaInitEmpty", feed_mode=FeedMode.EXA, feed_urls=[], status=TopicStatus.NEW)
+        settings = _make_settings()
+        with patch(
+            "app.checker.fetch_new_articles_for_topic",
+            new_callable=AsyncMock,
+            return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=0, feeds_failed=0),
+        ):
+            await initialize_new_topic(topic, db_conn, settings)
+        updated = get_topic(db_conn, topic.id)
+        assert updated.status == TopicStatus.ERROR
+        assert updated.error_message == "No articles found during initialization"
