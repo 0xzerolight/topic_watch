@@ -183,21 +183,46 @@ def _summarize_exc(exc: BaseException, *, limit: int = 200) -> str:
     return summary[:limit]
 
 
+# Permanent client-side 4xx errors: retrying them is pointless (the same request
+# fails identically) and, worse, instructor's retry loop buries the provider's
+# real message inside an opaque ``RetryError[<Future ... raised BadRequestError>]``
+# — the exact symptom reported for a new topic's first check (issue #53). Excluding
+# them from instructor's retry set makes the call fail once with the real error
+# surfaced (readable in ``str`` and bare on ``__cause__``). Exclusion is by TYPE,
+# not HTTP status, so a bare ``APIError(status_code=400)`` stays retryable and
+# ``BadRequestError`` subclasses (``ContextWindowExceededError`` etc.) are covered
+# via ``isinstance``.
+_NON_RETRYABLE_LLM_ERRORS = (
+    litellm.BadRequestError,  # 400
+    litellm.AuthenticationError,  # 401
+    litellm.PermissionDeniedError,  # 403
+    litellm.NotFoundError,  # 404 (unknown model/route)
+    litellm.UnprocessableEntityError,  # 422
+)
+
+
 def _instructor_retries(max_retries: int) -> AsyncRetrying:
     """Build instructor's per-call retry policy.
 
     Instructor's ``max_retries`` governs structured-output *validation* retries
     (re-prompting when the LLM's response fails Pydantic validation). We keep
-    those, but explicitly exclude ``RateLimitError`` from instructor's retry set
-    so a 429 propagates *bare* to ``_call_with_rate_limit_retry``, which owns the
-    rate-limit backoff. Otherwise instructor would swallow the 429 inside an
-    ``InstructorRetryException`` and immediately re-fire it ``max_retries`` times
-    with zero delay — hammering the throttled provider and hiding the rate limit
-    from operators (OVH-008).
+    those, but exclude two families from instructor's retry set:
+
+    - ``RateLimitError`` (429): propagates *bare* to ``_call_with_rate_limit_retry``,
+      which owns the rate-limit backoff. Otherwise instructor would swallow the 429
+      inside an ``InstructorRetryException`` and immediately re-fire it
+      ``max_retries`` times with zero delay — hammering the throttled provider and
+      hiding the rate limit from operators (OVH-008).
+    - ``_NON_RETRYABLE_LLM_ERRORS`` (permanent 4xx): retrying can't help and only
+      masks the provider's real message behind an opaque ``RetryError`` — the
+      issue #53 symptom. Excluding them fails fast with the true error visible.
+
+    ``ValidationError`` is deliberately absent from both, so structured-output
+    re-prompting is preserved.
     """
     return AsyncRetrying(
         stop=stop_after_attempt(max_retries + 1),
-        retry=retry_if_not_exception_type(litellm.RateLimitError),
+        retry=retry_if_not_exception_type((litellm.RateLimitError, *_NON_RETRYABLE_LLM_ERRORS)),
     )
 
 
