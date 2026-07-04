@@ -168,7 +168,7 @@ async def complete_setup(
     """Process setup form and start the application."""
     from pydantic import ValidationError
 
-    from app.config import LLMSettings, NotificationSettings
+    from app.config import ExaSettings, LLMSettings, NotificationSettings
     from app.scheduler import start_scheduler
 
     # Single-shot setup (OVH-059): once configured, a replay/double-submit/stale-bookmark
@@ -195,6 +195,10 @@ async def complete_setup(
                 base_url=effective_base_url,
             ),
             notifications=NotificationSettings(),
+            # Pass exa explicitly (mirrors notifications) so a TOPIC_WATCH_EXA__API_KEY env
+            # secret is not env-sourced into new_settings and then written to plaintext YAML
+            # by the default preserve_exa_key=False (OVH-003). Env still wins at load.
+            exa=ExaSettings(),
         )
         # Pre-flight: confirm the credentials actually work before completing setup,
         # so a bad key/model/base_url is caught here instead of failing silently later.

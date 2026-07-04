@@ -22,6 +22,16 @@ llm:
   # model: "openai/<gateway-model-id>"
   # base_url: "https://opencode.ai/zen/go/v1"
 
+# Exa AI search source (optional). A paid semantic web-search API (https://exa.ai)
+# that a topic can use instead of RSS by selecting the "Exa AI search" source mode.
+# Bring your own key; also settable via TOPIC_WATCH_EXA__API_KEY.
+# NOTE: each check runs one paid Exa search — mind your per-topic check interval.
+exa:
+  enabled: false
+  api_key: ""
+  # Optional advanced/proxy override; defaults to https://api.exa.ai when unset.
+  # base_url: "https://api.exa.ai"
+
 # Notification settings
 # Uses Apprise URL format. See: https://github.com/caronc/apprise/wiki
 # No notifications are sent until you add at least one URL (here or on the

@@ -429,3 +429,41 @@ class TestProviderTypoCaseInsensitive:
         with caplog.at_level(logging.WARNING, logger="app.config"):
             Settings(llm={"model": "opena/gpt-4o", "api_key": "sk"})  # type: ignore[call-arg]
         assert any("Did you mean" in r.message for r in caplog.records)
+
+
+class TestExaConfig:
+    """Exa settings: defaults, YAML load, env override, env-sourced detection."""
+
+    def test_exa_defaults_disabled_and_empty(self, minimal_config_yaml: Path) -> None:
+        """A config with no exa block yields a disabled, keyless ExaSettings."""
+        settings = load_settings(config_path=minimal_config_yaml)
+        assert settings.exa.enabled is False
+        assert settings.exa.api_key == ""
+        assert settings.exa.base_url is None
+
+    def test_exa_loaded_from_yaml(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("TOPIC_WATCH_EXA__API_KEY", raising=False)
+        config = tmp_path / "config.yml"
+        config.write_text(
+            'llm:\n  model: "openai/gpt-4o-mini"\n  api_key: "sk"\nexa:\n  enabled: true\n  api_key: "exa-yaml-key"\n'
+        )
+        settings = load_settings(config_path=config)
+        assert settings.exa.enabled is True
+        assert settings.exa.api_key == "exa-yaml-key"
+
+    def test_env_overrides_exa_api_key(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("TOPIC_WATCH_EXA__API_KEY", "exa-env-key")
+        config = tmp_path / "config.yml"
+        config.write_text(
+            'llm:\n  model: "openai/gpt-4o-mini"\n  api_key: "sk"\nexa:\n  enabled: true\n  api_key: "exa-yaml-key"\n'
+        )
+        settings = load_settings(config_path=config)
+        assert settings.exa.api_key == "exa-env-key"
+
+    def test_is_exa_key_env_sourced(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from app.config import is_exa_key_env_sourced
+
+        monkeypatch.delenv("TOPIC_WATCH_EXA__API_KEY", raising=False)
+        assert is_exa_key_env_sourced() is False
+        monkeypatch.setenv("TOPIC_WATCH_EXA__API_KEY", "exa-env-key")
+        assert is_exa_key_env_sourced() is True
