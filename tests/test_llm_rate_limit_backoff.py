@@ -8,6 +8,7 @@ import litellm
 import pytest
 
 from app.analysis.llm import (
+    InstructorRetryException,
     KnowledgeStateUpdate,
     NoveltyResult,
     _call_with_rate_limit_retry,
@@ -60,6 +61,16 @@ def _make_rate_limit_error() -> litellm.RateLimitError:
         message="Rate limit exceeded",
         llm_provider="openai",
         model="gpt-4",
+    )
+
+
+def _make_bad_request_error() -> litellm.BadRequestError:
+    # Shape of the real issue #53 400: litellm auto-injects the model's full
+    # max_tokens (64000 for claude-haiku-4-5), which Anthropic rejects.
+    return litellm.BadRequestError(
+        message="AnthropicException - max_tokens: 64000 > 8192, the maximum allowed",
+        llm_provider="anthropic",
+        model="claude-haiku-4-5",
     )
 
 
@@ -484,4 +495,86 @@ class TestRealInstructorStackBackoff:
         assert result.has_new_info is False
         assert all(d == 0 for d in sleeps)
         # Instructor retried the non-429 itself: max_retries + 1 = 3 attempts.
+        # NB: a bare ``APIError(status_code=400)`` is NOT a ``BadRequestError``, so
+        # the permanent-4xx exclusion (issue #53) does not apply — it stays retried.
+        # This pins the exclusion to exception TYPE, not HTTP status code.
+        assert counter["calls"] == 3
+
+
+# ============================================================
+# TestPermanentClientErrorNotRetried (issue #53)
+# ============================================================
+#
+# A permanent client error (litellm 4xx, e.g. BadRequestError) must NOT be
+# retried and must NOT be masked. Issue #53: a new topic's first check surfaced
+# the opaque ``RetryError[<Future ... raised BadRequestError>]`` because a
+# permanent 400 was treated as retryable — fired ``max_retries+1`` times, then
+# wrapped so the provider's real message was hidden. The retry policy now
+# excludes permanent litellm 4xx by TYPE, so the call happens once and the real
+# error surfaces (bare on ``__cause__``; readable in ``str``).
+
+
+class TestPermanentClientErrorNotRetried:
+    async def test_init_surfaces_real_error_without_retry(self) -> None:
+        """generate_initial_knowledge: one call, real message, no RetryError mask."""
+        settings = _make_settings(llm_max_retries=2)
+
+        with (
+            _real_instructor_raising(_make_bad_request_error) as counter,
+            patch("app.analysis.llm.asyncio.sleep", new=AsyncMock()),
+            pytest.raises(InstructorRetryException) as exc_info,
+        ):
+            await generate_initial_knowledge([_make_article()], _make_topic(), settings)
+
+        # Called exactly once — a permanent 400 is not retried (was max_retries+1=3).
+        assert counter["calls"] == 1
+        # The provider's real message surfaces; the opaque RetryError wrapper is gone,
+        # and the underlying BadRequestError is preserved on __cause__.
+        assert "RetryError" not in str(exc_info.value)
+        assert "max_tokens" in str(exc_info.value)
+        assert isinstance(exc_info.value.__cause__, litellm.BadRequestError)
+
+    async def test_analyze_articles_reports_real_error_not_wrapper(self) -> None:
+        """analyze_articles stays fail-safe but stores the real error, not RetryError[...]."""
+        settings = _make_settings(llm_max_retries=2)
+
+        with (
+            _real_instructor_raising(_make_bad_request_error) as counter,
+            patch("app.analysis.llm.asyncio.sleep", new=AsyncMock()),
+        ):
+            result = await analyze_articles([_make_article()], "Known facts.", _make_topic(), settings)
+
+        # Fail-safe result preserved (settled decision #3), no 3x hammering.
+        assert result.has_new_info is False
+        assert result.confidence == 0.0
+        assert counter["calls"] == 1
+        # Stored error is the real provider message (truncated 200 chars), not RetryError[...].
+        assert result.error is not None
+        assert "RetryError" not in result.error
+        assert "max_tokens" in result.error
+
+    async def test_genuine_validation_error_still_retried(self) -> None:
+        """Excluding permanent 4xx must NOT disable structured-output validation retries."""
+        settings = _make_settings(llm_max_retries=2)
+
+        def _pydantic_validation_error() -> Exception:
+            from pydantic import BaseModel
+
+            class _Req(BaseModel):
+                x: int
+
+            try:
+                _Req.model_validate({})
+            except Exception as e:  # pydantic.ValidationError
+                return e
+            raise AssertionError("expected a ValidationError")
+
+        with (
+            _real_instructor_raising(_pydantic_validation_error) as counter,
+            patch("app.analysis.llm.asyncio.sleep", new=AsyncMock()),
+            pytest.raises(InstructorRetryException),
+        ):
+            await generate_initial_knowledge([_make_article()], _make_topic(), settings)
+
+        # Not a permanent 4xx -> instructor still retries it max_retries + 1 = 3 times.
         assert counter["calls"] == 3
