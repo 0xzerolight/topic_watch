@@ -70,6 +70,32 @@
     </section>
 
     <section class="card">
+        <span class="card-kicker">Exa Search</span>
+
+        <label>
+            <input type="checkbox" name="enable_exa" value="true" role="switch"
+                   {% if (form.enable_exa if form is defined and form else settings.exa.enabled) %}checked{% endif %}>
+            Enable Exa AI search source
+        </label>
+        <small class="help">Lets a topic use the Exa semantic web-search API instead of RSS. Each check runs one paid Exa search — mind your per-topic check interval.</small>
+
+        {% if exa_key_env_sourced %}
+        <div class="field-group" style="margin-top: 1rem;">
+            <label for="exa_api_key">Exa API Key <small>(set via environment — read-only)</small></label>
+            <input type="text" id="exa_api_key" value="(set via environment variable TOPIC_WATCH_EXA__API_KEY)" disabled>
+            <small class="help">The Exa API key is supplied by an environment variable and cannot be changed here. Edits to this field are ignored and the key is never written to the config file.</small>
+        </div>
+        {% else %}
+        <div class="field-group" style="margin-top: 1rem;">
+            <label for="exa_api_key">Exa API Key <small>(leave blank to keep current key)</small></label>
+            <input type="password" id="exa_api_key" name="exa_api_key"
+                   value="{{ form.exa_api_key if form else '' }}"
+                   placeholder="{{ settings.exa.api_key[:4] }}...{{ settings.exa.api_key[-4:] if settings.exa.api_key|length > 8 else '****' }}">
+        </div>
+        {% endif %}
+    </section>
+
+    <section class="card">
         <span class="card-kicker">Notifications</span>
 
         <div class="field-group">

@@ -51,7 +51,7 @@
     </div>
     <div>
         <dt>Feed mode</dt>
-        <dd>{{ "Automatic" if topic.feed_mode.value == "auto" else "Manual" }}</dd>
+        <dd>{% if topic.feed_mode.value == "auto" %}Automatic{% elif topic.feed_mode.value == "exa" %}Exa AI search{% else %}Manual{% endif %}</dd>
     </div>
     <div>
         <dt>Confidence threshold</dt>

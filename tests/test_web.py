@@ -4,13 +4,14 @@ import logging
 import re
 import sqlite3
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 
-from app.config import LLMSettings, NotificationSettings, Settings
+from app.config import ExaSettings, LLMSettings, NotificationSettings, Settings
 from app.crud import (
     create_check_result,
     create_knowledge_state,
@@ -1511,3 +1512,119 @@ class TestCheckAll:
             response = await client.post("/check-all", follow_redirects=False)
         assert response.status_code == 303
         assert response.headers["location"] == "/"
+
+
+@asynccontextmanager
+async def _exa_client(db_conn: sqlite3.Connection, *, enabled: bool):
+    """A test client whose settings have Exa enabled/disabled (with a key when enabled)."""
+    settings = _make_settings(exa=ExaSettings(enabled=enabled, api_key="exa-key" if enabled else ""))
+
+    def override_db():
+        yield db_conn
+
+    def override_settings():
+        return settings
+
+    app.dependency_overrides[get_db_conn] = override_db
+    app.dependency_overrides[get_settings] = override_settings
+    try:
+        with patch("app.web.routers.settings.load_settings", return_value=settings):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://test",
+                cookies={"csrf_token": CSRF_TEST_TOKEN},
+                headers={"X-CSRF-Token": CSRF_TEST_TOKEN},
+            ) as ac:
+                yield ac
+    finally:
+        app.dependency_overrides.clear()
+
+
+class TestExaFeedModeWeb:
+    """Web layer for the EXA feed mode: create/edit guards, strict validation, detail render."""
+
+    async def test_create_exa_topic_when_enabled(self, db_conn: sqlite3.Connection) -> None:
+        async with _exa_client(db_conn, enabled=True) as client:
+            with patch("app.web.routers.background._run_init", new_callable=AsyncMock):
+                response = await client.post(
+                    "/topics",
+                    data={"name": "Exa Topic", "description": "d", "feed_mode": "exa", "feed_urls": "ignored"},
+                    follow_redirects=False,
+                )
+        assert response.status_code == 303
+        from app.crud import get_topic_by_name
+
+        topic = get_topic_by_name(db_conn, "Exa Topic")
+        assert topic is not None
+        assert topic.feed_mode == FeedMode.EXA
+        assert topic.feed_urls == []  # EXA carries no manual feed URLs
+
+    async def test_create_exa_topic_rejected_when_disabled(self, db_conn: sqlite3.Connection) -> None:
+        async with _exa_client(db_conn, enabled=False) as client:
+            response = await client.post(
+                "/topics",
+                data={"name": "Exa Off", "description": "d", "feed_mode": "exa"},
+                follow_redirects=False,
+            )
+        assert response.status_code == 422
+        assert "Exa search is not enabled" in response.text
+        from app.crud import get_topic_by_name
+
+        assert get_topic_by_name(db_conn, "Exa Off") is None
+
+    async def test_unknown_feed_mode_rejected(self, db_conn: sqlite3.Connection) -> None:
+        async with _exa_client(db_conn, enabled=True) as client:
+            response = await client.post(
+                "/topics",
+                data={"name": "Bad Mode", "description": "d", "feed_mode": "bogus"},
+                follow_redirects=False,
+            )
+        assert response.status_code == 422
+        assert "Invalid feed mode" in response.text
+
+    async def test_edit_conversion_into_exa_rejected_when_disabled(self, db_conn: sqlite3.Connection) -> None:
+        """Converting a working AUTO topic into EXA while Exa is off is blocked."""
+        topic = _make_topic(db_conn, name="Auto2Exa", feed_mode=FeedMode.AUTO, feed_urls=[])
+        async with _exa_client(db_conn, enabled=False) as client:
+            response = await client.post(
+                f"/topics/{topic.id}/edit",
+                data={"name": "Auto2Exa", "description": "d", "feed_mode": "exa"},
+                follow_redirects=False,
+            )
+        assert response.status_code == 422
+        assert "Exa search is not enabled" in response.text
+        from app.crud import get_topic
+
+        assert get_topic(db_conn, topic.id).feed_mode == FeedMode.AUTO  # unchanged
+
+    async def test_edit_already_exa_topic_allowed_when_disabled(self, db_conn: sqlite3.Connection) -> None:
+        """An already-EXA topic can still be edited while Exa is disabled (degrades gracefully)."""
+        topic = _make_topic(db_conn, name="StaysExa", feed_mode=FeedMode.EXA, feed_urls=[])
+        async with _exa_client(db_conn, enabled=False) as client:
+            response = await client.post(
+                f"/topics/{topic.id}/edit",
+                data={"name": "StaysExa", "description": "updated desc", "feed_mode": "exa"},
+                follow_redirects=False,
+            )
+        assert response.status_code == 303
+        from app.crud import get_topic
+
+        updated = get_topic(db_conn, topic.id)
+        assert updated.feed_mode == FeedMode.EXA
+        assert updated.description == "updated desc"
+
+    async def test_detail_page_labels_exa_mode(self, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn, name="ExaDetail", feed_mode=FeedMode.EXA, feed_urls=[])
+        async with _exa_client(db_conn, enabled=True) as client:
+            response = await client.get(f"/topics/{topic.id}")
+        assert response.status_code == 200
+        assert "Exa AI search" in response.text
+        assert "No feed URLs configured" not in response.text
+
+    async def test_feed_source_fragment_for_exa(self, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn, name="ExaFrag", feed_mode=FeedMode.EXA, feed_urls=[])
+        async with _exa_client(db_conn, enabled=True) as client:
+            response = await client.get(f"/topics/{topic.id}/feed-source")
+        assert response.status_code == 200
+        assert "Exa AI semantic search" in response.text
+        assert "No feed URLs configured" not in response.text

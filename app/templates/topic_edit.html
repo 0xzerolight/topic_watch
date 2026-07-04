@@ -55,7 +55,17 @@
                        onchange="document.getElementById('manual-feeds').style.display='block'; document.getElementById('manual-feeds').setAttribute('aria-hidden','false')">
                 Manual (provide RSS URLs)
             </label>
-            <small class="help">Automatic builds a Google News feed from the topic name. Manual lets you supply your own RSS/Atom feed URLs.</small>
+            <label>
+                <input type="radio" name="feed_mode" value="exa"
+                       {{ 'checked' if current_mode == 'exa' }}
+                       aria-controls="manual-feeds"
+                       onchange="document.getElementById('manual-feeds').style.display='none'; document.getElementById('manual-feeds').setAttribute('aria-hidden','true')">
+                Exa AI search
+            </label>
+            {% if not exa_enabled and current_mode != 'exa' %}
+            <small class="help">Exa AI search requires an Exa API key — configure it in <a href="/settings">Settings</a>.</small>
+            {% endif %}
+            <small class="help">Automatic builds a Google News feed from the topic name. Manual lets you supply your own RSS/Atom feed URLs. Exa AI search uses a semantic web-search API — each check runs one paid Exa search, so mind your check interval.</small>
         </fieldset>
 
         <div id="manual-feeds" aria-hidden="{{ 'false' if current_mode == 'manual' else 'true' }}" style="{{ 'display:block' if current_mode == 'manual' else 'display:none' }}">
