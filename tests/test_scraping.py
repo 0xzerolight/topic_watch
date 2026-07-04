@@ -1143,6 +1143,83 @@ class TestExtractArticleContent:
         assert reference is not None
         assert content == _truncate(reference, 5000)
 
+    async def test_prefetched_short_circuits_no_fetch(self) -> None:
+        """Non-empty prefetched text is returned directly; no HTTP request is made."""
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(str(request.url))
+            return httpx.Response(200, text=_SAMPLE_HTML)
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            content = await extract_article_content(
+                "https://example.com/article",
+                fallback_summary="ignored",
+                client=client,
+                prefetched="Exa full text body",
+            )
+        assert content == "Exa full text body"
+        assert calls == []  # short-circuited before any fetch
+
+    async def test_prefetched_truncated(self) -> None:
+        """Over-length prefetched text is truncated to max_content_length."""
+        async with httpx.AsyncClient(transport=_mock_transport({})) as client:
+            content = await extract_article_content(
+                "https://example.com/article",
+                client=client,
+                max_content_length=100,
+                prefetched="word " * 2000,
+            )
+        assert len(content) <= 104  # 100 + "..."
+
+    async def test_empty_prefetched_falls_through_to_fetch(self) -> None:
+        """Empty prefetched falls through to the normal fetch → fallback_summary path."""
+        transport = _mock_transport({"example.com": (500, "Error")})
+        async with httpx.AsyncClient(transport=transport) as client:
+            content = await extract_article_content(
+                "https://example.com/article",
+                fallback_summary="RSS fallback",
+                client=client,
+                prefetched="",
+            )
+        assert content == "RSS fallback"
+
+
+class TestExtractContentsPrefetched:
+    """_extract_contents threads FeedEntry.content so prefetched entries skip the fetch."""
+
+    async def test_mixed_batch_only_empty_content_fetched(self) -> None:
+        """Prefetched entries make no request; a content-less entry hits the network."""
+        from app.scraping import _extract_contents
+
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(str(request.url))
+            return httpx.Response(200, text=_SAMPLE_HTML)
+
+        transport = httpx.MockTransport(handler)
+        prefetched_entry = FeedEntry(
+            title="Exa A", url="https://example.com/a", source_feed="exa", content="Prefetched A body"
+        )
+        empty_entry = FeedEntry(
+            title="RSS B", url="https://example.com/b", summary="B summary", source_feed="rss", content=None
+        )
+        batch = [(prefetched_entry, "hashA"), (empty_entry, "hashB")]
+
+        original_init = httpx.AsyncClient.__init__
+
+        def patched_init(self_client, **kwargs):
+            kwargs["transport"] = transport
+            original_init(self_client, **kwargs)
+
+        with patch.object(httpx.AsyncClient, "__init__", patched_init):
+            contents = await _extract_contents(batch, article_fetch_timeout=5.0, concurrency=2)
+
+        assert contents[0] == "Prefetched A body"  # short-circuited
+        assert calls == ["https://example.com/b"]  # only the content-less entry fetched
+
 
 # ============================================================
 # TestTruncate

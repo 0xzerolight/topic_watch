@@ -50,6 +50,10 @@ class FeedEntry(BaseModel):
     published: datetime | None = None
     summary: str = ""
     source_feed: str
+    content: str | None = None
+    """Pre-extracted full text, when the source already provides it (e.g. Exa search).
+    ``None`` for RSS entries, whose text is fetched during content extraction. When set
+    and non-empty, it short-circuits the network fetch in ``extract_article_content``."""
 
 
 @dataclass

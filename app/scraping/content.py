@@ -76,8 +76,17 @@ async def extract_article_content(
     client: httpx.AsyncClient | None = None,
     max_content_length: int = _DEFAULT_MAX_CONTENT_LENGTH,
     timeout: float = _ARTICLE_FETCH_TIMEOUT,
+    prefetched: str | None = None,
 ) -> str:
-    """Extract article text from a URL, falling back to the RSS summary."""
+    """Extract article text from a URL, falling back to the RSS summary.
+
+    ``prefetched`` short-circuits the network fetch when the source already provides
+    full text (e.g. Exa search): a non-empty value is truncated and returned directly.
+    An empty/None ``prefetched`` falls through to the normal fetch → summary path.
+    """
+    if prefetched:
+        return _truncate(prefetched, max_content_length)
+
     html = await _fetch_html(url, client, timeout=timeout)
     if html:
         # OVH-115: parse the DOM once and reuse the tree across both extraction
