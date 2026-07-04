@@ -140,7 +140,9 @@ async def _run_init(topic: Topic, topic_name: str, conn: sqlite3.Connection, set
 
     # Fetch articles
     try:
-        fetch_result = await fetch_new_articles_for_topic(topic, conn, max_articles=settings.max_articles_per_check)
+        fetch_result = await fetch_new_articles_for_topic(
+            topic, conn, max_articles=settings.max_articles_per_check, exa_settings=settings.exa
+        )
         articles = fetch_result.articles
     except Exception:
         logger.error("Failed to fetch articles for '%s'", topic_name, exc_info=True)

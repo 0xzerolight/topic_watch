@@ -29,6 +29,7 @@ from app.models import FeedMode, Topic
 from app.url_validation import is_private_url, safe_get
 
 if TYPE_CHECKING:
+    from app.config import ExaSettings
     from app.models import FeedHealth
     from app.scraping.routing import ProviderRouter
 
@@ -422,17 +423,29 @@ async def fetch_feeds_for_topic(
     feed_state_loader: Callable[[str], FeedHealth | None] | None = None,
     backoff_base_minutes: int = BACKOFF_BASE_MINUTES,
     backoff_cap_hours: int = BACKOFF_CAP_HOURS,
+    exa_settings: ExaSettings | None = None,
+    max_results: int = 10,
 ) -> FeedResponse:
     """Fetch all feeds for a topic, deduplicated by URL.
 
     For AUTO mode: uses the router to select a provider, with within-cycle
     fallback (max 1 retry with the next provider). For MANUAL mode: fetches all
-    explicit feed URLs concurrently, skipping any in a backoff window.
+    explicit feed URLs concurrently, skipping any in a backoff window. For EXA
+    mode: queries the Exa search API (``exa_settings`` required; ``max_results``
+    bounds the paid result count).
 
     ``feed_state_loader`` supplies the stored ``FeedHealth`` per URL — used to
-    send conditional-GET validators (both modes) and to skip backed-off feeds
+    send conditional-GET validators (both RSS modes) and to skip backed-off feeds
     (MANUAL only; AUTO provider backoff is owned by ``ProviderRouter``).
     """
+    if topic.feed_mode == FeedMode.EXA:
+        # Lazy import avoids an exa <-> rss module cycle (mirrors _fetch_auto's router import).
+        from app.scraping.exa import fetch_exa_entries
+
+        if exa_settings is None:
+            logger.warning("Topic '%s' uses Exa mode but no Exa settings were supplied", topic.name)
+            return FeedResponse(provider_name="exa", feeds_total=0, feeds_failed=0)
+        return await fetch_exa_entries(topic, exa_settings, max_results=max_results, timeout=timeout)
     if topic.feed_mode == FeedMode.AUTO:
         return await _fetch_auto(topic, timeout, max_attempts, health_callback, router, feed_state_loader)
     return await _fetch_manual(

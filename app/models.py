@@ -173,6 +173,7 @@ class FeedMode(StrEnum):
 
     AUTO = "auto"
     MANUAL = "manual"
+    EXA = "exa"
 
 
 class Topic(SQLiteModel):
