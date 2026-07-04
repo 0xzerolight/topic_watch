@@ -49,6 +49,7 @@ async def topic_add_form(request: Request, settings: Settings = Depends(get_sett
         {
             "global_confidence_threshold": settings.min_confidence_threshold,
             "global_relevance_threshold": settings.min_relevance_threshold,
+            "exa_enabled": settings.exa.enabled,
         },
     )
 
@@ -76,6 +77,10 @@ async def create_topic_handler(
     conf_threshold = parse_threshold(confidence_threshold, "Confidence threshold", errors)
     rel_threshold = parse_threshold(relevance_threshold, "Relevance threshold", errors)
 
+    # Guard: a brand-new EXA topic while Exa is disabled would instantly ERROR (no source).
+    if mode == FeedMode.EXA and not settings.exa.enabled:
+        errors.append("Exa search is not enabled. Configure an Exa API key in Settings first.")
+
     def _render_errors() -> HTMLResponse:
         # Reuse the already-parsed interval (no re-parse) for the schedule preview.
         formatted = format_interval(parsed_interval) if parsed_interval else ""
@@ -95,6 +100,7 @@ async def create_topic_handler(
                 "relevance_threshold": relevance_threshold,
                 "global_confidence_threshold": settings.min_confidence_threshold,
                 "global_relevance_threshold": settings.min_relevance_threshold,
+                "exa_enabled": settings.exa.enabled,
             },
             status_code=422,
         )
@@ -453,6 +459,7 @@ async def topic_edit_form(
             "tags_string": ", ".join(topic.tags),
             "global_confidence_threshold": settings.min_confidence_threshold,
             "global_relevance_threshold": settings.min_relevance_threshold,
+            "exa_enabled": settings.exa.enabled,
         },
     )
 
@@ -484,6 +491,12 @@ async def edit_topic_handler(
     conf_threshold = parse_threshold(confidence_threshold, "Confidence threshold", errors)
     rel_threshold = parse_threshold(relevance_threshold, "Relevance threshold", errors)
 
+    # Guard only a CONVERSION into EXA while Exa is disabled: block turning a working
+    # AUTO/MANUAL topic into a non-fetching EXA one. An already-EXA topic edits freely
+    # (it degrades gracefully and is surfaced via the check/init failure path).
+    if mode == FeedMode.EXA and topic.feed_mode != FeedMode.EXA and not settings.exa.enabled:
+        errors.append("Exa search is not enabled. Configure an Exa API key in Settings first.")
+
     if errors:
         # Reuse the already-parsed interval (no re-parse) for the schedule preview.
         formatted = format_interval(parsed_interval) if parsed_interval else ""
@@ -505,6 +518,7 @@ async def edit_topic_handler(
                 "default_interval": settings.check_interval,
                 "global_confidence_threshold": settings.min_confidence_threshold,
                 "global_relevance_threshold": settings.min_relevance_threshold,
+                "exa_enabled": settings.exa.enabled,
             },
             status_code=422,
         )

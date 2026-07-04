@@ -44,10 +44,16 @@ async def validate_topic_form(
     """
     from app.interval import parse_interval
 
-    mode = FeedMode.AUTO if feed_mode == "auto" else FeedMode.MANUAL
+    # Strict three-way map: an unknown mode is an error, not a silent MANUAL fallback
+    # (which would build a never-fetching EXA-as-MANUAL topic with empty feed_urls).
+    mode_map = {"auto": FeedMode.AUTO, "manual": FeedMode.MANUAL, "exa": FeedMode.EXA}
+    mode = mode_map.get(feed_mode, FeedMode.AUTO)
 
     urls: list[str] = []
     errors: list[str] = []
+    if feed_mode not in mode_map:
+        errors.append(f"Invalid feed mode: {feed_mode!r}")
+    # AUTO and EXA carry no manual feed URLs; only MANUAL validates them.
     if mode == FeedMode.MANUAL:
         urls = [u.strip() for u in feed_urls.strip().splitlines() if u.strip()]
         if urls:

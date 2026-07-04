@@ -37,6 +37,8 @@
         {% endfor %}
     </ul>
     {% endif %}
+    {% elif topic.feed_mode.value == "exa" %}
+    <p>Uses Exa AI semantic search — no fixed RSS feeds. Matching articles are found via the Exa search API on each check.</p>
     {% else %}
     {% if topic.feed_urls %}
     <ul>

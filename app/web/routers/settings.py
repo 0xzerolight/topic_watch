@@ -11,6 +11,7 @@ from app.config import (
     LOCAL_PROVIDER_DEFAULTS,
     Settings,
     is_api_key_env_sourced,
+    is_exa_key_env_sourced,
     load_settings,
     save_settings_to_yaml,
 )
@@ -76,6 +77,7 @@ def _settings_template_ctx(request: Request, **extra: object) -> dict:
         "cloud_providers": sorted(CLOUD_PROVIDERS),
         "local_provider_defaults": LOCAL_PROVIDER_DEFAULTS,
         "api_key_env_sourced": is_api_key_env_sourced(),
+        "exa_key_env_sourced": is_exa_key_env_sourced(),
     }
     # Server-side schedule preview for the default interval. Use the submitted form value
     # on a re-render (the 422 path passes form=), else the persisted setting.
@@ -263,7 +265,7 @@ async def update_settings(request: Request):
     """
     from pydantic import ValidationError
 
-    from app.config import LLMSettings, NotificationSettings
+    from app.config import ExaSettings, LLMSettings, NotificationSettings
 
     form = await request.form()
 
@@ -278,6 +280,8 @@ async def update_settings(request: Request):
     webhook_urls = _get("webhook_urls")
     # An HTML checkbox is absent when unchecked, present (value "true") when checked.
     secure_cookies = form.get("secure_cookies") is not None
+    enable_exa = form.get("enable_exa") is not None
+    exa_api_key = _get("exa_api_key")
 
     # form_values drives the 422 re-render; build it from the parsed form (single source).
     form_values: dict = {
@@ -287,6 +291,8 @@ async def update_settings(request: Request):
         "notification_urls": notification_urls,
         "webhook_urls": webhook_urls,
         "secure_cookies": secure_cookies,
+        "enable_exa": enable_exa,
+        "exa_api_key": exa_api_key,
     }
     for field in _SCALAR_FORM_FIELDS:
         form_values[field] = _get(field)
@@ -299,6 +305,11 @@ async def update_settings(request: Request):
     # field is read-only in the UI and the on-disk value is preserved on save.
     api_key_env_sourced = is_api_key_env_sourced()
     effective_api_key = llm_api_key.strip() or request.app.state.settings.llm.api_key
+    # Exa key mirrors the LLM key: blank retains current, env-sourced key is preserved (OVH-003).
+    exa_key_env_sourced = is_exa_key_env_sourced()
+    effective_exa_key = exa_api_key.strip() or request.app.state.settings.exa.api_key
+    # exa base_url is infra/proxy-only (not a form field); preserve the current value like db_path.
+    exa_base_url = request.app.state.settings.exa.base_url
     # Shared normalization (OVH-153): blank -> None. base_url is honored for every
     # provider (OVH-104 reversal); setup and settings share this seam.
     effective_base_url = normalize_base_url(llm_base_url)
@@ -332,6 +343,11 @@ async def update_settings(request: Request):
                 urls=parsed_notification_urls,
                 webhook_urls=parsed_webhook_urls,
             ),
+            exa=ExaSettings(
+                enabled=enable_exa,
+                api_key=effective_exa_key,
+                base_url=exa_base_url,
+            ),
             secure_cookies=secure_cookies,
             # db_path is infra-only (read-only in the UI); preserve current value.
             db_path=request.app.state.settings.db_path,
@@ -341,6 +357,7 @@ async def update_settings(request: Request):
             new_settings,
             request.app.state.config_path,
             preserve_api_key=api_key_env_sourced,
+            preserve_exa_key=exa_key_env_sourced,
         )
         request.app.state.settings = new_settings
     except ValidationError as exc:

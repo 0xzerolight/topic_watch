@@ -717,3 +717,80 @@ class TestEnvSourcedSecretSafety:
         response = await client.get("/settings")
         assert response.status_code == 200
         assert "set via environment" in response.text.lower()
+
+
+class TestExaSettingsWeb:
+    """POST /settings and GET /settings wiring for the Exa Search card."""
+
+    async def test_enable_exa_and_key_persist_to_state(self, client: httpx.AsyncClient) -> None:
+        with patch("app.web.routers.settings.save_settings_to_yaml"):
+            await client.post(
+                "/settings",
+                data=valid_form_data(enable_exa="true", exa_api_key="new-exa-key"),
+                follow_redirects=False,
+            )
+        assert app.state.settings.exa.enabled is True
+        assert app.state.settings.exa.api_key == "new-exa-key"
+
+    async def test_unchecked_enable_exa_is_false(self, client: httpx.AsyncClient) -> None:
+        app.state.settings = _make_settings(exa=ExaSettings(enabled=True, api_key="k"))
+        with patch("app.web.routers.settings.save_settings_to_yaml"):
+            await client.post("/settings", data=valid_form_data(), follow_redirects=False)  # no enable_exa
+        assert app.state.settings.exa.enabled is False
+
+    async def test_blank_exa_key_retains_current(self, client: httpx.AsyncClient) -> None:
+        app.state.settings = _make_settings(exa=ExaSettings(enabled=True, api_key="existing-exa"))
+        with patch("app.web.routers.settings.save_settings_to_yaml"):
+            await client.post(
+                "/settings",
+                data=valid_form_data(enable_exa="true", exa_api_key=""),
+                follow_redirects=False,
+            )
+        assert app.state.settings.exa.api_key == "existing-exa"
+
+    async def test_422_preserves_exa_fields(self, client: httpx.AsyncClient) -> None:
+        """A 422 (blank model) re-render keeps the submitted enable_exa + exa_api_key."""
+        response = await client.post(
+            "/settings",
+            data=valid_form_data(llm_model="", enable_exa="true", exa_api_key="typed-exa-key"),
+            follow_redirects=False,
+        )
+        assert response.status_code == 422
+        assert "typed-exa-key" in response.text  # value re-rendered, not blanked
+
+    async def test_env_exa_key_not_written_when_blank(
+        self, client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """OVH-003 for Exa: an env-sourced Exa key is never materialized into plaintext YAML."""
+        config_file = tmp_path / "config.yml"
+        config_file.write_text(
+            'llm:\n  model: "openai/gpt-4o-mini"\n  api_key: "sk"\n'
+            'exa:\n  enabled: true\n  api_key: "exa-on-disk-original"\n'
+        )
+        monkeypatch.setenv("TOPIC_WATCH_EXA__API_KEY", "exa-env-secret-keep-out")
+        app.state.settings = _make_settings(exa=ExaSettings(enabled=True, api_key="exa-env-secret-keep-out"))
+        app.state.config_path = config_file
+
+        def save_real(settings, config_path=None, **kwargs):
+            from app.config import save_settings_to_yaml as _real_save
+
+            _real_save(settings, config_path or config_file, **kwargs)
+
+        with patch("app.web.routers.settings.save_settings_to_yaml", side_effect=save_real):
+            await client.post(
+                "/settings",
+                data=valid_form_data(enable_exa="true", exa_api_key=""),
+                follow_redirects=False,
+            )
+
+        data = yaml.safe_load(config_file.read_text())
+        assert data["exa"]["api_key"] != "exa-env-secret-keep-out"
+        assert data["exa"]["api_key"] == "exa-on-disk-original"
+
+    async def test_settings_page_marks_exa_env_key_readonly(
+        self, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TOPIC_WATCH_EXA__API_KEY", "exa-env-secret")
+        response = await client.get("/settings")
+        assert response.status_code == 200
+        assert "TOPIC_WATCH_EXA__API_KEY" in response.text
