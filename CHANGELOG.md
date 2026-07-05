@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.3] - 2026-07-05
+
+### Added
+
+- Exa AI search as a per-topic feed source: `ExaSettings` (env/YAML), a Settings card for the API key, per-topic source selection in add/edit, and pre-extracted content on `FeedEntry` (Exa returns article text directly, skipping a fetch)
+- `check`/`init`/`doctor` surface a clear error when every feed source for a topic fails, instead of reporting no new content
+
+### Fixed
+
+- LLM output-token cap is now a hard ceiling, preventing Anthropic non-streaming 400s on large completions (#53)
+- Permanent 4xx LLM errors surface the real provider message instead of a masked generic failure
+
 ## [1.2.2] - 2026-07-03
 
 ### Fixed
