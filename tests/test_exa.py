@@ -8,7 +8,7 @@ from unittest.mock import patch
 import httpx
 
 from app.config import ExaSettings
-from app.crud import create_topic, list_articles_for_topic
+from app.crud import create_topic, get_feed_health, list_articles_for_topic
 from app.models import FeedMode, Topic
 from app.scraping import fetch_new_articles_for_topic
 from app.scraping.exa import _map_exa_result, fetch_exa_entries
@@ -16,6 +16,24 @@ from app.scraping.rss import compute_article_hash, fetch_feeds_for_topic
 
 _EXA_TOPIC = Topic(name="AI safety", description="news about AI safety", feed_mode=FeedMode.EXA, feed_urls=[])
 _ENABLED = ExaSettings(enabled=True, api_key="test-exa-key")
+_EXA_ENDPOINT = "https://api.exa.ai/search"  # default effective endpoint (base_url + /search)
+
+
+class _Recorder:
+    """Records feed-health callback invocations (all 5 positional args)."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, bool, str | None, str | None, str | None]] = []
+
+    def __call__(
+        self,
+        feed_url: str,
+        success: bool,
+        error_msg: str | None,
+        etag: str | None,
+        last_modified: str | None,
+    ) -> None:
+        self.calls.append((feed_url, success, error_msg, etag, last_modified))
 
 
 def _exa_response(results: list[object]) -> httpx.MockTransport:
@@ -229,6 +247,132 @@ class TestFetchExaEntries:
         assert calls == []
 
 
+class TestExaHealthCallback:
+    """Feed-health recording: every attempted fetch records one 5-arg callback."""
+
+    async def test_success_records_healthy(self) -> None:
+        rec = _Recorder()
+        async with httpx.AsyncClient(transport=_exa_response([])) as client:
+            await fetch_exa_entries(
+                _EXA_TOPIC, _ENABLED, max_results=5, timeout=5.0, client=client, health_callback=rec
+            )
+        assert rec.calls == [(_EXA_ENDPOINT, True, None, None, None)]
+
+    async def test_http_error_records_failure(self) -> None:
+        rec = _Recorder()
+        transport = httpx.MockTransport(lambda r: httpx.Response(401, json={"error": "bad key"}))
+        async with httpx.AsyncClient(transport=transport) as client:
+            await fetch_exa_entries(
+                _EXA_TOPIC, _ENABLED, max_results=5, timeout=5.0, client=client, health_callback=rec
+            )
+        assert len(rec.calls) == 1
+        url, success, reason, etag, last_modified = rec.calls[0]
+        assert url == _EXA_ENDPOINT
+        assert success is False
+        assert reason  # non-empty reason
+        assert etag is None and last_modified is None
+
+    async def test_timeout_records_failure(self) -> None:
+        rec = _Recorder()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.TimeoutException("timed out", request=request)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            await fetch_exa_entries(
+                _EXA_TOPIC, _ENABLED, max_results=5, timeout=5.0, client=client, health_callback=rec
+            )
+        assert len(rec.calls) == 1
+        assert rec.calls[0][0] == _EXA_ENDPOINT
+        assert rec.calls[0][1] is False
+        assert rec.calls[0][2]
+
+    async def test_generic_error_records_failure(self) -> None:
+        """Invalid JSON hits the generic except path and records a failure."""
+        rec = _Recorder()
+        transport = httpx.MockTransport(lambda r: httpx.Response(200, text="not json {{{"))
+        async with httpx.AsyncClient(transport=transport) as client:
+            await fetch_exa_entries(
+                _EXA_TOPIC, _ENABLED, max_results=5, timeout=5.0, client=client, health_callback=rec
+            )
+        assert len(rec.calls) == 1
+        assert rec.calls[0][1] is False
+        assert rec.calls[0][2]
+
+    async def test_non_http_endpoint_records_failure(self) -> None:
+        rec = _Recorder()
+        settings = ExaSettings(enabled=True, api_key="k", base_url="ftp://host")
+        async with httpx.AsyncClient(transport=_exa_response([])) as client:
+            await fetch_exa_entries(
+                _EXA_TOPIC, settings, max_results=5, timeout=5.0, client=client, health_callback=rec
+            )
+        assert len(rec.calls) == 1
+        assert rec.calls[0] == ("ftp://host/search", False, rec.calls[0][2], None, None)
+        assert rec.calls[0][2]
+
+    async def test_private_endpoint_records_failure(self) -> None:
+        rec = _Recorder()
+        settings = ExaSettings(enabled=True, api_key="k", base_url="http://internal.local")
+        with patch("app.scraping.exa.is_private_url", return_value=True):
+            async with httpx.AsyncClient(transport=_exa_response([])) as client:
+                await fetch_exa_entries(
+                    _EXA_TOPIC, settings, max_results=5, timeout=5.0, client=client, health_callback=rec
+                )
+        assert len(rec.calls) == 1
+        assert rec.calls[0][0] == "http://internal.local/search"
+        assert rec.calls[0][1] is False
+        assert rec.calls[0][2]
+
+    async def test_malformed_endpoint_records_failure(self) -> None:
+        """The SSRF-check except path (no prior test) records a failure."""
+        rec = _Recorder()
+        with patch("app.scraping.exa.is_private_url", side_effect=ValueError):
+            async with httpx.AsyncClient(transport=_exa_response([])) as client:
+                await fetch_exa_entries(
+                    _EXA_TOPIC, _ENABLED, max_results=5, timeout=5.0, client=client, health_callback=rec
+                )
+        assert len(rec.calls) == 1
+        assert rec.calls[0][0] == _EXA_ENDPOINT
+        assert rec.calls[0][1] is False
+        assert rec.calls[0][2]
+
+    async def test_disabled_records_nothing(self) -> None:
+        rec = _Recorder()
+        async with httpx.AsyncClient(transport=_exa_response([])) as client:
+            await fetch_exa_entries(
+                _EXA_TOPIC,
+                ExaSettings(enabled=False, api_key="k"),
+                max_results=5,
+                timeout=5.0,
+                client=client,
+                health_callback=rec,
+            )
+        assert rec.calls == []
+
+    async def test_no_key_records_nothing(self) -> None:
+        rec = _Recorder()
+        async with httpx.AsyncClient(transport=_exa_response([])) as client:
+            await fetch_exa_entries(
+                _EXA_TOPIC,
+                ExaSettings(enabled=True, api_key=""),
+                max_results=5,
+                timeout=5.0,
+                client=client,
+                health_callback=rec,
+            )
+        assert rec.calls == []
+
+    async def test_none_callback_all_paths_safe(self) -> None:
+        """Default health_callback=None: both success and failure paths still work."""
+        async with httpx.AsyncClient(transport=_exa_response([])) as client:
+            ok = await fetch_exa_entries(_EXA_TOPIC, _ENABLED, max_results=5, timeout=5.0, client=client)
+        assert ok.feeds_failed == 0
+        transport = httpx.MockTransport(lambda r: httpx.Response(500, text="down"))
+        async with httpx.AsyncClient(transport=transport) as client:
+            bad = await fetch_exa_entries(_EXA_TOPIC, _ENABLED, max_results=5, timeout=5.0, client=client)
+        assert bad.feeds_failed == 1
+
+
 class TestExaDispatch:
     async def test_exa_mode_routes_to_exa(self) -> None:
         transport = _exa_response([{"url": "https://x.com/1", "title": "One", "text": "one"}])
@@ -276,3 +420,24 @@ class TestExaPipelineStore:
         assert stored[0].raw_content == "exa body"  # prefetched, not a second fetch
         assert isinstance(stored[0].published_at, datetime)
         assert stored[0].published_at.tzinfo is not None
+
+    async def test_check_records_exa_feed_health(self, db_conn: sqlite3.Connection) -> None:
+        """An EXA-mode check writes a feed_health row keyed on the Exa endpoint."""
+        topic = create_topic(db_conn, Topic(name="AI", description="ai news", feed_mode=FeedMode.EXA, feed_urls=[]))
+        db_conn.commit()
+
+        transport = _exa_response([{"url": "https://x.com/1", "title": "One", "text": "b"}])
+        original_init = httpx.AsyncClient.__init__
+
+        def patched_init(self_client, **kwargs):
+            kwargs["transport"] = transport
+            original_init(self_client, **kwargs)
+
+        with patch.object(httpx.AsyncClient, "__init__", patched_init):
+            await fetch_new_articles_for_topic(topic, db_conn, max_articles=5, exa_settings=_ENABLED)
+
+        health = get_feed_health(db_conn, _EXA_ENDPOINT)
+        assert health is not None
+        assert health.consecutive_failures == 0
+        assert health.total_fetches == 1
+        assert health.last_success_at is not None

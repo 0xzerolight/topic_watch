@@ -445,7 +445,9 @@ async def fetch_feeds_for_topic(
         if exa_settings is None:
             logger.warning("Topic '%s' uses Exa mode but no Exa settings were supplied", topic.name)
             return FeedResponse(provider_name="exa", feeds_total=0, feeds_failed=0)
-        return await fetch_exa_entries(topic, exa_settings, max_results=max_results, timeout=timeout)
+        return await fetch_exa_entries(
+            topic, exa_settings, max_results=max_results, timeout=timeout, health_callback=health_callback
+        )
     if topic.feed_mode == FeedMode.AUTO:
         return await _fetch_auto(topic, timeout, max_attempts, health_callback, router, feed_state_loader)
     return await _fetch_manual(

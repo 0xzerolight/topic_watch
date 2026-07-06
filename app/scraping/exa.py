@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 import httpx
 
 from app.log_redaction import redact_url
-from app.scraping.rss import FeedEntry, FeedResponse
+from app.scraping.rss import FeedEntry, FeedHealthCallback, FeedResponse
 from app.url_validation import is_private_url
 
 if TYPE_CHECKING:
@@ -79,11 +79,18 @@ async def fetch_exa_entries(
     max_results: int,
     timeout: float,
     client: httpx.AsyncClient | None = None,
+    health_callback: FeedHealthCallback | None = None,
 ) -> FeedResponse:
     """Query the Exa ``/search`` API for ``topic`` and return a ``FeedResponse``.
 
     Never raises: any failure logs a warning and returns a ``FeedResponse`` whose
     counters reflect the outcome, so the check pipeline degrades gracefully.
+
+    ``health_callback`` records the outcome for the Feed Health dashboard keyed on
+    the effective endpoint. It is invoked once per attempted fetch (success or
+    failure) but NOT on the disabled/no-key early return, where nothing is
+    attempted (mirrors ``all_sources_failed`` semantics). Exa has no
+    conditional-GET validators, so etag/last_modified are always ``None``.
     """
     if not exa_settings.enabled or not exa_settings.api_key:
         # Nothing attempted (no HTTP). feeds_total=0 keeps _log_feed_coverage from
@@ -97,12 +104,18 @@ async def fetch_exa_entries(
     try:
         if urlparse(endpoint).scheme not in ("http", "https"):
             logger.warning("Blocked Exa request to non-http(s) endpoint: %s", redact_url(endpoint))
+            if health_callback:
+                health_callback(endpoint, False, "Non-http(s) endpoint", None, None)
             return FeedResponse(provider_name="exa", feeds_total=1, feeds_failed=1)
         if await asyncio.to_thread(is_private_url, endpoint):
             logger.warning("Blocked Exa request to private/reserved endpoint: %s", redact_url(endpoint))
+            if health_callback:
+                health_callback(endpoint, False, "Private/reserved endpoint", None, None)
             return FeedResponse(provider_name="exa", feeds_total=1, feeds_failed=1)
     except Exception:
         logger.warning("Blocked Exa request to malformed endpoint: %s", redact_url(endpoint), exc_info=True)
+        if health_callback:
+            health_callback(endpoint, False, "Malformed endpoint", None, None)
         return FeedResponse(provider_name="exa", feeds_total=1, feeds_failed=1)
 
     query = f"{topic.name} {topic.description}".strip()
@@ -125,13 +138,19 @@ async def fetch_exa_entries(
         data = response.json()
     except httpx.TimeoutException:
         logger.warning("Exa request timed out for topic '%s'", topic.name)
+        if health_callback:
+            health_callback(endpoint, False, "Request timed out", None, None)
         return FeedResponse(provider_name="exa", feeds_total=1, feeds_failed=1)
     except httpx.HTTPStatusError as exc:
         logger.warning("Exa returned HTTP %d for topic '%s'", exc.response.status_code, topic.name)
+        if health_callback:
+            health_callback(endpoint, False, f"HTTP {exc.response.status_code}", None, None)
         return FeedResponse(provider_name="exa", feeds_total=1, feeds_failed=1)
-    except Exception:
+    except Exception as exc:
         # NetworkError, JSON-decode (ValueError), and any other failure: never raise.
         logger.warning("Exa request failed for topic '%s'", topic.name, exc_info=True)
+        if health_callback:
+            health_callback(endpoint, False, f"{type(exc).__name__}: {exc}", None, None)
         return FeedResponse(provider_name="exa", feeds_total=1, feeds_failed=1)
     finally:
         if owns_client:
@@ -149,6 +168,8 @@ async def fetch_exa_entries(
         if entry is not None:
             entries.append(entry)
 
+    if health_callback:
+        health_callback(endpoint, True, None, None, None)
     return FeedResponse(
         entries=entries,
         provider_name="exa",
