@@ -1700,16 +1700,34 @@ class TestRateLimitRetry:
 
 
 class TestClientCaching:
-    """_get_client returns a single cached client instead of rebuilding per call."""
+    """_get_client caches one client per structured-output mode."""
 
     def test_client_is_cached(self) -> None:
         from app.analysis import llm as llm_module
 
-        llm_module._client = None
+        llm_module._clients.clear()
         settings = _make_settings()
         first = llm_module._get_client(settings)
         second = llm_module._get_client(settings)
         assert first is second
+
+    def test_one_client_built_per_mode(self) -> None:
+        """Each distinct mode is built once and reused; different modes differ."""
+        import instructor
+
+        from app.analysis import llm as llm_module
+
+        llm_module._clients.clear()
+        settings = _make_settings()
+
+        with patch("app.analysis.llm.instructor.from_litellm", side_effect=instructor.from_litellm) as build_spy:
+            tools_a = llm_module._get_client(settings, instructor.Mode.TOOLS)
+            tools_b = llm_module._get_client(settings, instructor.Mode.TOOLS)
+            json_client = llm_module._get_client(settings, instructor.Mode.JSON)
+
+        assert tools_a is tools_b  # cache hit, not rebuilt
+        assert json_client is not tools_a  # distinct per mode
+        assert build_spy.call_count == 2  # one build per distinct mode
 
 
 # ============================================================
