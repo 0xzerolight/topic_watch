@@ -6,11 +6,13 @@ validation retry. All LLM calls go through this module.
 
 import asyncio
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 import instructor
 import litellm
+from instructor import Mode
 from instructor.core import InstructorRetryException
 from pydantic import BaseModel, Field
 from tenacity import AsyncRetrying, retry_if_not_exception_type, stop_after_attempt
@@ -176,6 +178,10 @@ class CompressedKnowledge(BaseModel):
 
 # --- Helpers ---
 
+# Structured-output response model, so ``_create_structured`` stays generic while
+# each call site keeps its concrete model type (mypy passes without new ignores).
+T = TypeVar("T", bound=BaseModel)
+
 
 def _summarize_exc(exc: BaseException, *, limit: int = 200) -> str:
     """One-line, length-bounded summary of an exception for stored error fields."""
@@ -259,21 +265,85 @@ def _unwrap_rate_limit(exc: BaseException) -> litellm.RateLimitError | None:
     return None
 
 
-_client: instructor.AsyncInstructor | None = None
+def _unwrap_bad_request(exc: BaseException) -> litellm.BadRequestError | None:
+    """Return the underlying ``BadRequestError`` (400) in ``exc``'s chain, else None.
 
-
-def _get_client(settings: Settings) -> instructor.AsyncInstructor:
-    """Return a cached async instructor-patched litellm client.
-
-    The client wraps ``litellm.acompletion``, which is stateless — model, key,
-    base_url, etc. are passed per call — so a single instance is reused across
-    all calls instead of being rebuilt each time. ``settings`` is accepted for
-    call-site symmetry and to keep ``_get_client`` the patch seam used by tests.
+    A bare ``BadRequestError`` is returned as-is. Otherwise the ``__cause__`` /
+    ``__context__`` chain is walked (cycle-guarded), because instructor's v2 retry
+    stack re-wraps an excluded 400 as ``InstructorRetryException`` with the real
+    error chained on ``__cause__`` (pinned by
+    test_llm_rate_limit_backoff.py:535); a bare 400 never propagates from
+    ``create_with_completion``. Returns ``None`` when no ``BadRequestError`` is in
+    the chain — e.g. a rate-limit wrapper — so 429s keep flowing untouched to
+    ``_call_with_rate_limit_retry``. Mirrors the final-fallback stanza of
+    ``_unwrap_rate_limit``.
     """
-    global _client
-    if _client is None:
-        _client = cast(instructor.AsyncInstructor, instructor.from_litellm(litellm.acompletion))
-    return _client
+    if isinstance(exc, litellm.BadRequestError):
+        return exc
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        nxt = cur.__cause__ or cur.__context__
+        if isinstance(nxt, litellm.BadRequestError):
+            return nxt
+        cur = nxt
+    return None
+
+
+# Ordered structured-output fallback chain. TOOLS sends a forced named
+# ``tool_choice`` (rejected by e.g. DeepSeek thinking mode); JSON sends
+# ``response_format={"type":"json_object"}``; MD_JSON uses plain prompting +
+# markdown-JSON parsing and needs no special provider support — the guaranteed
+# terminal (absent from the map, so ``_fallback_mode`` returns None there).
+_MODE_FALLBACK: dict[instructor.Mode, instructor.Mode] = {Mode.TOOLS: Mode.JSON, Mode.JSON: Mode.MD_JSON}
+
+
+def _fallback_mode(mode: instructor.Mode, exc: BaseException) -> instructor.Mode | None:
+    """Next structured-output mode to try after ``exc``, or ``None`` to give up.
+
+    The criterion is STRUCTURAL: fall back only on a 400 a mode switch could
+    plausibly fix (e.g. a forced ``tool_choice`` rejection), never on a
+    mode-INVARIANT error — one caused by a request property that
+    ``_create_structured`` sends identically in every mode, so switching cannot
+    change the outcome. Two invariants are excluded:
+
+    - ``ContextWindowExceededError``: prompt size is the same in every mode.
+    - a ``max_tokens`` 400: ``_bounded_max_tokens`` passes the same ceiling in all
+      three modes, so this guard is about that mode-invariance, NOT about trusting
+      provider phrasing in general — every other 400 falls back by design, so
+      MD_JSON stays the terminal no matter how an unknown gateway words its
+      rejection.
+
+    Anything that is not an unwrapped ``BadRequestError`` (e.g. a 429 wrapper)
+    returns ``None`` so it propagates to its own handler untouched.
+    """
+    bad_request = _unwrap_bad_request(exc)
+    if bad_request is None or isinstance(bad_request, litellm.ContextWindowExceededError):
+        return None
+    if "max_tokens" in str(bad_request).lower():
+        return None
+    return _MODE_FALLBACK.get(mode)
+
+
+# One instructor client per structured-output mode. The mode is baked into the
+# client at ``from_litellm`` time (it decides tool_choice vs response_format vs
+# markdown prompting), so the TOOLS -> JSON -> MD_JSON fallback needs a distinct
+# client per mode. Each wraps the stateless ``litellm.acompletion`` (model, key,
+# base_url passed per call), so one cached client per mode is reused across calls.
+_clients: dict[instructor.Mode, instructor.AsyncInstructor] = {}
+
+
+def _get_client(settings: Settings, mode: instructor.Mode = instructor.Mode.TOOLS) -> instructor.AsyncInstructor:
+    """Return a cached async instructor-patched litellm client for ``mode``.
+
+    Built lazily per mode and memoized in ``_clients``. ``settings`` is accepted
+    for call-site symmetry and to keep ``_get_client`` the patch seam used by
+    single-mode tests. Default ``Mode.TOOLS`` matches instructor's own default.
+    """
+    if mode not in _clients:
+        _clients[mode] = cast(instructor.AsyncInstructor, instructor.from_litellm(litellm.acompletion, mode=mode))
+    return _clients[mode]
 
 
 def _effective_base_url(settings: Settings) -> str | None:
@@ -393,6 +463,52 @@ async def _call_with_rate_limit_retry(
     raise last_exc
 
 
+async def _create_structured(
+    settings: Settings,
+    *,
+    response_model: type[T],
+    build_messages: Callable[[], list[dict[str, Any]]],
+    timeout: int,
+) -> tuple[T, Any]:
+    """Run one structured-output call, falling back TOOLS -> JSON -> MD_JSON.
+
+    On a structured-output-fixable 400 (see ``_fallback_mode``) the call is retried
+    in the next mode; a mode-invariant error re-raises immediately, and MD_JSON is
+    the terminal. ``build_messages`` is a factory invoked FRESH per attempt: this
+    preserves the rebuild-per-attempt invariant (also under 429 retries, since the
+    whole helper re-runs from TOOLS) and avoids instructor's in-place message
+    mutation leaking a doubled schema block across mode hops. Stateless by design —
+    no per-model memory, so a false-positive fallback costs one call and never
+    downgrades the process; it self-heals if the provider fixes its API.
+    """
+    mode: instructor.Mode = instructor.Mode.TOOLS
+    while True:
+        client = _get_client(settings, mode)
+        try:
+            return await client.chat.completions.create_with_completion(  # type: ignore[no-any-return]
+                model=settings.llm.model,
+                response_model=response_model,
+                messages=build_messages(),  # type: ignore[arg-type]
+                max_retries=_instructor_retries(settings.llm_max_retries),
+                api_key=settings.llm.api_key,
+                api_base=_effective_base_url(settings),
+                timeout=timeout,
+                temperature=settings.llm_temperature,
+                max_tokens=_bounded_max_tokens(settings),
+            )
+        except Exception as exc:
+            next_mode = _fallback_mode(mode, exc)
+            if next_mode is None:
+                raise
+            logger.warning(
+                "Provider rejected %s structured-output mode for model %s; retrying with %s",
+                mode.value,
+                settings.llm.model,
+                next_mode.value,
+            )
+            mode = next_mode
+
+
 # --- key_facts restatement filtering ---
 #
 # The phrase-matching algorithm lives in app/analysis/restatement.py (OVH-178);
@@ -441,23 +557,16 @@ async def analyze_articles(
     ``key_facts`` that merely restate the knowledge summary are dropped.
     """
 
-    async def _do_call() -> tuple[NoveltyResult, Any]:
-        client = _get_client(settings)
-        messages = build_novelty_messages(articles, knowledge_summary, topic)
-        return await client.chat.completions.create_with_completion(  # type: ignore[no-any-return]
-            model=settings.llm.model,
-            response_model=NoveltyResult,
-            messages=messages,  # type: ignore[arg-type]
-            max_retries=_instructor_retries(settings.llm_max_retries),
-            api_key=settings.llm.api_key,
-            api_base=_effective_base_url(settings),
-            timeout=settings.llm_analysis_timeout,
-            temperature=settings.llm_temperature,
-            max_tokens=_bounded_max_tokens(settings),
-        )
-
     try:
-        result, completion = await _call_with_rate_limit_retry(_do_call, max_retries=settings.llm_max_retries)
+        result, completion = await _call_with_rate_limit_retry(
+            lambda: _create_structured(
+                settings,
+                response_model=NoveltyResult,
+                build_messages=lambda: build_novelty_messages(articles, knowledge_summary, topic),
+                timeout=settings.llm_analysis_timeout,
+            ),
+            max_retries=settings.llm_max_retries,
+        )
     except Exception as exc:
         logger.warning("LLM analysis failed for topic '%s'", topic.name, exc_info=True)
         return NoveltyResult(has_new_info=False, confidence=0.0, error=_summarize_exc(exc))
@@ -496,22 +605,15 @@ async def generate_initial_knowledge(
     Raises on failure — knowledge initialization is critical.
     """
 
-    async def _do_call() -> tuple[KnowledgeStateUpdate, Any]:
-        client = _get_client(settings)
-        messages = build_knowledge_init_messages(articles, topic, settings.knowledge_state_max_tokens)
-        return await client.chat.completions.create_with_completion(  # type: ignore[no-any-return]
-            model=settings.llm.model,
+    raw_result, completion = await _call_with_rate_limit_retry(
+        lambda: _create_structured(
+            settings,
             response_model=KnowledgeStateUpdate,
-            messages=messages,  # type: ignore[arg-type]
-            max_retries=_instructor_retries(settings.llm_max_retries),
-            api_key=settings.llm.api_key,
-            api_base=_effective_base_url(settings),
+            build_messages=lambda: build_knowledge_init_messages(articles, topic, settings.knowledge_state_max_tokens),
             timeout=settings.llm_knowledge_timeout,
-            temperature=settings.llm_temperature,
-            max_tokens=_bounded_max_tokens(settings),
-        )
-
-    raw_result, completion = await _call_with_rate_limit_retry(_do_call, max_retries=settings.llm_max_retries)
+        ),
+        max_retries=settings.llm_max_retries,
+    )
     result: KnowledgeStateUpdate = raw_result
     # Strip article-index citations then leaked reliability notes before counting
     # tokens so the freed budget is real.
@@ -536,26 +638,19 @@ async def compress_knowledge_summary(
     completion's usage so this round-trip's cost is not lost (OVH-129).
     """
 
-    async def _do_call() -> tuple[CompressedKnowledge, Any]:
-        client = _get_client(settings)
-        messages = build_knowledge_compress_messages(
-            current_summary=current_summary,
-            topic=topic,
-            max_tokens=settings.knowledge_state_max_tokens,
-        )
-        return await client.chat.completions.create_with_completion(  # type: ignore[no-any-return]
-            model=settings.llm.model,
+    raw_result, completion = await _call_with_rate_limit_retry(
+        lambda: _create_structured(
+            settings,
             response_model=CompressedKnowledge,
-            messages=messages,  # type: ignore[arg-type]
-            max_retries=_instructor_retries(settings.llm_max_retries),
-            api_key=settings.llm.api_key,
-            api_base=_effective_base_url(settings),
+            build_messages=lambda: build_knowledge_compress_messages(
+                current_summary=current_summary,
+                topic=topic,
+                max_tokens=settings.knowledge_state_max_tokens,
+            ),
             timeout=settings.llm_knowledge_timeout,
-            temperature=settings.llm_temperature,
-            max_tokens=_bounded_max_tokens(settings),
-        )
-
-    raw_result, completion = await _call_with_rate_limit_retry(_do_call, max_retries=settings.llm_max_retries)
+        ),
+        max_retries=settings.llm_max_retries,
+    )
     result: CompressedKnowledge = raw_result
     # Strip article-index citations then leaked reliability notes before counting
     # tokens so the freed budget is real.
@@ -578,28 +673,21 @@ async def generate_knowledge_update(
     Raises on failure — knowledge updates are critical.
     """
 
-    async def _do_call() -> tuple[KnowledgeStateUpdate, Any]:
-        client = _get_client(settings)
-        messages = build_knowledge_update_messages(
-            current_summary=current_summary,
-            novelty_summary=novelty_result.summary or "",
-            key_facts=novelty_result.key_facts,
-            topic=topic,
-            max_tokens=settings.knowledge_state_max_tokens,
-        )
-        return await client.chat.completions.create_with_completion(  # type: ignore[no-any-return]
-            model=settings.llm.model,
+    raw_result, completion = await _call_with_rate_limit_retry(
+        lambda: _create_structured(
+            settings,
             response_model=KnowledgeStateUpdate,
-            messages=messages,  # type: ignore[arg-type]
-            max_retries=_instructor_retries(settings.llm_max_retries),
-            api_key=settings.llm.api_key,
-            api_base=_effective_base_url(settings),
+            build_messages=lambda: build_knowledge_update_messages(
+                current_summary=current_summary,
+                novelty_summary=novelty_result.summary or "",
+                key_facts=novelty_result.key_facts,
+                topic=topic,
+                max_tokens=settings.knowledge_state_max_tokens,
+            ),
             timeout=settings.llm_knowledge_timeout,
-            temperature=settings.llm_temperature,
-            max_tokens=_bounded_max_tokens(settings),
-        )
-
-    raw_result, completion = await _call_with_rate_limit_retry(_do_call, max_retries=settings.llm_max_retries)
+        ),
+        max_retries=settings.llm_max_retries,
+    )
     result: KnowledgeStateUpdate = raw_result
     # Strip article-index citations (the update LLM grafts them onto clean input by
     # mimicking the existing cited style) then leaked reliability notes before
