@@ -1,6 +1,6 @@
 [project]
 name = "topic-watch"
-version = "1.2.3"
+version = "1.2.4"
 description = "Self-hosted news watchdog with AI-powered novelty detection"
 license = "GPL-3.0-or-later"
 readme = "README.md"

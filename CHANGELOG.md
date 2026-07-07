@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.4] - 2026-07-07
+
+### Added
+
+- Exa feed-source fetch outcomes (success and every failure reason) are now recorded in Feed Health, matching RSS sources (#53)
+
+### Fixed
+
+- DeepSeek reasoning models (`deepseek-reasoner`, "thinking mode") no longer fail structured analysis: the LLM client falls back TOOLS → JSON → MD_JSON when a provider rejects instructor's forced `tool_choice` with a 400, while still re-raising mode-invariant errors (context-window, `max_tokens`) and preserving rate-limit backoff (#53)
+
 ## [1.2.3] - 2026-07-05
 
 ### Added
