@@ -23,6 +23,17 @@ updates:
       # breaks the hash-locked requirements under `pip install --require-hashes`.
       # Bump pydantic instead and relock with pip-compile.
       - dependency-name: "pydantic-core"
+      # instructor (latest 1.15.4) caps jiter<0.15 and rich<15; litellm caps
+      # importlib-metadata<9.0. These uninstallable ranges made every weekly
+      # group PR internally inconsistent (#46/#50/#55). Range-scoped so
+      # in-range (< cap) patch/security bumps still flow — only the impossible
+      # versions are suppressed. Lift when instructor/litellm lift their caps.
+      - dependency-name: "jiter"
+        versions: [">=0.15.0"]
+      - dependency-name: "rich"
+        versions: [">=15.0.0"]
+      - dependency-name: "importlib-metadata"
+        versions: [">=9.0.0"]
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
