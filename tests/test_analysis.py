@@ -220,6 +220,20 @@ class TestNoveltyResult:
         with pytest.raises(ValidationError):
             NoveltyResult(has_new_info=False, confidence=0.5, relevance=-0.1)
 
+    def test_importance_bounds(self) -> None:
+        with pytest.raises(ValidationError):
+            NoveltyResult(has_new_info=False, confidence=0.5, importance=0)
+        with pytest.raises(ValidationError):
+            NoveltyResult(has_new_info=False, confidence=0.5, importance=6)
+        assert NoveltyResult(has_new_info=True, confidence=0.9, importance=5).importance == 5
+
+    def test_importance_backcompat_parse_of_legacy_blob(self) -> None:
+        """Stored llm_response blobs predate importance; re-parsing (force-notify
+        path) must default to the neutral midpoint, not fail validation."""
+        legacy_blob = '{"has_new_info": true, "summary": "x", "confidence": 0.9, "relevance": 0.8}'
+        result = NoveltyResult.model_validate_json(legacy_blob)
+        assert result.importance == 3
+
 
 # ============================================================
 # TestKnowledgeStateUpdate
@@ -452,6 +466,14 @@ class TestBuildNoveltyMessages:
             topic = _make_topic(novelty_instruction=instruction)
             messages = build_novelty_messages(articles, "Known.", topic)
             assert "USER-DEFINED NOVELTY CRITERIA" not in messages[0]["content"]
+
+    def test_system_message_contains_importance_rubric(self) -> None:
+        topic = _make_topic()
+        articles = [_make_article()]
+        messages = build_novelty_messages(articles, "Known.", topic)
+        system_msg = messages[0]["content"]
+        assert "Set importance (1-5)" in system_msg
+        assert "Importance rates magnitude, NOT certainty" in system_msg
 
     def test_system_message_contains_relevance_instruction(self) -> None:
         topic = _make_topic()

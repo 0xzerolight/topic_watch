@@ -31,7 +31,12 @@ from app.scraping.routing import router as provider_router
 from app.web.csrf import verify_csrf
 from app.web.dependencies import get_db_conn, get_settings
 from app.web.routers import background
-from app.web.routers._validation import parse_novelty_instruction, parse_threshold, validate_topic_form
+from app.web.routers._validation import (
+    parse_importance,
+    parse_novelty_instruction,
+    parse_threshold,
+    validate_topic_form,
+)
 from app.web.routers.templates import templates
 from app.web.state import _checking_state
 
@@ -70,6 +75,7 @@ async def create_topic_handler(
     confidence_threshold: str = Form(""),
     relevance_threshold: str = Form(""),
     novelty_instruction: str = Form(""),
+    importance_threshold: str = Form(""),
 ):
     """Create a new topic and kick off initial research in the background."""
     from app.interval import format_interval
@@ -79,6 +85,7 @@ async def create_topic_handler(
     conf_threshold = parse_threshold(confidence_threshold, "Confidence threshold", errors)
     rel_threshold = parse_threshold(relevance_threshold, "Relevance threshold", errors)
     instruction = parse_novelty_instruction(novelty_instruction, errors)
+    imp_threshold = parse_importance(importance_threshold, errors)
 
     # Guard: a brand-new EXA topic while Exa is disabled would instantly ERROR (no source).
     if mode == FeedMode.EXA and not settings.exa.enabled:
@@ -102,6 +109,7 @@ async def create_topic_handler(
                 "confidence_threshold": confidence_threshold,
                 "relevance_threshold": relevance_threshold,
                 "novelty_instruction": novelty_instruction,
+                "importance_threshold": importance_threshold,
                 "global_confidence_threshold": settings.min_confidence_threshold,
                 "global_relevance_threshold": settings.min_relevance_threshold,
                 "novelty_instruction_max": NOVELTY_INSTRUCTION_MAX_CHARS,
@@ -129,6 +137,7 @@ async def create_topic_handler(
         confidence_threshold=conf_threshold,
         relevance_threshold=rel_threshold,
         novelty_instruction=instruction,
+        importance_threshold=imp_threshold,
     )
     try:
         created = create_topic(conn, topic)
@@ -486,6 +495,7 @@ async def edit_topic_handler(
     confidence_threshold: str = Form(""),
     relevance_threshold: str = Form(""),
     novelty_instruction: str = Form(""),
+    importance_threshold: str = Form(""),
 ):
     """Update an existing topic's name, description, feed URLs, and feed mode."""
     topic = get_topic(conn, topic_id)
@@ -499,6 +509,7 @@ async def edit_topic_handler(
     conf_threshold = parse_threshold(confidence_threshold, "Confidence threshold", errors)
     rel_threshold = parse_threshold(relevance_threshold, "Relevance threshold", errors)
     instruction = parse_novelty_instruction(novelty_instruction, errors)
+    imp_threshold = parse_importance(importance_threshold, errors)
 
     # Guard only a CONVERSION into EXA while Exa is disabled: block turning a working
     # AUTO/MANUAL topic into a non-fetching EXA one. An already-EXA topic edits freely
@@ -525,6 +536,7 @@ async def edit_topic_handler(
                 "confidence_threshold": confidence_threshold,
                 "relevance_threshold": relevance_threshold,
                 "novelty_instruction": novelty_instruction,
+                "importance_threshold": importance_threshold,
                 "default_interval": settings.check_interval,
                 "global_confidence_threshold": settings.min_confidence_threshold,
                 "global_relevance_threshold": settings.min_relevance_threshold,
@@ -543,6 +555,7 @@ async def edit_topic_handler(
     topic.confidence_threshold = conf_threshold
     topic.relevance_threshold = rel_threshold
     topic.novelty_instruction = instruction
+    topic.importance_threshold = imp_threshold
     update_topic(conn, topic)
     conn.commit()
 

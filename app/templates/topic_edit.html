@@ -135,6 +135,16 @@
                    placeholder="inherit global ({{ '%.2f'|format(global_relevance_threshold) }})">
             <small class="help">Leave blank to inherit the global default. 0.0–1.0.</small>
         </div>
+        {% set current_importance = importance_threshold if importance_threshold is defined
+            else (topic.importance_threshold if topic.importance_threshold is not none else '') %}
+        <div class="field-group">
+            <label for="importance_threshold">Importance threshold</label>
+            <input type="number" id="importance_threshold" name="importance_threshold"
+                   min="1" max="5" step="1"
+                   value="{{ current_importance }}"
+                   placeholder="off (notify on any importance)">
+            <small class="help">Leave blank to notify on any importance. 1–5: suppress notifications for new info the AI rates below this.</small>
+        </div>
         {% set current_instruction = novelty_instruction if novelty_instruction is defined
             else (topic.novelty_instruction if topic.novelty_instruction is not none else '') %}
         <div class="field-group">

@@ -210,6 +210,10 @@ async def _check_topic_inner(
     relevance_threshold = (
         topic.relevance_threshold if topic.relevance_threshold is not None else settings.min_relevance_threshold
     )
+    # Importance is per-topic only (no global setting by design: a global default
+    # of 1 would be a functional no-op). NULL = no suppression -> floor of 1,
+    # which every importance score passes.
+    importance_threshold = topic.importance_threshold if topic.importance_threshold is not None else 1
 
     # Step 4: If new info above thresholds, update knowledge. The notification
     # /webhook SENDS are deferred to Step 6 — AFTER the durable state is
@@ -234,7 +238,19 @@ async def _check_topic_inner(
                 relevance_threshold,
             )
         else:
-            should_notify = True
+            # Unlike the confidence/relevance gates above (which treat the result
+            # as unreliable and skip everything), the importance gate suppresses
+            # only the SENDS: the info is genuinely new and on-topic, so the
+            # knowledge state still absorbs it — otherwise the same trivial fact
+            # would re-flag as "new" every cycle.
+            should_notify = novelty.importance >= importance_threshold
+            if not should_notify:
+                logger.info(
+                    "Topic '%s': new info importance %d below threshold %d, updating knowledge without notification",
+                    topic.name,
+                    novelty.importance,
+                    importance_threshold,
+                )
             try:
                 write_result = await update_knowledge(topic, novelty, conn, settings)
                 result.prompt_tokens += write_result.usage.prompt_tokens
@@ -245,12 +261,14 @@ async def _check_topic_inner(
                     topic.name,
                     exc_info=True,
                 )
-                # OVH-009: the alert still fires, but record the failure distinctly
-                # and do NOT mark these new-info-bearing articles processed, so the
-                # next cycle re-attempts the knowledge update (no silent drift).
+                # OVH-009: any alert that passed the importance gate still fires,
+                # but record the failure distinctly and do NOT mark these
+                # new-info-bearing articles processed, so the next cycle
+                # re-attempts the knowledge update (no silent drift).
                 knowledge_update_failed = True
                 result.stage_error = f"knowledge_update_failed: {_summarize_exc(exc)}"
-            notification = format_notification(topic.name, novelty)
+            if should_notify:
+                notification = format_notification(topic.name, novelty)
 
     # Step 5: Mark articles as processed. "processed" means "we've evaluated
     # this article" — set even for below-threshold (new-but-not-notified) and

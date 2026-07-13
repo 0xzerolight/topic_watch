@@ -118,6 +118,16 @@ class NoveltyResult(BaseModel):
         default=0.0,
         description="How relevant the new information is to the topic description (0=off-topic, 1=exactly what user asked)",
     )
+    # Default (not required) is deliberate: stored llm_response blobs predate this
+    # field and are re-parsed via model_validate_json in the force-notify handler —
+    # a required field would break the Notify re-send button for pre-existing
+    # checks. 3 is the neutral midpoint so provider omission doesn't hard-suppress.
+    importance: int = Field(
+        ge=1,
+        le=5,
+        default=3,
+        description="How significant the new development is for someone monitoring this topic (1=trivial, 5=major)",
+    )
     prompt_tokens: int = 0
     completion_tokens: int = 0
     # Set ONLY on the fail-safe error path (LLM call failed). Lets the caller

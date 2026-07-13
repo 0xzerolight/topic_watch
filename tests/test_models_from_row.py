@@ -156,6 +156,34 @@ class TestTopicThresholdValidation:
         assert topic.confidence_threshold == 1.0
 
 
+class TestTopicImportanceThresholdClamping:
+    """Per-topic importance threshold must stay within [1, 5].
+
+    Mirrors the confidence/relevance clamp: a corrupt out-of-range value (e.g. 9)
+    reaching a topic row would make ``novelty.importance >= importance_threshold``
+    always false, silently suppressing ALL notifications for that topic.
+    """
+
+    def test_in_range_and_none_pass_through(self) -> None:
+        topic = Topic(name="T", description="d", importance_threshold=3)
+        assert topic.importance_threshold == 3
+        assert Topic(name="T", description="d").importance_threshold is None
+        assert Topic(name="T", description="d", importance_threshold=1).importance_threshold == 1
+        assert Topic(name="T", description="d", importance_threshold=5).importance_threshold == 5
+
+    def test_above_five_is_clamped(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING, logger="app.models"):
+            topic = Topic(name="T", description="d", importance_threshold=9)
+        assert topic.importance_threshold == 5
+        assert any("importance_threshold" in r.message for r in caplog.records)
+
+    def test_below_one_is_clamped(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING, logger="app.models"):
+            topic = Topic(name="T", description="d", importance_threshold=0)
+        assert topic.importance_threshold == 1
+        assert any("importance_threshold" in r.message for r in caplog.records)
+
+
 class TestArticleFromRow:
     """Article.from_row defensive handling of fetched_at."""
 

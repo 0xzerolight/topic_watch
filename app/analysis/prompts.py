@@ -202,6 +202,15 @@ Set confidence using this scale:
 Do NOT default to 0.7-0.8. Calibrate deliberately using the criteria above.
 Set relevance to indicate how directly the new information addresses the topic \
 description (0.0 = tangentially related, 1.0 = exactly what the user asked about).
+Set importance (1-5) to rate how significant the new development is for someone \
+monitoring this topic description:
+- 5: Major/definitive development — the awaited answer itself (date announced, ban lifted, decision made)
+- 4: Significant progress or an official partial answer
+- 3: Moderate update that meaningfully advances the story
+- 2: Minor detail or incremental refinement
+- 1: Trivial or peripheral mention
+Importance rates magnitude, NOT certainty — a well-sourced trivial fact is high \
+confidence, low importance.
 
 {rule_no_citations}
 

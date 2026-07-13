@@ -205,6 +205,7 @@ class Topic(SQLiteModel):
     confidence_threshold: float | None = None
     relevance_threshold: float | None = None
     novelty_instruction: str | None = None
+    importance_threshold: int | None = None
     init_attempts: int = 0
 
     @field_validator("confidence_threshold", "relevance_threshold", mode="before")
@@ -230,6 +231,29 @@ class Topic(SQLiteModel):
             field_name = getattr(info, "field_name", "threshold")
             clamped = min(max(parsed, 0.0), 1.0)
             logger.warning("Out-of-range %s %r clamped to %s", field_name, parsed, clamped)
+            return clamped
+        return parsed
+
+    @field_validator("importance_threshold", mode="before")
+    @classmethod
+    def _clamp_importance_threshold(cls, value: object) -> object:
+        """Clamp the per-topic importance threshold into [1, 5].
+
+        Mirrors ``_clamp_threshold``: an out-of-range value reaching a topic row
+        (manual DB edit, restore, or a write path that skips ``parse_importance``)
+        would make ``novelty.importance >= importance_threshold`` always false,
+        silently suppressing ALL notifications for the topic. Clamp and warn
+        rather than raise so loading a corrupt row degrades gracefully.
+        """
+        if value is None:
+            return None
+        try:
+            parsed = int(value)  # type: ignore[call-overload]
+        except (TypeError, ValueError):
+            return value  # let Pydantic raise its standard type error
+        if parsed < 1 or parsed > 5:
+            clamped = min(max(parsed, 1), 5)
+            logger.warning("Out-of-range importance_threshold %r clamped to %s", parsed, clamped)
             return clamped
         return parsed
 

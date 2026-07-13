@@ -89,6 +89,28 @@ def parse_threshold(value: str, label: str, errors: list[str]) -> float | None:
     return parsed
 
 
+def parse_importance(value: str, errors: list[str]) -> int | None:
+    """Parse the optional per-topic importance notify threshold.
+
+    Blank input returns ``None`` (no suppression — notify on any importance).
+    Non-integer or out-of-range input appends a message to ``errors`` and
+    returns ``None``. Single fixed label by design, unlike ``parse_threshold``
+    which serves two fields.
+    """
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        parsed = int(text)
+    except ValueError:
+        errors.append("Importance threshold must be a whole number between 1 and 5")
+        return None
+    if not 1 <= parsed <= 5:
+        errors.append("Importance threshold must be between 1 and 5")
+        return None
+    return parsed
+
+
 def parse_novelty_instruction(value: str, errors: list[str]) -> str | None:
     """Parse the optional per-topic novelty instruction.
 
