@@ -4,7 +4,7 @@ import asyncio
 
 from pydantic import ValidationError
 
-from app.models import FeedMode
+from app.models import NOVELTY_INSTRUCTION_MAX_CHARS, FeedMode
 from app.url_validation import validate_feed_urls
 
 
@@ -87,3 +87,20 @@ def parse_threshold(value: str, label: str, errors: list[str]) -> float | None:
         errors.append(f"{label} must be between 0.0 and 1.0")
         return None
     return parsed
+
+
+def parse_novelty_instruction(value: str, errors: list[str]) -> str | None:
+    """Parse the optional per-topic novelty instruction.
+
+    Blank input returns ``None`` (no topic-specific criteria). Input longer than
+    ``NOVELTY_INSTRUCTION_MAX_CHARS`` appends a message to ``errors`` and returns
+    ``None`` — this form boundary is the cap's enforcement point (the template
+    ``maxlength`` is only a client-side hint).
+    """
+    text = value.strip()
+    if not text:
+        return None
+    if len(text) > NOVELTY_INSTRUCTION_MAX_CHARS:
+        errors.append(f"Novelty instruction must be at most {NOVELTY_INSTRUCTION_MAX_CHARS} characters")
+        return None
+    return text

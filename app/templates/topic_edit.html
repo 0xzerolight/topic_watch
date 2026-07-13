@@ -135,6 +135,15 @@
                    placeholder="inherit global ({{ '%.2f'|format(global_relevance_threshold) }})">
             <small class="help">Leave blank to inherit the global default. 0.0–1.0.</small>
         </div>
+        {% set current_instruction = novelty_instruction if novelty_instruction is defined
+            else (topic.novelty_instruction if topic.novelty_instruction is not none else '') %}
+        <div class="field-group">
+            <label for="novelty_instruction">Novelty instruction</label>
+            <textarea id="novelty_instruction" name="novelty_instruction" rows="3"
+                      maxlength="{{ novelty_instruction_max }}"
+                      placeholder="e.g., Only notify on official announcements with confirmed dates; ignore rumors and analyst speculation.">{{ current_instruction }}</textarea>
+            <small class="help">Optional. Tell the AI what counts as new for this topic. Max {{ novelty_instruction_max }} characters.</small>
+        </div>
     </section>
 
     <div class="form-actions">

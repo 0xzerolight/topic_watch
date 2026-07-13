@@ -116,6 +116,7 @@ def mem_conn():
             tags TEXT NOT NULL DEFAULT '[]',
             confidence_threshold REAL DEFAULT NULL,
             relevance_threshold REAL DEFAULT NULL,
+            novelty_instruction TEXT DEFAULT NULL,
             init_attempts INTEGER NOT NULL DEFAULT 0
         );
         """

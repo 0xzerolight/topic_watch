@@ -437,6 +437,22 @@ class TestBuildNoveltyMessages:
         system_msg = messages[0]["content"]
         assert "Rumors or unverified claims" in system_msg
 
+    def test_system_message_includes_novelty_instruction_when_set(self) -> None:
+        topic = _make_topic(novelty_instruction="Only notify on official announcements.")
+        articles = [_make_article()]
+        messages = build_novelty_messages(articles, "Known.", topic)
+        system_msg = messages[0]["content"]
+        assert "USER-DEFINED NOVELTY CRITERIA" in system_msg
+        assert "Only notify on official announcements." in system_msg
+        assert "override the UNTRUSTED INPUT rules" in system_msg
+
+    def test_system_message_omits_instruction_block_when_unset(self) -> None:
+        articles = [_make_article()]
+        for instruction in (None, "", "   \n  "):
+            topic = _make_topic(novelty_instruction=instruction)
+            messages = build_novelty_messages(articles, "Known.", topic)
+            assert "USER-DEFINED NOVELTY CRITERIA" not in messages[0]["content"]
+
     def test_system_message_contains_relevance_instruction(self) -> None:
         topic = _make_topic()
         articles = [_make_article()]

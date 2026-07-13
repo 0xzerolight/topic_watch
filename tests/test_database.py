@@ -572,6 +572,11 @@ class TestMigrations:
         assert "confidence_threshold" in columns
         assert "relevance_threshold" in columns
 
+    def test_topic_novelty_instruction_column_exists(self, db_conn: sqlite3.Connection) -> None:
+        """Migration m022 adds the nullable novelty_instruction column."""
+        columns = {row[1] for row in db_conn.execute("PRAGMA table_info(topics)").fetchall()}
+        assert "novelty_instruction" in columns
+
     def test_check_result_token_columns_exist(self, db_conn: sqlite3.Connection) -> None:
         """Migration m012 adds prompt/completion token columns to check_results."""
         columns = {row[1] for row in db_conn.execute("PRAGMA table_info(check_results)").fetchall()}
@@ -661,6 +666,24 @@ class TestMigrations:
         assert loaded.confidence_threshold == 0.9
         assert loaded.relevance_threshold == 0.5
         assert loaded.init_attempts == 2
+
+    def test_topic_novelty_instruction_roundtrip(self, db_conn: sqlite3.Connection) -> None:
+        """The per-topic novelty instruction persists on create and update."""
+        topic = create_topic(
+            db_conn,
+            Topic(name="Instructed", description="d", novelty_instruction="Only official announcements."),
+        )
+        db_conn.commit()
+        loaded = get_topic(db_conn, topic.id)
+        assert loaded is not None
+        assert loaded.novelty_instruction == "Only official announcements."
+
+        loaded.novelty_instruction = None
+        update_topic(db_conn, loaded)
+        db_conn.commit()
+        reloaded = get_topic(db_conn, topic.id)
+        assert reloaded is not None
+        assert reloaded.novelty_instruction is None
 
     def test_check_result_token_roundtrip(self, db_conn: sqlite3.Connection) -> None:
         """CheckResult token columns persist and load back."""
