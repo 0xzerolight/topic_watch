@@ -621,6 +621,53 @@ class TestAddTopic:
         assert response.status_code == 422
         assert "between 0.0 and 1.0" in response.text
 
+    async def test_create_topic_persists_novelty_instruction(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """The per-topic novelty instruction is persisted on create; blank stores NULL."""
+        with patch("app.web.routers.background._run_init", new_callable=AsyncMock):
+            await client.post(
+                "/topics",
+                data={
+                    "name": "Instructed",
+                    "description": "Test",
+                    "feed_urls": "",
+                    "novelty_instruction": "  Only official announcements.  ",
+                },
+                follow_redirects=False,
+            )
+            await client.post(
+                "/topics",
+                data={"name": "Uninstructed", "description": "Test", "feed_urls": "", "novelty_instruction": "   "},
+                follow_redirects=False,
+            )
+
+        from app.crud import get_topic_by_name
+
+        instructed = get_topic_by_name(db_conn, "Instructed")
+        assert instructed is not None
+        assert instructed.novelty_instruction == "Only official announcements."
+        uninstructed = get_topic_by_name(db_conn, "Uninstructed")
+        assert uninstructed is not None
+        assert uninstructed.novelty_instruction is None
+
+    async def test_create_topic_rejects_over_length_novelty_instruction(self, client: httpx.AsyncClient) -> None:
+        """A novelty instruction over the cap returns 422."""
+        from app.models import NOVELTY_INSTRUCTION_MAX_CHARS
+
+        response = await client.post(
+            "/topics",
+            data={
+                "name": "TooLong",
+                "description": "Test",
+                "feed_urls": "",
+                "novelty_instruction": "x" * (NOVELTY_INSTRUCTION_MAX_CHARS + 1),
+            },
+            follow_redirects=False,
+        )
+        assert response.status_code == 422
+        assert f"at most {NOVELTY_INSTRUCTION_MAX_CHARS} characters" in response.text
+
 
 # --- Topic Detail ---
 
@@ -1453,6 +1500,61 @@ class TestTopicEdit:
         assert updated.description == "New description"
         assert updated.feed_urls == ["https://new.example.com/feed.xml"]
         assert updated.feed_mode == FeedMode.MANUAL
+
+    async def test_edit_persists_novelty_instruction(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """POST to edit persists the novelty instruction (guards the silent-drop trap).
+
+        create_topic and update_topic bind named params from to_insert_dict(), and
+        sqlite3 silently ignores surplus keys — so a missing handler assignment or a
+        missing SET column would drop the field on edit with no error while create
+        still works. This asserts the full edit round-trip, then clearing back to NULL.
+        """
+        topic = _make_topic(db_conn, name="Instructable")
+        response = await client.post(
+            f"/topics/{topic.id}/edit",
+            data={
+                "name": "Instructable",
+                "description": topic.description,
+                "feed_mode": "manual",
+                "feed_urls": "https://example.com/feed.xml",
+                "novelty_instruction": "Ignore rumors; official sources only.",
+            },
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+
+        from app.crud import get_topic
+
+        updated = get_topic(db_conn, topic.id)
+        assert updated is not None
+        assert updated.novelty_instruction == "Ignore rumors; official sources only."
+
+        response = await client.post(
+            f"/topics/{topic.id}/edit",
+            data={
+                "name": "Instructable",
+                "description": topic.description,
+                "feed_mode": "manual",
+                "feed_urls": "https://example.com/feed.xml",
+                "novelty_instruction": "",
+            },
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+        cleared = get_topic(db_conn, topic.id)
+        assert cleared is not None
+        assert cleared.novelty_instruction is None
+
+    async def test_edit_form_repopulates_novelty_instruction(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """GET edit form shows the stored novelty instruction in the textarea."""
+        topic = _make_topic(db_conn, name="Prefilled", novelty_instruction="Official sources only.")
+        response = await client.get(f"/topics/{topic.id}/edit")
+        assert response.status_code == 200
+        assert "Official sources only." in response.text
 
     async def test_edit_switch_to_auto_mode(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
         """Editing a topic can switch feed_mode from manual to auto."""

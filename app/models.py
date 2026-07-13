@@ -176,6 +176,12 @@ class FeedMode(StrEnum):
     EXA = "exa"
 
 
+# Cap for the per-topic novelty instruction (free text injected into the novelty
+# prompt). Single source of truth: enforced at the form boundary
+# (``parse_novelty_instruction``) and rendered as the textarea ``maxlength``.
+NOVELTY_INSTRUCTION_MAX_CHARS = 500
+
+
 class Topic(SQLiteModel):
     """A monitored topic with associated feed URLs."""
 
@@ -198,6 +204,7 @@ class Topic(SQLiteModel):
     tags: list[str] = Field(default_factory=list)
     confidence_threshold: float | None = None
     relevance_threshold: float | None = None
+    novelty_instruction: str | None = None
     init_attempts: int = 0
 
     @field_validator("confidence_threshold", "relevance_threshold", mode="before")

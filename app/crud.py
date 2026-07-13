@@ -32,10 +32,10 @@ def create_topic(conn: sqlite3.Connection, topic: Topic) -> Topic:
     cursor = conn.execute(
         """INSERT INTO topics (name, description, feed_urls, feed_mode,
            created_at, status_changed_at, is_active, status, error_message, check_interval_minutes, tags,
-           confidence_threshold, relevance_threshold, init_attempts)
+           confidence_threshold, relevance_threshold, novelty_instruction, init_attempts)
            VALUES (:name, :description, :feed_urls, :feed_mode,
            :created_at, :status_changed_at, :is_active, :status, :error_message, :check_interval_minutes, :tags,
-           :confidence_threshold, :relevance_threshold, :init_attempts)""",
+           :confidence_threshold, :relevance_threshold, :novelty_instruction, :init_attempts)""",
         data,
     )
     topic.id = cursor.lastrowid
@@ -110,7 +110,8 @@ def update_topic(conn: sqlite3.Connection, topic: Topic) -> Topic:
            is_active=:is_active, status=:status, status_changed_at=:status_changed_at,
            error_message=:error_message, check_interval_minutes=:check_interval_minutes,
            tags=:tags, confidence_threshold=:confidence_threshold,
-           relevance_threshold=:relevance_threshold, init_attempts=:init_attempts
+           relevance_threshold=:relevance_threshold, novelty_instruction=:novelty_instruction,
+           init_attempts=:init_attempts
            WHERE id=:id""",
         data,
     )

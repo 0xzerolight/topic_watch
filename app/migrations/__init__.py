@@ -28,6 +28,7 @@ from app.migrations.m018_article_published_at import up as m018_up
 from app.migrations.m019_feed_validators import up as m019_up
 from app.migrations.m020_check_result_seen_at import up as m020_up
 from app.migrations.m021_scrub_stub_notes import up as m021_up
+from app.migrations.m022_topic_novelty_instruction import up as m022_up
 
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "baseline schema version", m001_up),
@@ -51,4 +52,5 @@ MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (19, "add etag/last_modified validators to feed_health", m019_up),
     (20, "add seen_at column to check_results", m020_up),
     (21, "scrub leaked [STUB] reliability notes from knowledge summaries", m021_up),
+    (22, "add novelty_instruction column to topics", m022_up),
 ]
