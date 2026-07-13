@@ -84,6 +84,7 @@ def format_notification(topic_name: str, novelty_result: NoveltyResult) -> tuple
     parts.append("")
     parts.append(f"Confidence: {confidence_pct}%")
     parts.append(f"Relevance: {relevance_pct}%")
+    parts.append(f"Importance: {novelty_result.importance}/5")
 
     body = "\n".join(parts)
     return title, body

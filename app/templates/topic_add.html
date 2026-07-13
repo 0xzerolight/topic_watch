@@ -131,6 +131,14 @@
             <small class="help">Leave blank to inherit the global default. 0.0–1.0.</small>
         </div>
         <div class="field-group">
+            <label for="importance_threshold">Importance threshold</label>
+            <input type="number" id="importance_threshold" name="importance_threshold"
+                   min="1" max="5" step="1"
+                   value="{{ importance_threshold or '' }}"
+                   placeholder="off (notify on any importance)">
+            <small class="help">Leave blank to notify on any importance. 1–5: suppress notifications for new info the AI rates below this.</small>
+        </div>
+        <div class="field-group">
             <label for="novelty_instruction">Novelty instruction</label>
             <textarea id="novelty_instruction" name="novelty_instruction" rows="3"
                       maxlength="{{ novelty_instruction_max }}"

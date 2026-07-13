@@ -74,6 +74,17 @@
         </dd>
     </div>
     <div>
+        <dt>Importance threshold</dt>
+        <dd>
+            {# No global fallback by design: importance suppression is per-topic only. #}
+            {% if topic.importance_threshold is not none %}
+                {{ topic.importance_threshold }}/5
+            {% else %}
+                off <small class="quiet">(notify on all)</small>
+            {% endif %}
+        </dd>
+    </div>
+    <div>
         <dt>Created</dt>
         <dd><span title="{{ topic.created_at.strftime('%Y-%m-%d %H:%M') }}">{{ topic.created_at | timeago }}</span></dd>
     </div>

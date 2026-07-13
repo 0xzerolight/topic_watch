@@ -46,7 +46,7 @@ notifications:
 
   # Custom webhook URLs for JSON POST notifications
   # Each URL receives a POST with JSON body:
-  # {"topic": "name", "reasoning": "...", "summary": "...", "key_facts": [...], "source_urls": [...], "confidence": 0.85, "relevance": 0.88, "timestamp": "..."}
+  # {"topic": "name", "reasoning": "...", "summary": "...", "key_facts": [...], "source_urls": [...], "confidence": 0.85, "relevance": 0.88, "importance": 3, "timestamp": "..."}
   webhook_urls: []
     # - "https://your-server.com/webhook/topic-watch"
     # - "https://hooks.example.com/trigger"

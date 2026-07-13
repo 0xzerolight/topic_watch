@@ -577,6 +577,11 @@ class TestMigrations:
         columns = {row[1] for row in db_conn.execute("PRAGMA table_info(topics)").fetchall()}
         assert "novelty_instruction" in columns
 
+    def test_topic_importance_threshold_column_exists(self, db_conn: sqlite3.Connection) -> None:
+        """Migration m023 adds the nullable importance_threshold column."""
+        columns = {row[1] for row in db_conn.execute("PRAGMA table_info(topics)").fetchall()}
+        assert "importance_threshold" in columns
+
     def test_check_result_token_columns_exist(self, db_conn: sqlite3.Connection) -> None:
         """Migration m012 adds prompt/completion token columns to check_results."""
         columns = {row[1] for row in db_conn.execute("PRAGMA table_info(check_results)").fetchall()}
@@ -684,6 +689,21 @@ class TestMigrations:
         reloaded = get_topic(db_conn, topic.id)
         assert reloaded is not None
         assert reloaded.novelty_instruction is None
+
+    def test_topic_importance_threshold_roundtrip(self, db_conn: sqlite3.Connection) -> None:
+        """The per-topic importance threshold persists on create and update."""
+        topic = create_topic(db_conn, Topic(name="Important", description="d", importance_threshold=4))
+        db_conn.commit()
+        loaded = get_topic(db_conn, topic.id)
+        assert loaded is not None
+        assert loaded.importance_threshold == 4
+
+        loaded.importance_threshold = None
+        update_topic(db_conn, loaded)
+        db_conn.commit()
+        reloaded = get_topic(db_conn, topic.id)
+        assert reloaded is not None
+        assert reloaded.importance_threshold is None
 
     def test_check_result_token_roundtrip(self, db_conn: sqlite3.Connection) -> None:
         """CheckResult token columns persist and load back."""

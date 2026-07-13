@@ -105,9 +105,15 @@ class TestBuildWebhookPayload:
             "source_urls",
             "confidence",
             "relevance",
+            "importance",
             "timestamp",
         }
         assert set(payload.keys()) == expected_keys
+
+    def test_payload_includes_importance(self) -> None:
+        novelty = _make_novelty(importance=5)
+        payload = _build_webhook_payload("T", novelty)
+        assert payload["importance"] == 5
 
     def test_key_facts_is_list_type(self) -> None:
         novelty = _make_novelty(key_facts=[])

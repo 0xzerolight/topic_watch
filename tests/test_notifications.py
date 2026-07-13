@@ -157,6 +157,17 @@ class TestFormatNotification:
         _, body = format_notification("Test", novelty)
         assert "Relevance: 73%" in body
 
+    def test_body_includes_importance(self) -> None:
+        novelty = NoveltyResult(
+            has_new_info=True,
+            summary="Update",
+            confidence=0.9,
+            relevance=0.8,
+            importance=4,
+        )
+        _, body = format_notification("Test", novelty)
+        assert "Importance: 4/5" in body
+
 
 # --- send_notification ---
 

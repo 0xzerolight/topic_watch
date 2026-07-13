@@ -17,6 +17,7 @@ from app.crud import (
     create_pending_notification,
     create_topic,
     get_topic,
+    list_articles_for_topic,
     list_pending_notifications,
 )
 from app.models import (
@@ -1148,6 +1149,76 @@ class TestPerTopicThresholds:
 
         assert result.notification_sent is False
         mock_send.assert_not_called()
+
+
+class TestImportanceThreshold:
+    """Per-topic importance threshold suppresses sends but NOT the knowledge update.
+
+    Unlike the confidence/relevance gates (unreliable result -> skip everything),
+    below-importance info is genuinely new and on-topic: the knowledge state must
+    still absorb it, or the same trivial fact re-flags as "new" every cycle.
+    """
+
+    async def _run(self, db_conn, topic, novelty, settings):
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
+        db_conn.commit()
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[article], total_feed_entries=1),
+            ),
+            patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
+            patch(
+                "app.checker.update_knowledge", new_callable=AsyncMock, return_value=_make_write_result()
+            ) as mock_update,
+            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)) as mock_send,
+            patch("app.checker.send_webhooks", new_callable=AsyncMock) as mock_webhooks,
+        ):
+            result = await check_topic(topic, db_conn, settings)
+        return result, mock_send, mock_update, mock_webhooks, article
+
+    async def test_below_threshold_suppresses_sends_but_updates_knowledge(
+        self, db_conn: sqlite3.Connection
+    ) -> None:
+        """Importance 2 < threshold 4 → no notification/webhook, but knowledge updates
+        and articles are marked processed."""
+        topic = _make_topic(db_conn, importance_threshold=4)
+        settings = _make_settings(min_confidence_threshold=0.5, min_relevance_threshold=0.3)
+        novelty = NoveltyResult(has_new_info=True, summary="x", confidence=0.9, relevance=0.9, importance=2)
+
+        result, mock_send, mock_update, mock_webhooks, article = await self._run(db_conn, topic, novelty, settings)
+
+        assert result.has_new_info is True
+        assert result.notification_sent is False
+        mock_send.assert_not_called()
+        mock_webhooks.assert_not_called()
+        mock_update.assert_awaited_once()
+        articles = list_articles_for_topic(db_conn, topic.id)
+        assert all(a.processed for a in articles)
+
+    async def test_at_threshold_notifies(self, db_conn: sqlite3.Connection) -> None:
+        """Importance exactly at the threshold notifies (locks >= not >)."""
+        topic = _make_topic(db_conn, importance_threshold=4)
+        settings = _make_settings(min_confidence_threshold=0.5, min_relevance_threshold=0.3)
+        novelty = NoveltyResult(has_new_info=True, summary="x", confidence=0.9, relevance=0.9, importance=4)
+
+        result, mock_send, mock_update, _, _ = await self._run(db_conn, topic, novelty, settings)
+
+        assert result.notification_sent is True
+        mock_send.assert_called_once()
+        mock_update.assert_awaited_once()
+
+    async def test_null_threshold_notifies_at_importance_one(self, db_conn: sqlite3.Connection) -> None:
+        """NULL importance_threshold = no suppression: importance 1 still notifies."""
+        topic = _make_topic(db_conn, importance_threshold=None)
+        settings = _make_settings(min_confidence_threshold=0.5, min_relevance_threshold=0.3)
+        novelty = NoveltyResult(has_new_info=True, summary="x", confidence=0.9, relevance=0.9, importance=1)
+
+        result, mock_send, _, _, _ = await self._run(db_conn, topic, novelty, settings)
+
+        assert result.notification_sent is True
+        mock_send.assert_called_once()
 
 
 class TestCheckResultTokens:

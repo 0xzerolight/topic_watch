@@ -651,6 +651,52 @@ class TestAddTopic:
         assert uninstructed is not None
         assert uninstructed.novelty_instruction is None
 
+    async def test_create_topic_persists_importance_threshold(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """The per-topic importance threshold is persisted on create; blank stores NULL."""
+        with patch("app.web.routers.background._run_init", new_callable=AsyncMock):
+            await client.post(
+                "/topics",
+                data={
+                    "name": "ImportantOnly",
+                    "description": "Test",
+                    "feed_urls": "",
+                    "importance_threshold": "4",
+                },
+                follow_redirects=False,
+            )
+            await client.post(
+                "/topics",
+                data={"name": "AnyImportance", "description": "Test", "feed_urls": "", "importance_threshold": ""},
+                follow_redirects=False,
+            )
+
+        from app.crud import get_topic_by_name
+
+        important = get_topic_by_name(db_conn, "ImportantOnly")
+        assert important is not None
+        assert important.importance_threshold == 4
+        any_importance = get_topic_by_name(db_conn, "AnyImportance")
+        assert any_importance is not None
+        assert any_importance.importance_threshold is None
+
+    async def test_create_topic_rejects_out_of_range_importance(self, client: httpx.AsyncClient) -> None:
+        """Out-of-range or non-integer importance threshold returns 422."""
+        for bad_value in ("6", "0", "abc"):
+            response = await client.post(
+                "/topics",
+                data={
+                    "name": f"BadImportance{bad_value}",
+                    "description": "Test",
+                    "feed_urls": "",
+                    "importance_threshold": bad_value,
+                },
+                follow_redirects=False,
+            )
+            assert response.status_code == 422
+            assert "between 1 and 5" in response.text
+
     async def test_create_topic_rejects_over_length_novelty_instruction(self, client: httpx.AsyncClient) -> None:
         """A novelty instruction over the cap returns 422."""
         from app.models import NOVELTY_INSTRUCTION_MAX_CHARS
@@ -681,6 +727,21 @@ class TestTopicDetail:
         response = await client.get(f"/topics/{topic.id}")
         assert response.status_code == 200
         assert topic.name in response.text
+
+    async def test_detail_shows_importance_threshold(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """Detail page shows the per-topic importance threshold, or 'off' when NULL."""
+        topic = _make_topic(db_conn, name="Important Detail", importance_threshold=4)
+        response = await client.get(f"/topics/{topic.id}")
+        assert response.status_code == 200
+        assert "Importance threshold" in response.text
+        assert "4/5" in response.text
+
+        plain = _make_topic(db_conn, name="Plain Detail")
+        response = await client.get(f"/topics/{plain.id}")
+        assert response.status_code == 200
+        assert "notify on all" in response.text
 
     async def test_detail_shows_auto_feed_url(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
         """Detail page for auto mode shows the generated Google News URL."""
@@ -1555,6 +1616,36 @@ class TestTopicEdit:
         response = await client.get(f"/topics/{topic.id}/edit")
         assert response.status_code == 200
         assert "Official sources only." in response.text
+
+    async def test_edit_persists_importance_threshold(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """POST to edit persists the importance threshold, then clears it back to NULL."""
+        topic = _make_topic(db_conn, name="ImportanceEdit")
+        base = {
+            "name": "ImportanceEdit",
+            "description": topic.description,
+            "feed_mode": "manual",
+            "feed_urls": "https://example.com/feed.xml",
+        }
+        response = await client.post(
+            f"/topics/{topic.id}/edit", data={**base, "importance_threshold": "3"}, follow_redirects=False
+        )
+        assert response.status_code == 303
+
+        from app.crud import get_topic
+
+        updated = get_topic(db_conn, topic.id)
+        assert updated is not None
+        assert updated.importance_threshold == 3
+
+        response = await client.post(
+            f"/topics/{topic.id}/edit", data={**base, "importance_threshold": ""}, follow_redirects=False
+        )
+        assert response.status_code == 303
+        cleared = get_topic(db_conn, topic.id)
+        assert cleared is not None
+        assert cleared.importance_threshold is None
 
     async def test_edit_switch_to_auto_mode(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
         """Editing a topic can switch feed_mode from manual to auto."""
