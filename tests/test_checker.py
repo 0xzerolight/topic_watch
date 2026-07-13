@@ -1178,9 +1178,7 @@ class TestImportanceThreshold:
             result = await check_topic(topic, db_conn, settings)
         return result, mock_send, mock_update, mock_webhooks, article
 
-    async def test_below_threshold_suppresses_sends_but_updates_knowledge(
-        self, db_conn: sqlite3.Connection
-    ) -> None:
+    async def test_below_threshold_suppresses_sends_but_updates_knowledge(self, db_conn: sqlite3.Connection) -> None:
         """Importance 2 < threshold 4 → no notification/webhook, but knowledge updates
         and articles are marked processed."""
         topic = _make_topic(db_conn, importance_threshold=4)
