@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.5] - 2026-08-01
+
+### Added
+
+- Per-topic novelty instruction: a free-text field (max 500 chars) on add/edit that tells the model what counts as new for that topic, injected into the novelty prompt as user-defined criteria
+- Importance scoring: every novelty result now carries a 1-5 `importance` rating, shown in the notification body, the webhook payload (new `importance` key), and the topic's check history
+- Optional per-topic importance threshold: findings the model rates below it still update the knowledge state but do not notify, so a minor fact is neither delivered nor re-flagged as new next cycle. Blank (the default) notifies on any importance
+- Topic detail page shows the topic's novelty instruction and each check's importance, and labels a check whose notification was suppressed by the importance gate
+
+### Changed
+
+- The analysis log warns when the LLM omits `importance` from its response — that silently defaults the score to 3, which would make a threshold of 4 or 5 mute the topic
+- Frozen eval scenarios carry `novelty_instruction`, so a replayed scenario builds the same prompt production sent; `Expectation` gains `min_importance`
+- Dependencies relocked; CI actions, ruff (v0.16.0), mypy (v2.3.0), and the Python base image digest bumped
+
 ## [1.2.4] - 2026-07-07
 
 ### Added
