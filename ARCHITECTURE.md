@@ -57,7 +57,7 @@ All application code lives under `app/`.
 
 | Module | Responsibility |
 |--------|---------------|
-| `analysis/llm.py` | LiteLLM + Instructor wrappers. Defines `NoveltyResult` (with `confidence` and `relevance` scores), `KnowledgeStateUpdate`, and `TokenUsage`. Token counting, rate limit backoff with exponential delay. Returns safe default (`has_new_info=False`, `confidence=0.0`) on analysis failure. |
+| `analysis/llm.py` | LiteLLM + Instructor wrappers. Defines `NoveltyResult` (with `confidence`, `relevance`, and `importance` scores), `KnowledgeStateUpdate`, and `TokenUsage`. Token counting, rate limit backoff with exponential delay. Returns safe default (`has_new_info=False`, `confidence=0.0`) on analysis failure. |
 | `analysis/prompts.py` | System and user prompt builders for novelty detection and knowledge init/update/compress. Articles truncated to 1500 chars in prompts. |
 | `analysis/knowledge.py` | Knowledge state initialization and updates with DB persistence. Token budget enforcement via summary compression. |
 | `analysis/restatement.py` | Pure phrase-matching filter (`filter_restated_key_facts`, re-exported by `llm.py`). Drops a key fact only when it is a clear restatement of the existing knowledge summary (normalized verbatim or long contiguous n-gram match), so already-known facts aren't re-flagged as new. Conservative by design. |
@@ -81,7 +81,7 @@ All application code lives under `app/`.
 | `models.py` | Pydantic models: `Topic`, `Article`, `KnowledgeState`, `CheckResult`, `FeedHealth`, `DashboardStats`, `PendingNotification`, `PendingWebhook`. Enums: `TopicStatus` (new/researching/ready/error), `FeedMode` (auto/manual). Each model has `from_row()` and `to_insert_dict()` for SQLite interop; datetime cells are coerced defensively. |
 | `crud.py` | All SQL (parameterized), grouped by model: CRUD, feed-health upserts, notification + webhook retry queues, dashboard aggregation, article retention cleanup, stuck-topic recovery. |
 | `database.py` | SQLite connection factory (WAL mode, foreign keys, busy timeout). Schema init (`init_db`). Migration runner (`run_migrations`) — backs up the DB before applying pending migrations. |
-| `migrations/` | 19 sequential migrations (`m001`–`m019`) registered in `__init__.py` as `(version, description, up_function)` tuples. Tracked in `schema_version`. Append-only. |
+| `migrations/` | 23 sequential migrations (`m001`–`m023`) registered in `__init__.py` as `(version, description, up_function)` tuples. Tracked in `schema_version`. Append-only. |
 | `interval.py` | Human-readable interval parsing/formatting (`m`/`h`/`d`/`w`/`M`, combined syntax like `"1w 3d 2h"`). Enforces min/max interval bounds. |
 | `opml.py` | OPML import/export. Parses feeds from RSS readers (FreshRSS, Miniflux, TT-RSS), validates feed URLs, and exports topics as OPML. |
 
@@ -160,7 +160,7 @@ The route handlers were split out of `routes.py` into the `web/routers/` package
 
 | Table | Purpose |
 |-------|---------|
-| `topics` | Core entity. Name, description, `feed_urls` (JSON array), `feed_mode` (auto/manual), `status`, `is_active`, `status_changed_at`, `check_interval_minutes`, `tags` (JSON array), per-topic `confidence_threshold` / `relevance_threshold` (m011, nullable overrides), `init_attempts` (m013). |
+| `topics` | Core entity. Name, description, `feed_urls` (JSON array), `feed_mode` (auto/manual), `status`, `is_active`, `status_changed_at`, `check_interval_minutes`, `tags` (JSON array), per-topic `confidence_threshold` / `relevance_threshold` (m011, nullable overrides), `init_attempts` (m013), `novelty_instruction` (m022, nullable, ≤500 chars, injected into the novelty prompt), `importance_threshold` (m023, nullable 1-5; NULL = notify on any importance). |
 | `articles` | Fetched articles linked to a topic. Deduped by `content_hash` (unique per topic). `source_provider` records the news provider (m009), `published_at` the feed entry's date (m018). `processed` flag tracks analysis completion. |
 | `knowledge_states` | One per topic. Rolling LLM-generated summary. `token_count` tracks budget usage. |
 | `check_results` | Audit log of every check cycle. Stores articles found/new, `has_new_info`, full LLM response JSON, notification outcome, `prompt_tokens` / `completion_tokens` (m012), and `stage_error` recording which pipeline stage failed (m015). |
@@ -196,8 +196,8 @@ Topics created through the UI start in **RESEARCHING**: articles are fetched and
 4. For each due topic, `check_topic()` runs with a unique correlation ID:
    - **Fetch** - `fetch_new_articles_for_topic()`: fetch feeds, dedup against DB, extract content.
    - **Analyze** - `analyze_articles()`: LLM compares articles against knowledge state.
-   - **Update** - If `has_new_info`: update knowledge state via LLM.
-   - **Notify** - Send notification via Apprise + webhooks. Queue for retry on failure.
+   - **Update** - If `has_new_info` and confidence/relevance clear their thresholds: update knowledge state via LLM.
+   - **Notify** - Send notification via Apprise + webhooks. Queue for retry on failure. A finding below the topic's `importance_threshold` skips the send only — the knowledge state has already absorbed it, so the same minor fact never re-flags as new.
    - **Record** - Mark articles processed, create `CheckResult`.
 5. Each topic is independent. Errors in one do not affect others.
 
@@ -322,9 +322,14 @@ Payload:
   "source_urls": ["https://..."],
   "confidence": 0.92,
   "relevance": 0.88,
+  "importance": 4,
   "timestamp": "2026-04-01T12:00:00+00:00"
 }
 ```
+
+`importance` is the model's 1-5 significance rating (1 = trivial, 5 = major). A
+topic with an `importance_threshold` set only delivers findings that meet it;
+below-threshold findings still update the knowledge state, they just do not send.
 
 10-second timeout per endpoint, concurrent delivery, failures logged but non-blocking.
 

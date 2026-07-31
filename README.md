@@ -100,6 +100,8 @@ the SQLite database land in the project's `data/` directory.
 - Private and self-hosted on SQLite - no database server, no JavaScript build step. Outbound traffic only goes to RSS feeds, your LLM provider, and your notifier
 - Auto feeds (Bing News, falling back to Google News) or manual RSS/Atom URLs
 - Per-topic check intervals (10 min to 6 months, human-readable: `6h`, `1w 3d`, `2h 30m`)
+- Per-topic novelty instruction: tell the AI in plain English what counts as new for that topic ("official announcements only, ignore rumors")
+- Importance scoring: every finding is rated 1-5, with an optional per-topic threshold that mutes minor findings without dropping them from the knowledge state
 - Topic tags
 - 100+ notification services via [Apprise](https://github.com/caronc/apprise/wiki) (Discord, Slack, Telegram, email, ntfy, etc.)
 - Custom JSON webhooks
@@ -114,7 +116,8 @@ the SQLite database land in the project's `data/` directory.
 
 1. Dashboard -> **Add Topic**.
 2. Fill in **Name**, **Description** (what you care about in plain English), **Feed Source** (Automatic/Manual), **Feed URLs** (if Manual, one per line), **Check Interval**, **Tags**.
-3. **Save**.
+3. Optionally tune the per-topic gates: **Confidence threshold**, **Relevance threshold**, **Importance threshold** (1-5, blank = notify on anything), and **Novelty instruction** (up to 500 characters telling the AI what counts as new here). Blank leaves the global defaults in place.
+4. **Save**.
 
 The topic enters a "Researching" phase where it fetches articles and builds an initial knowledge state (under a minute), then enters the normal check cycle.
 
