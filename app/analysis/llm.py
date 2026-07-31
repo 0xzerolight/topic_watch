@@ -586,6 +586,19 @@ async def analyze_articles(
     # it on a clean run. Force it None here so ONLY the except-branch above ever
     # sets it; otherwise the checker mis-stamps a healthy run as analysis_failed.
     novelty.error = None
+    # ``importance`` has a default (see NoveltyResult), so a provider that ignores
+    # the field silently scores every result 3 — which makes a per-topic threshold
+    # of 4 or 5 mute the topic entirely, with nothing in the logs to explain it.
+    # Say so once per check rather than making the field required (that would break
+    # re-parsing of pre-m023 stored blobs in the force-notify handler).
+    if "importance" not in novelty.model_fields_set:
+        logger.warning(
+            "LLM omitted 'importance' for topic '%s'; defaulting to %d. "
+            "An importance threshold above %d will suppress every notification with this model.",
+            topic.name,
+            novelty.importance,
+            novelty.importance,
+        )
     usage = _extract_usage(completion)
     novelty.prompt_tokens = usage.prompt_tokens
     novelty.completion_tokens = usage.completion_tokens

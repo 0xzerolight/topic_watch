@@ -1,5 +1,6 @@
 """Tests for the LLM analysis module: prompts, structured output, knowledge management."""
 
+import logging
 import sqlite3
 from datetime import UTC
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -935,6 +936,35 @@ class TestAnalyzeArticles:
 
         assert result.has_new_info is True
         assert result.error is None
+
+    async def test_warns_when_provider_omits_importance(self, caplog: pytest.LogCaptureFixture) -> None:
+        """``importance`` has a default, so an omitting provider scores everything 3.
+
+        Silent, that turns an importance threshold of 4 or 5 into a permanent mute
+        with nothing in the logs to explain it.
+        """
+        omitted = NoveltyResult.model_validate({"has_new_info": True, "summary": "X", "confidence": 0.9})
+        mock_client, _ = _mock_instructor_client(omitted)
+        settings = _make_settings()
+
+        with patch("app.analysis.llm._get_client", return_value=mock_client), caplog.at_level(logging.WARNING):
+            result = await analyze_articles([_make_article()], "Known facts.", _make_topic(), settings)
+
+        assert result.importance == 3
+        assert any("omitted 'importance'" in r.getMessage() for r in caplog.records)
+
+    async def test_no_warning_when_provider_sets_importance(self, caplog: pytest.LogCaptureFixture) -> None:
+        """An explicit score — including one equal to the default — is not a warning."""
+        scored = NoveltyResult.model_validate(
+            {"has_new_info": True, "summary": "X", "confidence": 0.9, "importance": 3}
+        )
+        mock_client, _ = _mock_instructor_client(scored)
+        settings = _make_settings()
+
+        with patch("app.analysis.llm._get_client", return_value=mock_client), caplog.at_level(logging.WARNING):
+            await analyze_articles([_make_article()], "Known facts.", _make_topic(), settings)
+
+        assert not any("omitted 'importance'" in r.getMessage() for r in caplog.records)
 
 
 # ============================================================
