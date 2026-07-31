@@ -208,6 +208,30 @@ def _confidence_badge(llm_response: str | None) -> str:
     return _confidence_value(confidence)
 
 
+def _importance_score(llm_response: str | None) -> int | None:
+    """Pull the 1-5 importance score out of an ``llm_response`` JSON blob.
+
+    ``None`` when the blob is missing, unparseable, or predates m023 (checks
+    recorded before importance scoring existed). The check-history table renders
+    it directly and uses it to tell an importance-suppressed check apart from a
+    failed delivery.
+    """
+    if not llm_response:
+        return None
+
+    try:
+        data = json_mod.loads(llm_response)
+    except json_mod.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    try:
+        return int(data["importance"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def _feed_source_name(feed_url: str) -> str:
     """Convert a feed URL to a human-readable source name."""
     try:
@@ -233,4 +257,5 @@ templates.env.filters["mask_url"] = _mask_url
 templates.env.filters["safe_href"] = _safe_href
 templates.env.filters["confidence_badge"] = _confidence_badge
 templates.env.filters["confidence_value"] = _confidence_value
+templates.env.filters["importance_score"] = _importance_score
 templates.env.filters["feed_source_name"] = _feed_source_name

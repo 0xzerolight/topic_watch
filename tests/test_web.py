@@ -1,5 +1,6 @@
 """Tests for the web UI: routes, templates, and HTMX interactions."""
 
+import json
 import logging
 import re
 import sqlite3
@@ -742,6 +743,99 @@ class TestTopicDetail:
         response = await client.get(f"/topics/{plain.id}")
         assert response.status_code == 200
         assert "notify on all" in response.text
+
+    async def test_detail_shows_novelty_instruction(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """Detail page shows the per-topic novelty instruction, or 'none' when NULL."""
+        topic = _make_topic(db_conn, name="Instructed Detail", novelty_instruction="Official announcements only.")
+        response = await client.get(f"/topics/{topic.id}")
+        assert response.status_code == 200
+        assert "Novelty instruction" in response.text
+        assert "Official announcements only." in response.text
+
+        plain = _make_topic(db_conn, name="Uninstructed Detail")
+        response = await client.get(f"/topics/{plain.id}")
+        assert response.status_code == 200
+        assert "default criteria" in response.text
+
+    async def test_detail_check_history_shows_importance(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """Each check's importance score is rendered; pre-m023 blobs render as '-'."""
+        topic = _make_topic(db_conn, name="Importance History")
+        create_check_result(
+            db_conn,
+            CheckResult(
+                topic_id=topic.id,
+                has_new_info=True,
+                llm_response=json.dumps({"has_new_info": True, "confidence": 0.9, "importance": 5}),
+            ),
+        )
+        db_conn.commit()
+
+        response = await client.get(f"/topics/{topic.id}")
+        assert response.status_code == 200
+        assert "5/5" in response.text
+
+        legacy = _make_topic(db_conn, name="Legacy History")
+        create_check_result(
+            db_conn,
+            CheckResult(
+                topic_id=legacy.id,
+                has_new_info=True,
+                llm_response=json.dumps({"has_new_info": True, "confidence": 0.9}),
+            ),
+        )
+        db_conn.commit()
+
+        response = await client.get(f"/topics/{legacy.id}")
+        assert response.status_code == 200
+        assert "Importance" in response.text
+
+    async def test_detail_labels_importance_suppressed_check(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """A check muted by the importance gate reads 'Suppressed', not a bare '-'.
+
+        Without this the row is byte-identical to a notification that silently
+        failed to send.
+        """
+        topic = _make_topic(db_conn, name="Suppressed Topic", importance_threshold=4)
+        create_check_result(
+            db_conn,
+            CheckResult(
+                topic_id=topic.id,
+                has_new_info=True,
+                notification_sent=False,
+                llm_response=json.dumps({"has_new_info": True, "confidence": 0.9, "importance": 2}),
+            ),
+        )
+        db_conn.commit()
+
+        response = await client.get(f"/topics/{topic.id}")
+        assert response.status_code == 200
+        assert "Suppressed" in response.text
+
+    async def test_detail_does_not_label_above_threshold_check_suppressed(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """A check that cleared the importance gate is never labelled 'Suppressed'."""
+        topic = _make_topic(db_conn, name="Delivered Topic", importance_threshold=2)
+        create_check_result(
+            db_conn,
+            CheckResult(
+                topic_id=topic.id,
+                has_new_info=True,
+                notification_sent=True,
+                llm_response=json.dumps({"has_new_info": True, "confidence": 0.9, "importance": 4}),
+            ),
+        )
+        db_conn.commit()
+
+        response = await client.get(f"/topics/{topic.id}")
+        assert response.status_code == 200
+        assert "Suppressed" not in response.text
 
     async def test_detail_shows_auto_feed_url(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
         """Detail page for auto mode shows the generated Google News URL."""
