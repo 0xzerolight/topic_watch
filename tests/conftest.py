@@ -63,6 +63,22 @@ def _safe_config_path(tmp_path: Path):
 
 
 @pytest.fixture(autouse=True)
+def _safe_config_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Keep the YAML settings source off the developer's real data/config.yml.
+
+    ``Settings()`` runs ``settings_customise_sources``, which falls back to
+    ``DEFAULT_CONFIG_PATH`` whenever no explicit override is set — so a bare
+    ``Settings(...)`` in a test silently inherits whatever the developer has
+    configured locally (an Exa key, a non-default interval). CI has no such file,
+    so those tests pass there and fail on a real machine. Point the fallback at a
+    nonexistent temp path: unset fields resolve to their declared defaults.
+
+    ``_safe_config_path`` is the write-side counterpart; this is the read side.
+    """
+    monkeypatch.setattr("app.config.DEFAULT_CONFIG_PATH", tmp_path / "absent-config.yml")
+
+
+@pytest.fixture(autouse=True)
 def _safe_lifespan_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Point the app lifespan's init_db at a temp DB.
 
