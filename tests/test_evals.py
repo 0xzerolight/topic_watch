@@ -309,6 +309,46 @@ async def test_run_scenario_novelty_evaluates_expectations() -> None:
     assert oks["summary_contains"] is True
 
 
+async def test_run_scenario_novelty_evaluates_min_importance() -> None:
+    from evals.runner import run_scenario
+    from evals.scenario import Expectation, Scenario, ScenarioArticle, ScenarioTopic
+
+    inner = _mock_inner(novelty=_novelty(importance=2))
+    sc = Scenario(
+        kind="novelty",
+        topic=ScenarioTopic(name="T", description="d"),
+        articles=[ScenarioArticle(title="a", url="http://x", content="c", source_feed="http://f")],
+        expect=Expectation(min_importance=4),
+        name="s",
+    )
+    art = await run_scenario(sc, _settings(), inner=inner)
+
+    oks = {c.check: c.ok for c in art.expect_results}
+    assert oks["min_importance"] is False  # 2 < 4
+
+
+async def test_scenario_novelty_instruction_reaches_the_prompt() -> None:
+    """A scenario's novelty instruction must land in the built prompt.
+
+    Without it a frozen scenario replays against a different prompt than
+    production sent, so an instruction regression is invisible here.
+    """
+    from evals.runner import run_scenario
+    from evals.scenario import Scenario, ScenarioArticle, ScenarioTopic
+
+    inner = _mock_inner(novelty=_novelty())
+    sc = Scenario(
+        kind="novelty",
+        topic=ScenarioTopic(name="T", description="d", novelty_instruction="Official announcements only."),
+        articles=[ScenarioArticle(title="a", url="http://x", content="c", source_feed="http://f")],
+        name="s",
+    )
+    art = await run_scenario(sc, _settings(), inner=inner)
+
+    prompt = "\n".join(str(m.get("content", "")) for m in art.calls[0].messages)
+    assert "Official announcements only." in prompt
+
+
 async def test_run_scenario_expectation_mismatch_is_reported_not_raised() -> None:
     from evals.runner import run_scenario
     from evals.scenario import Expectation, Scenario, ScenarioArticle, ScenarioTopic
@@ -462,7 +502,13 @@ async def test_run_live_freeze_writes_replayable_scenario(tmp_path, monkeypatch)
     conn = get_connection(prod)
     create_topic(
         conn,
-        Topic(name="Acme Corp", description="track acme", feed_urls=["http://feed"], status=TopicStatus.READY),
+        Topic(
+            name="Acme Corp",
+            description="track acme",
+            feed_urls=["http://feed"],
+            status=TopicStatus.READY,
+            novelty_instruction="Official announcements only.",
+        ),
     )
     conn.commit()
     conn.close()
@@ -492,6 +538,9 @@ async def test_run_live_freeze_writes_replayable_scenario(tmp_path, monkeypatch)
     assert freeze.exists()
     sc = load_scenario(freeze)
     assert sc.topic.name == "Acme Corp"
+    # The frozen scenario must carry every prompt-affecting topic field, or a replay
+    # builds a different prompt than the live run did.
+    assert sc.topic.novelty_instruction == "Official announcements only."
     assert sc.articles[0].title == "fetched"
     assert sc.articles[0].content == "live body"
 

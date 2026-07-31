@@ -73,6 +73,7 @@ def _topic(sc: Scenario) -> Topic:
         description=sc.topic.description,
         confidence_threshold=sc.topic.confidence_threshold,
         relevance_threshold=sc.topic.relevance_threshold,
+        novelty_instruction=sc.topic.novelty_instruction,
     )
 
 
@@ -163,6 +164,9 @@ def _evaluate_expect(expect: Expectation, result: BaseModel) -> list[ExpectCheck
     if expect.min_relevance is not None:
         rel = float(getattr(result, "relevance", 0.0) or 0.0)
         add("min_relevance", rel >= expect.min_relevance, f"{rel} >= {expect.min_relevance}")
+    if expect.min_importance is not None:
+        imp = int(getattr(result, "importance", 0) or 0)
+        add("min_importance", imp >= expect.min_importance, f"{imp} >= {expect.min_importance}")
     if expect.summary_contains is not None:
         needle = expect.summary_contains.lower()
         add("summary_contains", needle in _result_text(result).lower(), f"{expect.summary_contains!r} in summary")
@@ -261,6 +265,7 @@ def _scenario_from_live(topic: Topic, summary: str, articles: list[Article], kin
             description=topic.description,
             confidence_threshold=topic.confidence_threshold,
             relevance_threshold=topic.relevance_threshold,
+            novelty_instruction=topic.novelty_instruction,
         ),
         knowledge_summary=summary,
         articles=[

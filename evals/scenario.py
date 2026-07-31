@@ -23,12 +23,19 @@ ScenarioKind = Literal["novelty", "knowledge_init", "knowledge_update", "compres
 
 
 class ScenarioTopic(BaseModel):
-    """The topic a scenario runs against (becomes an app ``Topic``)."""
+    """The topic a scenario runs against (becomes an app ``Topic``).
+
+    Carries every topic field the prompt builders read, so a frozen scenario
+    reproduces the exact prompt production would have sent. ``importance_threshold``
+    is deliberately absent: it gates notification sends in the checker and never
+    reaches an LLM prompt.
+    """
 
     name: str
     description: str
     confidence_threshold: float | None = None
     relevance_threshold: float | None = None
+    novelty_instruction: str | None = None
 
 
 class ScenarioArticle(BaseModel):
@@ -48,6 +55,7 @@ class Expectation(BaseModel):
     min_confidence: float | None = None
     max_confidence: float | None = None
     min_relevance: float | None = None
+    min_importance: int | None = None
     summary_contains: str | None = None
     sufficient_data: bool | None = None  # knowledge_init / knowledge_update
 
