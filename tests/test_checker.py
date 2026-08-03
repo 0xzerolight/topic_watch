@@ -1791,13 +1791,25 @@ class TestRetryPendingNotifications:
 class TestSourcesFailedSurfacing:
     """Mode-agnostic all-sources-failed surfacing on the check and init paths."""
 
-    async def _check(self, db_conn: sqlite3.Connection, topic: Topic, *, feeds_total: int, feeds_failed: int):
+    async def _check(
+        self,
+        db_conn: sqlite3.Connection,
+        topic: Topic,
+        *,
+        feeds_total: int,
+        feeds_failed: int,
+        feeds_skipped: int = 0,
+    ):
         settings = _make_settings()
         with patch(
             "app.checker.fetch_new_articles_for_topic",
             new_callable=AsyncMock,
             return_value=FetchResult(
-                articles=[], total_feed_entries=0, feeds_total=feeds_total, feeds_failed=feeds_failed
+                articles=[],
+                total_feed_entries=0,
+                feeds_total=feeds_total,
+                feeds_failed=feeds_failed,
+                feeds_skipped=feeds_skipped,
             ),
         ):
             return await check_topic(topic, db_conn, settings)
@@ -1816,11 +1828,25 @@ class TestSourcesFailedSurfacing:
         result = await self._check(db_conn, topic, feeds_total=1, feeds_failed=0)
         assert result.stage_error is None
 
-    async def test_check_nothing_attempted_no_stage_error(self, db_conn: sqlite3.Connection) -> None:
-        """feeds_total=0 (e.g. Exa disabled) is not a fetch failure."""
+    async def test_check_nothing_attempted_sets_sources_unavailable(self, db_conn: sqlite3.Connection) -> None:
+        """feeds_total=0 (Exa disabled, all feeds backed off, empty feed_urls) is invisible silence."""
         topic = _make_topic(db_conn)
         result = await self._check(db_conn, topic, feeds_total=0, feeds_failed=0)
-        assert result.stage_error is None
+        assert result.stage_error is not None
+        assert result.stage_error.startswith("sources_unavailable")
+        row = db_conn.execute("SELECT stage_error FROM check_results WHERE id = ?", (result.id,)).fetchone()
+        assert row["stage_error"].startswith("sources_unavailable")
+
+    async def test_sources_unavailable_names_backoff_skips(self, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn)
+        result = await self._check(db_conn, topic, feeds_total=0, feeds_failed=0, feeds_skipped=2)
+        assert "2 feed(s) in backoff" in result.stage_error
+
+    async def test_sources_unavailable_is_mode_agnostic(self, db_conn: sqlite3.Connection) -> None:
+        """An AUTO topic with nothing attempted gets the same marker (no FeedMode coupling)."""
+        topic = _make_topic(db_conn, name="AutoNothing", feed_mode=FeedMode.AUTO, feed_urls=[])
+        result = await self._check(db_conn, topic, feeds_total=0, feeds_failed=0)
+        assert result.stage_error.startswith("sources_unavailable")
 
     async def test_check_surfacing_is_mode_agnostic(self, db_conn: sqlite3.Connection) -> None:
         """An AUTO topic with the all-failed shape ALSO gets sources_failed (no FeedMode coupling)."""

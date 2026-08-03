@@ -19,6 +19,7 @@ from app.models import (
     PendingWebhook,
     Topic,
     TopicStatus,
+    is_source_failure,
 )
 
 
@@ -654,3 +655,24 @@ class TestCheckResultFromDashboardRow:
     def test_corrupt_seen_at_degrades_to_none(self) -> None:
         cr = CheckResult.from_dashboard_row(self._dash_row(cr_seen_at="garbage"), topic_id=1)
         assert cr.seen_at is None
+
+
+class TestStageErrorClassification:
+    """The stage_error vocabulary the Silence Heartbeat and the templates share."""
+
+    def test_source_failure_prefixes(self) -> None:
+        assert is_source_failure("sources_failed: all feed source(s) failed (see logs)")
+        assert is_source_failure("scrape_failed: TimeoutError: boom")
+        assert is_source_failure("sources_unavailable: no source attempted (2 feed(s) in backoff)")
+
+    def test_non_source_failures(self) -> None:
+        assert not is_source_failure(None)
+        assert not is_source_failure("")
+        assert not is_source_failure("analysis_failed: LLM timeout")
+        assert not is_source_failure("knowledge_update_failed: ValueError: nope")
+        assert not is_source_failure("skipped: already in flight")
+
+    def test_check_result_property(self) -> None:
+        assert CheckResult(topic_id=1, stage_error="sources_failed: x").sources_failing
+        assert not CheckResult(topic_id=1, stage_error="analysis_failed: x").sources_failing
+        assert not CheckResult(topic_id=1).sources_failing

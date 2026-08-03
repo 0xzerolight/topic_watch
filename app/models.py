@@ -301,6 +301,25 @@ class KnowledgeState(SQLiteModel):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
+# ``check_results.stage_error`` vocabulary, written by app/checker.py. Collected
+# here so the pipeline, the Silence Heartbeat and the templates classify a check
+# the same way instead of each re-deriving the prefixes.
+#
+# These three mean "this check could not see the news".
+# ``analysis_failed`` / ``knowledge_update_failed`` are deliberately excluded:
+# articles were fetched, so the sources themselves are healthy.
+SOURCE_FAILURE_PREFIXES: tuple[str, ...] = (
+    "sources_failed:",
+    "scrape_failed:",
+    "sources_unavailable:",
+)
+
+
+def is_source_failure(stage_error: str | None) -> bool:
+    """True when a recorded stage_error means no source produced usable results."""
+    return stage_error is not None and stage_error.startswith(SOURCE_FAILURE_PREFIXES)
+
+
 class CheckResult(SQLiteModel):
     """Record of a single check cycle for a topic."""
 
@@ -399,6 +418,11 @@ class CheckResult(SQLiteModel):
             # one without the other 500s the dashboard.
             seen_at=_coerce_dt(row["cr_seen_at"]),
         )
+
+    @property
+    def sources_failing(self) -> bool:
+        """True when this check saw no usable source (fetch failed, or none attempted)."""
+        return is_source_failure(self.stage_error)
 
 
 class FeedHealth(SQLiteModel):

@@ -183,6 +183,14 @@ async def _check_topic_inner(
         # the real cause instead of a silent empty check. Mode-agnostic by design.
         if all_sources_failed(fetch_result.feeds_total, fetch_result.feeds_failed):
             result.stage_error = "sources_failed: all feed source(s) failed (see logs)"
+        elif fetch_result.feeds_total == 0:
+            # Nothing was even attempted: Exa disabled/keyless, a MANUAL topic with no
+            # feed URLs, or every feed inside a backoff window. Not a fetch failure —
+            # hence not ``sources_failed`` — but equally a check that cannot see news,
+            # so it must not read as healthy silence (Silence Heartbeat).
+            skipped = fetch_result.feeds_skipped
+            detail = f"{skipped} feed(s) in backoff" if skipped else "no source configured or enabled"
+            result.stage_error = f"sources_unavailable: no source attempted ({detail})"
         logger.info("Topic '%s': no new articles found", topic.name)
         return _record_result(conn, result)
 
