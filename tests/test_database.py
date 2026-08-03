@@ -163,6 +163,39 @@ class TestTopicCRUD:
         assert retrieved.feed_urls == urls
 
 
+class TestHeartbeatLatch:
+    """The Silence Heartbeat latch is claimed/cleared exactly once, and survives edits."""
+
+    def test_heartbeat_latch_claim_is_exactly_once(self, db_conn: sqlite3.Connection) -> None:
+        from app.crud import claim_heartbeat_alert, clear_heartbeat_alert
+
+        topic = create_topic(db_conn, Topic(name="Latch", description="d"))
+        db_conn.commit()
+        stamp = datetime(2026, 8, 3, 10, 0, tzinfo=UTC)
+
+        assert claim_heartbeat_alert(db_conn, topic.id, stamp) is True
+        assert claim_heartbeat_alert(db_conn, topic.id, stamp) is False  # second caller loses
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at == stamp
+
+        assert clear_heartbeat_alert(db_conn, topic.id) is True
+        assert clear_heartbeat_alert(db_conn, topic.id) is False  # nothing left to clear
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is None
+
+    def test_update_topic_leaves_the_heartbeat_latch_alone(self, db_conn: sqlite3.Connection) -> None:
+        from app.crud import claim_heartbeat_alert
+
+        topic = create_topic(db_conn, Topic(name="LatchEdit", description="d"))
+        db_conn.commit()
+        stale = get_topic(db_conn, topic.id)  # loaded before the alert fired
+
+        claim_heartbeat_alert(db_conn, topic.id, datetime(2026, 8, 3, 10, 0, tzinfo=UTC))
+        stale.description = "edited"
+        update_topic(db_conn, stale)
+        db_conn.commit()
+
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is not None
+
+
 class TestArticleCRUD:
     """Test CRUD operations for articles."""
 
@@ -371,6 +404,24 @@ class TestKnowledgeStateCRUD:
 class TestCheckResultCRUD:
     """Test CRUD operations for check results."""
 
+    def test_list_recent_check_stage_errors_orders_newest_first(self, db_conn: sqlite3.Connection) -> None:
+        from app.crud import list_recent_check_stage_errors
+
+        topic = create_topic(db_conn, Topic(name="Streak", description="d"))
+        stamp = datetime(2026, 8, 3, 12, 0, tzinfo=UTC)
+        # Identical timestamps: ordering must fall back to id DESC, not scan order.
+        for stage_error in ("sources_failed: a", None, "sources_failed: b"):
+            create_check_result(db_conn, CheckResult(topic_id=topic.id, checked_at=stamp, stage_error=stage_error))
+        db_conn.commit()
+
+        assert list_recent_check_stage_errors(db_conn, topic.id, limit=10) == [
+            "sources_failed: b",
+            None,
+            "sources_failed: a",
+        ]
+        assert list_recent_check_stage_errors(db_conn, topic.id, limit=2) == ["sources_failed: b", None]
+        assert list_recent_check_stage_errors(db_conn, 9999, limit=10) == []
+
     def test_create_and_list(self, db_conn: sqlite3.Connection) -> None:
         topic = create_topic(db_conn, Topic(name="CRTopic", description="desc"))
         db_conn.commit()
@@ -551,6 +602,18 @@ class TestMigrations:
         run_migrations(db_conn)
         row = db_conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
         assert row[0] >= 3
+
+    def test_migration_024_adds_heartbeat_column_and_is_idempotent(self, db_conn: sqlite3.Connection) -> None:
+        """m024 adds the latch column; re-running it is a no-op that keeps data."""
+        from app.migrations.m024_topic_heartbeat_alerted_at import up as m024_up
+
+        columns = {row[1] for row in db_conn.execute("PRAGMA table_info(topics)").fetchall()}
+        assert "heartbeat_alerted_at" in columns
+
+        create_topic(db_conn, Topic(name="Survivor", description="d"))
+        db_conn.commit()
+        m024_up(db_conn)
+        assert db_conn.execute("SELECT COUNT(*) FROM topics WHERE name = 'Survivor'").fetchone()[0] == 1
 
     def test_pending_notifications_table_exists(self, db_conn: sqlite3.Connection) -> None:
         """Migration m002 creates the pending_notifications table."""

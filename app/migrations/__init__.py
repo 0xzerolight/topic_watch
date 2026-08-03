@@ -30,6 +30,7 @@ from app.migrations.m020_check_result_seen_at import up as m020_up
 from app.migrations.m021_scrub_stub_notes import up as m021_up
 from app.migrations.m022_topic_novelty_instruction import up as m022_up
 from app.migrations.m023_topic_importance_threshold import up as m023_up
+from app.migrations.m024_topic_heartbeat_alerted_at import up as m024_up
 
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "baseline schema version", m001_up),
@@ -55,4 +56,5 @@ MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (21, "scrub leaked [STUB] reliability notes from knowledge summaries", m021_up),
     (22, "add novelty_instruction column to topics", m022_up),
     (23, "add importance_threshold column to topics", m023_up),
+    (24, "add heartbeat_alerted_at column to topics", m024_up),
 ]

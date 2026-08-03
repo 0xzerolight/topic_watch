@@ -566,6 +566,27 @@ def count_check_results(conn: sqlite3.Connection, topic_id: int) -> int:
     return int(row[0])
 
 
+def list_recent_check_stage_errors(
+    conn: sqlite3.Connection,
+    topic_id: int,
+    limit: int,
+) -> list[str | None]:
+    """Return the ``stage_error`` of a topic's newest ``limit`` checks, newest first.
+
+    Only the one column is selected, so the Silence Heartbeat never ships the
+    ``llm_response`` blobs that ``list_check_results`` carries, and ties on
+    ``checked_at`` break by ``id`` so back-to-back checks order deterministically.
+    """
+    rows = conn.execute(
+        """SELECT stage_error FROM check_results
+           WHERE topic_id = ?
+           ORDER BY checked_at DESC, id DESC
+           LIMIT ?""",
+        (topic_id, limit),
+    ).fetchall()
+    return [row["stage_error"] for row in rows]
+
+
 def sum_check_tokens(conn: sqlite3.Connection, topic_id: int) -> tuple[int, int]:
     """Return (total_prompt_tokens, total_completion_tokens) across all checks."""
     row = conn.execute(
@@ -877,6 +898,35 @@ def claim_new_topic_for_init(conn: sqlite3.Connection, topic_id: int) -> bool:
         (TopicStatus.RESEARCHING.value, now, None, topic_id, TopicStatus.NEW.value),
     )
     conn.commit()
+    return cursor.rowcount == 1
+
+
+def claim_heartbeat_alert(conn: sqlite3.Connection, topic_id: int, alerted_at: datetime) -> bool:
+    """Atomically claim the right to announce a source outage for a topic.
+
+    Returns True only for the caller that won (rowcount == 1). The guard is
+    ``heartbeat_alerted_at IS NULL``, so an outage already announced — by this
+    process, or by a CLI ``check-all`` running against a live server — yields
+    False and no second alert. Mirrors ``claim_new_topic_for_init``; the caller
+    commits.
+    """
+    cursor = conn.execute(
+        "UPDATE topics SET heartbeat_alerted_at = ? WHERE id = ? AND heartbeat_alerted_at IS NULL",
+        (alerted_at.isoformat(), topic_id),
+    )
+    return cursor.rowcount == 1
+
+
+def clear_heartbeat_alert(conn: sqlite3.Connection, topic_id: int) -> bool:
+    """Clear an outstanding source-outage alert. True only if one was set.
+
+    The ``IS NOT NULL`` guard makes the recovery notice exactly-once for the same
+    reason the claim makes the alert exactly-once. The caller commits.
+    """
+    cursor = conn.execute(
+        "UPDATE topics SET heartbeat_alerted_at = NULL WHERE id = ? AND heartbeat_alerted_at IS NOT NULL",
+        (topic_id,),
+    )
     return cursor.rowcount == 1
 
 

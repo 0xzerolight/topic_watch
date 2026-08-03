@@ -187,7 +187,7 @@ class Topic(SQLiteModel):
 
     _bool_fields = ("is_active",)
     _required_dt_fields = ("created_at",)
-    _optional_dt_fields = ("status_changed_at",)
+    _optional_dt_fields = ("status_changed_at", "heartbeat_alerted_at")
     _json_fields = {"feed_urls": [], "tags": []}  # noqa: RUF012 - declarative
 
     id: int | None = None
@@ -207,6 +207,12 @@ class Topic(SQLiteModel):
     novelty_instruction: str | None = None
     importance_threshold: int | None = None
     init_attempts: int = 0
+    # Silence Heartbeat latch: when the checker last announced that this topic's
+    # sources are failing. NULL = no outstanding alert. Written only by
+    # ``crud.claim_heartbeat_alert`` / ``clear_heartbeat_alert`` and intentionally
+    # excluded from the create_topic/update_topic column lists (mirroring
+    # CheckResult.seen_at), so a topic edit carrying a stale Topic cannot reset it.
+    heartbeat_alerted_at: datetime | None = None
 
     @field_validator("confidence_threshold", "relevance_threshold", mode="before")
     @classmethod
