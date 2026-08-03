@@ -16,7 +16,9 @@ from app.analysis.llm import analyze_articles
 from app.check_context import check_id_var, generate_check_id
 from app.config import Settings
 from app.crud import (
+    claim_heartbeat_alert,
     claim_pending_notification,
+    clear_heartbeat_alert,
     create_check_result,
     create_pending_notification,
     delete_expired_notifications,
@@ -31,6 +33,7 @@ from app.crud import (
     update_topic_init_status,
 )
 from app.database import get_db, short_conn
+from app.heartbeat import evaluate_heartbeat
 from app.models import CheckResult, NotificationDelivery, PendingNotification, Topic, TopicStatus
 from app.notifications import format_notification, redact_url, send_notification, send_notification_per_url
 from app.scraping import all_sources_failed, fetch_new_articles_for_topic
@@ -152,6 +155,10 @@ async def _check_topic_inner(
             topic.name,
             topic.status,
         )
+        # No heartbeat here: a paused or errored topic is not being monitored, so
+        # it must neither alert nor claim recovery. The row it records carries no
+        # stage_error, so it also breaks any running streak — harmless, since this
+        # path is only reachable from a manual CLI/UI check.
         return _record_result(conn, result)
 
     # Step 1: Fetch new articles
@@ -171,7 +178,7 @@ async def _check_topic_inner(
     except Exception as exc:
         logger.warning("Scraping failed for topic '%s'", topic.name, exc_info=True)
         result.stage_error = f"scrape_failed: {_summarize_exc(exc)}"
-        return _record_result(conn, result)
+        return await _finish_check(conn, topic, result, settings)
 
     new_articles = fetch_result.articles
     result.articles_found = fetch_result.total_feed_entries
@@ -183,8 +190,16 @@ async def _check_topic_inner(
         # the real cause instead of a silent empty check. Mode-agnostic by design.
         if all_sources_failed(fetch_result.feeds_total, fetch_result.feeds_failed):
             result.stage_error = "sources_failed: all feed source(s) failed (see logs)"
+        elif fetch_result.feeds_total == 0:
+            # Nothing was even attempted: Exa disabled/keyless, a MANUAL topic with no
+            # feed URLs, or every feed inside a backoff window. Not a fetch failure —
+            # hence not ``sources_failed`` — but equally a check that cannot see news,
+            # so it must not read as healthy silence (Silence Heartbeat).
+            skipped = fetch_result.feeds_skipped
+            detail = f"{skipped} feed(s) in backoff" if skipped else "no source configured or enabled"
+            result.stage_error = f"sources_unavailable: no source attempted ({detail})"
         logger.info("Topic '%s': no new articles found", topic.name)
-        return _record_result(conn, result)
+        return await _finish_check(conn, topic, result, settings)
 
     # Step 2: Get current knowledge state
     knowledge = get_knowledge_state(conn, topic_id)
@@ -338,6 +353,11 @@ async def _check_topic_inner(
             )
             conn.commit()
 
+    # Reaching analysis proves the sources are alive: clear any outstanding
+    # Silence Heartbeat (and announce the recovery once). The CheckResult was
+    # committed at the Step 6 boundary above, so the streak query sees it.
+    await _run_heartbeat(conn, topic, result.id, settings)
+
     logger.info(
         "Topic '%s': %d articles, new_info=%s, notified=%s",
         topic.name,
@@ -354,6 +374,81 @@ def _record_result(conn: sqlite3.Connection, result: CheckResult) -> CheckResult
     created = create_check_result(conn, result)
     conn.commit()
     return created
+
+
+async def _finish_check(
+    conn: sqlite3.Connection,
+    topic: Topic,
+    result: CheckResult,
+    settings: Settings,
+) -> CheckResult:
+    """Persist a no-send check result, then run the Silence Heartbeat over it."""
+    recorded = _record_result(conn, result)
+    await _run_heartbeat(conn, topic, recorded.id, settings)
+    return recorded
+
+
+async def _run_heartbeat(
+    conn: sqlite3.Connection,
+    topic: Topic,
+    check_result_id: int | None,
+    settings: Settings,
+) -> None:
+    """Announce (or clear) a source outage for this topic. Never raises.
+
+    The heartbeat is an observability guarantee layered on top of the pipeline, so
+    a failure here must not turn a recorded check into a lost one. The latch is
+    claimed and committed BEFORE the send, mirroring the OVH-066 durable-state
+    boundary: a crash mid-send costs one missed message instead of re-alerting on
+    every subsequent check. The conditional UPDATE also makes the send
+    exactly-once when a CLI check-all races the server.
+    """
+    try:
+        if topic.id is None:
+            return
+
+        if settings.silence_heartbeat_checks <= 0:
+            # Switching the feature off must also reset the latch, silently.
+            # Otherwise a topic latched during an outage keeps that state parked
+            # and fires a phantom "recovered" whenever the feature is re-enabled.
+            if topic.heartbeat_alerted_at is not None and clear_heartbeat_alert(conn, topic.id):
+                conn.commit()
+            return
+
+        action = evaluate_heartbeat(conn, topic, settings.silence_heartbeat_checks)
+        if action is None:
+            return
+
+        if action.kind == "alert":
+            won = claim_heartbeat_alert(conn, topic.id, datetime.now(UTC))
+        else:
+            won = clear_heartbeat_alert(conn, topic.id)
+        if not won:
+            # Another checker (e.g. a CLI run against the live server) already sent
+            # this one. Release the implicit write transaction the UPDATE opened.
+            conn.rollback()
+            return
+        conn.commit()
+
+        deliveries = await send_notification_per_url(action.title, action.body, settings)
+        failed = [d for d in deliveries if not d.ok]
+        if failed:
+            logger.warning(
+                "Silence Heartbeat delivery failed for topic '%s': %s",
+                topic.name,
+                _summarize_delivery_failures(failed),
+            )
+            _queue_failed_notifications(
+                conn,
+                topic.id,
+                action.title,
+                action.body,
+                deliveries,
+                check_result_id=check_result_id,
+            )
+            conn.commit()
+    except Exception:
+        logger.warning("Silence Heartbeat failed for topic '%s'", topic.name, exc_info=True)
 
 
 def _summarize_delivery_failures(failed: list[NotificationDelivery]) -> str:

@@ -207,6 +207,14 @@
                 </div>
 
                 <div class="field-group">
+                    <label for="silence_heartbeat_checks">Alert when sources fail for (checks)</label>
+                    <input type="number" id="silence_heartbeat_checks" name="silence_heartbeat_checks"
+                           min="0" max="50"
+                           value="{{ form.silence_heartbeat_checks if form else settings.silence_heartbeat_checks }}">
+                    <small class="help">Counted in checks, not hours — 3 checks is about 18 hours at the default 6h interval. 1 alerts on the very first failing check, which is noisy on a flapping feed. 0 turns it off.</small>
+                </div>
+
+                <div class="field-group">
                     <label for="apprise_timeout_seconds">Apprise Timeout (seconds)</label>
                     <input type="number" id="apprise_timeout_seconds" name="apprise_timeout_seconds"
                            min="1"

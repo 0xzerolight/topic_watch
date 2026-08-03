@@ -44,6 +44,7 @@ _SCALAR_FORM_FIELDS: tuple[str, ...] = (
     "web_page_size",
     "min_confidence_threshold",
     "min_relevance_threshold",
+    "silence_heartbeat_checks",
     "feed_max_retries",
     "content_fetch_concurrency",
     "scheduler_misfire_grace_time",

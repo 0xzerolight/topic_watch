@@ -203,6 +203,12 @@ class Settings(BaseSettings):
         le=1.0,
         description="Minimum relevance score to act on novelty results (how related to topic description)",
     )
+    silence_heartbeat_checks: int = Field(
+        default=3,
+        ge=0,
+        le=50,
+        description="Consecutive checks with no usable source before a Silence Heartbeat alert (0 disables)",
+    )
     secure_cookies: bool = Field(
         default=False,
         description="Set Secure flag on cookies (enable when TLS is terminated at reverse proxy)",
@@ -399,6 +405,7 @@ def save_settings_to_yaml(
         "llm_temperature": settings.llm_temperature,
         "min_confidence_threshold": settings.min_confidence_threshold,
         "min_relevance_threshold": settings.min_relevance_threshold,
+        "silence_heartbeat_checks": settings.silence_heartbeat_checks,
         "secure_cookies": settings.secure_cookies,
     }
 

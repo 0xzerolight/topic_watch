@@ -187,7 +187,7 @@ class Topic(SQLiteModel):
 
     _bool_fields = ("is_active",)
     _required_dt_fields = ("created_at",)
-    _optional_dt_fields = ("status_changed_at",)
+    _optional_dt_fields = ("status_changed_at", "heartbeat_alerted_at")
     _json_fields = {"feed_urls": [], "tags": []}  # noqa: RUF012 - declarative
 
     id: int | None = None
@@ -207,6 +207,12 @@ class Topic(SQLiteModel):
     novelty_instruction: str | None = None
     importance_threshold: int | None = None
     init_attempts: int = 0
+    # Silence Heartbeat latch: when the checker last announced that this topic's
+    # sources are failing. NULL = no outstanding alert. Written only by
+    # ``crud.claim_heartbeat_alert`` / ``clear_heartbeat_alert`` and intentionally
+    # excluded from the create_topic/update_topic column lists (mirroring
+    # CheckResult.seen_at), so a topic edit carrying a stale Topic cannot reset it.
+    heartbeat_alerted_at: datetime | None = None
 
     @field_validator("confidence_threshold", "relevance_threshold", mode="before")
     @classmethod
@@ -299,6 +305,25 @@ class KnowledgeState(SQLiteModel):
     summary_text: str
     token_count: int = 0
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+# ``check_results.stage_error`` vocabulary, written by app/checker.py. Collected
+# here so the pipeline, the Silence Heartbeat and the templates classify a check
+# the same way instead of each re-deriving the prefixes.
+#
+# These three mean "this check could not see the news".
+# ``analysis_failed`` / ``knowledge_update_failed`` are deliberately excluded:
+# articles were fetched, so the sources themselves are healthy.
+SOURCE_FAILURE_PREFIXES: tuple[str, ...] = (
+    "sources_failed:",
+    "scrape_failed:",
+    "sources_unavailable:",
+)
+
+
+def is_source_failure(stage_error: str | None) -> bool:
+    """True when a recorded stage_error means no source produced usable results."""
+    return stage_error is not None and stage_error.startswith(SOURCE_FAILURE_PREFIXES)
 
 
 class CheckResult(SQLiteModel):
@@ -395,10 +420,18 @@ class CheckResult(SQLiteModel):
             confidence=row["cr_confidence"],
             notification_sent=bool(row["cr_notification_sent"]),
             notification_error=row["cr_notification_error"],
+            # Paired with the ``cr.stage_error AS cr_stage_error`` alias in
+            # _DASHBOARD_SELECT; drives the dashboard's failing-sources badge.
+            stage_error=row["cr_stage_error"],
             # Paired with the ``cr.seen_at AS cr_seen_at`` alias in _DASHBOARD_SELECT;
             # one without the other 500s the dashboard.
             seen_at=_coerce_dt(row["cr_seen_at"]),
         )
+
+    @property
+    def sources_failing(self) -> bool:
+        """True when this check saw no usable source (fetch failed, or none attempted)."""
+        return is_source_failure(self.stage_error)
 
 
 class FeedHealth(SQLiteModel):

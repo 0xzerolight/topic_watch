@@ -260,6 +260,41 @@ class TestThresholdDefaults:
         assert data["min_relevance_threshold"] == 0.6
 
 
+class TestSilenceHeartbeatSetting:
+    """Silence Heartbeat threshold: default, bounds, and YAML persistence."""
+
+    def test_default_is_three(self) -> None:
+        settings = Settings(llm={"model": "openai/gpt-4o-mini", "api_key": "sk-test"})  # type: ignore[call-arg]
+        assert settings.silence_heartbeat_checks == 3
+
+    def test_zero_allowed_negative_rejected(self) -> None:
+        disabled = Settings(
+            llm={"model": "openai/gpt-4o-mini", "api_key": "sk-test"},
+            silence_heartbeat_checks=0,
+        )  # type: ignore[call-arg]
+        assert disabled.silence_heartbeat_checks == 0
+        with pytest.raises(ValidationError):
+            Settings(
+                llm={"model": "openai/gpt-4o-mini", "api_key": "sk-test"},
+                silence_heartbeat_checks=-1,
+            )  # type: ignore[call-arg]
+
+    def test_persisted_to_yaml(self, tmp_path: Path) -> None:
+        import yaml
+
+        from app.config import LLMSettings, save_settings_to_yaml
+
+        settings = Settings(
+            llm=LLMSettings(model="openai/gpt-4o-mini", api_key="sk-test"),
+            silence_heartbeat_checks=5,
+        )  # type: ignore[call-arg]
+        config_file = tmp_path / "config.yml"
+        save_settings_to_yaml(settings, config_file)
+
+        data = yaml.safe_load(config_file.read_text())
+        assert data["silence_heartbeat_checks"] == 5
+
+
 class TestTimeoutValidation:
     """Timeouts must be strictly positive; zero/negative breaks every HTTP/LLM call."""
 

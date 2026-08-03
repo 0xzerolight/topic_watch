@@ -157,6 +157,17 @@
 </div>
 {% endif %}
 
+{# Sources gone dark: the newest check found nothing to read, so this topic's
+   quiet is not evidence of "nothing new". A SIBLING of #status-area, never
+   nested inside it (see the CRITICAL note above). #}
+{% if page == 1 and checks and checks[0].sources_failing %}
+<p class="row-error">
+    <span class="badge badge--bad"><span class="badge-dot"></span>Sources failing</span>
+    The most recent check found no usable source — this topic's silence may not mean "nothing new".
+    <a href="/feeds">Feed Health</a>
+</p>
+{% endif %}
+
 <h2>Check History</h2>
 {% if (total_prompt_tokens + total_completion_tokens) %}
 <p><small>Total LLM cost across all checks: {{ total_prompt_tokens + total_completion_tokens }} tokens
