@@ -262,6 +262,7 @@ On first run, `config.example.yml` is auto-copied to `data/config.yml`.
 | `llm_temperature` | float | `0.2` | LLM sampling temperature (0.0-2.0, lower = more factual) |
 | `min_confidence_threshold` | float | `0.7` | Minimum LLM confidence to send notifications (0.0-1.0) |
 | `min_relevance_threshold` | float | `0.5` | Minimum relevance to topic description to send notifications (0.0-1.0) |
+| `silence_heartbeat_checks` | int | `3` | Consecutive checks with no usable source before a Silence Heartbeat alert (0-50, 0 disables) |
 | `secure_cookies` | bool | `false` | Set the Secure flag on cookies (enable when TLS terminates at a reverse proxy) |
 
 Environment-only settings (no YAML equivalent):

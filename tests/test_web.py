@@ -1326,6 +1326,10 @@ class TestSettings:
         assert response.status_code == 200
         assert "openai/gpt-4o-mini" in response.text
 
+    async def test_settings_page_renders_silence_heartbeat_field(self, client: httpx.AsyncClient) -> None:
+        page = await client.get("/settings")
+        assert 'name="silence_heartbeat_checks"' in page.text
+
     async def test_settings_masks_api_key(self, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch) -> None:
         """Settings page masks the API key (editable, non-env-sourced path)."""
         # Clear the env override so the editable (masked) API-key field renders (OVH-003).

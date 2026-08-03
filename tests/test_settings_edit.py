@@ -45,6 +45,7 @@ def valid_form_data(**overrides) -> dict:
         "web_page_size": "20",
         "min_confidence_threshold": "0.7",
         "min_relevance_threshold": "0.5",
+        "silence_heartbeat_checks": "3",
         "secure_cookies": "true",
         "feed_max_retries": "2",
         "content_fetch_concurrency": "3",
@@ -532,6 +533,16 @@ class TestSettingsPost:
                 follow_redirects=False,
             )
         assert app.state.settings.min_relevance_threshold == 0.85
+
+    async def test_silence_heartbeat_checks_persisted(self, client: httpx.AsyncClient) -> None:
+        """silence_heartbeat_checks from the form is saved, not reset to default."""
+        with patch("app.web.routers.settings.save_settings_to_yaml"):
+            await client.post(
+                "/settings",
+                data=self._valid_form_data(silence_heartbeat_checks="7"),
+                follow_redirects=False,
+            )
+        assert app.state.settings.silence_heartbeat_checks == 7
 
     async def test_secure_cookies_persisted(self, client: httpx.AsyncClient) -> None:
         """secure_cookies checkbox from the form is saved, not silently reset to False."""
