@@ -19,6 +19,7 @@ from app.crud import (
     get_topic,
     list_articles_for_topic,
     list_pending_notifications,
+    update_topic,
 )
 from app.models import (
     Article,
@@ -36,6 +37,9 @@ def _make_settings(**overrides) -> Settings:
     defaults = {
         "llm": LLMSettings(model="openai/gpt-4o-mini", api_key="test-key"),
         "notifications": NotificationSettings(urls=["json://localhost"]),
+        # Off by default so an unrelated test that happens to record several
+        # source-failing checks never attempts a real Apprise send.
+        "silence_heartbeat_checks": 0,
     }
     defaults.update(overrides)
     return Settings(**defaults)
@@ -1885,3 +1889,185 @@ class TestSourcesFailedSurfacing:
         updated = get_topic(db_conn, topic.id)
         assert updated.status == TopicStatus.ERROR
         assert updated.error_message == "No articles found during initialization"
+
+
+class TestSilenceHeartbeatPipeline:
+    """Heartbeat behaviour driven end-to-end through check_topic."""
+
+    async def _failing_check(self, db_conn: sqlite3.Connection, topic: Topic, send, *, threshold: int = 3):
+        settings = _make_settings(silence_heartbeat_checks=threshold)
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=1, feeds_failed=1),
+            ),
+            patch("app.checker.send_notification_per_url", send),
+        ):
+            return await check_topic(get_topic(db_conn, topic.id), db_conn, settings)
+
+    async def _healthy_empty_check(self, db_conn: sqlite3.Connection, topic: Topic, send, *, threshold: int = 3):
+        settings = _make_settings(silence_heartbeat_checks=threshold)
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=1, feeds_failed=0),
+            ),
+            patch("app.checker.send_notification_per_url", send),
+        ):
+            return await check_topic(get_topic(db_conn, topic.id), db_conn, settings)
+
+    async def test_alert_fires_once_at_the_threshold(self, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn)
+        send = _per_url_mock(ok=True)
+
+        for _ in range(2):
+            await self._failing_check(db_conn, topic, send)
+        assert send.await_count == 0
+
+        await self._failing_check(db_conn, topic, send)
+        assert send.await_count == 1
+        assert "sources failing" in send.await_args.args[0]
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is not None
+
+        for _ in range(3):
+            await self._failing_check(db_conn, topic, send)
+        assert send.await_count == 1
+
+    async def test_scrape_exception_path_also_heartbeats(self, db_conn: sqlite3.Connection) -> None:
+        """The fetch-raised branch is a source failure too."""
+        topic = _make_topic(db_conn)
+        send = _per_url_mock(ok=True)
+        settings = _make_settings(silence_heartbeat_checks=2)
+        for _ in range(2):
+            with (
+                patch(
+                    "app.checker.fetch_new_articles_for_topic",
+                    new_callable=AsyncMock,
+                    side_effect=RuntimeError("boom"),
+                ),
+                patch("app.checker.send_notification_per_url", send),
+            ):
+                result = await check_topic(get_topic(db_conn, topic.id), db_conn, settings)
+        assert result.stage_error.startswith("scrape_failed")
+        assert send.await_count == 1
+
+    async def test_recovery_notice_after_the_outage(self, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn)
+        send = _per_url_mock(ok=True)
+        for _ in range(3):
+            await self._failing_check(db_conn, topic, send)
+        assert send.await_count == 1
+
+        await self._healthy_empty_check(db_conn, topic, send)
+        assert send.await_count == 2
+        assert "recovered" in send.await_args.args[0]
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is None
+
+        await self._healthy_empty_check(db_conn, topic, send)
+        assert send.await_count == 2
+
+    async def test_recovery_on_the_main_analysis_path(self, db_conn: sqlite3.Connection) -> None:
+        """A check that reaches analysis also clears the outage."""
+        topic = _make_topic(db_conn)
+        send = _per_url_mock(ok=True)
+        for _ in range(3):
+            await self._failing_check(db_conn, topic, send)
+        assert send.await_count == 1
+
+        novelty = NoveltyResult(has_new_info=False, confidence=0.9, reasoning="nothing new")
+        settings = _make_settings(silence_heartbeat_checks=3)
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[_make_article()], total_feed_entries=1),
+            ),
+            patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
+            patch("app.checker.send_notification_per_url", send),
+        ):
+            await check_topic(get_topic(db_conn, topic.id), db_conn, settings)
+
+        assert send.await_count == 2
+        assert "recovered" in send.await_args.args[0]
+
+    async def test_disabled_by_zero(self, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn)
+        send = _per_url_mock(ok=True)
+        for _ in range(4):
+            await self._failing_check(db_conn, topic, send, threshold=0)
+        assert send.await_count == 0
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is None
+
+    async def test_disabling_clears_an_outstanding_latch_silently(self, db_conn: sqlite3.Connection) -> None:
+        """Turning the feature off must reset state, not park a phantom recovery."""
+        topic = _make_topic(db_conn)
+        send = _per_url_mock(ok=True)
+        for _ in range(3):
+            await self._failing_check(db_conn, topic, send)
+        assert send.await_count == 1
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is not None
+
+        await self._failing_check(db_conn, topic, send, threshold=0)
+        assert send.await_count == 1
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is None
+
+        # Re-enabled later: a healthy check must NOT announce a stale recovery.
+        await self._healthy_empty_check(db_conn, topic, send)
+        assert send.await_count == 1
+
+    async def test_failed_heartbeat_delivery_is_queued_and_drains(self, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn)
+        send = _per_url_mock(ok=False, error="unreachable")
+        for _ in range(3):
+            await self._failing_check(db_conn, topic, send)
+
+        rows = db_conn.execute(
+            "SELECT title, last_error FROM pending_notifications WHERE topic_id = ?", (topic.id,)
+        ).fetchall()
+        assert len(rows) == 1
+        assert "sources failing" in rows[0]["title"]
+        assert rows[0]["last_error"] == "unreachable"
+        # The latch is claimed before the send, so a dead channel never re-alerts.
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is not None
+
+        with patch("app.checker.send_notification", new_callable=AsyncMock, return_value=True):
+            await retry_pending_notifications(db_conn, _make_settings(silence_heartbeat_checks=3))
+        remaining = db_conn.execute(
+            "SELECT COUNT(*) AS n FROM pending_notifications WHERE topic_id = ?", (topic.id,)
+        ).fetchone()
+        assert remaining["n"] == 0
+
+    async def test_heartbeat_failure_does_not_break_the_check(self, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn)
+        settings = _make_settings(silence_heartbeat_checks=1)
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=1, feeds_failed=1),
+            ),
+            patch("app.checker.evaluate_heartbeat", side_effect=RuntimeError("boom")),
+        ):
+            result = await check_topic(topic, db_conn, settings)
+        assert result.id is not None
+        assert result.stage_error.startswith("sources_failed")
+
+    async def test_non_ready_topic_never_heartbeats(self, db_conn: sqlite3.Connection) -> None:
+        """A non-READY check must neither alert nor claim recovery."""
+        topic = _make_topic(db_conn)
+        send = _per_url_mock(ok=True)
+        for _ in range(3):
+            await self._failing_check(db_conn, topic, send)
+        assert send.await_count == 1
+
+        topic = get_topic(db_conn, topic.id)
+        topic.status = TopicStatus.ERROR
+        update_topic(db_conn, topic)
+        db_conn.commit()
+
+        with patch("app.checker.send_notification_per_url", send):
+            await check_topic(topic, db_conn, _make_settings(silence_heartbeat_checks=3))
+        assert send.await_count == 1
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is not None
