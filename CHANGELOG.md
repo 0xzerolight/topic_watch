@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Silence Heartbeat: after `silence_heartbeat_checks` consecutive checks where no source returned usable results, topic_watch sends one "sources failing" alert per affected topic, and one "sources recovered" notice when they come back. A failure shared by every topic (expired API key, no network) therefore produces one alert per topic in the same cycle; the message points at the shared cause. The dashboard and topic detail show a failing-sources badge from the first such check
+- Checks where no source was even attempted (every feed in backoff, Exa disabled, no feed URLs) now record a `sources_unavailable` stage error instead of looking like healthy silence
+
 ## [1.2.5] - 2026-08-01
 
 ### Added

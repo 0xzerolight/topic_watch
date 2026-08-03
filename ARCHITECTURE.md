@@ -201,6 +201,21 @@ Topics created through the UI start in **RESEARCHING**: articles are fetched and
    - **Record** - Mark articles processed, create `CheckResult`.
 5. Each topic is independent. Errors in one do not affect others.
 
+**Silence Heartbeat.** Each recorded check is classified by its `stage_error`:
+`sources_failed`, `scrape_failed` and `sources_unavailable` all mean no source
+produced usable results. `app/heartbeat.py` counts the leading run of those for a
+topic; once it reaches `silence_heartbeat_checks`, the checker claims the
+`topics.heartbeat_alerted_at` latch with a conditional UPDATE and sends one
+alert. The latch is what makes it one alert per outage rather than one per check,
+and the conditional UPDATE keeps it exactly-once even when a CLI `check-all` runs
+alongside the server. The first check that sees a working source again clears the
+latch and sends a recovery notice. Both messages go out over the normal Apprise
+channels and share the `pending_notifications` retry queue; webhooks are not
+fired for heartbeat events. Setting `silence_heartbeat_checks` to 0 clears any
+outstanding latch on the next check, silently. The dashboard/detail badge is
+derived from the newest check's `stage_error`, never from the latch, so it always
+reflects the last check's real outcome.
+
 ### Manual Check (Web UI)
 
 1. User clicks "Check Now" on the topic detail page.
