@@ -34,6 +34,9 @@
         {% else %}
             <span class="badge badge--bad"><span class="badge-dot"></span>Error</span>
         {% endif %}
+        {% if last_check and last_check.sources_failing %}
+            <span class="badge badge--bad" title="{{ last_check.stage_error }}"><span class="badge-dot"></span>Sources failing</span>
+        {% endif %}
     </td>
     <td class="cell-stack" data-label="Last Check">
         {% if last_check %}

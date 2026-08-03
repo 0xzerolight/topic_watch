@@ -172,6 +172,28 @@ class TestDashboard:
         assert response.status_code == 200
         assert "Add your first topic" in response.text
 
+    async def test_failing_sources_badge(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        """A topic whose newest check saw no usable source is badged on the dashboard."""
+        topic = _make_topic(db_conn, name="HBWeb")
+        create_check_result(
+            db_conn,
+            CheckResult(topic_id=topic.id, stage_error="sources_failed: all feed source(s) failed (see logs)"),
+        )
+        db_conn.commit()
+
+        page = await client.get("/")
+        assert "Sources failing" in page.text
+
+    async def test_no_badge_for_a_healthy_quiet_topic(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        topic = _make_topic(db_conn, name="HBOk")
+        create_check_result(db_conn, CheckResult(topic_id=topic.id))
+        db_conn.commit()
+
+        page = await client.get("/")
+        assert "Sources failing" not in page.text
+
     async def test_dashboard_shows_error_banner(self, client: httpx.AsyncClient) -> None:
         """The ?error= query param (e.g. from a failed OPML import redirect) is surfaced."""
         response = await client.get("/?error=No+file+selected")
@@ -728,6 +750,23 @@ class TestTopicDetail:
         response = await client.get(f"/topics/{topic.id}")
         assert response.status_code == 200
         assert topic.name in response.text
+
+    async def test_failing_sources_callout(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        """The detail page warns when the most recent check found no usable source."""
+        topic = _make_topic(db_conn, name="HBDetail")
+        create_check_result(db_conn, CheckResult(topic_id=topic.id, stage_error="sources_failed: x"))
+        db_conn.commit()
+
+        page = await client.get(f"/topics/{topic.id}")
+        assert "Sources failing" in page.text
+
+    async def test_no_callout_for_a_healthy_topic(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn, name="HBDetailOk")
+        create_check_result(db_conn, CheckResult(topic_id=topic.id))
+        db_conn.commit()
+
+        page = await client.get(f"/topics/{topic.id}")
+        assert "Sources failing" not in page.text
 
     async def test_detail_shows_importance_threshold(
         self, client: httpx.AsyncClient, db_conn: sqlite3.Connection

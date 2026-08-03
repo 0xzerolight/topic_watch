@@ -420,6 +420,9 @@ class CheckResult(SQLiteModel):
             confidence=row["cr_confidence"],
             notification_sent=bool(row["cr_notification_sent"]),
             notification_error=row["cr_notification_error"],
+            # Paired with the ``cr.stage_error AS cr_stage_error`` alias in
+            # _DASHBOARD_SELECT; drives the dashboard's failing-sources badge.
+            stage_error=row["cr_stage_error"],
             # Paired with the ``cr.seen_at AS cr_seen_at`` alias in _DASHBOARD_SELECT;
             # one without the other 500s the dashboard.
             seen_at=_coerce_dt(row["cr_seen_at"]),

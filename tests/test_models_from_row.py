@@ -616,6 +616,7 @@ class TestCheckResultFromDashboardRow:
             "cr_confidence": 0.75,
             "cr_notification_sent": 0,
             "cr_notification_error": None,
+            "cr_stage_error": None,
             "cr_seen_at": None,
         }
         row.update(overrides)
@@ -655,6 +656,16 @@ class TestCheckResultFromDashboardRow:
     def test_corrupt_seen_at_degrades_to_none(self) -> None:
         cr = CheckResult.from_dashboard_row(self._dash_row(cr_seen_at="garbage"), topic_id=1)
         assert cr.seen_at is None
+
+    def test_stage_error_alias_maps_through(self) -> None:
+        cr = CheckResult.from_dashboard_row(self._dash_row(cr_stage_error="sources_failed: x"), topic_id=3)
+        assert cr.stage_error == "sources_failed: x"
+        assert cr.sources_failing
+
+    def test_null_stage_error_stays_none(self) -> None:
+        cr = CheckResult.from_dashboard_row(self._dash_row(), topic_id=3)
+        assert cr.stage_error is None
+        assert not cr.sources_failing
 
 
 class TestStageErrorClassification:

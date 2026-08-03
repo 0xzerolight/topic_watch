@@ -213,6 +213,7 @@ _DASHBOARD_SELECT = """
            json_extract(cr.llm_response, '$.confidence') AS cr_confidence,
            cr.notification_sent AS cr_notification_sent,
            cr.notification_error AS cr_notification_error,
+           cr.stage_error AS cr_stage_error,
            cr.seen_at AS cr_seen_at,
            (SELECT COUNT(*) FROM articles WHERE articles.topic_id = t.id) AS article_count
     FROM topics t
