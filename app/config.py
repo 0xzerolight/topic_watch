@@ -152,6 +152,12 @@ class Settings(BaseSettings):
 
     max_articles_per_check: int = Field(default=10, ge=1, le=100)
     knowledge_state_max_tokens: int = Field(default=2000, ge=500, le=10000)
+    knowledge_revision_limit: int = Field(
+        default=50,
+        ge=2,
+        le=200,
+        description="Knowledge revisions retained per topic for the diff timeline; older ones are pruned",
+    )
     article_retention_days: int = Field(default=90, ge=1, le=3650)
     db_path: str = Field(
         default="data/topic_watch.db",
@@ -388,6 +394,7 @@ def save_settings_to_yaml(
         "check_interval": settings.check_interval,
         "max_articles_per_check": settings.max_articles_per_check,
         "knowledge_state_max_tokens": settings.knowledge_state_max_tokens,
+        "knowledge_revision_limit": settings.knowledge_revision_limit,
         "article_retention_days": settings.article_retention_days,
         "db_path": settings.db_path,
         "feed_fetch_timeout": settings.feed_fetch_timeout,

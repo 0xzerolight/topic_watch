@@ -14,6 +14,8 @@ from app.models import (
     Article,
     CheckResult,
     FeedMode,
+    KnowledgeRevision,
+    KnowledgeRevisionSource,
     KnowledgeState,
     PendingNotification,
     PendingWebhook,
@@ -318,6 +320,45 @@ class TestKnowledgeStateFromRow:
         row["updated_at"] = "xyz"
         state = KnowledgeState.from_row(row)
         assert isinstance(state.updated_at, datetime)
+
+
+class TestKnowledgeRevisionFromRow:
+    """KnowledgeRevision.from_row defensive handling of created_at and source."""
+
+    def _base_row(self) -> dict:
+        return {
+            "id": 1,
+            "topic_id": 1,
+            "summary_text": "body",
+            "token_count": 10,
+            "source": "init",
+            "change_note": None,
+            "created_at": "2026-06-13T12:00:00+00:00",
+        }
+
+    def test_valid_row_parses(self) -> None:
+        revision = KnowledgeRevision.from_row(self._base_row())
+        assert revision.source == KnowledgeRevisionSource.INIT
+        assert revision.created_at.year == 2026
+
+    def test_empty_created_at_does_not_raise(self) -> None:
+        row = self._base_row()
+        row["created_at"] = ""
+        assert isinstance(KnowledgeRevision.from_row(row).created_at, datetime)
+
+    def test_unknown_source_degrades_to_update(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A value written by a future version must not 500 the detail page."""
+        row = self._base_row()
+        row["source"] = "from-the-future"
+        with caplog.at_level(logging.WARNING, logger="app.models"):
+            revision = KnowledgeRevision.from_row(row)
+        assert revision.source == KnowledgeRevisionSource.UPDATE
+        assert any("source" in r.message for r in caplog.records)
+
+    def test_non_string_source_degrades_to_update(self) -> None:
+        row = self._base_row()
+        row["source"] = 42
+        assert KnowledgeRevision.from_row(row).source == KnowledgeRevisionSource.UPDATE
 
 
 class TestPendingNotificationFromRow:

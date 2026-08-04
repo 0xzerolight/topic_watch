@@ -502,3 +502,76 @@ fieldset legend {
     font-size: 1.1rem;
     padding: 0 0.25rem;
 }
+
+/* --- Screen-reader-only utility --- */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* --- Knowledge revision timeline + diff --- */
+.rev-timeline {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.rev-item { border-bottom: 1px solid var(--app-hairline); }
+.rev-item:last-child { border-bottom: none; }
+/* Flex lives on an inner span, never on <summary>: Pico positions the
+   disclosure chevron with summary::after { float: right }, and float is
+   ignored on flex items. */
+.rev-summary-row {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: var(--app-2);
+  align-items: center;
+  font-size: var(--app-text-sm);
+}
+.rev-item > details > summary { padding: var(--app-2) 0; }
+.rev-body { padding: 0 0 var(--app-3); }
+.rev-note { margin: 0 0 var(--app-2); color: var(--app-ink-quiet); }
+
+.diff {
+  max-height: 24rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.diff > * {
+  display: block;
+  padding: var(--app-1) var(--app-2);
+  border-radius: var(--app-radius);
+  font-size: var(--app-text-sm);
+  /* Summaries can contain long URLs; without this, overflow-y:auto forces a
+     horizontal scrollbar inside the diff box. */
+  overflow-wrap: anywhere;
+}
+.diff .diff-eq { color: var(--app-ink-quiet); }
+/* The +/- markers and line-through carry the meaning without color, so the diff
+   reads for color-blind users and in monochrome print. Screen readers get the
+   .sr-only text in the markup, since NVDA and JAWS do not announce ins/del. */
+.diff .diff-ins,
+.diff .diff-del { color: var(--app-ink); }
+.diff .diff-ins {
+  background: var(--app-ok-tint);
+  box-shadow: inset 2px 0 0 var(--app-ok);
+  text-decoration: none;
+}
+.diff .diff-del {
+  background: var(--app-bad-tint);
+  box-shadow: inset 2px 0 0 var(--app-bad);
+  text-decoration: line-through;
+}
+/* Plain content, NOT the `content: "+ " / ""` alt-text syntax: that is not
+   universally supported, and an unsupported value invalidates the whole
+   declaration — which would silently drop the visual marker. Generated content
+   does reach the accessibility tree, so a screen reader hears the marker and
+   then the .sr-only label. Mildly redundant, never silent, never invisible. */
+.diff .diff-ins::before { content: "+ "; font-weight: 600; }
+.diff .diff-del::before { content: "− "; font-weight: 600; }

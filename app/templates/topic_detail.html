@@ -117,6 +117,8 @@
     {% include "topic_status.html" %}
 </div>
 
+{% include "_knowledge_history.html" %}
+
 {# Feed Source: a SIBLING of #status-area, never nested (see the CRITICAL note above). The
    fragment carries its own every-30s poll so the health badges refresh live without a reload. #}
 <div id="feed-source-area">

@@ -102,6 +102,7 @@ the SQLite database land in the project's `data/` directory.
 - Per-topic check intervals (10 min to 6 months, human-readable: `6h`, `1w 3d`, `2h 30m`)
 - Per-topic novelty instruction: tell the AI in plain English what counts as new for that topic ("official announcements only, ignore rumors")
 - Importance scoring: every finding is rated 1-5, with an optional per-topic threshold that mutes minor findings without dropping them from the knowledge state
+- Knowledge history: every update to a topic's knowledge state is kept as a revision, with an inline diff timeline showing exactly what the AI added or removed
 - Topic tags
 - 100+ notification services via [Apprise](https://github.com/caronc/apprise/wiki) (Discord, Slack, Telegram, email, ntfy, etc.)
 - Custom JSON webhooks

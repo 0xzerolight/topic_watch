@@ -144,6 +144,8 @@ The route handlers were split out of `routes.py` into the `web/routers/` package
 
 **Knowledge state with token budget.** Rolling summary compressed by sentence-level truncation when exceeding `knowledge_state_max_tokens`. Prevents unbounded context growth.
 
+**Knowledge revisions with capped retention.** Every knowledge write also appends a row to `knowledge_revisions`; rows are never rewritten, only pruned oldest-first to `knowledge_revision_limit`. The append happens *after* the state write commits, in its own transaction, so a disk-full abort can never take the knowledge state with it — which is why the append can safely swallow every error. The checker never reads the table. Diffs are computed on read with `difflib`; no diff is ever stored.
+
 **Apprise for notifications.** Supports 100+ services via URL format. No need for individual service integrations.
 
 **No built-in authentication.** Deliberate choice for a single-user tool. Remote deployments use a reverse proxy with auth (Authelia, Caddy basicauth, etc.).
@@ -163,6 +165,7 @@ The route handlers were split out of `routes.py` into the `web/routers/` package
 | `topics` | Core entity. Name, description, `feed_urls` (JSON array), `feed_mode` (auto/manual), `status`, `is_active`, `status_changed_at`, `check_interval_minutes`, `tags` (JSON array), per-topic `confidence_threshold` / `relevance_threshold` (m011, nullable overrides), `init_attempts` (m013), `novelty_instruction` (m022, nullable, ≤500 chars, injected into the novelty prompt), `importance_threshold` (m023, nullable 1-5; NULL = notify on any importance). |
 | `articles` | Fetched articles linked to a topic. Deduped by `content_hash` (unique per topic). `source_provider` records the news provider (m009), `published_at` the feed entry's date (m018). `processed` flag tracks analysis completion. |
 | `knowledge_states` | One per topic. Rolling LLM-generated summary. `token_count` tracks budget usage. |
+| `knowledge_revisions` | History of knowledge-state writes (one row per init/update), pruned per topic to `knowledge_revision_limit`. |
 | `check_results` | Audit log of every check cycle. Stores articles found/new, `has_new_info`, full LLM response JSON, notification outcome, `prompt_tokens` / `completion_tokens` (m012), and `stage_error` recording which pipeline stage failed (m015). |
 | `pending_notifications` | Failed notifications queued for retry. Retried at the start of each check cycle. Deleted after `max_retries`. |
 | `pending_webhooks` | Failed webhook deliveries queued for retry (m010). Stores `url`, `payload`, `retry_count`/`max_retries`. Retried at the start of each check cycle; expired entries pruned. |
@@ -258,6 +261,7 @@ On first run, `config.example.yml` is auto-copied to `data/config.yml`.
 | `check_interval` | string | `"6h"` | Default check interval. Units: m, h, d, w, M. Combine: `1w 3d`, `2h 30m`. Min 10m, max 6M. |
 | `max_articles_per_check` | int | `10` | Articles to process per check per topic (1-100) |
 | `knowledge_state_max_tokens` | int | `2000` | Token budget for knowledge state (500-10,000) |
+| `knowledge_revision_limit` | int | `50` | Knowledge revisions retained per topic for the diff timeline (2-200). Config-only; no Settings-page field |
 | `article_retention_days` | int | `90` | Days to keep articles before cleanup (1-3,650) |
 | `db_path` | string | `data/topic_watch.db` | SQLite database path (relative or absolute) |
 | `feed_fetch_timeout` | float | `15.0` | RSS feed fetch timeout (seconds) |
