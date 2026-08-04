@@ -1,5 +1,6 @@
 """Topic CRUD, detail, articles, check/init triggers, and per-topic exports."""
 
+import asyncio
 import logging
 import sqlite3
 from datetime import UTC, datetime
@@ -7,6 +8,7 @@ from datetime import UTC, datetime
 from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
+from app.analysis.knowledge_diff import diff_segments
 from app.analysis.llm import NoveltyResult
 from app.config import Settings
 from app.crud import (
@@ -16,16 +18,19 @@ from app.crud import (
     delete_topic,
     get_check_result,
     get_feed_health,
+    get_knowledge_revision,
     get_knowledge_state,
+    get_previous_knowledge_revision,
     get_topic,
     get_topic_by_name,
     list_articles_for_topic,
     list_check_results,
+    list_knowledge_revision_headers,
     mark_latest_check_seen,
     sum_check_tokens,
     update_topic,
 )
-from app.models import NOVELTY_INSTRUCTION_MAX_CHARS, FeedMode, Topic, TopicStatus
+from app.models import NOVELTY_INSTRUCTION_MAX_CHARS, FeedMode, KnowledgeRevisionSource, Topic, TopicStatus
 from app.notifications import format_notification, send_notification
 from app.scraping.routing import router as provider_router
 from app.web.csrf import verify_csrf
@@ -212,6 +217,11 @@ async def topic_detail(
     offset = (max(1, page) - 1) * per_page
 
     knowledge = get_knowledge_state(conn, topic_id)
+    # Fetch the full retained set, NOT web_page_size (default 20 vs a cap of up
+    # to 200): the page's single ``page`` param already drives check history, so
+    # a second paginated list would strand later revisions. This query omits
+    # summary_text and is covered by idx_knowledge_revisions_topic.
+    revisions = list_knowledge_revision_headers(conn, topic_id, limit=settings.knowledge_revision_limit)
     checks = list_check_results(conn, topic_id, limit=per_page, offset=offset)
     total_checks = count_check_results(conn, topic_id)
     total_prompt_tokens, total_completion_tokens = sum_check_tokens(conn, topic_id)
@@ -226,6 +236,7 @@ async def topic_detail(
         {
             "topic": topic,
             "knowledge": knowledge,
+            "revisions": revisions,
             "checks": checks,
             "articles": articles,
             "article_count": article_count,
@@ -274,6 +285,56 @@ async def topic_status(
             "topic": topic,
             "knowledge": knowledge,
             "knowledge_state_max_tokens": settings.knowledge_state_max_tokens,
+        },
+    )
+
+
+@router.get("/topics/{topic_id}/knowledge-diff/{revision_id}", response_class=HTMLResponse)
+async def topic_knowledge_diff(
+    request: Request,
+    topic_id: int,
+    revision_id: int,
+    conn: sqlite3.Connection = Depends(get_db_conn),
+):
+    """Render the diff between a knowledge revision and the one before it.
+
+    Lazy-loaded by HTMX on first expand, so the detail page never ships every
+    revision's summary. Diffs are computed on read rather than stored — the
+    summaries are the source of truth. GET only, so no CSRF (web.md).
+    """
+    revision = get_knowledge_revision(conn, revision_id)
+    # The topic_id check is not redundant: without it any topic's URL could read
+    # any other topic's revision. It also subsumes the missing-topic 404, since
+    # the FK is ON DELETE CASCADE.
+    if revision is None or revision.topic_id != topic_id:
+        raise HTTPException(status_code=404, detail="Revision not found")
+
+    previous = get_previous_knowledge_revision(conn, topic_id, revision_id)
+    # An 'init' revision starts a new lineage (first research, or Re-initialize).
+    # Diffing it against the last revision of the OLD lineage would render a
+    # wholesale delete+insert as though the model had rewritten its
+    # understanding, so treat it as having no predecessor.
+    if revision.source is KnowledgeRevisionSource.INIT:
+        previous = None
+
+    previous_text = previous.summary_text if previous else ""
+    # difflib is CPU-bound — up to ~0.32 s at MAX_DIFF_SEGMENTS on repetitive
+    # input — and would otherwise block the event loop (CLAUDE.md).
+    segments = await asyncio.to_thread(diff_segments, previous_text, revision.summary_text)
+    inserted = sum(1 for segment in segments if segment.kind == "insert")
+    deleted = sum(1 for segment in segments if segment.kind == "delete")
+    token_delta = revision.token_count - (previous.token_count if previous else 0)
+
+    return templates.TemplateResponse(
+        request,
+        "_knowledge_diff.html",
+        {
+            "revision": revision,
+            "previous": previous,
+            "segments": segments,
+            "inserted": inserted,
+            "deleted": deleted,
+            "token_delta": token_delta,
         },
     )
 

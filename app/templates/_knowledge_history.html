@@ -1,0 +1,50 @@
+{# Knowledge revision timeline. A SIBLING of #status-area, never a child — the
+   researching poll swaps #status-area's innerHTML every 3s and would wipe this.
+   Each diff body is fetched on first expand, and the listing query omits
+   summary_text, so the page never ships every revision's full summary.
+
+   Like Check History below, this does NOT live-refresh; both update on reload. #}
+<h2>Knowledge History</h2>
+{% if revisions %}
+<details>
+    <summary>{{ revisions|length }} revision{{ "s" if revisions|length != 1 }} (showing the newest {{ revisions|length }})</summary>
+    <ol class="rev-timeline">
+        {% for revision in revisions %}
+        <li class="rev-item">
+            <details>
+                {# The flex row is an INNER span: Pico draws the disclosure chevron
+                   with summary::after { float: right }, and float is ignored on
+                   flex items, so flexing <summary> would strand the chevron. #}
+                <summary>
+                    <span class="rev-summary-row">
+                        <span title="{{ revision.created_at.strftime('%Y-%m-%d %H:%M') }}">{{ revision.created_at | timeago }}</span>
+                        {% if revision.source.value == "init" %}
+                        <span class="badge badge--signal"><span class="badge-dot"></span>Initial</span>
+                        {% else %}
+                        <span class="badge badge--idle"><span class="badge-dot"></span>Update</span>
+                        {% endif %}
+                        <small class="quiet num">{{ revision.token_count }} tokens</small>
+                    </span>
+                </summary>
+                {# hx-trigger fires on the parent <details> toggle so the fetch happens
+                   on first expand. `intersect` is unreliable here: a closed <details>
+                   hides its children, so the observer may never fire. Errors are
+                   handled globally by notifications.js, which toasts and offers a
+                   working retry (htmxRetry re-issues into this same element). #}
+                <div class="rev-body"
+                     hx-get="/topics/{{ topic.id }}/knowledge-diff/{{ revision.id }}"
+                     hx-trigger="toggle once from:closest details"
+                     hx-swap="innerHTML">
+                    <small class="quiet">Loading diff...</small>
+                </div>
+            </details>
+        </li>
+        {% endfor %}
+    </ol>
+</details>
+{% else %}
+<div class="empty-state">
+    <p>No knowledge revisions recorded yet.</p>
+    <p class="empty-state-hint">A revision is saved every time initial research runs or a check finds genuinely new information. Expanding one shows exactly what the AI added or removed.</p>
+</div>
+{% endif %}

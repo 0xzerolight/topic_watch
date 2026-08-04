@@ -8,6 +8,8 @@ Model-level defensive loading lives in tests/test_models_from_row.py.
 import sqlite3
 from datetime import UTC, datetime
 
+import pytest
+
 from app.database import get_connection, init_db
 from app.models import KnowledgeRevision, KnowledgeRevisionSource, KnowledgeState, Topic, TopicStatus
 
@@ -523,3 +525,160 @@ class TestDiffSegments:
         segments = diff_segments(old, new)
         assert {s.kind for s in segments} == {"insert"}
         assert segments[0].text == "- New fact 0."
+
+
+CSRF_TEST_TOKEN = "test-csrf-token-for-tests"
+
+
+@pytest.fixture
+async def client(db_conn: sqlite3.Connection):
+    """httpx client bound to the test DB (mirrors tests/test_web.py::client)."""
+    from unittest.mock import patch
+
+    import httpx
+
+    from app.main import app
+    from app.web.dependencies import get_db_conn, get_settings
+
+    settings = _revision_settings(notifications={"urls": ["json://localhost"]})
+
+    def override_db():
+        yield db_conn
+
+    def override_settings():
+        return settings
+
+    app.dependency_overrides[get_db_conn] = override_db
+    app.dependency_overrides[get_settings] = override_settings
+    with patch("app.web.routers.settings.load_settings", return_value=settings):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+            cookies={"csrf_token": CSRF_TEST_TOKEN},
+            headers={"X-CSRF-Token": CSRF_TEST_TOKEN},
+        ) as ac:
+            yield ac
+    app.dependency_overrides.clear()
+
+
+class TestKnowledgeHistoryUI:
+    async def test_timeline_lists_revisions(self, client, db_conn: sqlite3.Connection) -> None:
+        topic = _seed_topic(db_conn, "Timeline Topic")
+        _seed_revision(db_conn, topic.id, "First.", source=KnowledgeRevisionSource.INIT)
+        _seed_revision(db_conn, topic.id, "Second.", source=KnowledgeRevisionSource.UPDATE)
+
+        response = await client.get(f"/topics/{topic.id}")
+        assert response.status_code == 200
+        assert "Knowledge History" in response.text
+        assert "showing the newest 2" in response.text
+
+    async def test_timeline_emits_the_lazy_load_wiring(self, client, db_conn: sqlite3.Connection) -> None:
+        """Without these attributes the diff never loads, yet every other test still passes."""
+        topic = _seed_topic(db_conn, "Wiring Topic")
+        revision = _seed_revision(db_conn, topic.id, "Only.")
+
+        response = await client.get(f"/topics/{topic.id}")
+        assert f'hx-get="/topics/{topic.id}/knowledge-diff/{revision.id}"' in response.text
+        assert 'hx-trigger="toggle once from:closest details"' in response.text
+
+    async def test_timeline_does_not_ship_summaries(self, client, db_conn: sqlite3.Connection) -> None:
+        topic = _seed_topic(db_conn, "Light Topic")
+        _seed_revision(db_conn, topic.id, "SECRET-SUMMARY-BODY")
+
+        response = await client.get(f"/topics/{topic.id}")
+        assert "SECRET-SUMMARY-BODY" not in response.text
+
+    async def test_timeline_honors_the_revision_limit(self, client, db_conn: sqlite3.Connection) -> None:
+        """Pins the fetch to knowledge_revision_limit, not web_page_size."""
+        from app.main import app
+        from app.web.dependencies import get_settings
+
+        topic = _seed_topic(db_conn, "Capped Topic")
+        for i in range(3):
+            _seed_revision(db_conn, topic.id, f"Rev {i}.")
+        capped = _revision_settings(
+            knowledge_revision_limit=2,
+            notifications={"urls": ["json://localhost"]},
+        )
+        app.dependency_overrides[get_settings] = lambda: capped
+
+        response = await client.get(f"/topics/{topic.id}")
+        assert "showing the newest 2" in response.text
+
+    async def test_empty_state_when_no_revisions(self, client, db_conn: sqlite3.Connection) -> None:
+        topic = _seed_topic(db_conn, "No History Topic")
+        response = await client.get(f"/topics/{topic.id}")
+        assert response.status_code == 200
+        assert "No knowledge revisions recorded yet" in response.text
+
+    async def test_diff_fragment_marks_added_and_removed(self, client, db_conn: sqlite3.Connection) -> None:
+        topic = _seed_topic(db_conn, "Diff Topic")
+        _seed_revision(db_conn, topic.id, "Alpha fact.\nBravo fact.", token_count=5)
+        newer = _seed_revision(db_conn, topic.id, "Alpha fact.\nCharlie fact.", token_count=9)
+
+        response = await client.get(f"/topics/{topic.id}/knowledge-diff/{newer.id}")
+        assert response.status_code == 200
+        assert "Charlie fact." in response.text
+        assert "Bravo fact." in response.text
+        assert "diff-ins" in response.text
+        assert "diff-del" in response.text
+        assert "+4" in response.text  # token delta renders its sign
+
+    async def test_diff_fragment_shows_change_note(self, client, db_conn: sqlite3.Connection) -> None:
+        topic = _seed_topic(db_conn, "Note Topic")
+        _seed_revision(db_conn, topic.id, "Old.")
+        newer = _seed_revision(db_conn, topic.id, "New.", change_note="Verdict announced.")
+
+        response = await client.get(f"/topics/{topic.id}/knowledge-diff/{newer.id}")
+        assert "Verdict announced." in response.text
+
+    async def test_oldest_revision_renders_as_snapshot(self, client, db_conn: sqlite3.Connection) -> None:
+        topic = _seed_topic(db_conn, "Oldest Topic")
+        oldest = _seed_revision(db_conn, topic.id, "Baseline fact.")
+
+        response = await client.get(f"/topics/{topic.id}/knowledge-diff/{oldest.id}")
+        assert response.status_code == 200
+        assert "No earlier revision is retained" in response.text
+        assert "Baseline fact." in response.text
+
+    async def test_reinitialize_renders_as_snapshot(self, client, db_conn: sqlite3.Connection) -> None:
+        """An init revision starts a new lineage; diffing it against the old one is nonsense."""
+        topic = _seed_topic(db_conn, "Reinit Topic")
+        _seed_revision(db_conn, topic.id, "Old lineage fact.", source=KnowledgeRevisionSource.UPDATE)
+        reinit = _seed_revision(db_conn, topic.id, "Fresh baseline.", source=KnowledgeRevisionSource.INIT)
+
+        response = await client.get(f"/topics/{topic.id}/knowledge-diff/{reinit.id}")
+        assert response.status_code == 200
+        assert "Old lineage fact." not in response.text
+        assert "Fresh baseline." in response.text
+
+    async def test_unchanged_revision_says_so(self, client, db_conn: sqlite3.Connection) -> None:
+        topic = _seed_topic(db_conn, "Unchanged Topic")
+        _seed_revision(db_conn, topic.id, "Identical body.")
+        newer = _seed_revision(db_conn, topic.id, "Identical body.")
+
+        response = await client.get(f"/topics/{topic.id}/knowledge-diff/{newer.id}")
+        assert "No textual change" in response.text
+
+    async def test_diff_escapes_html_in_summary(self, client, db_conn: sqlite3.Connection) -> None:
+        """Summaries are LLM output derived from articles — never trust them as markup."""
+        topic = _seed_topic(db_conn, "XSS Topic")
+        _seed_revision(db_conn, topic.id, "Safe.")
+        newer = _seed_revision(db_conn, topic.id, "Safe.\n<script>alert(1)</script>")
+
+        response = await client.get(f"/topics/{topic.id}/knowledge-diff/{newer.id}")
+        assert "<script>alert(1)</script>" not in response.text
+        assert "&lt;script&gt;" in response.text
+
+    async def test_revision_from_another_topic_is_404(self, client, db_conn: sqlite3.Connection) -> None:
+        a = _seed_topic(db_conn, "Topic A")
+        b = _seed_topic(db_conn, "Topic B")
+        b_rev = _seed_revision(db_conn, b.id, "B content.")
+
+        response = await client.get(f"/topics/{a.id}/knowledge-diff/{b_rev.id}")
+        assert response.status_code == 404
+
+    async def test_missing_revision_is_404(self, client, db_conn: sqlite3.Connection) -> None:
+        topic = _seed_topic(db_conn, "Missing Rev Topic")
+        response = await client.get(f"/topics/{topic.id}/knowledge-diff/999999")
+        assert response.status_code == 404
