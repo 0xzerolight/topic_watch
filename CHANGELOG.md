@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Knowledge history: every knowledge-state write is now recorded as a revision, with an inline diff timeline on the topic detail page showing exactly what the AI added or removed. Retention is capped per topic by the new config-only `knowledge_revision_limit` setting (default 50); revisions are not included in the JSON/CSV export
 - Silence Heartbeat: after `silence_heartbeat_checks` consecutive checks where no source returned usable results, topic_watch sends one "sources failing" alert per affected topic, and one "sources recovered" notice when they come back. A failure shared by every topic (expired API key, no network) therefore produces one alert per topic in the same cycle; the message points at the shared cause. The dashboard and topic detail show a failing-sources badge from the first such check
 - Checks where no source was even attempted (every feed in backoff, Exa disabled, no feed URLs) now record a `sources_unavailable` stage error instead of looking like healthy silence
 
