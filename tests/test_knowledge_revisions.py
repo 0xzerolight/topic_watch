@@ -438,3 +438,88 @@ class TestRevisionWritePath:
         # so even a whole-transaction abort cannot take it with it.
         assert get_knowledge_state(db_conn, topic.id).summary_text == "Survives."
         assert "revision" in caplog.text.lower()
+
+
+class TestSplitSegments:
+    def test_splits_sentences_within_a_line(self) -> None:
+        from app.analysis.knowledge_diff import split_segments
+
+        assert split_segments("One fact. Two facts! Three?") == ["One fact.", "Two facts!", "Three?"]
+
+    def test_splits_on_line_boundaries(self) -> None:
+        from app.analysis.knowledge_diff import split_segments
+
+        text = "**Current Status**\n- Trial began.\n- Verdict pending."
+        assert split_segments(text) == ["**Current Status**", "- Trial began.", "- Verdict pending."]
+
+    def test_drops_blank_lines_and_strips(self) -> None:
+        from app.analysis.knowledge_diff import split_segments
+
+        assert split_segments("  A fact.  \n\n\n   \n  B fact.  ") == ["A fact.", "B fact."]
+
+    def test_empty_text_yields_no_segments(self) -> None:
+        from app.analysis.knowledge_diff import split_segments
+
+        assert split_segments("") == []
+        assert split_segments("   \n  ") == []
+
+
+class TestDiffSegments:
+    def test_identical_text_is_all_equal(self) -> None:
+        from app.analysis.knowledge_diff import diff_segments
+
+        assert [s.kind for s in diff_segments("A fact. B fact.", "A fact. B fact.")] == ["equal", "equal"]
+
+    def test_pure_addition(self) -> None:
+        from app.analysis.knowledge_diff import diff_segments
+
+        segments = diff_segments("A fact.", "A fact. B fact.")
+        assert [(s.kind, s.text) for s in segments] == [("equal", "A fact."), ("insert", "B fact.")]
+
+    def test_pure_deletion(self) -> None:
+        from app.analysis.knowledge_diff import diff_segments
+
+        segments = diff_segments("A fact. B fact.", "A fact.")
+        assert [(s.kind, s.text) for s in segments] == [("equal", "A fact."), ("delete", "B fact.")]
+
+    def test_replacement_emits_delete_then_insert(self) -> None:
+        from app.analysis.knowledge_diff import diff_segments
+
+        segments = diff_segments("Verdict pending.", "Verdict returned.")
+        assert [(s.kind, s.text) for s in segments] == [
+            ("delete", "Verdict pending."),
+            ("insert", "Verdict returned."),
+        ]
+
+    def test_empty_old_is_all_insert(self) -> None:
+        """The oldest retained revision has no predecessor — render it as a snapshot."""
+        from app.analysis.knowledge_diff import diff_segments
+
+        assert [s.kind for s in diff_segments("", "A fact. B fact.")] == ["insert", "insert"]
+
+    def test_empty_both_yields_nothing(self) -> None:
+        from app.analysis.knowledge_diff import diff_segments
+
+        assert diff_segments("", "") == []
+
+    def test_preserves_document_order(self) -> None:
+        from app.analysis.knowledge_diff import diff_segments
+
+        old = "Alpha.\nBravo.\nCharlie."
+        new = "Alpha.\nDelta.\nCharlie."
+        assert [(s.kind, s.text) for s in diff_segments(old, new)] == [
+            ("equal", "Alpha."),
+            ("delete", "Bravo."),
+            ("insert", "Delta."),
+            ("equal", "Charlie."),
+        ]
+
+    def test_oversized_input_falls_back_to_snapshot(self) -> None:
+        """Beyond the cap, skip the quadratic matcher rather than burn CPU."""
+        from app.analysis.knowledge_diff import MAX_DIFF_SEGMENTS, diff_segments
+
+        old = "\n".join(f"- Old fact {i}." for i in range(MAX_DIFF_SEGMENTS + 1))
+        new = "\n".join(f"- New fact {i}." for i in range(MAX_DIFF_SEGMENTS + 1))
+        segments = diff_segments(old, new)
+        assert {s.kind for s in segments} == {"insert"}
+        assert segments[0].text == "- New fact 0."
