@@ -9,7 +9,7 @@ import sqlite3
 from datetime import UTC, datetime
 
 from app.database import get_connection, init_db
-from app.models import Topic, TopicStatus
+from app.models import KnowledgeRevision, KnowledgeRevisionSource, Topic, TopicStatus
 
 
 def _revision_settings(**overrides):
@@ -170,3 +170,136 @@ class TestM025Backfill:
             assert [r[0] for r in rows] == ["Live."]
         finally:
             conn.close()
+
+
+def _seed_topic(conn: sqlite3.Connection, name: str = "CRUD Topic") -> Topic:
+    from app.crud import create_topic
+
+    topic = create_topic(conn, Topic(name=name, description="d", status=TopicStatus.READY))
+    conn.commit()
+    return topic
+
+
+def _seed_revision(conn: sqlite3.Connection, topic_id: int, text: str, **overrides) -> KnowledgeRevision:
+    from app.crud import create_knowledge_revision
+
+    created = create_knowledge_revision(conn, KnowledgeRevision(topic_id=topic_id, summary_text=text, **overrides))
+    conn.commit()
+    return created
+
+
+class TestKnowledgeRevisionCRUD:
+    def test_create_assigns_id(self, db_conn: sqlite3.Connection) -> None:
+        topic = _seed_topic(db_conn)
+        created = _seed_revision(db_conn, topic.id, "First.", token_count=3)
+        assert created.id is not None
+        assert created.token_count == 3
+
+    def test_headers_are_newest_first(self, db_conn: sqlite3.Connection) -> None:
+        from app.crud import list_knowledge_revision_headers
+
+        topic = _seed_topic(db_conn)
+        first = _seed_revision(db_conn, topic.id, "One.")
+        second = _seed_revision(db_conn, topic.id, "Two.")
+        third = _seed_revision(db_conn, topic.id, "Three.")
+        headers = list_knowledge_revision_headers(db_conn, topic.id, limit=10)
+        assert [h.id for h in headers] == [third.id, second.id, first.id]
+
+    def test_headers_omit_summary_text(self, db_conn: sqlite3.Connection) -> None:
+        """The listing must not ship every revision's full summary."""
+        from app.crud import list_knowledge_revision_headers
+
+        topic = _seed_topic(db_conn)
+        _seed_revision(db_conn, topic.id, "A very long summary body.")
+        headers = list_knowledge_revision_headers(db_conn, topic.id, limit=10)
+        assert headers[0].summary_text == ""
+
+    def test_headers_carry_metadata(self, db_conn: sqlite3.Connection) -> None:
+        from app.crud import list_knowledge_revision_headers
+
+        topic = _seed_topic(db_conn)
+        _seed_revision(db_conn, topic.id, "x", token_count=17, source=KnowledgeRevisionSource.INIT)
+        header = list_knowledge_revision_headers(db_conn, topic.id, limit=10)[0]
+        assert header.token_count == 17
+        assert header.source == KnowledgeRevisionSource.INIT
+
+    def test_headers_respect_limit(self, db_conn: sqlite3.Connection) -> None:
+        from app.crud import list_knowledge_revision_headers
+
+        topic = _seed_topic(db_conn)
+        for i in range(5):
+            _seed_revision(db_conn, topic.id, f"Rev {i}.", token_count=i)
+        headers = list_knowledge_revision_headers(db_conn, topic.id, limit=2)
+        assert [h.token_count for h in headers] == [4, 3]
+
+    def test_headers_scoped_to_topic(self, db_conn: sqlite3.Connection) -> None:
+        from app.crud import list_knowledge_revision_headers
+
+        a = _seed_topic(db_conn, "A")
+        b = _seed_topic(db_conn, "B")
+        a_rev = _seed_revision(db_conn, a.id, "A rev.")
+        _seed_revision(db_conn, b.id, "B rev.")
+        assert [h.id for h in list_knowledge_revision_headers(db_conn, a.id, limit=10)] == [a_rev.id]
+
+    def test_get_by_id_returns_full_summary(self, db_conn: sqlite3.Connection) -> None:
+        from app.crud import get_knowledge_revision
+
+        topic = _seed_topic(db_conn)
+        created = _seed_revision(db_conn, topic.id, "Only.")
+        loaded = get_knowledge_revision(db_conn, created.id)
+        assert loaded is not None
+        assert loaded.summary_text == "Only."
+        assert get_knowledge_revision(db_conn, created.id + 999) is None
+
+    def test_get_previous(self, db_conn: sqlite3.Connection) -> None:
+        from app.crud import get_previous_knowledge_revision
+
+        topic = _seed_topic(db_conn)
+        first = _seed_revision(db_conn, topic.id, "First.")
+        second = _seed_revision(db_conn, topic.id, "Second.")
+        previous = get_previous_knowledge_revision(db_conn, topic.id, second.id)
+        assert previous is not None
+        assert previous.id == first.id
+        assert previous.summary_text == "First."
+        assert get_previous_knowledge_revision(db_conn, topic.id, first.id) is None
+
+    def test_get_previous_ignores_other_topics(self, db_conn: sqlite3.Connection) -> None:
+        from app.crud import get_previous_knowledge_revision
+
+        a = _seed_topic(db_conn, "A")
+        b = _seed_topic(db_conn, "B")
+        _seed_revision(db_conn, a.id, "A older.")
+        b_rev = _seed_revision(db_conn, b.id, "B only.")
+        assert get_previous_knowledge_revision(db_conn, b.id, b_rev.id) is None
+
+    def test_prune_keeps_newest(self, db_conn: sqlite3.Connection) -> None:
+        from app.crud import list_knowledge_revision_headers, prune_knowledge_revisions
+
+        topic = _seed_topic(db_conn)
+        for i in range(5):
+            _seed_revision(db_conn, topic.id, f"Rev {i}.", token_count=i)
+        deleted = prune_knowledge_revisions(db_conn, topic.id, keep=2)
+        db_conn.commit()
+        assert deleted == 3
+        headers = list_knowledge_revision_headers(db_conn, topic.id, limit=10)
+        assert [h.token_count for h in headers] == [4, 3]
+
+    def test_prune_noop_under_cap(self, db_conn: sqlite3.Connection) -> None:
+        from app.crud import prune_knowledge_revisions
+
+        topic = _seed_topic(db_conn)
+        _seed_revision(db_conn, topic.id, "One.")
+        assert prune_knowledge_revisions(db_conn, topic.id, keep=10) == 0
+
+    def test_prune_scoped_to_topic(self, db_conn: sqlite3.Connection) -> None:
+        from app.crud import list_knowledge_revision_headers, prune_knowledge_revisions
+
+        a = _seed_topic(db_conn, "A")
+        b = _seed_topic(db_conn, "B")
+        for i in range(3):
+            _seed_revision(db_conn, a.id, f"A {i}.")
+            _seed_revision(db_conn, b.id, f"B {i}.")
+        prune_knowledge_revisions(db_conn, a.id, keep=1)
+        db_conn.commit()
+        assert len(list_knowledge_revision_headers(db_conn, a.id, limit=10)) == 1
+        assert len(list_knowledge_revision_headers(db_conn, b.id, limit=10)) == 3

@@ -13,6 +13,7 @@ from app.models import (
     CheckResult,
     DashboardStats,
     FeedHealth,
+    KnowledgeRevision,
     KnowledgeState,
     PendingNotification,
     PendingWebhook,
@@ -470,6 +471,97 @@ def update_knowledge_state(conn: sqlite3.Connection, state: KnowledgeState) -> K
         data,
     )
     return state
+
+
+# --- KnowledgeRevision CRUD ---
+
+
+def create_knowledge_revision(conn: sqlite3.Connection, revision: KnowledgeRevision) -> KnowledgeRevision:
+    """Append a knowledge revision. Never updates or replaces an existing row."""
+    data = revision.to_insert_dict()
+    cursor = conn.execute(
+        """INSERT INTO knowledge_revisions
+               (topic_id, summary_text, token_count, source, change_note, created_at)
+           VALUES (:topic_id, :summary_text, :token_count, :source, :change_note, :created_at)""",
+        data,
+    )
+    revision.id = cursor.lastrowid
+    return revision
+
+
+def list_knowledge_revision_headers(
+    conn: sqlite3.Connection,
+    topic_id: int,
+    limit: int,
+) -> list[KnowledgeRevision]:
+    """List a topic's revisions newest-first WITHOUT their summary text.
+
+    The timeline renders four metadata fields per row and lazy-loads each diff,
+    so shipping ``summary_text`` would read up to ~40 KB per revision for text
+    no template shows. ``''`` is selected as a literal rather than dropping the
+    column so the shared ``from_row`` coercion still applies; the returned models
+    carry an empty ``summary_text`` and must never be written back.
+
+    Ordered by ``id DESC`` rather than ``created_at DESC``: two revisions written
+    in the same second must still order deterministically, and ``id`` is the
+    insertion order the diff timeline depends on. The column list matches
+    ``idx_knowledge_revisions_topic`` so this is served from the index alone.
+    """
+    rows = conn.execute(
+        """SELECT id, topic_id, '' AS summary_text, token_count, source,
+                  NULL AS change_note, created_at
+           FROM knowledge_revisions
+           WHERE topic_id = ?
+           ORDER BY id DESC
+           LIMIT ?""",
+        (topic_id, limit),
+    ).fetchall()
+    return [KnowledgeRevision.from_row(row) for row in rows]
+
+
+def get_knowledge_revision(conn: sqlite3.Connection, revision_id: int) -> KnowledgeRevision | None:
+    """Get a single revision, summary text included, or None."""
+    row = conn.execute("SELECT * FROM knowledge_revisions WHERE id = ?", (revision_id,)).fetchone()
+    return KnowledgeRevision.from_row(row) if row else None
+
+
+def get_previous_knowledge_revision(
+    conn: sqlite3.Connection,
+    topic_id: int,
+    revision_id: int,
+) -> KnowledgeRevision | None:
+    """Get the revision immediately preceding ``revision_id`` for this topic.
+
+    ``None`` when ``revision_id`` is the topic's oldest retained revision — the
+    diff view then renders the full snapshot. Pruning always removes the oldest
+    rows, so retained revisions stay contiguous and this is never a
+    non-adjacent comparison.
+    """
+    row = conn.execute(
+        "SELECT * FROM knowledge_revisions WHERE topic_id = ? AND id < ? ORDER BY id DESC LIMIT 1",
+        (topic_id, revision_id),
+    ).fetchone()
+    return KnowledgeRevision.from_row(row) if row else None
+
+
+def prune_knowledge_revisions(conn: sqlite3.Connection, topic_id: int, keep: int) -> int:
+    """Delete all but the newest ``keep`` revisions for a topic. Returns rows deleted.
+
+    Bounds history growth: a busy topic would otherwise accumulate one full
+    knowledge summary per new-info check forever.
+    """
+    cursor = conn.execute(
+        """DELETE FROM knowledge_revisions
+           WHERE topic_id = :topic_id
+             AND id NOT IN (
+                 SELECT id FROM knowledge_revisions
+                 WHERE topic_id = :topic_id
+                 ORDER BY id DESC
+                 LIMIT :keep
+             )""",
+        {"topic_id": topic_id, "keep": keep},
+    )
+    return cursor.rowcount
 
 
 # --- CheckResult CRUD ---
