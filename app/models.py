@@ -176,6 +176,13 @@ class FeedMode(StrEnum):
     EXA = "exa"
 
 
+class KnowledgeRevisionSource(StrEnum):
+    """What produced a knowledge revision."""
+
+    INIT = "init"
+    UPDATE = "update"
+
+
 # Cap for the per-topic novelty instruction (free text injected into the novelty
 # prompt). Single source of truth: enforced at the form boundary
 # (``parse_novelty_instruction``) and rendered as the textarea ``maxlength``.
@@ -305,6 +312,49 @@ class KnowledgeState(SQLiteModel):
     summary_text: str
     token_count: int = 0
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class KnowledgeRevision(SQLiteModel):
+    """One recorded snapshot of a topic's knowledge state.
+
+    History beside ``knowledge_states``: rows are appended on write and pruned
+    oldest-first, never rewritten. The checker never reads them, so a corrupt or
+    pruned revision cannot affect novelty detection. ``change_note`` is the
+    novelty summary that prompted an update (NULL for 'init' revisions and for
+    updates where the LLM returned no summary).
+    """
+
+    _required_dt_fields = ("created_at",)
+
+    id: int | None = None
+    topic_id: int
+    summary_text: str
+    token_count: int = 0
+    source: KnowledgeRevisionSource = KnowledgeRevisionSource.UPDATE
+    change_note: str | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @field_validator("source", mode="before")
+    @classmethod
+    def _coerce_source(cls, value: object) -> object:
+        """Degrade an unrecognised stored ``source`` to UPDATE instead of raising.
+
+        Mirrors ``Topic._clamp_importance_threshold``: a value written by a
+        future version, restored from an old backup, or hand-edited in sqlite3
+        must not raise ValidationError and 500 the topic detail page over a
+        badge label. The ``isinstance`` check is load-bearing for mypy, whose
+        enum plugin types ``StrEnum.__call__`` as ``(value: str)``.
+        """
+        if isinstance(value, KnowledgeRevisionSource):
+            return value
+        if not isinstance(value, str):
+            logger.warning("Non-string knowledge revision source %r; treating as 'update'", value)
+            return KnowledgeRevisionSource.UPDATE
+        try:
+            return KnowledgeRevisionSource(value)
+        except ValueError:
+            logger.warning("Unknown knowledge revision source %r; treating as 'update'", value)
+            return KnowledgeRevisionSource.UPDATE
 
 
 # ``check_results.stage_error`` vocabulary, written by app/checker.py. Collected
