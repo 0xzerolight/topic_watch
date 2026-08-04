@@ -67,6 +67,15 @@ max_articles_per_check: 10
 # providers' non-streaming limits, so raising this above ~8000 has no effect.
 knowledge_state_max_tokens: 2000
 
+# How many knowledge revisions to keep per topic for the diff timeline on the
+# topic detail page. Each revision stores a full copy of the knowledge summary
+# — roughly 8 KB at the default 2000-token budget, ~40 KB at the 10000-token
+# ceiling — so this bounds history growth. Oldest revisions are pruned as new
+# ones land, and only on a write: lowering this later will not retro-prune a
+# topic that has stopped updating.
+# Config-only: there is no field for this on the Settings page.
+knowledge_revision_limit: 50
+
 # Number of days to retain articles before automatic cleanup
 # Older articles are deleted daily at 4 AM
 article_retention_days: 90

@@ -9,7 +9,7 @@ import sqlite3
 from datetime import UTC, datetime
 
 from app.database import get_connection, init_db
-from app.models import KnowledgeRevision, KnowledgeRevisionSource, Topic, TopicStatus
+from app.models import KnowledgeRevision, KnowledgeRevisionSource, KnowledgeState, Topic, TopicStatus
 
 
 def _revision_settings(**overrides):
@@ -303,3 +303,138 @@ class TestKnowledgeRevisionCRUD:
         db_conn.commit()
         assert len(list_knowledge_revision_headers(db_conn, a.id, limit=10)) == 1
         assert len(list_knowledge_revision_headers(db_conn, b.id, limit=10)) == 3
+
+
+def _one_article(topic_id: int):
+    from app.models import Article
+
+    return [
+        Article(
+            topic_id=topic_id,
+            title="A",
+            url="https://example.com/a",
+            content_hash="h1",
+            source_feed="https://example.com/feed.xml",
+        )
+    ]
+
+
+class TestRevisionWritePath:
+    async def test_initialize_records_init_revision(self, db_conn: sqlite3.Connection) -> None:
+        from app.analysis.knowledge import initialize_knowledge
+        from app.crud import get_knowledge_revision, list_knowledge_revision_headers
+        from tests.helpers import make_knowledge_update, stub_llm_boundary
+
+        topic = _seed_topic(db_conn, "Init Topic")
+        with stub_llm_boundary(knowledge_init=make_knowledge_update("Baseline summary.")):
+            await initialize_knowledge(topic, _one_article(topic.id), db_conn, _revision_settings())
+
+        headers = list_knowledge_revision_headers(db_conn, topic.id, limit=10)
+        assert len(headers) == 1
+        assert headers[0].source == KnowledgeRevisionSource.INIT
+        assert headers[0].token_count > 0
+        full = get_knowledge_revision(db_conn, headers[0].id)
+        assert full.summary_text == "Baseline summary."
+        assert full.change_note is None
+
+    async def test_initialize_with_insufficient_data_still_records(self, db_conn: sqlite3.Connection) -> None:
+        """Thin/off-topic articles still persist a baseline state, so they get a revision."""
+        from app.analysis.knowledge import initialize_knowledge
+        from app.crud import list_knowledge_revision_headers
+        from tests.helpers import make_knowledge_update, stub_llm_boundary
+
+        topic = _seed_topic(db_conn, "Thin Topic")
+        thin = make_knowledge_update("Not enough information yet.", sufficient_data=False)
+        with stub_llm_boundary(knowledge_init=thin):
+            result = await initialize_knowledge(topic, _one_article(topic.id), db_conn, _revision_settings())
+
+        assert result.sufficient_data is False
+        assert len(list_knowledge_revision_headers(db_conn, topic.id, limit=10)) == 1
+
+    async def test_update_records_update_revision_with_change_note(self, db_conn: sqlite3.Connection) -> None:
+        from app.analysis.knowledge import update_knowledge
+        from app.crud import create_knowledge_state, get_knowledge_revision, list_knowledge_revision_headers
+        from tests.helpers import make_knowledge_update, make_novelty_result, stub_llm_boundary
+
+        topic = _seed_topic(db_conn, "Update Topic")
+        create_knowledge_state(db_conn, KnowledgeState(topic_id=topic.id, summary_text="Old.", token_count=3))
+        db_conn.commit()
+
+        novelty = make_novelty_result(summary="Court ruled on Tuesday.")
+        with stub_llm_boundary(knowledge_init=make_knowledge_update("New summary.")):
+            await update_knowledge(topic, novelty, db_conn, _revision_settings())
+
+        headers = list_knowledge_revision_headers(db_conn, topic.id, limit=10)
+        assert len(headers) == 1
+        assert headers[0].source == KnowledgeRevisionSource.UPDATE
+        full = get_knowledge_revision(db_conn, headers[0].id)
+        assert full.summary_text == "New summary."
+        assert full.change_note == "Court ruled on Tuesday."
+
+    async def test_insufficient_update_records_no_revision(self, db_conn: sqlite3.Connection) -> None:
+        from app.analysis.knowledge import update_knowledge
+        from app.crud import create_knowledge_state, list_knowledge_revision_headers
+        from tests.helpers import make_knowledge_update, make_novelty_result, stub_llm_boundary
+
+        topic = _seed_topic(db_conn, "Insufficient Topic")
+        create_knowledge_state(db_conn, KnowledgeState(topic_id=topic.id, summary_text="Old.", token_count=2))
+        db_conn.commit()
+
+        thin = make_knowledge_update("Ignored.", sufficient_data=False)
+        with stub_llm_boundary(knowledge_init=thin):
+            result = await update_knowledge(topic, make_novelty_result(), db_conn, _revision_settings())
+
+        assert result.sufficient_data is False
+        assert list_knowledge_revision_headers(db_conn, topic.id, limit=10) == []
+
+    async def test_prunes_to_configured_limit(self, db_conn: sqlite3.Connection) -> None:
+        from app.analysis.knowledge import update_knowledge
+        from app.crud import create_knowledge_state, get_knowledge_revision, list_knowledge_revision_headers
+        from tests.helpers import make_knowledge_update, make_novelty_result, stub_llm_boundary
+
+        settings = _revision_settings(knowledge_revision_limit=2)
+        topic = _seed_topic(db_conn, "Prune Topic")
+        create_knowledge_state(db_conn, KnowledgeState(topic_id=topic.id, summary_text="Start.", token_count=2))
+        db_conn.commit()
+
+        for i in range(4):
+            # A fresh boundary per iteration resets the stub's call counter, so
+            # knowledge_init= is what each single update call receives.
+            with stub_llm_boundary(knowledge_init=make_knowledge_update(f"Summary {i}.")):
+                await update_knowledge(topic, make_novelty_result(), db_conn, settings)
+
+        headers = list_knowledge_revision_headers(db_conn, topic.id, limit=10)
+        assert len(headers) == 2
+        assert [get_knowledge_revision(db_conn, h.id).summary_text for h in headers] == [
+            "Summary 3.",
+            "Summary 2.",
+        ]
+
+    async def test_revision_failure_does_not_break_the_write(self, db_conn: sqlite3.Connection, caplog) -> None:
+        """History is secondary: an append failure must never fail the knowledge write."""
+        import logging
+        from unittest.mock import patch
+
+        from app.analysis.knowledge import update_knowledge
+        from app.crud import create_knowledge_state, get_knowledge_state
+        from tests.helpers import make_knowledge_update, make_novelty_result, stub_llm_boundary
+
+        topic = _seed_topic(db_conn, "Resilient Topic")
+        create_knowledge_state(db_conn, KnowledgeState(topic_id=topic.id, summary_text="Old.", token_count=2))
+        db_conn.commit()
+
+        with (
+            caplog.at_level(logging.WARNING),
+            patch(
+                "app.analysis.knowledge.create_knowledge_revision",
+                side_effect=sqlite3.OperationalError("database or disk is full"),
+            ),
+            stub_llm_boundary(knowledge_init=make_knowledge_update("Survives.")),
+        ):
+            result = await update_knowledge(topic, make_novelty_result(), db_conn, _revision_settings())
+
+        assert result.sufficient_data is True
+        # The state write is already committed before the append is attempted,
+        # so even a whole-transaction abort cannot take it with it.
+        assert get_knowledge_state(db_conn, topic.id).summary_text == "Survives."
+        assert "revision" in caplog.text.lower()

@@ -20,8 +20,14 @@ from app.analysis.llm import (
     generate_knowledge_update,
 )
 from app.config import Settings
-from app.crud import create_knowledge_state, get_knowledge_state, update_knowledge_state
-from app.models import Article, KnowledgeState, Topic
+from app.crud import (
+    create_knowledge_revision,
+    create_knowledge_state,
+    get_knowledge_state,
+    prune_knowledge_revisions,
+    update_knowledge_state,
+)
+from app.models import Article, KnowledgeRevision, KnowledgeRevisionSource, KnowledgeState, Topic
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +203,53 @@ async def _compress_if_over_budget(
     return compress_usage
 
 
+def _record_revision(
+    conn: sqlite3.Connection,
+    topic: Topic,
+    result: KnowledgeStateUpdate,
+    source: KnowledgeRevisionSource,
+    settings: Settings,
+    change_note: str | None = None,
+) -> None:
+    """Append a snapshot of a knowledge write, then prune to the retention cap.
+
+    MUST be called AFTER the caller has committed the knowledge-state write.
+    ``SQLITE_FULL``/``SQLITE_IOERR`` roll back the entire transaction rather
+    than just the failing statement, so appending inside the caller's
+    transaction could silently discard the state write while the caller still
+    reported success — the checker would then mark articles processed and notify
+    against knowledge that was never saved (OVH-009). Running afterwards makes
+    the state durable first, so this can fail harmlessly.
+
+    Every failure is therefore swallowed: the history is a read-only audit trail
+    the checker never reads, and raising here would flip the topic to ERROR on
+    the init path (checker.py:750) with a misleading "LLM failed" message
+    (cli.py:188). Worst case is one missing revision row.
+    """
+    if topic.id is None:  # unreachable at runtime; both callers pre-check. Kept for mypy.
+        return
+    try:
+        create_knowledge_revision(
+            conn,
+            KnowledgeRevision(
+                topic_id=topic.id,
+                summary_text=result.updated_summary,
+                token_count=result.token_count,
+                source=source,
+                change_note=change_note,
+            ),
+        )
+        prune_knowledge_revisions(conn, topic.id, settings.knowledge_revision_limit)
+        conn.commit()
+    except Exception:
+        logger.warning(
+            "Failed to record knowledge revision for topic '%s'; the knowledge write is already committed",
+            topic.name,
+            exc_info=True,
+        )
+        conn.rollback()
+
+
 async def initialize_knowledge(
     topic: Topic,
     articles: list[Article],
@@ -246,6 +299,7 @@ async def initialize_knowledge(
     )
     created = create_knowledge_state(conn, state)
     conn.commit()
+    _record_revision(conn, topic, result, KnowledgeRevisionSource.INIT, settings)
 
     logger.info(
         "Initialized knowledge for topic '%s' (%d tokens)",
@@ -304,6 +358,14 @@ async def update_knowledge(
 
     update_knowledge_state(conn, current)
     conn.commit()
+    _record_revision(
+        conn,
+        topic,
+        result,
+        KnowledgeRevisionSource.UPDATE,
+        settings,
+        change_note=novelty_result.summary,
+    )
 
     logger.info(
         "Updated knowledge for topic '%s' (%d tokens)",

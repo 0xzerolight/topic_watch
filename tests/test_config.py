@@ -4,9 +4,10 @@ import logging
 from pathlib import Path
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
-from app.config import Settings, load_settings
+from app.config import Settings, load_settings, save_settings_to_yaml
 
 
 class TestConfigLoading:
@@ -502,3 +503,27 @@ class TestExaConfig:
         assert is_exa_key_env_sourced() is False
         monkeypatch.setenv("TOPIC_WATCH_EXA__API_KEY", "exa-env-key")
         assert is_exa_key_env_sourced() is True
+
+
+class TestKnowledgeRevisionLimit:
+    def test_default(self) -> None:
+        settings = Settings(llm={"model": "openai/gpt-4o-mini", "api_key": "k" * 12})
+        assert settings.knowledge_revision_limit == 50
+
+    def test_rejects_below_floor(self) -> None:
+        with pytest.raises(ValidationError):
+            Settings(llm={"model": "openai/gpt-4o-mini", "api_key": "k" * 12}, knowledge_revision_limit=1)
+
+    def test_rejects_above_ceiling(self) -> None:
+        with pytest.raises(ValidationError):
+            Settings(llm={"model": "openai/gpt-4o-mini", "api_key": "k" * 12}, knowledge_revision_limit=201)
+
+    def test_written_to_yaml(self, tmp_path: Path) -> None:
+        """A config-only field must still be persisted by a settings save."""
+        path = tmp_path / "config.yml"
+        settings = Settings(
+            llm={"model": "openai/gpt-4o-mini", "api_key": "k" * 12},
+            knowledge_revision_limit=7,
+        )
+        save_settings_to_yaml(settings, path)
+        assert yaml.safe_load(path.read_text())["knowledge_revision_limit"] == 7
