@@ -29,7 +29,7 @@ An LLM tracks a per-topic knowledge state and stays silent until something actua
 
 ## How It Works
 
-1. Define a topic with RSS feed URLs, or let it auto-generate a news-search feed (Bing News first, Google News as fallback).
+1. Define a topic with RSS feed URLs, let it auto-generate a news-search feed (Bing News first, Google News as fallback), or point it at Exa AI semantic search.
 2. On a schedule, articles are fetched and compared against a **knowledge state** - a rolling summary of what's already known.
 3. An LLM decides if anything is actually new.
 4. New info -> notification with summary + sources. Nothing new -> silence.
@@ -99,6 +99,7 @@ the SQLite database land in the project's `data/` directory.
 - Cheap: ~$0.0003/check on GPT-5.4 Nano (under $0.20/month for 5 topics checked 4×/day), or free with Ollama
 - Private and self-hosted on SQLite - no database server, no JavaScript build step. Outbound traffic only goes to RSS feeds, your LLM provider, and your notifier
 - Auto feeds (Bing News, falling back to Google News) or manual RSS/Atom URLs
+- Optional [Exa](https://exa.ai) AI search as a per-topic source instead of RSS - a paid semantic web-search API, bring your own key, one search per check
 - Per-topic check intervals (10 min to 6 months, human-readable: `6h`, `1w 3d`, `2h 30m`)
 - Per-topic novelty instruction: tell the AI in plain English what counts as new for that topic ("official announcements only, ignore rumors")
 - Importance scoring: every finding is rated 1-5, with an optional per-topic threshold that mutes minor findings without dropping them from the knowledge state
@@ -108,6 +109,7 @@ the SQLite database land in the project's `data/` directory.
 - Custom JSON webhooks
 - Notification retry queue
 - Feed health dashboard
+- Silence Heartbeat: silence normally means nothing new, so after a few consecutive checks where no source returned anything usable, you get one "sources failing" alert per affected topic - and a recovery notice when they come back
 - Data export (JSON, CSV) and OPML import/export
 - Bulk check/delete
 - 5 color themes (Nord, Dracula, Solarized Dark, High Contrast, Tokyo Night)
@@ -116,7 +118,7 @@ the SQLite database land in the project's `data/` directory.
 ## Adding Topics
 
 1. Dashboard -> **Add Topic**.
-2. Fill in **Name**, **Description** (what you care about in plain English), **Feed Source** (Automatic/Manual), **Feed URLs** (if Manual, one per line), **Check Interval**, **Tags**.
+2. Fill in **Name**, **Description** (what you care about in plain English), **Feed Source** (Automatic / Manual / Exa AI search), **Feed URLs** (if Manual, one per line), **Check Interval**, **Tags**. Exa AI search needs an Exa API key set on the **Settings** page, and bills you for one search per check - keep the interval in mind.
 3. Optionally tune the per-topic gates: **Confidence threshold**, **Relevance threshold**, **Importance threshold** (1-5, blank = notify on anything), and **Novelty instruction** (up to 500 characters telling the AI what counts as new here). Blank leaves the global defaults in place.
 4. **Save**.
 
@@ -223,6 +225,7 @@ The database is automatically backed up before any schema migration.
 | **LLM errors / checks failing** | Check your API key. Make sure the model string has the provider prefix (`openai/gpt-5.4-nano`, not `gpt-5.4-nano`). Check logs: `docker compose logs -f`. |
 | **No notifications** | Check `notifications.urls` in config. Use the Test Notification button on Settings. Verify the [Apprise URL format](https://github.com/caronc/apprise/wiki). |
 | **0 articles found** | Verify the RSS URL works in a browser. Check the Feed Health page. Some sites block bots. |
+| **"Sources failing" alert** | Sent after `silence_heartbeat_checks` consecutive checks (default 3) where no source returned anything usable - a dead feed, an expired Exa key, or no network. The dashboard and topic page show a failing-sources badge from the first such check. Fix the source, or set `silence_heartbeat_checks: 0` to turn the alert off. |
 | **Topic stuck in "Researching"** | Auto-recovers after 15 minutes (set to Error). Retry from the topic page. Usually an LLM connectivity issue. |
 | **Docker container exits** | `docker compose logs` for details. Check that `data/` is writable. The installer sets `PUID`/`PGID` automatically; see [SECURITY.md](SECURITY.md). |
 | **High memory** | Lower `max_articles_per_check` or `content_fetch_concurrency`. Increase check intervals. |

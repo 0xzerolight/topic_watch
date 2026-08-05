@@ -62,6 +62,7 @@ All application code lives under `app/`.
 | `analysis/knowledge.py` | Knowledge state initialization and updates with DB persistence. Token budget enforcement via summary compression. |
 | `analysis/restatement.py` | Pure phrase-matching filter (`filter_restated_key_facts`, re-exported by `llm.py`). Drops a key fact only when it is a clear restatement of the existing knowledge summary (normalized verbatim or long contiguous n-gram match), so already-known facts aren't re-flagged as new. Conservative by design. |
 | `analysis/citations.py` | `strip_index_citations()` removes ephemeral `(Article [N])`-style citations from LLM output before it's persisted — they reference one run's article list and cause coherence drift if stored. |
+| `analysis/knowledge_diff.py` | Pure `difflib` diffing for the revision timeline. `split_segments()` breaks a knowledge summary into sentence/bullet segments; `diff_segments()` returns `DiffSegment` records (added / removed / unchanged). No DB access, no LLM call — diffs are computed on read and never stored. |
 
 ### Scraping
 
@@ -72,29 +73,29 @@ All application code lives under `app/`.
 | `scraping/content.py` | Article HTML fetch + trafilatura content extraction. Falls back to RSS summary on failure. Content truncated to 5000 chars at word boundary. |
 | `scraping/providers.py` | News search provider definitions. `NewsProvider` Protocol plus `GoogleNewsProvider` / `BingNewsProvider` concrete classes that build keyword-search feed URLs from topic name + description (auto feed mode). |
 | `scraping/routing.py` | Health-based provider cascade. Tracks per-provider health in-memory and selects the first healthy provider per cycle (Bing first, Google second). Separate from the per-URL `feed_health` table. |
+| `scraping/exa.py` | Exa AI search source for EXA-mode topics. `fetch_exa_entries()` queries the Exa `/search` API and maps results straight to `FeedEntry`, bypassing feedparser. Same hardening as `webhooks.send_webhook` (scheme allowlist, offloaded SSRF check, no redirects, redacted logging, never raises). Exa returns page text, carried through as prefetched `FeedEntry.content` so the pipeline skips a second fetch. |
 | `scraping/google_news.py` | Resolves opaque Google News redirect URLs (`news.google.com/rss/articles/...`) to real article URLs via Google's `batchexecute` endpoint. |
 
 ### Data Layer
 
 | Module | Responsibility |
 |--------|---------------|
-| `models.py` | Pydantic models: `Topic`, `Article`, `KnowledgeState`, `CheckResult`, `FeedHealth`, `DashboardStats`, `PendingNotification`, `PendingWebhook`. Enums: `TopicStatus` (new/researching/ready/error), `FeedMode` (auto/manual). Each model has `from_row()` and `to_insert_dict()` for SQLite interop; datetime cells are coerced defensively. |
+| `models.py` | Pydantic models: `Topic`, `Article`, `KnowledgeState`, `KnowledgeRevision`, `CheckResult`, `FeedHealth`, `DashboardStats`, `PendingNotification`, `PendingWebhook`. Enums: `TopicStatus` (new/researching/ready/error), `FeedMode` (auto/manual/exa), `KnowledgeRevisionSource` (init/update). Each model has `from_row()` and `to_insert_dict()` for SQLite interop; datetime cells are coerced defensively. |
 | `crud.py` | All SQL (parameterized), grouped by model: CRUD, feed-health upserts, notification + webhook retry queues, dashboard aggregation, article retention cleanup, stuck-topic recovery. |
 | `database.py` | SQLite connection factory (WAL mode, foreign keys, busy timeout). Schema init (`init_db`). Migration runner (`run_migrations`) — backs up the DB before applying pending migrations. |
-| `migrations/` | 23 sequential migrations (`m001`–`m023`) registered in `__init__.py` as `(version, description, up_function)` tuples. Tracked in `schema_version`. Append-only. |
+| `migrations/` | 25 sequential migrations (`m001`–`m025`) registered in `__init__.py` as `(version, description, up_function)` tuples. Tracked in `schema_version`. Append-only. |
 | `interval.py` | Human-readable interval parsing/formatting (`m`/`h`/`d`/`w`/`M`, combined syntax like `"1w 3d 2h"`). Enforces min/max interval bounds. |
 | `opml.py` | OPML import/export. Parses feeds from RSS readers (FreshRSS, Miniflux, TT-RSS), validates feed URLs, and exports topics as OPML. |
 
 ### Web
 
-The route handlers were split out of `routes.py` into the `web/routers/` package. The HTMX/HTML routes are mounted via an aggregate router; the JSON API lives separately in `web/api.py`.
+The route handlers live in the `web/routers/` package. The HTMX/HTML routes are mounted via an aggregate router; the JSON API lives separately in `web/api.py`.
 
 | Module | Responsibility |
 |--------|---------------|
-| `web/routes.py` | Backwards-compatible shim. Re-exports `router` from `web/routers/` so existing `from app.web.routes import router` imports still work. No handlers live here anymore. |
 | `web/routers/__init__.py` | Aggregate router. Includes the per-domain routers in include-order so static topic paths (`/topics/search`, `/topics/new`) register before the dynamic `/topics/{topic_id}` route. |
 | `web/routers/dashboard.py` | Dashboard page, `/health` check, and topic search. Reads the dashboard stats cache. |
-| `web/routers/topics.py` | Topic CRUD, detail/articles pages, and manual check + init triggers. |
+| `web/routers/topics.py` | Topic CRUD, detail/articles pages, manual check + init triggers, and the knowledge revision timeline — `GET /topics/{topic_id}/knowledge-diff/{revision_id}` returns one revision's diff against its predecessor as an HTMX partial. |
 | `web/routers/exports.py` | Data export endpoints: all-topics JSON (`/export/topics/json`) and per-topic JSON/CSV (`/topics/{id}/export/json`, `/topics/{id}/export/csv`). |
 | `web/routers/settings.py` | Setup wizard, settings editor, and notification-test endpoint. Reads/writes config via `load_settings()` / `save_settings_to_yaml()`. |
 | `web/routers/feed_health.py` | Global feed-health dashboard and feed-URL validation endpoint (rate-limited). |
@@ -121,11 +122,12 @@ The route handlers were split out of `routes.py` into the `web/routers/` package
 | `notifications.py` | Apprise wrapper. Formats `NoveltyResult` into title/body. Sync Apprise send wrapped in `asyncio.to_thread()`. Re-exports `redact_url` from `log_redaction.py`. |
 | `log_redaction.py` | Log-hygiene helper. `redact_url` strips userinfo, query strings, fragments, and long (likely-secret) path segments from notification/webhook URLs, keeping scheme + host + a short path prefix for diagnostics. |
 | `webhooks.py` | JSON POST to configured webhook endpoints. Concurrent delivery via `asyncio.gather()`. Failed deliveries are queued in `pending_webhooks` and retried via `retry_pending_webhooks()` at the start of each check cycle. |
-| `cli.py` | Argparse CLI: `list`, `check`, `check-all`, `init`. |
+| `heartbeat.py` | Silence Heartbeat decision logic. `evaluate_heartbeat()` counts the leading run of failing `stage_error`s for a topic and returns a pure `HeartbeatAction` (alert, recovery, or nothing) with the formatted message. No DB writes, no sends — the checker owns the latch and the delivery. |
+| `cli.py` | Argparse CLI: `list`, `check`, `check-all`, `init`, `doctor` (secret-safe diagnostic report for bug reports). |
 
 ### Frontend
 
-- `templates/` - 16 Jinja2 templates. Pico CSS + HTMX base layout; partials for dynamic updates.
+- `templates/` - 19 Jinja2 templates. Pico CSS + HTMX base layout; partials for dynamic updates.
 - `static/themes.css` - Color themes (Nord, Dracula, Solarized, High Contrast, Tokyo Night).
 - `static/components.css` - Component styles (cards, badges, tables) layered on Pico.
 - `static/theme.js` - Theme switcher with localStorage persistence.
@@ -162,10 +164,10 @@ The route handlers were split out of `routes.py` into the `web/routers/` package
 
 | Table | Purpose |
 |-------|---------|
-| `topics` | Core entity. Name, description, `feed_urls` (JSON array), `feed_mode` (auto/manual), `status`, `is_active`, `status_changed_at`, `check_interval_minutes`, `tags` (JSON array), per-topic `confidence_threshold` / `relevance_threshold` (m011, nullable overrides), `init_attempts` (m013), `novelty_instruction` (m022, nullable, ≤500 chars, injected into the novelty prompt), `importance_threshold` (m023, nullable 1-5; NULL = notify on any importance). |
+| `topics` | Core entity. Name, description, `feed_urls` (JSON array), `feed_mode` (auto/manual), `status`, `is_active`, `status_changed_at`, `check_interval_minutes`, `tags` (JSON array), per-topic `confidence_threshold` / `relevance_threshold` (m011, nullable overrides), `init_attempts` (m013), `novelty_instruction` (m022, nullable, ≤500 chars, injected into the novelty prompt), `importance_threshold` (m023, nullable 1-5; NULL = notify on any importance), `heartbeat_alerted_at` (m024, nullable Silence Heartbeat latch — stamped when a "sources failing" alert is sent, cleared on recovery). |
 | `articles` | Fetched articles linked to a topic. Deduped by `content_hash` (unique per topic). `source_provider` records the news provider (m009), `published_at` the feed entry's date (m018). `processed` flag tracks analysis completion. |
 | `knowledge_states` | One per topic. Rolling LLM-generated summary. `token_count` tracks budget usage. |
-| `knowledge_revisions` | History of knowledge-state writes (one row per init/update), pruned per topic to `knowledge_revision_limit`. |
+| `knowledge_revisions` | History of knowledge-state writes (m025), one row per init/update: `summary_text` (full copy), `token_count`, `source` (init/update), `change_note`, `created_at`. Append-only, pruned oldest-first per topic to `knowledge_revision_limit`. |
 | `check_results` | Audit log of every check cycle. Stores articles found/new, `has_new_info`, full LLM response JSON, notification outcome, `prompt_tokens` / `completion_tokens` (m012), and `stage_error` recording which pipeline stage failed (m015). |
 | `pending_notifications` | Failed notifications queued for retry. Retried at the start of each check cycle. Deleted after `max_retries`. |
 | `pending_webhooks` | Failed webhook deliveries queued for retry (m010). Stores `url`, `payload`, `retry_count`/`max_retries`. Retried at the start of each check cycle; expired entries pruned. |
@@ -256,6 +258,9 @@ On first run, `config.example.yml` is auto-copied to `data/config.yml`.
 | `llm.model` | string | - | LiteLLM model string (e.g. `openai/gpt-5.4-nano`) |
 | `llm.api_key` | string | - | API key for your LLM provider |
 | `llm.base_url` | string | - | Base URL for a self-hosted (Ollama) or OpenAI-compatible gateway endpoint. Honored for any provider. |
+| `exa.enabled` | bool | `false` | Enable the [Exa](https://exa.ai) AI search source for EXA-mode topics |
+| `exa.api_key` | string | `""` | Exa API key. Also settable via `TOPIC_WATCH_EXA__API_KEY`, in which case the Settings page shows it read-only and never writes it to YAML |
+| `exa.base_url` | string | - | Exa endpoint override (advanced/proxy). Defaults to `https://api.exa.ai` |
 | `notifications.urls` | list | `[]` | [Apprise](https://github.com/caronc/apprise/wiki) notification URLs |
 | `notifications.webhook_urls` | list | `[]` | Webhook endpoints for JSON POST (see [HTTP API](#http-api)) |
 | `check_interval` | string | `"6h"` | Default check interval. Units: m, h, d, w, M. Combine: `1w 3d`, `2h 30m`. Min 10m, max 6M. |
@@ -315,6 +320,10 @@ The check endpoint returns `{"status": "checked", "has_new_info": <bool>, "check
 | `GET` | `/export/opml` | All topics as OPML XML |
 | `GET` | `/topics/{id}/export/json` | Single topic with articles, checks, knowledge state |
 | `GET` | `/topics/{id}/export/csv` | Check history as CSV |
+
+Knowledge revisions are not exported. The per-topic JSON carries the current
+knowledge state; the revision history is a UI affordance for reading what
+changed, not part of the data contract.
 
 Move feeds in and out of RSS readers (FreshRSS, Miniflux, Tiny Tiny RSS) via OPML:
 
