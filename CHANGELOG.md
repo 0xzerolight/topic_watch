@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-08-05
+
 ### Added
 
 - Knowledge history: every knowledge-state write is now recorded as a revision, with an inline diff timeline on the topic detail page showing exactly what the AI added or removed. Retention is capped per topic by the new config-only `knowledge_revision_limit` setting (default 50); revisions are not included in the JSON/CSV export
