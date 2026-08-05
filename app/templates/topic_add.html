@@ -66,7 +66,7 @@
             {% if not exa_enabled %}
             <small class="help">Exa AI search requires an Exa API key — configure it in <a href="/settings">Settings</a>.</small>
             {% endif %}
-            <small class="help">Automatic builds a Google News feed from the topic name. Manual lets you supply your own RSS/Atom feed URLs. Exa AI search uses a semantic web-search API — each check runs one paid Exa search, so mind your check interval.</small>
+            <small class="help">Automatic builds a news-search feed from the topic name (Bing News, falling back to Google News). Manual lets you supply your own RSS/Atom feed URLs. Exa AI search uses a semantic web-search API — each check runs one paid Exa search, so mind your check interval.</small>
         </fieldset>
 
         <div id="manual-feeds" aria-hidden="{{ 'false' if (feed_mode or 'auto') == 'manual' else 'true' }}" style="{{ 'display:block' if (feed_mode or 'auto') == 'manual' else 'display:none' }}">
