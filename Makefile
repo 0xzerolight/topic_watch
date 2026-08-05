@@ -1,4 +1,4 @@
-.PHONY: dev test smoke lint format typecheck coverage docker docker-run run clean ci lock help
+.PHONY: dev test smoke lint format typecheck coverage docker docker-run run clean ci lock lock-upgrade help
 
 help: ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -12,6 +12,14 @@ dev: ## Install project in editable mode with dev dependencies
 lock: ## Regenerate pinned requirements lockfiles from pyproject.toml
 	pip-compile --strip-extras --generate-hashes --output-file=requirements.txt pyproject.toml
 	pip-compile --strip-extras --generate-hashes --extra=dev --output-file=requirements-dev.txt pyproject.toml
+
+# `lock` keeps every version already pinned in the output files, so it cannot
+# pull in a bumped dependency. Use this when Dependabot's group PR fails to
+# install: its updater rewrites known pins but never adds newly-introduced
+# transitive packages, which breaks `pip install --require-hashes`.
+lock-upgrade: ## Relock at the newest versions pyproject.toml allows
+	pip-compile --upgrade --strip-extras --generate-hashes --output-file=requirements.txt pyproject.toml
+	pip-compile --upgrade --strip-extras --generate-hashes --extra=dev --output-file=requirements-dev.txt pyproject.toml
 
 test: ## Run tests with pytest
 	pytest --tb=short
