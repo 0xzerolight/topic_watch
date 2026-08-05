@@ -27,13 +27,6 @@ Adding a topic - Topic Watch fetches the latest news and builds a per-topic know
 
 An LLM tracks a per-topic knowledge state and stays silent until something actually changes. Bring your own key, or run free against a local model.
 
-## How It Works
-
-1. Define a topic with RSS feed URLs, let it auto-generate a news-search feed (Bing News first, Google News as fallback), or point it at Exa AI semantic search.
-2. On a schedule, articles are fetched and compared against a **knowledge state** - a rolling summary of what's already known.
-3. An LLM decides if anything is actually new.
-4. New info -> notification with summary + sources. Nothing new -> silence.
-
 ## Install
 
 ### 1. Install Docker
@@ -92,47 +85,58 @@ the SQLite database land in the project's `data/` directory.
 
 </details>
 
+<details>
+<summary><strong>Updating</strong></summary>
+
+```bash
+cd ~/topic-watch  # or your install directory
+docker compose pull
+docker compose up -d
+```
+
+The database is automatically backed up before any schema migration.
+
+</details>
+
 ## Features
 
 - Novelty detection: per-topic knowledge state, not keyword matching or summarization - ignores the 10th article rehashing the same story
 - Any LLM via [LiteLLM](https://docs.litellm.ai/docs/providers) - OpenAI, Anthropic, Gemini, Groq, and more. BYOK, or run free and local with Ollama
 - Cheap: ~$0.0003/check on GPT-5.4 Nano (under $0.20/month for 5 topics checked 4×/day), or free with Ollama
 - Private and self-hosted on SQLite - no database server, no JavaScript build step. Outbound traffic only goes to RSS feeds, your LLM provider, and your notifier
-- Auto feeds (Bing News, falling back to Google News) or manual RSS/Atom URLs
-- Optional [Exa](https://exa.ai) AI search as a per-topic source instead of RSS - a paid semantic web-search API, bring your own key, one search per check
-- Per-topic check intervals (10 min to 6 months, human-readable: `6h`, `1w 3d`, `2h 30m`)
-- Per-topic novelty instruction: tell the AI in plain English what counts as new for that topic ("official announcements only, ignore rumors")
+- Auto feeds (Bing News, falling back to Google News), manual RSS/Atom URLs, or optional [Exa](https://exa.ai) AI semantic search per topic
+- Per-topic check intervals (10 min to 6 months: `6h`, `1w 3d`, `2h 30m`) and a plain-English novelty instruction ("official announcements only, ignore rumors")
+- 100+ notification services via [Apprise](https://github.com/caronc/apprise/wiki) - Discord, Slack, Telegram, email, ntfy, etc.
+
+<details>
+<summary><strong>More features</strong></summary>
+
 - Importance scoring: every finding is rated 1-5, with an optional per-topic threshold that mutes minor findings without dropping them from the knowledge state
-- Knowledge history: every update to a topic's knowledge state is kept as a revision, with an inline diff timeline showing exactly what the AI added or removed
-- Topic tags
-- 100+ notification services via [Apprise](https://github.com/caronc/apprise/wiki) (Discord, Slack, Telegram, email, ntfy, etc.)
-- Custom JSON webhooks
-- Notification retry queue
+- Knowledge history: every update to a topic's knowledge state is kept as a revision, with an inline diff timeline showing what the AI added or removed
+- Silence Heartbeat: after a few consecutive checks where no source returned anything usable, you get one "sources failing" alert per affected topic - and a recovery notice when they come back
+- Custom JSON webhooks and a notification retry queue
 - Feed health dashboard
-- Silence Heartbeat: silence normally means nothing new, so after a few consecutive checks where no source returned anything usable, you get one "sources failing" alert per affected topic - and a recovery notice when they come back
+- Topic tags and bulk check/delete
 - Data export (JSON, CSV) and OPML import/export
-- Bulk check/delete
 - 5 color themes (Nord, Dracula, Solarized Dark, High Contrast, Tokyo Night)
 - In-app settings page
 
-## Adding Topics
+</details>
 
-1. Dashboard -> **Add Topic**.
-2. Fill in **Name**, **Description** (what you care about in plain English), **Feed Source** (Automatic / Manual / Exa AI search), **Feed URLs** (if Manual, one per line), **Check Interval**, **Tags**. Exa AI search needs an Exa API key set on the **Settings** page, and bills you for one search per check - keep the interval in mind.
-3. Optionally tune the per-topic gates: **Confidence threshold**, **Relevance threshold**, **Importance threshold** (1-5, blank = notify on anything), and **Novelty instruction** (up to 500 characters telling the AI what counts as new here). Blank leaves the global defaults in place.
-4. **Save**.
+<details>
+<summary><strong>How It Works</strong></summary>
 
-The topic enters a "Researching" phase where it fetches articles and builds an initial knowledge state (under a minute), then enters the normal check cycle.
+1. Define a topic with RSS feed URLs, let it auto-generate a news-search feed (Bing News first, Google News as fallback), or point it at Exa AI semantic search.
+2. On a schedule, articles are fetched and compared against a **knowledge state** - a rolling summary of what's already known.
+3. An LLM decides if anything is actually new.
+4. New info -> notification with summary + sources. Nothing new -> silence.
 
-**Finding RSS feeds:**
+</details>
 
-- Try appending `/rss`, `/feed`, or `/atom.xml` to a site URL.
-- Reddit: `https://www.reddit.com/r/SUBREDDIT/search.rss?q=QUERY&sort=new`
-- Most blogs use `/feed` or `/index.xml`.
+<details>
+<summary><strong>LLM providers</strong></summary>
 
-## LLM Providers
-
-Uses [LiteLLM](https://docs.litellm.ai/docs/providers). Anything LiteLLM supports works.
+Uses [LiteLLM](https://docs.litellm.ai/docs/providers). Anything LiteLLM supports works - the model string needs its provider prefix.
 
 | Provider | Model String |
 |----------|-------------|
@@ -153,66 +157,27 @@ Uses [LiteLLM](https://docs.litellm.ai/docs/providers). Anything LiteLLM support
 [DeepSeek](https://platform.deepseek.com/api_keys). Or skip keys entirely and run
 free + local with [Ollama](https://ollama.com/download).
 
-Ollama config:
+Ollama and OpenAI-compatible gateways (LM Studio, a LiteLLM proxy, OpenCode Go) need a
+`base_url` - see [`config.example.yml`](config.example.yml). Running Ollama in Docker
+also needs the override file: `cp docker-compose.override.example.yml docker-compose.override.yml`.
 
-```yaml
-llm:
-  model: "ollama/llama3.3"
-  api_key: "unused"
-  base_url: "http://host.docker.internal:11434"  # or http://localhost:11434 outside Docker
-```
+</details>
 
-Running Ollama in Docker needs the override file: `cp docker-compose.override.example.yml docker-compose.override.yml`.
+<details>
+<summary><strong>Notifications and configuration</strong></summary>
 
-Any OpenAI-compatible gateway (e.g. [OpenCode Go](https://opencode.ai/docs/go/), a
-LiteLLM proxy, LM Studio) works via the `openai/` prefix plus its `base_url`:
+Notifications are **off by default** - Topic Watch tracks topics silently until you add
+at least one [Apprise URL](https://github.com/caronc/apprise/wiki) on the **Settings**
+page (`ntfy://your-topic`, `discord://webhook_id/webhook_token`, ...). Multiple URLs are
+supported; **Test Notification** verifies them.
 
-```yaml
-llm:
-  model: "openai/<gateway-model-id>"
-  api_key: "your-gateway-key"
-  base_url: "https://opencode.ai/zen/go/v1"
-```
+Everything else lives in `data/config.yml` (auto-copied from
+[`config.example.yml`](config.example.yml) on first run) and is editable on the Settings
+page. Any key can be overridden with the `TOPIC_WATCH_` env prefix, using `__` for nested
+keys (e.g. `TOPIC_WATCH_LLM__API_KEY`). Full key reference:
+[`config.example.yml`](config.example.yml) and [ARCHITECTURE.md](ARCHITECTURE.md).
 
-## Notifications
-
-Notifications are **off by default** - Topic Watch tracks topics silently until you
-add at least one URL (here or on the **Settings** page; use **Test Notification** to
-verify it works).
-
-100+ services via [Apprise](https://github.com/caronc/apprise/wiki) URL format:
-
-| Service | URL Format |
-|---------|-----------|
-| Ntfy | `ntfy://your-topic` |
-| Discord | `discord://webhook_id/webhook_token` |
-| Telegram | `tgram://bot_token/chat_id` |
-| Slack | `slack://token_a/token_b/token_c/channel` |
-| Email (Gmail) | `mailto://user:app_password@gmail.com` |
-| Pushover | `pover://user_key@api_token` |
-
-Multiple URLs supported. Use the **Test Notification** button on the Settings page to verify.
-
-```yaml
-notifications:
-  urls:
-    - "ntfy://my-news-tracker"
-    - "discord://webhook_id/webhook_token"
-```
-
-## Configuration
-
-Settings live in `data/config.yml` (auto-copied from `config.example.yml` on first run) and can be edited there or on the **Settings** page. Override any key with the `TOPIC_WATCH_` env prefix (use `__` for nested keys, e.g. `TOPIC_WATCH_LLM__API_KEY`). Full key reference is in [`config.example.yml`](config.example.yml) and [ARCHITECTURE.md](ARCHITECTURE.md).
-
-## Updating
-
-```bash
-cd ~/topic-watch  # or your install directory
-docker compose pull
-docker compose up -d
-```
-
-The database is automatically backed up before any schema migration.
+</details>
 
 ## Security
 
@@ -222,10 +187,10 @@ The database is automatically backed up before any schema migration.
 
 | Issue | Fix |
 |-------|-----|
-| **LLM errors / checks failing** | Check your API key. Make sure the model string has the provider prefix (`openai/gpt-5.4-nano`, not `gpt-5.4-nano`). Check logs: `docker compose logs -f`. |
-| **No notifications** | Check `notifications.urls` in config. Use the Test Notification button on Settings. Verify the [Apprise URL format](https://github.com/caronc/apprise/wiki). |
-| **0 articles found** | Verify the RSS URL works in a browser. Check the Feed Health page. Some sites block bots. |
-| **"Sources failing" alert** | Sent after `silence_heartbeat_checks` consecutive checks (default 3) where no source returned anything usable - a dead feed, an expired Exa key, or no network. The dashboard and topic page show a failing-sources badge from the first such check. Fix the source, or set `silence_heartbeat_checks: 0` to turn the alert off. |
+| **LLM errors / checks failing** | Check your API key and that the model string has its provider prefix (`openai/gpt-5.4-nano`, not `gpt-5.4-nano`). Logs: `docker compose logs -f`. |
+| **No notifications** | Add an Apprise URL on the Settings page and press Test Notification. Verify the [URL format](https://github.com/caronc/apprise/wiki). |
+| **0 articles found** | Open the RSS URL in a browser and check the Feed Health page. Some sites block bots. |
+| **"Sources failing" alert** | Sent after `silence_heartbeat_checks` consecutive checks (default 3) with no usable source - a dead feed, an expired Exa key, or no network. Fix the source, or set `silence_heartbeat_checks: 0` to turn the alert off. |
 | **Topic stuck in "Researching"** | Auto-recovers after 15 minutes (set to Error). Retry from the topic page. Usually an LLM connectivity issue. |
 | **Docker container exits** | `docker compose logs` for details. Check that `data/` is writable. The installer sets `PUID`/`PGID` automatically; see [SECURITY.md](SECURITY.md). |
 | **High memory** | Lower `max_articles_per_check` or `content_fetch_concurrency`. Increase check intervals. |
