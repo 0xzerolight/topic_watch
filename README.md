@@ -4,6 +4,7 @@
   <a href="https://www.gnu.org/licenses/gpl-3.0"><img src="https://img.shields.io/badge/License-GPLv3-blue.svg" alt="License: GPL v3"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.11+-blue.svg" alt="Python 3.11+"></a>
   <a href="https://github.com/0xzerolight/topic_watch/releases"><img src="https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2F0xzerolight%2Ftopic_watch%2Fmain%2Fpyproject.toml&query=%24.project.version&label=release&prefix=v&color=blue" alt="Latest release"></a>
+  <a href="https://github.com/0xzerolight/topic_watch/pkgs/container/topic_watch"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2F0xzerolight%2Ftopic_watch%2Fbadges%2Fdownloads.json" alt="Docker pulls"></a>
   <a href="https://github.com/0xzerolight/topic_watch/stargazers"><img src="https://img.shields.io/github/stars/0xzerolight/topic_watch?style=social" alt="GitHub stars"></a>
 </p>
 

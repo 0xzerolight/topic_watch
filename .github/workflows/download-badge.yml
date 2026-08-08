@@ -1,0 +1,48 @@
+name: Download Badge
+
+# GitHub exposes no API for container download counts, so the public package page is scraped once a
+# day and the result published as a shields.io endpoint badge on the orphan `badges` branch.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: download-badge
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Read total downloads from the package page
+        run: |
+          set -euo pipefail
+          curl -sSfL --max-time 30 -A topic-watch-badge \
+            "https://github.com/${{ github.repository }}/pkgs/container/topic_watch" \
+            | python3 scripts/ghcr_downloads.py > "$RUNNER_TEMP/downloads.json"
+          cat "$RUNNER_TEMP/downloads.json"
+
+      - name: Publish the badge JSON to the badges branch
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git fetch --depth=1 origin +refs/heads/badges:refs/remotes/origin/badges; then
+            git switch -c badges origin/badges
+          else
+            git switch --orphan badges
+          fi
+          cp "$RUNNER_TEMP/downloads.json" downloads.json
+          git add downloads.json
+          if git diff --quiet --cached; then
+            echo "count unchanged, nothing to publish"
+          else
+            git commit -m "chore: update docker pull count"
+            git push origin badges
+          fi
