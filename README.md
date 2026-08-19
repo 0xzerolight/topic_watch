@@ -219,7 +219,12 @@ keys (e.g. `TOPIC_WATCH_LLM__API_KEY`). Full key reference:
 
 **No built-in authentication** by design (single-user tool). Because of that, the port is published on `127.0.0.1` by default - a stock install is reachable only from the machine it runs on.
 
+<details>
+<summary><strong>Reaching it from other devices</strong></summary>
+
 To reach it from other devices, set `TOPIC_WATCH_BIND_ADDR=0.0.0.0` in `.env` (the installer offers this as a question) and put it behind a reverse proxy with auth ([Authelia](https://www.authelia.com/), [Authentik](https://goauthentik.io/), Caddy `basicauth`, Nginx basic auth). A host firewall is not a substitute: Docker publishes ports ahead of `ufw` and `firewalld` rules. See [SECURITY.md](SECURITY.md).
+
+</details>
 
 ## Troubleshooting
 
