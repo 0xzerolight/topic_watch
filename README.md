@@ -48,9 +48,9 @@ curl -fsSL https://raw.githubusercontent.com/0xzerolight/topic_watch/main/script
 irm https://raw.githubusercontent.com/0xzerolight/topic_watch/main/scripts/install.ps1 | iex
 ```
 
-The installer asks who should be able to reach Topic Watch (this computer only, or any device on your network) and whether to start it at boot, then pulls the image, starts the container, and opens the setup wizard at [http://localhost:8000](http://localhost:8000) - set your LLM API key there.
+The installer asks who can reach Topic Watch (this computer only, or any device on your network) and whether to start at boot, then pulls the image, starts the container, and opens the setup wizard at [http://localhost:8000](http://localhost:8000) - set your LLM API key there.
 
-Answer without being asked by setting `TOPIC_WATCH_BIND_ADDR` (`127.0.0.1` or `0.0.0.0`), `TOPIC_WATCH_AUTOSTART` (`yes`/`no`) or `TOPIC_WATCH_PORT` beforehand. With no terminal - a cloud-init or CI run - the installer prompts for nothing and defaults to this computer only, no autostart, port 8000.
+To skip the prompts, set `TOPIC_WATCH_BIND_ADDR` (`127.0.0.1` or `0.0.0.0`), `TOPIC_WATCH_AUTOSTART` (`yes`/`no`) or `TOPIC_WATCH_PORT` first. With no terminal (cloud-init, CI) it defaults to this computer only, no autostart, port 8000.
 
 <details>
 <summary><strong>Manual install (without the script)</strong></summary>
@@ -64,8 +64,8 @@ curl -fsSL https://raw.githubusercontent.com/0xzerolight/topic_watch/main/docker
 docker compose up -d
 ```
 
-The `.env` line matches the container's user to yours so it can write `data/`.
-It is written owner-only because that file is where any secrets you add later go.
+The `.env` line matches the container's user to yours so it can write `data/`, and is
+owner-only since secrets go there later.
 
 **Build from source** - no prebuilt image, builds from the Dockerfile:
 
@@ -76,8 +76,8 @@ cd topic_watch
 docker compose up -d
 ```
 
-Skip the `.env` line here and the container chowns your checkout's `data/` to
-UID 1000, which takes it away from you if your own UID differs.
+Without the `.env` line the container chowns your checkout's `data/` to UID 1000 - a
+problem if your UID differs.
 
 **Without Docker** (Python 3.11+):
 
@@ -90,11 +90,9 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
 Then open [http://localhost:8000](http://localhost:8000) and set your LLM key in the
-setup wizard - no manual config step. Use the editable install (`-e`) so config and
-the SQLite database land in the project's `data/` directory.
-
-`--host 127.0.0.1` keeps it on this machine. Topic Watch has no login screen, so
-only widen that once an authenticating reverse proxy is in front of it.
+setup wizard. The editable install (`-e`) keeps config and the SQLite database in the
+project's `data/`. `--host 127.0.0.1` keeps it local - widen only behind an
+authenticating reverse proxy (no login screen).
 
 </details>
 
@@ -132,7 +130,7 @@ The database is automatically backed up before any schema migration.
 - Novelty detection: per-topic knowledge state, not keyword matching or summarization - ignores the 10th article rehashing the same story
 - Any LLM via [LiteLLM](https://docs.litellm.ai/docs/providers) - OpenAI, Anthropic, Gemini, Groq, and more. BYOK, or run free and local with Ollama
 - Cheap: ~$0.0003/check on GPT-5.4 Nano (under $0.20/month for 5 topics checked 4×/day), or free with Ollama
-- Private and self-hosted on SQLite - no database server, no JavaScript build step. Outbound traffic only goes to RSS feeds, your LLM provider, and your notifier
+- Private and self-hosted on SQLite - no database server, no JavaScript build step. Outbound traffic: RSS feeds, your LLM provider, your notifier
 - Auto feeds (Bing News, falling back to Google News), manual RSS/Atom URLs, or optional [Exa](https://exa.ai) AI semantic search per topic
 - Per-topic check intervals (10 min to 6 months: `6h`, `1w 3d`, `2h 30m`) and a plain-English novelty instruction ("official announcements only, ignore rumors")
 - 100+ notification services via [Apprise](https://github.com/caronc/apprise/wiki) - Discord, Slack, Telegram, email, ntfy, etc.
@@ -142,7 +140,7 @@ The database is automatically backed up before any schema migration.
 
 - Importance scoring: every finding is rated 1-5, with an optional per-topic threshold that mutes minor findings without dropping them from the knowledge state
 - Knowledge history: every update to a topic's knowledge state is kept as a revision, with an inline diff timeline showing what the AI added or removed
-- Silence Heartbeat: after a few consecutive checks where no source returned anything usable, you get one "sources failing" alert per affected topic - and a recovery notice when they come back
+- Silence Heartbeat: one "sources failing" alert per topic after consecutive empty checks, and a recovery notice when sources return
 - Custom JSON webhooks and a notification retry queue
 - Feed health dashboard
 - Topic tags and bulk check/delete
@@ -236,7 +234,7 @@ To reach it from other devices, set `TOPIC_WATCH_BIND_ADDR=0.0.0.0` in `.env` (t
 | **Can't reach it from another device** | The port is published on `127.0.0.1` by default. Set `TOPIC_WATCH_BIND_ADDR=0.0.0.0` in `.env` and run `docker compose up -d`. Add a reverse proxy with auth first - there is no login screen. |
 | **High memory** | Lower `max_articles_per_check` or `content_fetch_concurrency`. Increase check intervals. |
 
-Still stuck? Run `python -m app.cli doctor` (Docker: `docker compose exec topic-watch python -m app.cli doctor`) for a secret-safe diagnostic snapshot - version, runtime, redacted config, schema, and feed health - and paste it into a bug report. Update to the latest release first.
+Still stuck? `python -m app.cli doctor` (Docker: `docker compose exec topic-watch python -m app.cli doctor`) prints a secret-safe diagnostic snapshot to paste into a bug report. Update to the latest release first.
 
 ## Contributing
 
