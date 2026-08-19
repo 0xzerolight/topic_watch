@@ -48,10 +48,6 @@ curl -fsSL https://raw.githubusercontent.com/0xzerolight/topic_watch/main/script
 irm https://raw.githubusercontent.com/0xzerolight/topic_watch/main/scripts/install.ps1 | iex
 ```
 
-The installer asks who can reach Topic Watch (this computer only, or any device on your network) and whether to start at boot, then pulls the image, starts the container, and opens the setup wizard at [http://localhost:8000](http://localhost:8000) - set your LLM API key there.
-
-To skip the prompts, set `TOPIC_WATCH_BIND_ADDR` (`127.0.0.1` or `0.0.0.0`), `TOPIC_WATCH_AUTOSTART` (`yes`/`no`) or `TOPIC_WATCH_PORT` first. With no terminal (cloud-init, CI) it defaults to this computer only, no autostart, port 8000.
-
 <details>
 <summary><strong>Manual install (without the script)</strong></summary>
 
