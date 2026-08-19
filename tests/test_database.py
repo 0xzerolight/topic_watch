@@ -919,6 +919,62 @@ class TestMigrations:
             conn_after.close()
         assert applied is None
 
+    def test_failing_migration_does_not_claim_a_restore(self, tmp_path, caplog, monkeypatch) -> None:
+        """The failure log must not say the DB was restored — nothing restores it.
+
+        ``_backup_db`` only copies. On failure the connection is rolled back and
+        the DB is left at the last committed version, which is correct, but the
+        message told operators a rollback-to-backup had happened.
+        """
+        import app.migrations as migrations_mod
+        from app.database import get_connection, init_db
+
+        db_path = tmp_path / "noclaim.db"
+        init_db(db_path)
+
+        def _boom(_conn: sqlite3.Connection) -> None:
+            raise ValueError("simulated migration failure")
+
+        monkeypatch.setattr(migrations_mod, "MIGRATIONS", [(9999, "intentionally broken", _boom)])
+
+        conn = get_connection(db_path)
+        try:
+            with caplog.at_level("ERROR"), pytest.raises(ValueError):
+                run_migrations(conn, db_path=db_path)
+        finally:
+            conn.close()
+
+        msg = [r for r in caplog.records if r.levelname == "ERROR"][-1].getMessage()
+        assert "restored" not in msg.lower(), f"log claims a restore that never happens: {msg!r}"
+
+    def test_failing_migration_without_backup_reports_no_backup(self, tmp_path, caplog, monkeypatch) -> None:
+        """With no backup taken, the log must say so rather than print 'None'.
+
+        Reachable whenever run_migrations gets a db_path that does not exist —
+        including the default-path form used by callers that pass no db_path.
+        """
+        import app.migrations as migrations_mod
+        from app.database import get_connection
+
+        conn_path = tmp_path / "live.db"
+        missing_path = tmp_path / "not-created-yet.db"
+
+        def _boom(_conn: sqlite3.Connection) -> None:
+            raise ValueError("simulated migration failure")
+
+        monkeypatch.setattr(migrations_mod, "MIGRATIONS", [(9999, "intentionally broken", _boom)])
+
+        conn = get_connection(conn_path)
+        try:
+            with caplog.at_level("ERROR"), pytest.raises(ValueError):
+                run_migrations(conn, db_path=missing_path)
+        finally:
+            conn.close()
+
+        msg = [r for r in caplog.records if r.levelname == "ERROR"][-1].getMessage()
+        assert "None" not in msg, f"log prints a null backup path: {msg!r}"
+        assert "backup" in msg.lower()
+
     def test_partial_failure_commits_prior_migrations_and_resumes(self, tmp_path, monkeypatch) -> None:
         """OVH-060: a crash mid-sequence durably records the migrations that DID succeed,
         and a re-run resumes from there without re-running already-applied migrations."""

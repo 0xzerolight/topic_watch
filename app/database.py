@@ -212,12 +212,24 @@ def run_migrations(conn: sqlite3.Connection, db_path: Path | None = None) -> Non
             # (possibly non-idempotent) migrations against a changed schema.
             conn.commit()
         except Exception:
-            logger.exception(
-                "Migration %d (%s) failed; DB restored from backup at %s",
-                version,
-                description,
-                backup_path,
-            )
+            # No restore happens here, and none is needed: each migration commits
+            # on success and the connection is rolled back on the way out, so the
+            # DB is left at the last successfully applied version. Saying
+            # "restored" told operators a recovery had run that never did.
+            if backup_path is not None:
+                logger.exception(
+                    "Migration %d (%s) failed; database left at the last applied version. Pre-migration backup: %s",
+                    version,
+                    description,
+                    backup_path,
+                )
+            else:
+                logger.exception(
+                    "Migration %d (%s) failed; database left at the last applied version. "
+                    "No pre-migration backup was taken (no database file at that path).",
+                    version,
+                    description,
+                )
             raise
         logger.info("Applied migration %d: %s", version, description)
 
