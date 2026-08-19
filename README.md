@@ -48,7 +48,9 @@ curl -fsSL https://raw.githubusercontent.com/0xzerolight/topic_watch/main/script
 irm https://raw.githubusercontent.com/0xzerolight/topic_watch/main/scripts/install.ps1 | iex
 ```
 
-This pulls the image, starts the container, and opens the setup wizard at [http://localhost:8000](http://localhost:8000) - set your LLM API key there.
+The installer asks who should be able to reach Topic Watch (this computer only, or any device on your network) and whether to start it at boot, then pulls the image, starts the container, and opens the setup wizard at [http://localhost:8000](http://localhost:8000) - set your LLM API key there.
+
+Answer without being asked by setting `TOPIC_WATCH_BIND_ADDR` (`127.0.0.1` or `0.0.0.0`), `TOPIC_WATCH_AUTOSTART` (`yes`/`no`) or `TOPIC_WATCH_PORT` beforehand. With no terminal - a cloud-init or CI run - the installer prompts for nothing and defaults to this computer only, no autostart, port 8000.
 
 <details>
 <summary><strong>Manual install (without the script)</strong></summary>
@@ -58,17 +60,24 @@ This pulls the image, starts the container, and opens the setup wizard at [http:
 ```bash
 mkdir -p topic-watch/data && cd topic-watch
 curl -fsSL https://raw.githubusercontent.com/0xzerolight/topic_watch/main/docker-compose.prod.yml -o docker-compose.yml
-printf 'PUID=%s\nPGID=%s\n' "$(id -u)" "$(id -g)" > .env   # only if your host UID isn't 1000
+(umask 077; printf 'PUID=%s\nPGID=%s\n' "$(id -u)" "$(id -g)" > .env)
 docker compose up -d
 ```
+
+The `.env` line matches the container's user to yours so it can write `data/`.
+It is written owner-only because that file is where any secrets you add later go.
 
 **Build from source** - no prebuilt image, builds from the Dockerfile:
 
 ```bash
 git clone https://github.com/0xzerolight/topic_watch.git
 cd topic_watch
+(umask 077; printf 'PUID=%s\nPGID=%s\n' "$(id -u)" "$(id -g)" > .env)
 docker compose up -d
 ```
+
+Skip the `.env` line here and the container chowns your checkout's `data/` to
+UID 1000, which takes it away from you if your own UID differs.
 
 **Without Docker** (Python 3.11+):
 
@@ -77,22 +86,41 @@ git clone https://github.com/0xzerolight/topic_watch.git
 cd topic_watch
 python -m venv .venv && source .venv/bin/activate
 pip install -e .
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
 Then open [http://localhost:8000](http://localhost:8000) and set your LLM key in the
 setup wizard - no manual config step. Use the editable install (`-e`) so config and
 the SQLite database land in the project's `data/` directory.
 
+`--host 127.0.0.1` keeps it on this machine. Topic Watch has no login screen, so
+only widen that once an authenticating reverse proxy is in front of it.
+
 </details>
 
 <details>
 <summary><strong>Updating</strong></summary>
 
+**If you used the install script or the prebuilt image:**
+
 ```bash
 cd ~/topic-watch  # or your install directory
 docker compose pull
 docker compose up -d
+```
+
+Or run the updater, which reports the version change and points at your backups:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/0xzerolight/topic_watch/main/scripts/update.sh | bash
+```
+
+**If you built from source,** there is no image to pull - rebuild instead:
+
+```bash
+cd topic_watch  # your clone
+git pull
+docker compose up -d --build
 ```
 
 The database is automatically backed up before any schema migration.
@@ -159,8 +187,17 @@ Uses [LiteLLM](https://docs.litellm.ai/docs/providers). Anything LiteLLM support
 free + local with [Ollama](https://ollama.com/download).
 
 Ollama and OpenAI-compatible gateways (LM Studio, a LiteLLM proxy, OpenCode Go) need a
-`base_url` - see [`config.example.yml`](config.example.yml). Running Ollama in Docker
-also needs the override file: `cp docker-compose.override.example.yml docker-compose.override.yml`.
+`base_url` - see [`config.example.yml`](config.example.yml).
+
+Reaching Ollama on the host from inside the container also needs an override file.
+From your install directory (`~/topic-watch` if you used the script):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/0xzerolight/topic_watch/main/docker-compose.override.example.yml -o docker-compose.override.yml
+docker compose up -d
+```
+
+In a git clone the file is already there: `cp docker-compose.override.example.yml docker-compose.override.yml`.
 
 </details>
 
@@ -182,7 +219,9 @@ keys (e.g. `TOPIC_WATCH_LLM__API_KEY`). Full key reference:
 
 ## Security
 
-**No built-in authentication** by design (single-user tool). Safe as-is on localhost. For remote access, put it behind a reverse proxy with auth ([Authelia](https://www.authelia.com/), [Authentik](https://goauthentik.io/), Caddy `basicauth`, Nginx basic auth). See [SECURITY.md](SECURITY.md).
+**No built-in authentication** by design (single-user tool). Because of that, the port is published on `127.0.0.1` by default - a stock install is reachable only from the machine it runs on.
+
+To reach it from other devices, set `TOPIC_WATCH_BIND_ADDR=0.0.0.0` in `.env` (the installer offers this as a question) and put it behind a reverse proxy with auth ([Authelia](https://www.authelia.com/), [Authentik](https://goauthentik.io/), Caddy `basicauth`, Nginx basic auth). A host firewall is not a substitute: Docker publishes ports ahead of `ufw` and `firewalld` rules. See [SECURITY.md](SECURITY.md).
 
 ## Troubleshooting
 
@@ -194,6 +233,7 @@ keys (e.g. `TOPIC_WATCH_LLM__API_KEY`). Full key reference:
 | **"Sources failing" alert** | Sent after `silence_heartbeat_checks` consecutive checks (default 3) with no usable source - a dead feed, an expired Exa key, or no network. Fix the source, or set `silence_heartbeat_checks: 0` to turn the alert off. |
 | **Topic stuck in "Researching"** | Auto-recovers after 15 minutes (set to Error). Retry from the topic page. Usually an LLM connectivity issue. |
 | **Docker container exits** | `docker compose logs` for details. Check that `data/` is writable. The installer sets `PUID`/`PGID` automatically; see [SECURITY.md](SECURITY.md). |
+| **Can't reach it from another device** | The port is published on `127.0.0.1` by default. Set `TOPIC_WATCH_BIND_ADDR=0.0.0.0` in `.env` and run `docker compose up -d`. Add a reverse proxy with auth first - there is no login screen. |
 | **High memory** | Lower `max_articles_per_check` or `content_fetch_concurrency`. Increase check intervals. |
 
 Still stuck? Run `python -m app.cli doctor` (Docker: `docker compose exec topic-watch python -m app.cli doctor`) for a secret-safe diagnostic snapshot - version, runtime, redacted config, schema, and feed health - and paste it into a bug report. Update to the latest release first.
