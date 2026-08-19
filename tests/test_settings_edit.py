@@ -209,6 +209,42 @@ class TestSaveSettingsToYaml:
         assert data["check_interval"] == "12h"
         assert data["max_articles_per_check"] == 25
 
+    async def test_feed_backoff_settings_persist(self, tmp_path: Path) -> None:
+        """Feed-backoff tuning survives a save.
+
+        Both fields are documented as user-settable, but were missing from the
+        write dict — so any Settings save silently reset a user's values to the
+        15/24 defaults.
+        """
+        from app.config import save_settings_to_yaml
+
+        settings = _make_settings(feed_backoff_base_minutes=45, feed_backoff_cap_hours=72)
+        config_file = tmp_path / "config.yml"
+        save_settings_to_yaml(settings, config_file)
+
+        data = yaml.safe_load(config_file.read_text())
+        assert data["feed_backoff_base_minutes"] == 45
+        assert data["feed_backoff_cap_hours"] == 72
+
+    async def test_every_scalar_setting_is_written(self, tmp_path: Path) -> None:
+        """No scalar setting may be silently dropped on save.
+
+        Guards the whole class of bug rather than one instance: a field added to
+        Settings but forgotten in the write dict reverts to its default the next
+        time the user saves anything, with no error.
+        """
+        from app.config import save_settings_to_yaml
+
+        settings = _make_settings()
+        config_file = tmp_path / "config.yml"
+        save_settings_to_yaml(settings, config_file)
+
+        data = yaml.safe_load(config_file.read_text())
+        nested = {"llm", "notifications", "exa"}
+        expected = set(Settings.model_fields) - nested
+        missing = sorted(expected - set(data))
+        assert not missing, f"settings dropped by save_settings_to_yaml: {missing}"
+
 
 class TestExaSettingsPersistence:
     """Exa config persists through save_settings_to_yaml (each field asserted independently)."""

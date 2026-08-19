@@ -404,6 +404,8 @@ def save_settings_to_yaml(
         "apprise_timeout_seconds": settings.apprise_timeout_seconds,
         "web_page_size": settings.web_page_size,
         "feed_max_retries": settings.feed_max_retries,
+        "feed_backoff_base_minutes": settings.feed_backoff_base_minutes,
+        "feed_backoff_cap_hours": settings.feed_backoff_cap_hours,
         "content_fetch_concurrency": settings.content_fetch_concurrency,
         "topic_check_concurrency": settings.topic_check_concurrency,
         "scheduler_misfire_grace_time": settings.scheduler_misfire_grace_time,
