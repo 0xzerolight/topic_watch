@@ -33,7 +33,9 @@ When deploying Topic Watch on a public network:
 
 - **TLS is required.** Terminate TLS at your reverse proxy (Caddy, Nginx, Traefik) before forwarding to Topic Watch. Without TLS, CSRF tokens and session cookies are transmitted in plaintext.
 - **Enable secure cookies.** Set `TOPIC_WATCH_SECURE_COOKIES=true` (or `secure_cookies: true` in `data/config.yml`) so cookies are only sent over HTTPS connections.
-- **Restrict network access.** Bind Topic Watch to `127.0.0.1` and proxy from your reverse proxy. Do not expose port 8000 directly to the internet.
+- **Restrict network access.** Both compose files publish the port on `127.0.0.1` by default, so a stock install is reachable only from the host. To reach it from other devices, set `TOPIC_WATCH_BIND_ADDR=0.0.0.0` in `.env` — and put an authenticating reverse proxy in front before you do. Do not expose port 8000 directly to the internet.
+
+  Note that this is not something a host firewall will save you from: Docker inserts its own iptables rules ahead of the ones `ufw` and `firewalld` manage, so a published port stays reachable even when the firewall is configured to deny incoming traffic. The bind address is the control that actually applies.
 - **Protect `data/config.yml`.** This file contains your LLM API key. Ensure it is not world-readable (`chmod 600 data/config.yml`).
 - **Keep dependencies updated.** `requirements.txt` is a hash-pinned lockfile (exact `==` versions plus `--hash` entries), so `pip install --upgrade -r requirements.txt` cannot raise versions — it is a no-op for upgrades. Updates land through the configured Dependabot PRs; to bump versions locally, regenerate the lockfile with `make lock` and reinstall.
 - **Use the Docker image.** It runs as a non-root user with resource limits.
