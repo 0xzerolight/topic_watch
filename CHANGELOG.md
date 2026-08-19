@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-08-19
+
+### Added
+
+- Live topic status: dashboard rows and the topic detail page now update themselves while a topic is new or researching. A row polls `GET /topics/{id}/row` (every 3s researching, 30s new) and the endpoint answers 204 while the status is unchanged, so htmx skips the swap and checkbox/focus state survives; the re-rendered ready/error row carries no poll attributes and therefore stops itself. The detail-page status poll carries `?since=`, so the endpoint can answer `HX-Refresh` on a transition and let the `h1` badge, the actions row and the error alert outside `#status-area` catch up
+- The install scripts ask how to set up: who should reach Topic Watch (loopback vs LAN, with a warning on LAN), whether to start at boot (recommended — without it monitoring stops after a reboot and nothing says so), and for a port only when the default is taken. Answers are persisted to `.env`, which the installer upserts, so they survive a later `up -d` or a re-run; each question is skipped when its env var is already set. `install.ps1` gains the same questions and the `.env` writing it never had
+
+### Changed
+
+- Both compose files publish the web port on `${TOPIC_WATCH_BIND_ADDR:-127.0.0.1}` instead of every interface, matching what SECURITY.md already told users to do — Topic Watch has no authentication, and Docker inserts its port rules ahead of ufw/firewalld, so a host firewall does not contain it. Set `TOPIC_WATCH_BIND_ADDR=0.0.0.0` in `.env` for LAN access. Existing installs are unaffected: their `docker-compose.yml` is a copy made at install time and is not rewritten by `docker compose pull`
+- `TZ` and `TOPIC_WATCH_PORT` are honored by both compose files; `.env.example` documented both as having no effect. The commented env examples used mapping syntax inside a list, so uncommenting them verbatim failed the YAML parse
+- `make lock` and `make lock-upgrade` are runnable: `pip-compile` was never installed by anything, so the command SECURITY.md tells users to run died with "pip-compile: command not found". pip-tools stays out of the dev extras on purpose (locking it would hash-pin pip itself into the `requirements-dev.txt` that `make dev` and all three CI jobs install, and pip 26 breaks pip-tools 7.5.3); instead it gets its own `make lock-tools` target with the known-good pins, and both lock targets fail with that pointer rather than a bare command-not-found. SECURITY.md now points at `lock-upgrade`, since plain `lock` cannot raise versions
+- Dependabot and pre-commit.ci PRs enable auto-merge, which then waits on the required status checks from branch protection. pip semver-major bumps are excluded: the mocked-LLM suite cannot catch litellm/instructor behavior changes
+- README gains a docker pulls badge. GitHub exposes no API for container download counts, so a daily workflow scrapes the public package page and publishes a shields.io endpoint JSON to an orphan `badges` branch
+- Dependencies relocked (litellm 1.96.0, starlette 1.6.0, pydantic-settings 2.15.0 and 8 more); ruff 0.16.3 and mypy 2.3.1 in pre-commit; Python base image digest bumped
+
+### Fixed
+
+- The install scripts' setup prompt was gated on `[ -t 0 ]`, which is false whenever the script is piped — so the documented `curl … | bash` path never asked, and every Linux/macOS user silently got no autostart, leaving monitoring stopped after the next reboot. The scripts probe `/dev/tty` instead, which is the controlling terminal regardless of how stdin is wired. The systemd unit also resolves the real `docker` path instead of assuming `/usr/bin`, which left the unit failing at boot on some distros
+- `feed_backoff_base_minutes` and `feed_backoff_cap_hours` are written back to `data/config.yml` on save. Both are real `Settings` fields, used by the checker and the feed-health pages and documented as user-settable, but neither was in the write dict — so any save from `/setup` or `/settings` silently reverted the user's values to 15 minutes and 24 hours. A guard test asserts every scalar `Settings` field is written, so a field added to `Settings` but forgotten here fails the suite instead of quietly resetting itself
+- README install commands that failed as written: the Ollama override `cp` only works in a git clone (a `curl` is given instead), `docker compose pull` errors on a source install that has `build: .` and no image (the update instructions are split by install path), building from source was missing the `PUID`/`PGID` step the prebuilt path already has (without it the container chowns the user's own checkout to UID 1000), `.env` is written under umask 077 to match the installer, and the no-Docker uvicorn command binds 127.0.0.1 rather than 0.0.0.0
+- A failed migration no longer logs "DB restored from backup at %s". Nothing restores anything — `_backup_db` only copies — and the state it described was wrong in the other direction too: migrations commit per version and the connection is rolled back on the way out, so the DB is already left at the last applied version and needs no restore. It also stops printing "at None" when no backup was taken, which happens whenever `run_migrations` gets a `db_path` that does not exist
+
 ## [1.3.0] - 2026-08-05
 
 ### Added
