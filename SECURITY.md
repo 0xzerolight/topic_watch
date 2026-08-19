@@ -37,7 +37,7 @@ When deploying Topic Watch on a public network:
 
   Note that this is not something a host firewall will save you from: Docker inserts its own iptables rules ahead of the ones `ufw` and `firewalld` manage, so a published port stays reachable even when the firewall is configured to deny incoming traffic. The bind address is the control that actually applies.
 - **Protect `data/config.yml`.** This file contains your LLM API key. Ensure it is not world-readable (`chmod 600 data/config.yml`).
-- **Keep dependencies updated.** `requirements.txt` is a hash-pinned lockfile (exact `==` versions plus `--hash` entries), so `pip install --upgrade -r requirements.txt` cannot raise versions — it is a no-op for upgrades. Updates land through the configured Dependabot PRs; to bump versions locally, regenerate the lockfile with `make lock` and reinstall.
+- **Keep dependencies updated.** `requirements.txt` is a hash-pinned lockfile (exact `==` versions plus `--hash` entries), so `pip install --upgrade -r requirements.txt` cannot raise versions — it is a no-op for upgrades. Updates land through the configured Dependabot PRs; to bump versions locally, run `make lock-tools` (installs the pinned `pip-compile` toolchain — use a throwaway venv, it pins pip to 25.1.1), then `make lock-upgrade` and reinstall. Plain `make lock` reproduces the current pins and will not raise versions.
 - **Use the Docker image.** It runs as a non-root user with resource limits.
 
 ### Reverse Proxy Auth Examples

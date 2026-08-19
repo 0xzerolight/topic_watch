@@ -1,4 +1,4 @@
-.PHONY: dev test smoke lint format typecheck coverage docker docker-run run clean ci lock lock-upgrade help
+.PHONY: dev test smoke lint format typecheck coverage docker docker-run run clean ci lock lock-tools lock-upgrade _require_pip_compile help
 
 help: ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -9,7 +9,25 @@ dev: ## Install project in editable mode with dev dependencies
 	pre-commit install
 	pre-commit install --hook-type pre-push
 
-lock: ## Regenerate pinned requirements lockfiles from pyproject.toml
+# pip-compile ships with pip-tools, which is deliberately NOT in the dev extras:
+# it requires pip/setuptools/wheel, so locking it would hash-pin pip itself into
+# the requirements-dev.txt that `make dev` and every CI job install.
+lock-tools: ## Install the pinned pip-compile toolchain (use a throwaway/worktree venv)
+	pip install "pip==25.1.1" "pip-tools==7.5.3"
+
+_require_pip_compile:
+	@command -v pip-compile >/dev/null 2>&1 || { \
+		echo "pip-compile not found — the lock targets need it."; \
+		echo ""; \
+		echo "  make lock-tools    # installs pip==25.1.1 + pip-tools==7.5.3"; \
+		echo ""; \
+		echo "Run that in a throwaway or worktree venv: it pins pip to 25.1.1."; \
+		echo "pip 26 removed an internal that pip-tools 7.5.3 imports, so newer"; \
+		echo "pip fails every pip-compile call with an ImportError."; \
+		exit 1; \
+	}
+
+lock: _require_pip_compile ## Regenerate pinned requirements lockfiles from pyproject.toml
 	pip-compile --strip-extras --generate-hashes --output-file=requirements.txt pyproject.toml
 	pip-compile --strip-extras --generate-hashes --extra=dev --output-file=requirements-dev.txt pyproject.toml
 
@@ -17,7 +35,7 @@ lock: ## Regenerate pinned requirements lockfiles from pyproject.toml
 # pull in a bumped dependency. Use this when Dependabot's group PR fails to
 # install: its updater rewrites known pins but never adds newly-introduced
 # transitive packages, which breaks `pip install --require-hashes`.
-lock-upgrade: ## Relock at the newest versions pyproject.toml allows
+lock-upgrade: _require_pip_compile ## Relock at the newest versions pyproject.toml allows
 	pip-compile --upgrade --strip-extras --generate-hashes --output-file=requirements.txt pyproject.toml
 	pip-compile --upgrade --strip-extras --generate-hashes --extra=dev --output-file=requirements-dev.txt pyproject.toml
 

@@ -33,6 +33,32 @@ def test_config_example_ships_no_live_notification_urls() -> None:
     assert data["notifications"]["urls"] == []
 
 
+def test_lock_targets_declare_their_toolchain() -> None:
+    """``make lock`` must be runnable, or say exactly how to make it runnable.
+
+    The lock targets call ``pip-compile``, which ships with pip-tools — but
+    pip-tools was declared nowhere, so the command SECURITY.md tells users to run
+    died with ``pip-compile: command not found``. It deliberately does NOT belong
+    in requirements-dev.txt: pip-tools depends on pip/setuptools/wheel, which
+    would hash-pin pip itself into the file ``make dev`` and CI install.
+    """
+    makefile = (_ROOT / "Makefile").read_text()
+    assert "lock-tools:" in makefile, "no target installs the pip-compile toolchain"
+    assert "pip-tools==" in makefile, "the pip-tools version must be pinned"
+    # Both lock targets must fail with guidance rather than 'command not found'.
+    for target in ("lock:", "lock-upgrade:"):
+        line = next(ln for ln in makefile.splitlines() if ln.startswith(target))
+        assert "_require_pip_compile" in line, f"{target} is not guarded"
+
+
+def test_security_md_points_at_a_real_relock_target() -> None:
+    """SECURITY.md tells users to regenerate the lockfile; that path must exist."""
+    security = (_ROOT / "SECURITY.md").read_text()
+    makefile = (_ROOT / "Makefile").read_text()
+    assert "make lock-tools" in security
+    assert "lock-tools:" in makefile
+
+
 def test_env_example_has_no_uncommented_llm_key() -> None:
     """``.env`` is interpolation-only — Compose never injects it into the
     container — so a live ``TOPIC_WATCH_LLM__*`` line in .env.example is a false
