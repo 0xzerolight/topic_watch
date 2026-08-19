@@ -1,0 +1,42 @@
+name: Auto-merge
+
+# Enables GitHub auto-merge on dependabot and pre-commit.ci PRs. The merge
+# itself still waits for the required status checks on main (branch
+# protection), so red CI blocks it. Major-version pip bumps are excluded:
+# the test suite mocks all LLM traffic, so behavior shifts in litellm /
+# instructor majors can pass CI unseen.
+
+on: pull_request
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  dependabot:
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Enable auto-merge
+        # For grouped PRs update-type reports the highest bump in the group.
+        if: steps.metadata.outputs.package-ecosystem != 'pip' || steps.metadata.outputs.update-type != 'version-update:semver-major'
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  pre-commit-ci:
+    if: github.event.pull_request.user.login == 'pre-commit-ci[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enable auto-merge
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
