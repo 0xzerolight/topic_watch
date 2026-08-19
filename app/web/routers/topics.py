@@ -258,14 +258,24 @@ async def topic_detail(
 async def topic_status(
     request: Request,
     topic_id: int,
+    since: str | None = None,
     conn: sqlite3.Connection = Depends(get_db_conn),
     settings: Settings = Depends(get_settings),
 ):
-    """HTMX partial: knowledge state fragment for polling during research."""
+    """HTMX partial: knowledge state fragment for polling during research.
+
+    ``since`` carries the status the client rendered its page under. When the
+    status has moved on, the response gets ``HX-Refresh: true`` so htmx reloads
+    the whole page once — the h1 badge, Actions row and error alert live outside
+    ``#status-area`` and a fragment swap alone would leave them stale. htmx
+    discards the body on HX-Refresh; non-htmx callers ignore the header.
+    """
     topic = get_topic(conn, topic_id)
     if topic is None:
         # Topic deleted mid-research: return a 200 terminal fragment (no polling
         # trigger) so the every-3s HTMX poll swaps it in and stops (OVH-048).
+        # Deliberately no HX-Refresh here — a reload would land on a 404 page,
+        # the terminal fragment is the better end state.
         return templates.TemplateResponse(
             request,
             "topic_status.html",
@@ -278,7 +288,7 @@ async def topic_status(
 
     knowledge = get_knowledge_state(conn, topic_id)
 
-    return templates.TemplateResponse(
+    response = templates.TemplateResponse(
         request,
         "topic_status.html",
         {
@@ -287,6 +297,9 @@ async def topic_status(
             "knowledge_state_max_tokens": settings.knowledge_state_max_tokens,
         },
     )
+    if since is not None and topic.status.value != since:
+        response.headers["HX-Refresh"] = "true"
+    return response
 
 
 @router.get("/topics/{topic_id}/knowledge-diff/{revision_id}", response_class=HTMLResponse)
@@ -405,6 +418,35 @@ def _topic_row_response(
         "_topic_row.html",
         {**_topic_row_context(conn, topic, topic_id), "just_checked": just_checked},
     )
+
+
+@router.get("/topics/{topic_id}/row", response_class=HTMLResponse)
+async def topic_row(
+    request: Request,
+    topic_id: int,
+    since: str | None = None,
+    conn: sqlite3.Connection = Depends(get_db_conn),
+):
+    """HTMX partial: single dashboard row, polled while a topic is new/researching.
+
+    ``since`` is the status the row was rendered with. While unchanged this
+    returns 204 (htmx skips the swap, leaving checkbox/focus state untouched);
+    on a transition the full row is re-rendered once and, being ready/error, no
+    longer carries poll attributes — the poll terminates itself. GET only — no
+    CSRF needed (web.md).
+    """
+    topic = get_topic(conn, topic_id)
+    if topic is None:
+        # Topic deleted mid-poll: 200 empty body so the outerHTML swap removes
+        # the row and the poll dies with it (OVH-048).
+        return HTMLResponse("")
+
+    if since is not None and topic.status.value == since:
+        return Response(status_code=204)
+
+    # just_checked stays False: a status-poll re-render must not re-fire the
+    # dashboard's browser notification (OVH-119).
+    return _topic_row_response(request, conn, topic, topic_id)
 
 
 @router.post("/topics/{topic_id}/check", response_class=HTMLResponse, dependencies=[Depends(verify_csrf)])

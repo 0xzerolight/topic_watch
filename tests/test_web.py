@@ -1023,6 +1023,110 @@ class TestTopicStatus:
         # Surfaces the failure to the user.
         assert "no longer exists" in response.text.lower()
 
+    async def test_status_since_mismatch_sets_hx_refresh(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """Status moved on since the page rendered -> HX-Refresh triggers a one-shot reload."""
+        topic = _make_topic(db_conn, status=TopicStatus.READY)
+        response = await client.get(f"/topics/{topic.id}/status?since=researching")
+        assert response.status_code == 200
+        assert response.headers["HX-Refresh"] == "true"
+
+    async def test_status_since_match_no_refresh(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        """Unchanged status keeps polling: fragment as usual, no refresh header."""
+        topic = _make_topic(db_conn, status=TopicStatus.RESEARCHING)
+        response = await client.get(f"/topics/{topic.id}/status?since=researching")
+        assert response.status_code == 200
+        assert "HX-Refresh" not in response.headers
+        assert "every 3s" in response.text
+        assert "since=researching" in response.text
+
+    async def test_status_without_since_never_refreshes(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """Plain GET without ?since behaves exactly as before (regression guard)."""
+        topic = _make_topic(db_conn, status=TopicStatus.READY)
+        response = await client.get(f"/topics/{topic.id}/status")
+        assert response.status_code == 200
+        assert "HX-Refresh" not in response.headers
+
+    async def test_status_deleted_with_since_no_refresh(self, client: httpx.AsyncClient) -> None:
+        """Deleted topic never triggers a reload — that would land on a 404 page."""
+        response = await client.get("/topics/9999/status?since=researching")
+        assert response.status_code == 200
+        assert "HX-Refresh" not in response.headers
+        assert "hx-trigger" not in response.text
+
+    async def test_status_new_fragment_polls(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        """NEW topics poll too (slow cadence) so NEW -> RESEARCHING appears without a reload."""
+        topic = _make_topic(db_conn, status=TopicStatus.NEW)
+        response = await client.get(f"/topics/{topic.id}/status")
+        assert response.status_code == 200
+        assert "hx-trigger" in response.text
+        assert "every 30s" in response.text
+        assert "since=new" in response.text
+
+
+class TestTopicRow:
+    """Tests for GET /topics/{id}/row (dashboard row status poll)."""
+
+    async def test_row_returns_row(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        """Plain poll (no since) renders the row without the just-checked marker (OVH-119)."""
+        topic = _make_topic(db_conn, status=TopicStatus.RESEARCHING)
+        response = await client.get(f"/topics/{topic.id}/row", headers={"HX-Request": "true"})
+        assert response.status_code == 200
+        assert f'id="topic-{topic.id}"' in response.text
+        assert "data-just-checked" not in response.text
+
+    async def test_row_since_match_returns_204(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        """Unchanged status -> 204 so htmx skips the swap and checkbox state survives."""
+        topic = _make_topic(db_conn, status=TopicStatus.RESEARCHING)
+        response = await client.get(f"/topics/{topic.id}/row?since=researching", headers={"HX-Request": "true"})
+        assert response.status_code == 204
+        assert response.text == ""
+
+    async def test_row_since_mismatch_returns_terminated_row(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """Transition re-renders the row once; the ready row carries no poll attrs."""
+        topic = _make_topic(db_conn, status=TopicStatus.READY)
+        response = await client.get(f"/topics/{topic.id}/row?since=researching", headers={"HX-Request": "true"})
+        assert response.status_code == 200
+        assert "Ready" in response.text
+        assert "hx-trigger" not in response.text
+
+    async def test_row_missing_topic_returns_empty_200(self, client: httpx.AsyncClient) -> None:
+        """Deleted mid-poll: 200 empty body removes the row via outerHTML swap (OVH-048)."""
+        response = await client.get("/topics/9999/row", headers={"HX-Request": "true"})
+        assert response.status_code == 200
+        assert response.text == ""
+
+    async def test_row_poll_attrs_by_status(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        """Only new/researching rows poll; ready/error rows emit no poll attrs."""
+        cases = {
+            TopicStatus.RESEARCHING: "every 3s",
+            TopicStatus.NEW: "every 30s",
+        }
+        for status, interval in cases.items():
+            topic = _make_topic(db_conn, name=f"Poll {status.value}", status=status)
+            response = await client.get(f"/topics/{topic.id}/row", headers={"HX-Request": "true"})
+            assert f"/topics/{topic.id}/row?since={status.value}" in response.text
+            assert interval in response.text
+        for status in (TopicStatus.READY, TopicStatus.ERROR):
+            topic = _make_topic(db_conn, name=f"NoPoll {status.value}", status=status)
+            response = await client.get(f"/topics/{topic.id}/row", headers={"HX-Request": "true"})
+            assert "/row?since=" not in response.text
+            assert "hx-trigger" not in response.text
+
+    async def test_row_non_htmx_redirects_to_detail(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """A direct browser GET of the fragment redirects to the detail page (helper fallback)."""
+        topic = _make_topic(db_conn, status=TopicStatus.READY)
+        response = await client.get(f"/topics/{topic.id}/row")
+        assert response.status_code == 303
+        assert response.headers["location"] == f"/topics/{topic.id}"
+
 
 # --- Generic exception handler (OVH-046) ---
 

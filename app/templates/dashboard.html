@@ -195,6 +195,9 @@ document.body.addEventListener("htmx:afterSwap", function(event) {
         // For outerHTML swaps, detail.target is the old (detached) element.
         // Look up the new element by ID instead.
         var target = document.getElementById(detailTarget.id) || detailTarget;
+        // A row swap (status poll, check, toggle) rebuilds the checkbox unchecked;
+        // re-sync the bulk bar so its count doesn't include the lost selection.
+        if (typeof updateBulkBar === "function") updateBulkBar();
         // Only fire for a fresh check: the /check response sets data-just-checked,
         // while unrelated row re-renders (e.g. toggle-active) do not. Without this
         // gate, toggling a topic whose last check found new info re-fires a

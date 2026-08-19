@@ -6,7 +6,13 @@
 </article>
 
 {% elif topic.status.value == "new" %}
-<article>
+{# Slow poll (scheduler inits at most 1 NEW topic per minute). ?since lets the
+   endpoint answer with HX-Refresh once the status moves on, so the h1 badge and
+   Actions row outside #status-area catch up too. #}
+<article hx-get="/topics/{{ topic.id }}/status?since=new"
+         hx-trigger="every 30s"
+         hx-target="#status-area"
+         hx-swap="innerHTML">
     <header>Pending Initialization</header>
     <p>This topic will be initialized on the next scheduler cycle (~1 minute). Articles will be fetched and an initial knowledge state will be built automatically.</p>
     <form method="post" action="/topics/{{ topic.id }}/init" style="display:inline">
@@ -17,7 +23,7 @@
 
 {% elif topic.status.value == "researching" %}
 <article aria-busy="true"
-         hx-get="/topics/{{ topic.id }}/status"
+         hx-get="/topics/{{ topic.id }}/status?since=researching"
          hx-trigger="every 3s"
          hx-target="#status-area"
          hx-swap="innerHTML">

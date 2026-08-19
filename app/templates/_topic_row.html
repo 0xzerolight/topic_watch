@@ -5,7 +5,17 @@
     {% if row_classes %} class="{{ row_classes | join(' ') }}"{% endif %}
     data-topic-name="{{ topic.name }}"
     {% if last_check and last_check.has_new_info and not last_check.seen_at %}data-new-info="true"{% endif %}
-    {% if just_checked %}data-just-checked="true"{% endif %}>
+    {% if just_checked %}data-just-checked="true"{% endif %}
+    {#- Self-terminating status poll: only new/researching rows carry the attrs, and
+        the re-rendered ready/error row emits none, so polling stops itself. The
+        endpoint answers 204 while the status is unchanged (htmx skips the swap, so
+        checkbox/focus state survives the steady state). No hx-target: the row
+        replaces itself. -#}
+    {% if topic.status.value in ("researching", "new") %}
+    hx-get="/topics/{{ topic.id }}/row?since={{ topic.status.value }}"
+    hx-trigger="every {{ '3s' if topic.status.value == 'researching' else '30s' }}"
+    hx-swap="outerHTML"
+    {% endif %}>
     <td data-label="">
         <input type="checkbox" name="topic_ids" value="{{ topic.id }}"
                class="topic-select" aria-label="Select {{ topic.name }}" onchange="updateBulkBar()">
