@@ -20,6 +20,11 @@ REPO="0xzerolight/topic_watch"
 BRANCH="${TOPIC_WATCH_REF:-main}"
 INSTALL_DIR="${TOPIC_WATCH_DIR:-$HOME/topic-watch}"
 PORT="${TOPIC_WATCH_PORT:-8000}"
+# Host interface the container's port is published on. Loopback by default:
+# Topic Watch has no authentication, and Docker's published ports bypass ufw /
+# firewalld, so binding every interface would expose an unauthenticated app even
+# on a host whose firewall denies incoming traffic. Asked interactively below.
+BIND_ADDR="${TOPIC_WATCH_BIND_ADDR:-}"
 # Autostart persistence is opt-in (OVH-147). Set TOPIC_WATCH_AUTOSTART=yes|no to
 # answer non-interactively; default in a non-interactive (piped) run is "no".
 AUTOSTART="${TOPIC_WATCH_AUTOSTART:-}"
@@ -38,6 +43,38 @@ fi
 info()  { echo -e "${GREEN}[+]${RESET} $*"; }
 warn()  { echo -e "${YELLOW}[!]${RESET} $*"; }
 error() { echo -e "${RED}[x]${RESET} $*" >&2; }
+
+# --- Interactive prompts ---
+# The documented install path is `curl … | bash`, which makes stdin the script
+# pipe. `[ -t 0 ]` is therefore false even in a real terminal, so gating prompts
+# on it silently skips every question. /dev/tty is the controlling terminal
+# regardless of how stdin is wired — probe that instead.
+TTY_OK=0
+if (exec 3</dev/tty) 2>/dev/null; then
+    TTY_OK=1
+fi
+
+# Write to the terminal, bypassing any redirection of stdout.
+say() { [ "$TTY_OK" = "1" ] && printf "%b" "$*" > /dev/tty; return 0; }
+
+# Ask a question and echo the reply, or echo the default unchanged when there is
+# no terminal. Never blocks: a non-interactive run answers itself.
+prompt_tty() {
+    local text="$1" default="$2" reply=""
+    if [ "$TTY_OK" != "1" ]; then
+        printf '%s' "$default"
+        return 0
+    fi
+    printf "%b" "$text" > /dev/tty
+    read -r reply < /dev/tty || reply=""
+    printf '%s' "${reply:-$default}"
+}
+
+# True when something is already listening on the given TCP port. Uses bash's
+# /dev/tcp rather than ss/lsof/netstat, none of which are present everywhere.
+port_in_use() {
+    (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+}
 
 # --- Prerequisite checks ---
 check_docker() {
@@ -58,6 +95,77 @@ if ! check_docker; then
 fi
 
 info "Docker found: $(docker compose version 2>/dev/null | head -1)"
+
+# --- Setup questions ---
+# Asked up front so the install runs uninterrupted afterwards. Every question is
+# skipped when its environment variable is already set, which keeps automated
+# and re-run installs reproducible. With no terminal, each falls back to its
+# default and nothing blocks.
+
+# 1. Network exposure. Loopback unless the user opts into LAN access.
+if [ -z "$BIND_ADDR" ]; then
+    if [ "$TTY_OK" = "1" ]; then
+        say "\n${BOLD}Who should be able to reach Topic Watch?${RESET}\n"
+        say "  ${BOLD}1${RESET}) This computer only          (recommended)\n"
+        say "  ${BOLD}2${RESET}) Any device on my network    (needs a reverse proxy to be safe)\n"
+        case "$(prompt_tty "Choice [1]: " "1")" in
+            2) BIND_ADDR="0.0.0.0" ;;
+            *) BIND_ADDR="127.0.0.1" ;;
+        esac
+    else
+        BIND_ADDR="127.0.0.1"
+    fi
+fi
+
+if [ "$BIND_ADDR" = "0.0.0.0" ]; then
+    warn "Topic Watch will be reachable from your whole network."
+    warn "It has no login screen: anyone who can reach this machine can read your"
+    warn "topics and spend your LLM API budget. Beyond a trusted home network, put"
+    warn "it behind a reverse proxy with authentication — see SECURITY.md."
+fi
+
+# 2. Autostart at boot. Linux only — this script installs a systemd user
+#    service, and there is no launchd equivalent here. Persistence stays opt-in
+#    for unattended runs (OVH-147), but an interactive user is asked directly and
+#    the recommended answer is yes: Topic Watch checks topics on a schedule, so
+#    without autostart it stops monitoring after a reboot and says nothing.
+want_autostart="no"
+if [[ "${OSTYPE:-}" == linux* ]]; then
+    case "${AUTOSTART}" in
+        yes|y|YES|Y) want_autostart="yes" ;;
+        no|n|NO|N)   want_autostart="no" ;;
+        "")
+            if [ "$TTY_OK" = "1" ]; then
+                say "\n${BOLD}Start Topic Watch automatically at boot?${RESET}\n"
+                say "  Recommended: it checks topics on a schedule, so without this it\n"
+                say "  stops monitoring after a reboot until you start it by hand.\n"
+                case "$(prompt_tty "Enable autostart? [Y/n]: " "y")" in
+                    n|N|no|NO|No) want_autostart="no" ;;
+                    *)            want_autostart="yes" ;;
+                esac
+            else
+                warn "Skipping boot autostart (non-interactive). Set TOPIC_WATCH_AUTOSTART=yes to enable it."
+            fi
+            ;;
+    esac
+fi
+
+# 3. Port, asked only when the default is already taken — most users have no
+#    reason to think about it.
+if [ -z "${TOPIC_WATCH_PORT:-}" ] && port_in_use "$PORT"; then
+    if [ "$TTY_OK" = "1" ]; then
+        say "\n"
+        warn "Port ${PORT} is already in use on this machine."
+        chosen="$(prompt_tty "Use a different port [8080]: " "8080")"
+        case "$chosen" in
+            ''|*[!0-9]*) warn "Not a port number — keeping ${PORT}; the install may fail." ;;
+            *)           PORT="$chosen" ;;
+        esac
+    else
+        warn "Port ${PORT} is already in use — the install will likely fail."
+        warn "Set TOPIC_WATCH_PORT to choose another and re-run."
+    fi
+fi
 
 # --- Create install directory ---
 info "Installing to ${BOLD}${INSTALL_DIR}${RESET}"
@@ -106,6 +214,11 @@ upsert_env() {
 
 upsert_env "PUID" "${HOST_UID}" "${ENV_FILE}"
 upsert_env "PGID" "${HOST_GID}" "${ENV_FILE}"
+# The compose file reads both of these. Persisting them here is what makes the
+# answers above survive a later `docker compose up -d` and any future re-run of
+# this installer: .env is upserted, whereas docker-compose.yml is overwritten.
+upsert_env "TOPIC_WATCH_PORT" "${PORT}" "${ENV_FILE}"
+upsert_env "TOPIC_WATCH_BIND_ADDR" "${BIND_ADDR}" "${ENV_FILE}"
 
 # Restrict the .env to the owner: it holds PUID/PGID and any secrets a user adds
 # (proxy creds, etc.). Without this it is created world/group-readable by the
@@ -170,25 +283,15 @@ DESKTOP_EOF
 
     # --- Autostart at boot (opt-in, OVH-147) ---
     # A systemd user service + enable-linger starts the container at boot even
-    # when you are not logged in. That is real persistence, so ask first instead
-    # of installing it silently. Non-interactive runs default to "no".
-    want_autostart="no"
-    case "${AUTOSTART}" in
-        yes|y|YES|Y) want_autostart="yes" ;;
-        no|n|NO|N)   want_autostart="no" ;;
-        "")
-            if [ -t 0 ]; then
-                printf "%b" "${YELLOW}[?]${RESET} Start Topic Watch automatically at boot (systemd user service + linger)? [y/N] "
-                read -r reply </dev/tty || reply=""
-                case "$reply" in y|Y|yes|YES) want_autostart="yes" ;; esac
-            else
-                warn "Skipping boot autostart (non-interactive). Set TOPIC_WATCH_AUTOSTART=yes to enable it."
-            fi
-            ;;
-    esac
-
+    # when you are not logged in. That is real persistence, so it is never
+    # installed silently: want_autostart was decided by the question above, or by
+    # TOPIC_WATCH_AUTOSTART, and defaults to "no" without a terminal.
     if [ "$want_autostart" = "yes" ]; then
-        # Systemd user service
+        # Systemd user service. systemd requires an absolute ExecStart, and
+        # docker is not at /usr/bin everywhere (Docker Desktop and several
+        # distros put it under /usr/local/bin), so resolve it rather than
+        # hardcoding a path that leaves the unit failing silently at boot.
+        DOCKER_BIN="$(command -v docker)"
         SYSTEMD_DIR="$HOME/.config/systemd/user"
         mkdir -p "$SYSTEMD_DIR"
         cat > "$SYSTEMD_DIR/topic-watch.service" << SERVICE_EOF
@@ -200,8 +303,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=/usr/bin/docker compose up
-ExecStop=/usr/bin/docker compose down
+ExecStart=${DOCKER_BIN} compose up
+ExecStop=${DOCKER_BIN} compose down
 Restart=on-failure
 RestartSec=10
 
@@ -231,6 +334,13 @@ info "${BOLD}Topic Watch is running!${RESET}"
 echo ""
 echo "  Open http://localhost:${PORT} to complete setup."
 echo "  Data stored in: ${INSTALL_DIR}/data/"
+if [ "$BIND_ADDR" = "127.0.0.1" ]; then
+    echo "  Reachable from: this computer only"
+    echo "    To allow other devices, set TOPIC_WATCH_BIND_ADDR=0.0.0.0 in"
+    echo "    ${INSTALL_DIR}/.env and run: docker compose up -d"
+else
+    echo "  Reachable from: any device on your network (no login required)"
+fi
 echo ""
 echo "  Manage with:"
 echo "    cd ${INSTALL_DIR} && docker compose logs    # View logs"

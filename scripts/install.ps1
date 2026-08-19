@@ -21,9 +21,15 @@ $Repo = "0xzerolight/topic_watch"
 $Branch = if ($env:TOPIC_WATCH_REF) { $env:TOPIC_WATCH_REF } else { "main" }
 $InstallDir = if ($env:TOPIC_WATCH_DIR) { $env:TOPIC_WATCH_DIR } else { Join-Path $env:LOCALAPPDATA "TopicWatch" }
 $Port = if ($env:TOPIC_WATCH_PORT) { $env:TOPIC_WATCH_PORT } else { "8000" }
+# Host interface the container's port is published on. Loopback by default:
+# Topic Watch has no authentication, so binding every interface would expose an
+# unauthenticated app to the whole network. Asked interactively below.
+$BindAddr = $env:TOPIC_WATCH_BIND_ADDR
 # Login autostart is opt-in (OVH-147). Set TOPIC_WATCH_AUTOSTART=yes|no to answer
 # non-interactively; default in a non-interactive (piped) run is "no".
-$Autostart = $env:TOPIC_WATCH_AUTOSTART
+# Normalized to "" rather than $null so the switch below reliably reaches its
+# default (prompt) branch when the variable is unset.
+$Autostart = if ($env:TOPIC_WATCH_AUTOSTART) { $env:TOPIC_WATCH_AUTOSTART } else { "" }
 
 function Write-Info($msg)  { Write-Host "[+] $msg" -ForegroundColor Green }
 function Write-Warn($msg)  { Write-Host "[!] $msg" -ForegroundColor Yellow }
@@ -43,6 +49,80 @@ try {
 $dockerVersion = (docker compose version 2>&1) | Select-Object -First 1
 Write-Info "Docker found: $dockerVersion"
 
+# --- Setup questions ---
+# Asked up front so the install runs uninterrupted afterwards. Every question is
+# skipped when its environment variable is already set, which keeps automated and
+# re-run installs reproducible. With no console, each falls back to its default.
+$Interactive = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
+
+# 1. Network exposure. Loopback unless the user opts into LAN access.
+if (-not $BindAddr) {
+    if ($Interactive) {
+        Write-Host ""
+        Write-Host "Who should be able to reach Topic Watch?"
+        Write-Host "  1) This computer only          (recommended)"
+        Write-Host "  2) Any device on my network    (needs a reverse proxy to be safe)"
+        $choice = Read-Host "Choice [1]"
+        $BindAddr = if ($choice -eq "2") { "0.0.0.0" } else { "127.0.0.1" }
+    } else {
+        $BindAddr = "127.0.0.1"
+    }
+}
+
+if ($BindAddr -eq "0.0.0.0") {
+    Write-Warn "Topic Watch will be reachable from your whole network."
+    Write-Warn "It has no login screen: anyone who can reach this machine can read your"
+    Write-Warn "topics and spend your LLM API budget. Beyond a trusted home network, put"
+    Write-Warn "it behind a reverse proxy with authentication - see SECURITY.md."
+}
+
+# 2. Autostart on login. Persistence stays opt-in for unattended runs (OVH-147),
+#    but an interactive user is asked directly and the recommended answer is yes:
+#    Topic Watch checks topics on a schedule, so without it monitoring stops after
+#    a reboot and nothing says so.
+$wantAutostart = $false
+switch -Regex ($Autostart) {
+    '^(?i)(yes|y)$' { $wantAutostart = $true }
+    '^(?i)(no|n)$'  { $wantAutostart = $false }
+    default {
+        if ($Interactive) {
+            Write-Host ""
+            Write-Host "Start Topic Watch automatically on login?"
+            Write-Host "  Recommended: it checks topics on a schedule, so without this it"
+            Write-Host "  stops monitoring after a reboot until you start it by hand."
+            $reply = Read-Host "Enable autostart? [Y/n]"
+            $wantAutostart = -not ($reply -match '^(?i)(n|no)$')
+        } else {
+            Write-Warn "Skipping login autostart (non-interactive). Set TOPIC_WATCH_AUTOSTART=yes to enable it."
+        }
+    }
+}
+
+# 3. Port, asked only when the default is already taken.
+if (-not $env:TOPIC_WATCH_PORT) {
+    # Fail open: this check is a convenience, and $ErrorActionPreference='Stop'
+    # would otherwise let a missing Get-NetTCPConnection abort the whole install.
+    $inUse = $false
+    try {
+        $inUse = $null -ne (Get-NetTCPConnection -LocalPort ([int]$Port) -State Listen -ErrorAction SilentlyContinue)
+    } catch {
+        $inUse = $false
+    }
+    if ($inUse) {
+        if ($Interactive) {
+            Write-Host ""
+            Write-Warn "Port $Port is already in use on this machine."
+            $chosen = Read-Host "Use a different port [8080]"
+            if (-not $chosen) { $chosen = "8080" }
+            if ($chosen -match '^\d+$') { $Port = $chosen }
+            else { Write-Warn "Not a port number - keeping $Port; the install may fail." }
+        } else {
+            Write-Warn "Port $Port is already in use - the install will likely fail."
+            Write-Warn "Set TOPIC_WATCH_PORT to choose another and re-run."
+        }
+    }
+}
+
 # --- Create install directory ---
 Write-Info "Installing to $InstallDir"
 New-Item -ItemType Directory -Path (Join-Path $InstallDir "data") -Force | Out-Null
@@ -52,6 +132,26 @@ $ComposeUrl = "https://raw.githubusercontent.com/$Repo/$Branch/docker-compose.pr
 $ComposeDest = Join-Path $InstallDir "docker-compose.yml"
 Write-Info "Downloading docker-compose.yml..."
 Invoke-WebRequest -Uri $ComposeUrl -OutFile $ComposeDest -UseBasicParsing
+
+# --- Persist the answers to .env ---
+# The compose file reads these. Writing them here is what makes the answers above
+# survive a later `docker compose up -d` and any future re-run of this installer:
+# .env is upserted key by key, whereas docker-compose.yml is overwritten.
+$EnvFile = Join-Path $InstallDir ".env"
+
+function Set-EnvVar($key, $value, $file) {
+    $line = "$key=$value"
+    if (Test-Path $file) {
+        $kept = @(Get-Content $file | Where-Object { $_ -notmatch "^$([regex]::Escape($key))=" })
+        Set-Content -Path $file -Value ($kept + $line) -Encoding ASCII
+    } else {
+        Set-Content -Path $file -Value $line -Encoding ASCII
+    }
+}
+
+Set-EnvVar "TOPIC_WATCH_PORT" $Port $EnvFile
+Set-EnvVar "TOPIC_WATCH_BIND_ADDR" $BindAddr $EnvFile
+Write-Info "Wrote port and access settings to .env"
 
 # --- Pull and start ---
 Push-Location $InstallDir
@@ -112,22 +212,9 @@ try {
 
 # --- Autostart on login (opt-in, OVH-147) ---
 # A Startup-folder shortcut runs Topic Watch on every login. That is real
-# persistence, so ask first instead of installing it silently. Non-interactive
-# runs default to "no".
-$wantAutostart = $false
-switch -Regex ($Autostart) {
-    '^(?i)(yes|y)$' { $wantAutostart = $true }
-    '^(?i)(no|n)$'  { $wantAutostart = $false }
-    default {
-        if ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
-            $reply = Read-Host "Start Topic Watch automatically on login (Startup-folder shortcut)? [y/N]"
-            if ($reply -match '^(?i)(yes|y)$') { $wantAutostart = $true }
-        } else {
-            Write-Warn "Skipping login autostart (non-interactive). Set TOPIC_WATCH_AUTOSTART=yes to enable it."
-        }
-    }
-}
-
+# persistence, so it is never installed silently: $wantAutostart was decided by
+# the question above, or by TOPIC_WATCH_AUTOSTART, and defaults to false when
+# there is no console.
 $StartupDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup"
 $StartupShortcut = Join-Path $StartupDir "Topic Watch.lnk"
 if ($wantAutostart) {
@@ -164,6 +251,13 @@ Write-Info "Topic Watch is running!"
 Write-Host ""
 Write-Host "  Open http://localhost:$Port to complete setup."
 Write-Host "  Data stored in: $(Join-Path $InstallDir 'data')"
+if ($BindAddr -eq "127.0.0.1") {
+    Write-Host "  Reachable from: this computer only"
+    Write-Host "    To allow other devices, set TOPIC_WATCH_BIND_ADDR=0.0.0.0 in"
+    Write-Host "    $EnvFile and run: docker compose up -d"
+} else {
+    Write-Host "  Reachable from: any device on your network (no login required)"
+}
 Write-Host ""
 Write-Host "  Manage with:"
 Write-Host "    cd `"$InstallDir`"; docker compose logs      # View logs"
