@@ -5,6 +5,8 @@ Per-topic JSON/CSV and the bulk topics-JSON export live in ``exports.py``
 """
 
 import sqlite3
+from typing import TYPE_CHECKING
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import RedirectResponse, StreamingResponse
@@ -15,7 +17,30 @@ from app.models import FeedMode, Topic, TopicStatus
 from app.web.csrf import verify_csrf
 from app.web.dependencies import get_db_conn, get_settings
 
+if TYPE_CHECKING:
+    from app.opml import OPMLResult
+
 router = APIRouter()
+
+
+def _import_failure_message(result: "OPMLResult") -> str:
+    """Describe a failed import from its counts alone.
+
+    Validation warnings quote the rejected feed URL verbatim, and that URL can
+    carry userinfo or a signed query token. Copying one into the Location header
+    put it in browser history, in synced history and in any access log along the
+    way (AUG-206), so the message is rebuilt from the structured counts instead.
+    """
+    reasons = []
+    if result.skipped_invalid:
+        reasons.append(f"{result.skipped_invalid} feed URL(s) rejected")
+    if result.skipped_dupes:
+        reasons.append(f"{result.skipped_dupes} duplicate feed(s)")
+    if result.skipped_name_dupes:
+        reasons.append(f"{result.skipped_name_dupes} name collision(s)")
+    if not reasons:
+        return "No topics imported: the file contained no usable feeds."
+    return "No topics imported: " + ", ".join(reasons) + "."
 
 
 @router.get("/export/opml")
@@ -45,7 +70,10 @@ async def import_opml_handler(
     """Import topics from an OPML file."""
     import asyncio
 
-    from fastapi import UploadFile
+    # Starlette's class, not fastapi.UploadFile: request.form() always yields the
+    # former, and fastapi.UploadFile is a subclass — so an isinstance check against
+    # the FastAPI one rejects every real upload as "no file selected".
+    from starlette.datastructures import UploadFile
 
     from app.crud import create_topic, get_all_feed_urls, get_all_topic_names
     from app.opml import parse_opml
@@ -73,8 +101,7 @@ async def import_opml_handler(
     result = await asyncio.to_thread(parse_opml, content, existing_urls, existing_names)
 
     if result.warnings and not result.topics:
-        warning_msg = result.warnings[0][:200]
-        return RedirectResponse(url=f"/?error={warning_msg}", status_code=303)
+        return RedirectResponse(url=f"/?error={quote(_import_failure_message(result))}", status_code=303)
 
     # Create topics with NEW status (collisions already filtered by parse_opml).
     created = 0

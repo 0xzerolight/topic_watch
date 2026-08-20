@@ -97,9 +97,10 @@
     /**
      * Show a non-blocking error toast at the corner of the page.
      * @param {string} message
-     * @param {function} [onRetry] - optional callback wired to a "Retry" button
+     * @param {function} [onRetry] - optional callback wired to an action button
+     * @param {string} [actionLabel] - button text, defaults to "Retry"
      */
-    function toast(message, onRetry) {
+    function toast(message, onRetry, actionLabel) {
         var container = toastContainer();
         var el = document.createElement("div");
         el.className = "tw-toast";
@@ -121,7 +122,7 @@
             var retry = document.createElement("button");
             retry.type = "button";
             retry.className = "tw-toast-retry";
-            retry.textContent = "Retry";
+            retry.textContent = actionLabel || "Retry";
             retry.addEventListener("click", function () {
                 dismiss();
                 onRetry();
@@ -146,11 +147,26 @@
     // all; without a listener they fail silently. One global handler covers every
     // partial action: surface a non-blocking toast with the status and a retry.
 
+    // AUG-218: only GET/HEAD may be replayed. A POST that failed after the server
+    // committed it, or whose response was lost, has an unknown outcome — re-issuing
+    // it can toggle a topic back, queue a second check, or fire another external
+    // send. Those failures get a Reload so the user can see the real state instead.
+    function isSafeVerb(verb) {
+        var v = (verb || "").toLowerCase();
+        return v === "get" || v === "head";
+    }
+
+    function requestVerb(evt) {
+        var cfg = evt && evt.detail ? evt.detail.requestConfig : null;
+        return cfg ? cfg.verb : null;
+    }
+
     function htmxRetry(evt) {
         var elt = evt && evt.detail ? evt.detail.elt : null;
-        if (elt && window.htmx && typeof window.htmx.trigger === "function") {
+        var path = evt && evt.detail && evt.detail.pathInfo ? evt.detail.pathInfo.requestPath : null;
+        if (elt && path && isSafeVerb(requestVerb(evt)) && window.htmx && typeof window.htmx.ajax === "function") {
             try {
-                window.htmx.ajax(evt.detail.requestConfig.verb, evt.detail.pathInfo.requestPath, { source: elt });
+                window.htmx.ajax(requestVerb(evt), path, { source: elt });
                 return;
             } catch (e) {
                 /* fall through to reload */
@@ -159,20 +175,28 @@
         window.location.reload();
     }
 
+    function surfaceHtmxError(evt, message) {
+        if (isSafeVerb(requestVerb(evt))) {
+            toast(message + " Please try again.", function () {
+                htmxRetry(evt);
+            });
+            return;
+        }
+        toast(message + " The change may or may not have been applied — reload to check.", function () {
+            window.location.reload();
+        }, "Reload");
+    }
+
     function wireHtmxErrorListeners() {
         // HTMX dispatches these events on the triggering element; they bubble to
         // document, so one document-level listener covers every partial action.
         document.addEventListener("htmx:responseError", function (evt) {
             var status = evt.detail && evt.detail.xhr ? evt.detail.xhr.status : "?";
-            toast("Request failed (HTTP " + status + "). Please try again.", function () {
-                htmxRetry(evt);
-            });
+            surfaceHtmxError(evt, "Request failed (HTTP " + status + ").");
         });
 
         document.addEventListener("htmx:sendError", function (evt) {
-            toast("Network error — could not reach the server.", function () {
-                htmxRetry(evt);
-            });
+            surfaceHtmxError(evt, "Network error — could not reach the server.");
         });
     }
 

@@ -14,6 +14,10 @@ import pytest
 # isolation or in an order that does not happen to leak a configured state.
 os.environ.setdefault("TOPIC_WATCH_LLM__MODEL", "openai/gpt-4o-mini")
 os.environ.setdefault("TOPIC_WATCH_LLM__API_KEY", "test-key-not-real")
+# Test clients address the app as "test"/"testserver", which the Host allowlist
+# (AUG-002) rejects. Disable the check for the module-global app; the allowlist's
+# own behavior is covered against purpose-built apps in tests/test_host_allowlist.py.
+os.environ.setdefault("TOPIC_WATCH_ALLOWED_HOSTS", "*")
 
 from app.database import get_connection, init_db
 from app.main import app

@@ -18,8 +18,10 @@ import asyncio
 import logging
 import os
 import platform
+import re
 import sqlite3
 import sys
+import unicodedata
 from collections import Counter
 from datetime import UTC, datetime
 from urllib.parse import urlparse
@@ -37,6 +39,66 @@ from app.logging_config import setup_logging
 from app.models import Topic, TopicStatus
 
 logger = logging.getLogger(__name__)
+
+# Width of the Name column in `list`.
+_NAME_COLUMN = 30
+
+# Characters a terminal acts on rather than draws: C0/C1 controls (line breaks,
+# ESC), the bidirectional formatting set, zero-width marks and the BOM. A topic
+# name arrives from an OPML file a third party wrote (app/opml.py keeps whatever
+# the attribute contained), so any of these can forge a row, reverse the visible
+# order of a line, or hide text outright (AUG-330).
+_TERMINAL_UNSAFE = re.compile(
+    "["
+    "\x00-\x1f\x7f-\x9f"  # C0 and C1 controls: line breaks, ESC, CSI
+    "؜"  # Arabic letter mark
+    "​-‏"  # zero-width space/joiners, LRM, RLM
+    "  "  # line and paragraph separators
+    "‪-‮"  # bidi embeddings and overrides
+    "⁠-⁤"  # word joiner and invisible operators
+    "⁦-⁩"  # bidi isolates
+    "﻿"  # BOM / zero-width no-break space
+    "]"
+)
+
+
+def display_width(text: str) -> int:
+    """Columns ``text`` occupies in a monospaced terminal.
+
+    East Asian wide and fullwidth characters take two cells; combining marks
+    take none. Without this a CJK name silently doubles its column and shears
+    the table.
+    """
+    width = 0
+    for char in text:
+        if unicodedata.combining(char):
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+    return width
+
+
+def terminal_safe(text: str, *, width: int | None) -> str:
+    """Render untrusted text as a single, bounded, literally-displayed line.
+
+    Control and directional-formatting characters become visible ``\\uXXXX``
+    escapes; ordinary Unicode (accents, CJK, emoji) is left alone. When ``width``
+    is given the result is truncated to that many terminal columns.
+    """
+    cleaned = _TERMINAL_UNSAFE.sub(lambda match: f"\\u{ord(match.group()):04x}", text)
+    if width is None or display_width(cleaned) <= width:
+        return cleaned
+
+    kept: list[str] = []
+    used = 0
+    for char in cleaned:
+        char_width = (
+            0 if unicodedata.combining(char) else (2 if unicodedata.east_asian_width(char) in ("W", "F") else 1)
+        )
+        if used + char_width > width - 1:
+            break
+        kept.append(char)
+        used += char_width
+    return "".join(kept) + "…"
 
 
 async def _cmd_check(topic_name: str) -> None:
@@ -56,7 +118,7 @@ async def _cmd_check(topic_name: str) -> None:
     # phase (AUG-136).
     result = await check_topic(topic, settings)
 
-    print(f"Check complete for '{topic_name}':")
+    print(f"Check complete for '{terminal_safe(topic_name, width=None)}':")
     print(f"  Articles found: {result.articles_found}")
     print(f"  New info: {result.has_new_info}")
     print(f"  Notification sent: {result.notification_sent}")
@@ -103,9 +165,9 @@ async def _cmd_init(topic_name: str) -> None:
 
     assert topic.id is not None
     if topic.status == TopicStatus.READY:
-        print(f"Re-initializing knowledge for '{topic_name}'...")
+        print(f"Re-initializing knowledge for '{terminal_safe(topic_name, width=None)}'...")
     else:
-        print(f"Initializing knowledge for '{topic_name}'...")
+        print(f"Initializing knowledge for '{terminal_safe(topic_name, width=None)}'...")
 
     # Claim the topic before the long fetch+LLM work so the scheduler's gradual
     # init (and a second CLI init) are excluded by the same RESEARCHING status
@@ -202,7 +264,7 @@ async def _run_init(topic: Topic, topic_name: str, settings: Settings) -> bool:
     topic.status = TopicStatus.READY
     topic.error_message = None
     print(f"  Knowledge state built ({plan.token_count} tokens)")
-    print(f"  Topic '{topic_name}' is now READY")
+    print(f"  Topic '{terminal_safe(topic_name, width=None)}' is now READY")
     return False
 
 
@@ -373,7 +435,9 @@ def _cmd_list() -> None:
             interval = format_interval(topic.check_interval_minutes)
         else:
             interval = "default"
-        print(f"{topic.name:<30} {topic.status.value:<15} {active:<8} {interval:<10}")
+        name = terminal_safe(topic.name, width=_NAME_COLUMN)
+        padding = " " * (_NAME_COLUMN - display_width(name))
+        print(f"{name}{padding} {topic.status.value:<15} {active:<8} {interval:<10}")
 
 
 def main() -> None:

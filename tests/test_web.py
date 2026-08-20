@@ -18,7 +18,7 @@ from app.crud import (
     create_knowledge_state,
     create_topic,
 )
-from app.main import app
+from app.main import REQUEST_ID_PATTERN, app
 from app.models import (
     CheckResult,
     FeedMode,
@@ -119,6 +119,37 @@ class TestRequestId:
         """A client-supplied X-Request-ID is preserved and echoed back."""
         response = await client.get("/", headers={"X-Request-ID": "client-supplied-123"})
         assert response.headers.get("X-Request-ID") == "client-supplied-123"
+
+    async def test_oversized_inbound_id_is_replaced(self, client: httpx.AsyncClient) -> None:
+        """AUG-331: an unbounded client id is neither trusted nor echoed."""
+        oversized = "a" * 4096
+        response = await client.get("/", headers={"X-Request-ID": oversized})
+        echoed = response.headers["X-Request-ID"]
+        assert echoed != oversized
+        assert len(echoed) <= 128
+
+    @pytest.mark.parametrize("hostile", ["with space", "tab\there", "semi;colon", 'quote"here', ""])
+    async def test_ids_outside_the_grammar_are_replaced(self, client: httpx.AsyncClient, hostile: str) -> None:
+        response = await client.get("/", headers={"X-Request-ID": hostile})
+        assert response.headers["X-Request-ID"] != hostile
+
+    @pytest.mark.parametrize("hostile", [b"\x9bcsi-here", b"\xc2\xadsoft-hyphen", b"\x7fdel"])
+    async def test_non_ascii_bytes_are_replaced(self, client: httpx.AsyncClient, hostile: bytes) -> None:
+        """Bytes the plain formatter would emit raw never become the correlation id."""
+        response = await client.get("/", headers={"X-Request-ID": hostile})
+        echoed = response.headers["X-Request-ID"]
+        assert echoed != hostile.decode("latin-1")
+        assert REQUEST_ID_PATTERN.match(echoed)
+
+    async def test_max_length_id_is_still_accepted(self, client: httpx.AsyncClient) -> None:
+        at_limit = "b" * 128
+        response = await client.get("/", headers={"X-Request-ID": at_limit})
+        assert response.headers["X-Request-ID"] == at_limit
+
+    @pytest.mark.parametrize("proxy_id", ["9c1b2f4e8a", "trace-1-5759e988-bd862e3f", "req.42_ok"])
+    async def test_ordinary_proxy_ids_are_preserved(self, client: httpx.AsyncClient, proxy_id: str) -> None:
+        response = await client.get("/", headers={"X-Request-ID": proxy_id})
+        assert response.headers["X-Request-ID"] == proxy_id
 
     async def test_request_id_set_in_context_during_request(self) -> None:
         """While a request is in flight, request_id_var (and thus logs) carries the inbound id."""
@@ -259,6 +290,78 @@ class TestDashboard:
         assert 'id="opml_file"' in response.text
         assert 'aria-describedby="opml-file-hint"' in response.text
         assert 'id="opml-file-hint"' in response.text
+
+
+class TestOpmlImportErrorRedirect:
+    """AUG-206: a rejected feed URL must not travel in the redirect Location."""
+
+    _OPML_WITH_SECRET_FEED = (
+        '<?xml version="1.0"?><opml version="2.0"><body>'
+        '<outline text="Leaky" type="rss" xmlUrl="https://user:s3cr3t@feeds.example.com/x?token=abc123"/>'
+        "</body></opml>"
+    )
+
+    async def test_a_valid_upload_is_actually_read(self, client: httpx.AsyncClient) -> None:
+        """The uploaded file reaches parse_opml instead of being read as absent.
+
+        request.form() yields starlette.datastructures.UploadFile; the route used
+        to isinstance-check against fastapi.UploadFile, a subclass, so every real
+        upload fell through to "No file selected".
+        """
+        from urllib.parse import unquote
+
+        from app.opml import OPMLResult
+
+        parsed = OPMLResult()
+        parsed.topics.append({"name": "Imported", "feed_urls": ["https://feeds.example.com/ok"], "tags": []})
+
+        with patch("app.opml.parse_opml", return_value=parsed) as mock_parse:
+            response = await client.post(
+                "/import/opml",
+                files={"opml_file": ("feeds.opml", self._OPML_WITH_SECRET_FEED, "text/xml")},
+                follow_redirects=False,
+            )
+
+        assert mock_parse.call_count == 1
+        assert "Imported 1 topic(s)" in unquote(response.headers["location"])
+
+    async def test_rejected_url_never_reaches_the_location_header(self, client: httpx.AsyncClient) -> None:
+        from app.opml import OPMLResult
+
+        rejected = OPMLResult()
+        rejected.skipped_invalid = 1
+        rejected.warnings.append("Invalid feed URL: https://user:s3cr3t@feeds.example.com/x?token=abc123 (blocked)")
+
+        with patch("app.opml.parse_opml", return_value=rejected):
+            response = await client.post(
+                "/import/opml",
+                files={"opml_file": ("feeds.opml", self._OPML_WITH_SECRET_FEED, "text/xml")},
+                follow_redirects=False,
+            )
+
+        assert response.status_code == 303
+        location = response.headers["location"]
+        assert "s3cr3t" not in location
+        assert "token=abc123" not in location
+        assert "feeds.example.com" not in location
+
+    async def test_redirect_still_says_how_many_were_rejected(self, client: httpx.AsyncClient) -> None:
+        from urllib.parse import unquote
+
+        from app.opml import OPMLResult
+
+        rejected = OPMLResult()
+        rejected.skipped_invalid = 2
+        rejected.warnings.append("Invalid feed URL: https://feeds.example.com/x (blocked)")
+
+        with patch("app.opml.parse_opml", return_value=rejected):
+            response = await client.post(
+                "/import/opml",
+                files={"opml_file": ("feeds.opml", self._OPML_WITH_SECRET_FEED, "text/xml")},
+                follow_redirects=False,
+            )
+
+        assert "2 feed URL(s) rejected" in unquote(response.headers["location"])
 
 
 class TestDashboardStatsFreshness:
@@ -1352,6 +1455,20 @@ class TestHtmxErrorSurfacing:
         # Surfaces a toast and offers a retry affordance.
         assert "toast" in js.lower()
         assert "retry" in js.lower()
+
+    def test_retry_replays_only_safe_verbs(self) -> None:
+        """AUG-218: a failed POST is never re-issued — its outcome is unknown."""
+        from pathlib import Path
+
+        js = (Path(__file__).resolve().parent.parent / "app" / "static" / "notifications.js").read_text()
+        # The retry path decides on the verb before touching htmx.ajax.
+        ajax_idx = js.find("window.htmx.ajax(")
+        assert ajax_idx != -1
+        guard = js[:ajax_idx]
+        assert "isSafeVerb" in guard
+        # Unsafe failures offer a reload to verify state instead.
+        assert "Reload" in js
+        assert "may or may not" in js
 
 
 # --- Browser-notification robustness (OVH-117 / OVH-118 / OVH-119) ---

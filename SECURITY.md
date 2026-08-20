@@ -33,6 +33,7 @@ When deploying Topic Watch on a public network:
 
 - **TLS is required.** Terminate TLS at your reverse proxy (Caddy, Nginx, Traefik) before forwarding to Topic Watch. Without TLS, CSRF tokens and session cookies are transmitted in plaintext.
 - **Enable secure cookies.** Set `TOPIC_WATCH_SECURE_COOKIES=true` (or `secure_cookies: true` in `data/config.yml`) so cookies are only sent over HTTPS connections.
+- **Declare your hostname.** Topic Watch answers only to `localhost`, `*.localhost`, `*.local` and IP addresses; anything else gets a 400. That stops a hostile site from re-pointing its own domain at this machine and driving the console from your browser. When a reverse proxy forwards a hostname, list it: `TOPIC_WATCH_ALLOWED_HOSTS=topic-watch.example.com` (comma-separated for several; `*.example.com` covers the subdomains and the apex; `*` turns the check off).
 - **Restrict network access.** Both compose files publish the port on `127.0.0.1` by default, so a stock install is reachable only from the host. To reach it from other devices, set `TOPIC_WATCH_BIND_ADDR=0.0.0.0` in `.env` — and put an authenticating reverse proxy in front before you do. Do not expose port 8000 directly to the internet.
 
   Note that this is not something a host firewall will save you from: Docker inserts its own iptables rules ahead of the ones `ufw` and `firewalld` manage, so a published port stays reachable even when the firewall is configured to deny incoming traffic. The bind address is the control that actually applies.

@@ -763,3 +763,58 @@ class TestCmdList:
         assert "ready" in captured.out
         assert "Topic Beta" in captured.out
         assert "error" in captured.out
+
+
+class TestTerminalSafeRendering:
+    """AUG-330: an imported name cannot forge or reorder CLI rows."""
+
+    @pytest.fixture(autouse=True)
+    def _use_cli_db(self, cli_db):
+        return cli_db
+
+    def test_line_controls_become_visible_escapes(self) -> None:
+        from app.cli import terminal_safe
+
+        rendered = terminal_safe("Real\nFAKE ready yes", width=None)
+        assert "\n" not in rendered
+        assert "\\u000a" in rendered
+
+    def test_bidi_override_is_escaped(self) -> None:
+        from app.cli import terminal_safe
+
+        rendered = terminal_safe("news‮gnp.exe", width=None)
+        assert "‮" not in rendered
+        assert "\\u202e" in rendered
+
+    def test_ordinary_unicode_names_survive(self) -> None:
+        from app.cli import terminal_safe
+
+        assert terminal_safe("Ökonomie – Übersicht", width=None) == "Ökonomie – Übersicht"
+        assert terminal_safe("日本の経済", width=None) == "日本の経済"
+
+    def test_long_name_is_truncated_to_the_column(self) -> None:
+        from app.cli import display_width, terminal_safe
+
+        rendered = terminal_safe("x" * 200, width=30)
+        assert display_width(rendered) == 30
+
+    def test_wide_characters_count_double(self) -> None:
+        from app.cli import display_width, terminal_safe
+
+        assert display_width("日本") == 4
+        assert display_width(terminal_safe("日" * 40, width=30)) <= 30
+
+    def test_list_escapes_a_forged_row(self, db_conn: sqlite3.Connection, capsys) -> None:
+        create_topic(
+            db_conn,
+            Topic(name="Innocent\nForged         ready           yes", description="d", status=TopicStatus.READY),
+        )
+        db_conn.commit()
+
+        with patch("app.cli.init_db"):
+            _cmd_list()
+
+        captured = capsys.readouterr()
+        # Header, separator and exactly one topic row.
+        assert len([line for line in captured.out.splitlines() if line.strip()]) == 3
+        assert "\\u000a" in captured.out

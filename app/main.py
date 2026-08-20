@@ -6,6 +6,7 @@ Run with: uvicorn app.main:app
 """
 
 import logging
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -26,6 +27,7 @@ from app.logging_config import setup_logging
 from app.scheduler import start_scheduler, stop_scheduler
 from app.web.api import router as api_router
 from app.web.csrf import CSRFMiddleware
+from app.web.host_allowlist import HostAllowlistMiddleware
 from app.web.routers import router
 from app.web.routers.templates import templates
 from app.web.setup_middleware import SetupRedirectMiddleware
@@ -34,18 +36,28 @@ logger = logging.getLogger(__name__)
 
 REQUEST_ID_HEADER = "X-Request-ID"
 
+# A correlation id is copied into log lines and echoed back, so it needs a shape.
+# Without one, tabs, C1 bytes and soft hyphens make log fields visually ambiguous
+# and an arbitrarily long value is amplified into every record (AUG-331). The
+# grammar covers what real proxies emit: nginx $request_id, Cloudflare Ray IDs,
+# X-Ray trace ids, UUIDs.
+REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
 
 class RequestIdMiddleware(BaseHTTPMiddleware):
     """Correlate each inbound request with an id surfaced to logs and echoed back.
 
-    Reads the inbound ``X-Request-ID`` header if present (so an upstream proxy's
-    trace id is preserved), otherwise generates one. Sets ``request_id_var`` for
-    the request scope (the logging filter surfaces it as ``check_id``) and echoes
-    the id back in the response header (OVH-043).
+    Reads the inbound ``X-Request-ID`` header when it matches
+    :data:`REQUEST_ID_PATTERN` (so an upstream proxy's trace id is preserved),
+    otherwise generates one — an id outside the grammar is replaced rather than
+    reflected. Sets ``request_id_var`` for the request scope (the logging filter
+    surfaces it as ``check_id``) and echoes the id back in the response header
+    (OVH-043).
     """
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-        request_id = request.headers.get(REQUEST_ID_HEADER) or generate_check_id()
+        inbound = request.headers.get(REQUEST_ID_HEADER, "")
+        request_id = inbound if REQUEST_ID_PATTERN.match(inbound) else generate_check_id()
         token = request_id_var.set(request_id)
         try:
             response = await call_next(request)
@@ -84,6 +96,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Topic Watch", version=_app_version, lifespan=lifespan)
 app.add_middleware(CSRFMiddleware)
 app.add_middleware(SetupRedirectMiddleware)
+# Host check runs before routing, setup redirects and CSRF issuance, so a rebound
+# attacker domain never receives a CSRF token or a redirect (AUG-002).
+app.add_middleware(HostAllowlistMiddleware)
 # Added last so it wraps everything: the correlation id is set before any other
 # middleware/handler runs and is available to all of their log lines.
 app.add_middleware(RequestIdMiddleware)

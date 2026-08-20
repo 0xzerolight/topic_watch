@@ -1,6 +1,7 @@
 """Setup wizard, settings editor, and notification-test routes."""
 
 import logging
+import re
 
 import litellm
 from fastapi import APIRouter, Depends, Form, Request
@@ -19,7 +20,7 @@ from app.notifications import send_notification
 from app.web.csrf import verify_csrf
 from app.web.dependencies import get_settings
 from app.web.routers._validation import format_validation_errors, normalize_base_url
-from app.web.routers.templates import templates
+from app.web.routers.templates import _mask_url, templates
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,9 @@ router = APIRouter()
 
 # Seconds to wait for the pre-flight credential ping before giving up.
 _PREFLIGHT_TIMEOUT = 15.0
+
+# A masked delivery target the settings page rendered: "scheme://**** [3]".
+_MASKED_TARGET = re.compile(r"^(?P<mask>\S+) \[(?P<index>\d+)\]$")
 
 # Scalar Settings fields the settings form edits 1:1 (name on form == name on model).
 # Nested (llm/notifications), checkbox (secure_cookies) and infra-only (db_path) fields
@@ -71,6 +75,55 @@ def _interval_preview(raw: str) -> str | None:
         return None
 
 
+def _render(request: Request, template: str, ctx: dict, status_code: int = 200) -> HTMLResponse:
+    """Render a setup/settings page with ``Cache-Control: no-store``.
+
+    These pages carry key hints and delivery targets, so they must not survive in
+    a disk cache, a back-forward restore or a saved-page capture (AUG-017).
+    """
+    response = templates.TemplateResponse(request, template, ctx, status_code=status_code)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def mask_targets(urls: list[str]) -> list[str]:
+    """Render saved delivery URLs as numbered masked placeholders.
+
+    Apprise and webhook URLs routinely carry a token in the userinfo or the path,
+    and the settings page put them on screen verbatim (AUG-127). Each entry
+    becomes ``scheme://**** [n]``; the index is what lets a placeholder the user
+    left alone be resolved back to the URL it stands for on save.
+    """
+    return [f"{_mask_url(url)} [{index}]" for index, url in enumerate(urls, start=1)]
+
+
+def restore_masked_targets(submitted: list[str], stored: list[str], *, field: str) -> list[str]:
+    """Turn masked placeholders back into the URLs they stand for.
+
+    A line the user left untouched resolves to its stored URL; a line they
+    deleted is gone; anything else is taken as typed.
+
+    Raises ``ValueError`` when a line looks like a placeholder but resolves to
+    nothing — never resolve it to a different entry, and never store the
+    placeholder text itself, which would look like a normal masked line on the
+    next page load while quietly being an unusable delivery target.
+    """
+    restored: list[str] = []
+    for line in submitted:
+        match = _MASKED_TARGET.match(line)
+        if match:
+            index = int(match.group("index")) - 1
+            if 0 <= index < len(stored) and match.group("mask") == _mask_url(stored[index]):
+                restored.append(stored[index])
+                continue
+            raise ValueError(
+                f"{field}: '{line}' does not match a saved URL. Delete the line to remove that "
+                "target, or type the full URL to replace it."
+            )
+        restored.append(line)
+    return restored
+
+
 def _settings_template_ctx(request: Request, **extra: object) -> dict:
     """Shared template context for the settings page (provider lists + env-key state)."""
     ctx: dict = {
@@ -91,6 +144,10 @@ def _settings_template_ctx(request: Request, **extra: object) -> dict:
     else:
         raw_interval = ""
     ctx["interval_preview"] = _interval_preview(raw_interval)
+    if settings is not None:
+        notifications = getattr(settings, "notifications", None)
+        ctx["masked_notification_urls"] = mask_targets(getattr(notifications, "urls", []) or [])
+        ctx["masked_webhook_urls"] = mask_targets(getattr(notifications, "webhook_urls", []) or [])
     ctx.update(extra)
     return ctx
 
@@ -153,7 +210,7 @@ async def setup_view(request: Request):
     if not getattr(request.app.state, "setup_required", False):
         return RedirectResponse(url="/", status_code=303)
     _provider_ctx = {"cloud_providers": sorted(CLOUD_PROVIDERS), "local_provider_defaults": LOCAL_PROVIDER_DEFAULTS}
-    return templates.TemplateResponse(
+    return _render(
         request,
         "setup.html",
         {"setup_mode": True, **_provider_ctx},
@@ -184,9 +241,11 @@ async def complete_setup(
     # persist. base_url is honored for every provider (OVH-104 reversal); OVH-153.
     effective_base_url = normalize_base_url(llm_base_url)
 
+    # The key is deliberately absent: every use of this dict is an error re-render,
+    # and a submitted secret must not be written back into the page (AUG-017).
     form_values = {
         "llm_model": llm_model,
-        "llm_api_key": llm_api_key,
+        "llm_api_key": "",
         "llm_base_url": llm_base_url,
     }
     _provider_ctx = {"cloud_providers": sorted(CLOUD_PROVIDERS), "local_provider_defaults": LOCAL_PROVIDER_DEFAULTS}
@@ -219,14 +278,14 @@ async def complete_setup(
         # Wire the app so scheduler jobs read live settings from app.state (OVH-015/036).
         start_scheduler(new_settings, db_path=request.app.state.db_path, app=request.app)
     except LLMValidationError as exc:
-        return templates.TemplateResponse(
+        return _render(
             request,
             "setup.html",
             {"setup_mode": True, "errors": [str(exc)], "form": form_values, **_provider_ctx},
             status_code=422,
         )
     except ValidationError as exc:
-        return templates.TemplateResponse(
+        return _render(
             request,
             "setup.html",
             {"setup_mode": True, "errors": format_validation_errors(exc), "form": form_values, **_provider_ctx},
@@ -234,7 +293,7 @@ async def complete_setup(
         )
     except Exception as exc:
         logger.exception("Setup failed: %s", exc)
-        return templates.TemplateResponse(
+        return _render(
             request,
             "setup.html",
             {"setup_mode": True, "errors": [f"Setup failed: {exc}"], "form": form_values, **_provider_ctx},
@@ -249,7 +308,7 @@ async def complete_setup(
 async def settings_view(request: Request):
     """Display of current configuration as an editable form."""
     settings = load_settings(config_path=request.app.state.config_path)
-    return templates.TemplateResponse(
+    return _render(
         request,
         "settings.html",
         _settings_template_ctx(request, settings=settings),
@@ -285,21 +344,49 @@ async def update_settings(request: Request):
     exa_api_key = _get("exa_api_key")
 
     # form_values drives the 422 re-render; build it from the parsed form (single source).
+    # The two key fields are blanked: they are password inputs the user cannot read
+    # back, so echoing a submitted secret leaves it in the page source, the browser's
+    # form cache and any saved-page capture for no benefit (AUG-017). Both fields
+    # already mean "leave blank to keep the current key", so re-entry is the norm.
     form_values: dict = {
         "llm_model": llm_model,
-        "llm_api_key": llm_api_key,
+        "llm_api_key": "",
         "llm_base_url": llm_base_url,
         "notification_urls": notification_urls,
         "webhook_urls": webhook_urls,
         "secure_cookies": secure_cookies,
         "enable_exa": enable_exa,
-        "exa_api_key": exa_api_key,
+        "exa_api_key": "",
     }
     for field in _SCALAR_FORM_FIELDS:
         form_values[field] = _get(field)
 
-    parsed_notification_urls = [u.strip() for u in notification_urls.splitlines() if u.strip()]
-    parsed_webhook_urls = [u.strip() for u in webhook_urls.splitlines() if u.strip()]
+    # Saved targets reach the form as masked placeholders (AUG-127); resolve the ones
+    # the user left untouched back to the URLs they stand for.
+    current_notifications = request.app.state.settings.notifications
+    try:
+        parsed_notification_urls = restore_masked_targets(
+            [u.strip() for u in notification_urls.splitlines() if u.strip()],
+            current_notifications.urls,
+            field="notification_urls",
+        )
+        parsed_webhook_urls = restore_masked_targets(
+            [u.strip() for u in webhook_urls.splitlines() if u.strip()],
+            current_notifications.webhook_urls,
+            field="webhook_urls",
+        )
+    except ValueError as exc:
+        return _render(
+            request,
+            "settings.html",
+            _settings_template_ctx(
+                request,
+                settings=request.app.state.settings,
+                errors=[str(exc)],
+                form=form_values,
+            ),
+            status_code=422,
+        )
 
     # API key special-case: a blank field retains the current key (OVH-081). When the key
     # is env-sourced we must not persist the env secret to plaintext YAML (OVH-003), so the
@@ -321,7 +408,7 @@ async def update_settings(request: Request):
     # llm_model is required; an empty value has no Pydantic constraint to trip, so guard it
     # explicitly to keep the previous "blank model → 422" behavior (preserved across OVH-069).
     if not llm_model.strip():
-        return templates.TemplateResponse(
+        return _render(
             request,
             "settings.html",
             _settings_template_ctx(
@@ -362,7 +449,7 @@ async def update_settings(request: Request):
         )
         request.app.state.settings = new_settings
     except ValidationError as exc:
-        return templates.TemplateResponse(
+        return _render(
             request,
             "settings.html",
             _settings_template_ctx(
@@ -375,7 +462,7 @@ async def update_settings(request: Request):
         )
     except Exception as exc:
         logger.exception("Failed to save settings: %s", exc)
-        return templates.TemplateResponse(
+        return _render(
             request,
             "settings.html",
             _settings_template_ctx(
