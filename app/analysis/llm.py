@@ -21,6 +21,7 @@ from instructor.core import InstructorRetryException
 from instructor.core import ResponseParsingError as InstructorResponseParsingError
 from pydantic import BaseModel, Field
 from pydantic import ValidationError as PydanticValidationError
+from pydantic.json_schema import SkipJsonSchema
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt
 
 from app.analysis.citations import strip_index_citations, strip_reliability_notes
@@ -96,6 +97,22 @@ def _extract_usage(completion: Any) -> TokenUsage:
 
 
 # --- Response models (structured output) ---
+
+
+# Which of the input articles the request actually carried. Populated AFTER the
+# call, like the token counts, never by the model: ``_fit_article_prompt`` drops
+# trailing articles to fit the context window — on a small-context model that
+# fires on every call — and a caller that assumes its whole input was read marks
+# articles processed the model never saw. Nothing re-offers those, so they are
+# lost (TW-AUD-016).
+#
+# ``SkipJsonSchema`` keeps it out of the structured-output schema the provider is
+# shown, so the live contract and its ``required`` list are unchanged; ``exclude``
+# keeps it out of the stored ``llm_response`` blob, so re-parsing an old or new
+# blob behaves identically. ``None`` means "not reported" and callers read that as
+# "the whole input was used" (``knowledge.reported_article_ids``) — the behaviour
+# from before the signal existed.
+AnalyzedArticleIds = SkipJsonSchema[list[int] | None]
 
 
 class NoveltyResponse(BaseModel):
@@ -176,6 +193,9 @@ class NoveltyResult(BaseModel):
     importance: int = Field(ge=1, le=5, default=3)
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # See ``AnalyzedArticleIds``. Left None on the fail-safe error path, where the
+    # caller treats the whole batch as unfinished anyway.
+    analyzed_article_ids: AnalyzedArticleIds = Field(default=None, exclude=True)
     # Set ONLY on the fail-safe error path (LLM call failed). Lets the caller
     # distinguish a genuine analysis failure from a clean "nothing new" result
     # without making analyze_articles raise (settled decision #3). None on
@@ -235,6 +255,9 @@ class KnowledgeStateUpdate(BaseModel):
     token_count: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # See ``AnalyzedArticleIds``. Only the init path carries articles, so only
+    # ``generate_initial_knowledge`` populates it; the update path leaves it None.
+    analyzed_article_ids: AnalyzedArticleIds = Field(default=None, exclude=True)
 
 
 class CompressedKnowledge(BaseModel):
@@ -651,18 +674,23 @@ def _fit_article_prompt(
     knowledge_summary: str,
     settings: Settings,
     topic_name: str,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[Article]]:
     """Assemble an article-bearing request that fits the model's context window.
 
     Degrades in the order that costs the least information: shrink article bodies,
     then drop trailing (oldest-scored) articles, then trim the knowledge state that
     is only being READ for comparison. Each step is logged, because a silently
     smaller prompt is a silently worse analysis.
+
+    Returns the messages AND the articles they actually carry. The drop is a fact
+    the caller needs, not a log line: an article the model never read must not be
+    marked processed, because the scraper deduplicates against stored hashes and
+    no feed will ever offer it again (TW-AUD-016).
     """
     budget = _input_token_budget(settings)
     messages = build(articles, _PROMPT_ARTICLE_MAX_CHARS, knowledge_summary)
     if budget is None or _count_messages(messages, settings.llm.model) <= budget:
-        return messages
+        return messages, list(articles)
 
     for cap in _ARTICLE_CHAR_LADDER[1:]:
         messages = build(articles, cap, knowledge_summary)
@@ -672,7 +700,7 @@ def _fit_article_prompt(
                 topic_name,
                 cap,
             )
-            return messages
+            return messages, list(articles)
 
     floor = _ARTICLE_CHAR_LADDER[-1]
     kept = list(articles)
@@ -686,7 +714,7 @@ def _fit_article_prompt(
                 len(kept),
                 len(articles),
             )
-            return messages
+            return messages, kept
 
     if knowledge_summary:
         # Last lever, and only available where the summary is an INPUT being
@@ -702,13 +730,13 @@ def _fit_article_prompt(
             len(trimmed),
             len(knowledge_summary),
         )
-        return messages
+        return messages, kept
 
     logger.warning(
         "Prompt for topic '%s' exceeds the model's input budget and cannot be trimmed further; sending anyway",
         topic_name,
     )
-    return messages
+    return messages, kept
 
 
 async def _call_with_transport_retry(
@@ -935,22 +963,33 @@ async def analyze_articles(
     Returns a safe default (has_new_info=False) on any LLM error to prevent
     spurious notifications, with ``error`` set and the provider's own text kept on
     ``raw_response`` when there was one. On success, ``prompt_tokens`` /
-    ``completion_tokens`` are populated from the raw completion's usage, and
-    ``key_facts`` that merely restate the knowledge summary are dropped.
+    ``completion_tokens`` are populated from the raw completion's usage,
+    ``analyzed_article_ids`` reports the articles the request actually carried,
+    and ``key_facts`` that merely restate the knowledge summary are dropped.
     """
+    # Rebound by every prompt build; after a successful call it holds the subset
+    # the winning attempt sent. ``build_messages`` is invoked fresh per attempt and
+    # per mode hop, so reading it afterwards is what makes the answer match the
+    # request that was actually answered.
+    fitted: list[Article] = list(articles)
+
+    def _build_novelty_prompt() -> list[dict[str, Any]]:
+        nonlocal fitted
+        messages, fitted = _fit_article_prompt(
+            lambda arts, chars, summary: build_novelty_messages(arts, summary, topic, chars),
+            articles,
+            knowledge_summary,
+            settings,
+            topic.name,
+        )
+        return messages
 
     try:
         response, completion = await _call_with_transport_retry(
             lambda: _create_structured(
                 settings,
                 response_model=NoveltyResponse,
-                build_messages=lambda: _fit_article_prompt(
-                    lambda arts, chars, summary: build_novelty_messages(arts, summary, topic, chars),
-                    articles,
-                    knowledge_summary,
-                    settings,
-                    topic.name,
-                ),
+                build_messages=_build_novelty_prompt,
                 timeout=settings.llm_analysis_timeout,
             ),
             max_retries=settings.llm_max_retries,
@@ -971,6 +1010,7 @@ async def analyze_articles(
     usage = _extract_usage(completion)
     novelty.prompt_tokens = usage.prompt_tokens
     novelty.completion_tokens = usage.completion_tokens
+    novelty.analyzed_article_ids = [a.id for a in fitted if a.id is not None]
     # Sanitize BEFORE filtering restatements (AUG-168). A fact identical to known
     # knowledge except for its "(Article [1])" tail used to miss the overlap
     # threshold, survive the filter, and only then become an exact restatement —
@@ -1008,22 +1048,31 @@ async def generate_initial_knowledge(
 ) -> KnowledgeStateUpdate:
     """Generate an initial knowledge state from articles.
 
-    Raises on failure — knowledge initialization is critical.
+    Raises on failure — knowledge initialization is critical. On success,
+    ``analyzed_article_ids`` reports the articles the baseline was actually built
+    from, so the caller leaves an over-budget remainder for a later cycle.
     """
+    # See ``analyze_articles``: rebound per attempt, read after the winning call.
+    fitted: list[Article] = list(articles)
+
+    def _build_init_prompt() -> list[dict[str, Any]]:
+        nonlocal fitted
+        messages, fitted = _fit_article_prompt(
+            lambda arts, chars, _summary: build_knowledge_init_messages(
+                arts, topic, settings.knowledge_state_max_tokens, chars
+            ),
+            articles,
+            "",
+            settings,
+            topic.name,
+        )
+        return messages
 
     raw_result, completion = await _call_with_transport_retry(
         lambda: _create_structured(
             settings,
             response_model=KnowledgeStateUpdate,
-            build_messages=lambda: _fit_article_prompt(
-                lambda arts, chars, _summary: build_knowledge_init_messages(
-                    arts, topic, settings.knowledge_state_max_tokens, chars
-                ),
-                articles,
-                "",
-                settings,
-                topic.name,
-            ),
+            build_messages=_build_init_prompt,
             timeout=settings.llm_knowledge_timeout,
         ),
         max_retries=settings.llm_max_retries,
@@ -1038,6 +1087,7 @@ async def generate_initial_knowledge(
     usage = _extract_usage(completion)
     result.prompt_tokens = usage.prompt_tokens
     result.completion_tokens = usage.completion_tokens
+    result.analyzed_article_ids = [a.id for a in fitted if a.id is not None]
     return result
 
 

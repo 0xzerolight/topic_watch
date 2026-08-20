@@ -162,19 +162,37 @@ class TestMigration:
         m008_up(db_conn)  # Already applied; column exists; should be a no-op
         db_conn.commit()
 
-    def test_from_row_backwards_compat(self, db_conn: sqlite3.Connection) -> None:
-        """Topic.from_row converts check_interval_hours if minutes is NULL."""
-        # Insert with only hours set, minutes NULL
+    def test_from_row_backwards_compat(self) -> None:
+        """A row shape predating the minute column still converts from hours."""
+        row = {
+            "id": 1,
+            "name": "HoursOnly",
+            "description": "desc",
+            "feed_urls": "[]",
+            "feed_mode": "auto",
+            "created_at": datetime.now(UTC).isoformat(),
+            "is_active": 1,
+            "status": "ready",
+            "check_interval_hours": 3,
+        }
+        assert Topic.from_row(row).check_interval_minutes == 180  # 3h * 60
+
+    def test_cleared_minute_override_is_not_resurrected_from_hours(self, db_conn: sqlite3.Connection) -> None:
+        """AUG-145: NULL minutes means 'inherit the global interval', full stop.
+
+        m008 copied the legacy hours into minutes but left the old column
+        populated, so clearing the override later used to expose the stale value
+        again — and a later unrelated edit could write it back.
+        """
         db_conn.execute(
             """INSERT INTO topics (name, description, feed_urls, feed_mode, created_at,
                is_active, status, check_interval_hours, check_interval_minutes)
-               VALUES ('HoursOnly', 'desc', '[]', 'auto', datetime('now'), 1, 'ready', 3, NULL)"""
+               VALUES ('Cleared', 'desc', '[]', 'auto', datetime('now'), 1, 'ready', 3, NULL)"""
         )
         db_conn.commit()
 
-        row = db_conn.execute("SELECT * FROM topics WHERE name = 'HoursOnly'").fetchone()
-        topic = Topic.from_row(row)
-        assert topic.check_interval_minutes == 180  # 3h * 60
+        row = db_conn.execute("SELECT * FROM topics WHERE name = 'Cleared'").fetchone()
+        assert Topic.from_row(row).check_interval_minutes is None
 
 
 class TestGetTopicsDueForCheck:

@@ -860,7 +860,7 @@ class TestAggregateInputBudget:
         settings = _make_settings(llm=_SMALL_CONTEXT)
         articles = [_long_article(i) for i in range(40)]
 
-        messages = _fit_article_prompt(
+        messages, kept = _fit_article_prompt(
             lambda arts, chars, summary: _novelty_build(arts, chars, summary, topic),
             articles,
             "Known facts.",
@@ -871,13 +871,17 @@ class TestAggregateInputBudget:
         budget = _input_token_budget(settings)
         assert budget is not None
         assert llm_module._count_messages(messages, settings.llm.model) <= budget
+        # The trim is reported, not merely logged: these are the only articles the
+        # model actually read, and the caller marks the rest unfinished.
+        assert 0 < len(kept) < len(articles)
+        assert kept == articles[: len(kept)]
 
     def test_small_batch_is_untouched(self) -> None:
         topic = _make_topic()
         settings = _make_settings()
         articles = [_make_article(id=1, raw_content="x" * 900)]
 
-        fitted = _fit_article_prompt(
+        fitted, kept = _fit_article_prompt(
             lambda arts, chars, summary: _novelty_build(arts, chars, summary, topic),
             articles,
             "Known facts.",
@@ -889,13 +893,14 @@ class TestAggregateInputBudget:
         # per call, so the messages are compared by their variable part).
         assert "x" * 900 in fitted[1]["content"]
         assert "..." not in fitted[1]["content"]
+        assert kept == articles
 
     def test_articles_are_shrunk_before_any_are_dropped(self) -> None:
         topic = _make_topic()
         settings = _make_settings(llm=_SMALL_CONTEXT)
         articles = [_long_article(i, body_chars=3_000) for i in range(6)]
 
-        messages = _fit_article_prompt(
+        messages, kept = _fit_article_prompt(
             lambda arts, chars, summary: _novelty_build(arts, chars, summary, topic),
             articles,
             "",
@@ -907,6 +912,7 @@ class TestAggregateInputBudget:
         # Every article still present, just with shorter bodies.
         for i in range(6):
             assert f"https://example.com/{i}" in user
+        assert kept == articles
 
     def test_oversized_knowledge_state_is_trimmed_last(self) -> None:
         topic = _make_topic()
@@ -914,7 +920,7 @@ class TestAggregateInputBudget:
         articles = [_make_article(id=1, raw_content="body")]
         huge_summary = " ".join(f"fact{i}" for i in range(200_000))
 
-        messages = _fit_article_prompt(
+        messages, kept = _fit_article_prompt(
             lambda arts, chars, summary: _novelty_build(arts, chars, summary, topic),
             articles,
             huge_summary,
@@ -925,6 +931,8 @@ class TestAggregateInputBudget:
         budget = _input_token_budget(settings)
         assert budget is not None
         assert llm_module._count_messages(messages, settings.llm.model) <= budget
+        # Trimming the knowledge state costs no article: the one input stays read.
+        assert kept == articles
 
     async def test_analyze_articles_sends_a_fitting_request(self) -> None:
         """The gateway, not the caller, is where the whole request is bounded."""
@@ -966,3 +974,77 @@ class TestAggregateInputBudget:
         assert budget is not None
         assert llm_module._count_messages(captured["messages"], settings.llm.model) <= budget
         assert build_knowledge_init_messages  # imported builder is the one under test
+
+
+class TestAnalyzedSubsetIsReported:
+    """A prompt fitted by dropping articles has to say which ones survived.
+
+    The drop is what the caller needs to know about: an article the model never
+    read must not be marked processed, because nothing would ever offer it again.
+    """
+
+    @staticmethod
+    def _mock_client(result) -> MagicMock:
+        client = MagicMock()
+        client.chat.completions.create_with_completion = AsyncMock(
+            return_value=(result, MagicMock(usage=None)),
+        )
+        return client
+
+    async def test_analyze_articles_reports_the_analyzed_subset(self) -> None:
+        settings = _make_settings(llm=_SMALL_CONTEXT)
+        articles = [_long_article(i) for i in range(40)]
+        client = self._mock_client(
+            llm_module.NoveltyResponse(has_new_info=False, confidence=0.5, relevance=0.1, importance=1)
+        )
+
+        with patch("app.analysis.llm._get_client", return_value=client):
+            result = await analyze_articles(articles, "Known.", _make_topic(), settings)
+
+        assert result.analyzed_article_ids is not None
+        assert 0 < len(result.analyzed_article_ids) < len(articles)
+        assert result.analyzed_article_ids == [a.id for a in articles[: len(result.analyzed_article_ids)]]
+
+    async def test_analyze_articles_reports_every_article_when_nothing_is_dropped(self) -> None:
+        settings = _make_settings()
+        articles = [_make_article(id=7, raw_content="Short body.")]
+        client = self._mock_client(
+            llm_module.NoveltyResponse(has_new_info=False, confidence=0.5, relevance=0.1, importance=1)
+        )
+
+        with patch("app.analysis.llm._get_client", return_value=client):
+            result = await analyze_articles(articles, "Known.", _make_topic(), settings)
+
+        assert result.analyzed_article_ids == [7]
+
+    async def test_initial_knowledge_reports_the_analyzed_subset(self) -> None:
+        settings = _make_settings(llm=_SMALL_CONTEXT)
+        articles = [_long_article(i) for i in range(40)]
+        client = self._mock_client(
+            KnowledgeStateUpdate(sufficient_data=True, confidence=0.9, updated_summary="Summary.")
+        )
+
+        with patch("app.analysis.llm._get_client", return_value=client):
+            result = await generate_initial_knowledge(articles, _make_topic(), settings)
+
+        assert result.analyzed_article_ids is not None
+        assert 0 < len(result.analyzed_article_ids) < len(articles)
+
+    def test_the_subset_is_never_asked_of_the_provider(self) -> None:
+        """It is filled in after the call, like the token counts — not by the model."""
+        for model in (llm_module.NoveltyResponse, KnowledgeStateUpdate, NoveltyResult):
+            schema = model.model_json_schema()
+            assert "analyzed_article_ids" not in schema["properties"]
+            assert "analyzed_article_ids" not in schema.get("required", [])
+        assert sorted(llm_module.NoveltyResponse.model_json_schema()["required"]) == [
+            "confidence",
+            "has_new_info",
+            "importance",
+            "relevance",
+        ]
+
+    def test_the_subset_is_not_persisted_in_the_stored_blob(self) -> None:
+        """Stored ``llm_response`` blobs are re-parsed by the force-notify handler."""
+        stored = NoveltyResult(has_new_info=False, confidence=0.5, analyzed_article_ids=[1, 2]).model_dump_json()
+        assert "analyzed_article_ids" not in stored
+        assert NoveltyResult.model_validate_json(stored).analyzed_article_ids is None
