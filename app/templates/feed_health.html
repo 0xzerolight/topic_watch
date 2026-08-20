@@ -6,21 +6,19 @@
     <h1>Feed Health</h1>
 </div>
 
-{% if feeds %}
+{% if rows %}
 <table class="data-table">
     <thead>
         <tr>
-            <th>Status</th>
-            <th>Feed URL</th>
-            <th>Last Success</th>
-            <th>Last Error</th>
-            <th title="Consecutive Failures">Consec. Fail</th>
-            <th>Fetches</th>
-            <th title="Failure Rate">Fail %</th>
+            <th>Source</th>
+            <th>Used by</th>
+            <th>Health</th>
+            <th>Next retry</th>
+            <th>Repair</th>
         </tr>
     </thead>
     <tbody>
-        {% for feed in feeds %}
+        {% for row in rows %}
         {% include "_feed_health_row.html" %}
         {% endfor %}
     </tbody>
