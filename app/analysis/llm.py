@@ -19,7 +19,7 @@ from instructor import Mode
 from instructor.core import AsyncValidationError as InstructorAsyncValidationError
 from instructor.core import InstructorRetryException
 from instructor.core import ResponseParsingError as InstructorResponseParsingError
-from pydantic import BaseModel, Field, ValidationInfo, model_validator
+from pydantic import BaseModel, Field
 from pydantic import ValidationError as PydanticValidationError
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt
 
@@ -98,39 +98,26 @@ def _extract_usage(completion: Any) -> TokenUsage:
 # --- Response models (structured output) ---
 
 
-# Validation-context flag marking a decode as LIVE provider output rather than a
-# stored blob being re-read. The two have opposite needs — see NoveltyResult —
-# and the context is the seam that lets one class serve both.
-_LIVE_OUTPUT_CONTEXT = {"live_llm_output": True}
-_SCORE_FIELDS = ("relevance", "importance")
+class NoveltyResponse(BaseModel):
+    """The LIVE provider contract for novelty detection — what the model must send.
 
+    Separate from ``NoveltyResult`` (the internal/persisted shape) because the two
+    have opposite needs. Here ``relevance`` and ``importance`` carry NO default, so
+    they land in the JSON schema's ``required`` list and the provider is asked for
+    them up front. ``NoveltyResult``'s defaults are load-bearing downstream —
+    ``relevance=0.0`` is below every usable threshold and ``importance=3`` is below
+    a threshold of 4 or 5 — so a provider that simply omitted them would silently
+    mute a genuine update with nothing in the logs (AUG-159 / TW-AUD-009).
 
-class NoveltyResult(BaseModel):
-    """LLM response for novelty detection, decoded under one of two contracts.
+    Requiring them in the SCHEMA is what makes the contract enforceable: under
+    ``Mode.JSON`` / strict structured outputs the model follows the schema, so a
+    validation re-prompt can actually fix an omission instead of re-asking for
+    something the schema said was optional. If the provider never complies,
+    ``analyze_articles`` maps the failure through the settled safe-false path with
+    ``error`` populated, so the checker records ``analysis_failed``.
 
-    STORED (default): every scoring field has a default, so an ``llm_response``
-    blob written before that field existed still re-parses — the force-notify
-    handler calls ``model_validate_json`` on exactly those blobs.
-
-    LIVE (``context=_LIVE_OUTPUT_CONTEXT``, used by ``analyze_articles``): a
-    POSITIVE result must carry its own ``relevance`` and ``importance``. Those
-    defaults are load-bearing downstream — ``relevance=0.0`` is below every usable
-    threshold and ``importance=3`` is below a threshold of 4 or 5 — so a provider
-    that simply omits the field would silently mute a genuine update with nothing
-    in the logs (AUG-159 / TW-AUD-009). Omission is told apart from a real zero via
-    ``model_fields_set``: an explicit ``relevance: 0.0`` is the model's own
-    judgement and passes.
-
-    A live violation raises ``ValidationError``, which instructor re-prompts with
-    the message (the model usually complies, so the update is DELIVERED rather
-    than suppressed); if it never complies, ``analyze_articles`` maps it through
-    the settled safe-false path with ``error`` populated, so the checker records
-    ``analysis_failed`` instead of a silent skip. The requirement is scoped to
-    ``has_new_info=true`` because nothing is gated on either score otherwise.
-
-    ``prompt_tokens`` / ``completion_tokens`` are NOT filled by the LLM — they
-    default to 0 and are populated from the raw completion's usage after the
-    call (0 on the safe-default error path or when the provider omits usage).
+    Only fields the MODEL fills live here: token counts and the internal ``error``
+    channel belong to ``NoveltyResult`` and are never shown to the provider.
     """
 
     reasoning: str = Field(default="", description="Brief chain-of-thought: what you compared, why you decided.")
@@ -147,49 +134,80 @@ class NoveltyResult(BaseModel):
     key_facts: list[str] = []
     source_urls: list[str] = []
     confidence: float = Field(ge=0.0, le=1.0)
-    # Default (not required) is deliberate: see the class docstring — stored blobs
-    # predate this field. 0.0 is the value the checker's relevance gate reads as
-    # "off-topic", which is why a LIVE omission must never reach it (AUG-159).
     relevance: float = Field(
         ge=0.0,
         le=1.0,
-        default=0.0,
         description="How relevant the new information is to the topic description (0=off-topic, 1=exactly what user asked)",
     )
+    importance: int = Field(
+        ge=1,
+        le=5,
+        description="How significant the new development is for someone monitoring this topic (1=trivial, 5=major)",
+    )
+
+
+class NoveltyResult(BaseModel):
+    """Novelty detection as the app carries and STORES it.
+
+    Every scoring field has a default, so an ``llm_response`` blob written before
+    that field existed still re-parses — the force-notify handler calls
+    ``model_validate_json`` on exactly those blobs. The strict live contract lives
+    in ``NoveltyResponse``; ``analyze_articles`` decodes into that and converts.
+
+    ``prompt_tokens`` / ``completion_tokens`` are populated from the raw
+    completion's usage after the call (0 on the safe-default error path or when
+    the provider omits usage).
+    """
+
+    reasoning: str = Field(default="", description="Brief chain-of-thought: what you compared, why you decided.")
+    has_new_info: bool
+    summary: str | None = None
+    key_facts: list[str] = []
+    source_urls: list[str] = []
+    confidence: float = Field(ge=0.0, le=1.0)
+    # Default (not required) is deliberate: stored blobs predate this field. 0.0
+    # is the value the checker's relevance gate reads as "off-topic", which is why
+    # the live schema demands the model's own number (AUG-159).
+    relevance: float = Field(ge=0.0, le=1.0, default=0.0)
     # Default (not required) is deliberate: stored llm_response blobs predate this
     # field and are re-parsed via model_validate_json in the force-notify handler —
     # a required field would break the Notify re-send button for pre-existing
     # checks. 3 is the neutral midpoint so an old blob doesn't hard-suppress.
-    importance: int = Field(
-        ge=1,
-        le=5,
-        default=3,
-        description="How significant the new development is for someone monitoring this topic (1=trivial, 5=major)",
-    )
+    importance: int = Field(ge=1, le=5, default=3)
     prompt_tokens: int = 0
     completion_tokens: int = 0
     # Set ONLY on the fail-safe error path (LLM call failed). Lets the caller
     # distinguish a genuine analysis failure from a clean "nothing new" result
     # without making analyze_articles raise (settled decision #3). None on
-    # every successful call, including a legitimate has_new_info=False. The
-    # description instructs the model not to populate it; analyze_articles also
-    # force-resets it on the success path (belt-and-suspenders).
-    error: str | None = Field(
-        default=None,
-        description="Internal error channel; the model must always leave this null.",
-    )
+    # every successful call, including a legitimate has_new_info=False — the
+    # success path builds the result from ``NoveltyResponse``, which has no such
+    # field, so the model cannot populate it.
+    error: str | None = None
+    # The provider text behind ``error``, when there was one: a response that
+    # failed the live contract is the only place the model's own (possibly
+    # POSITIVE) finding still exists, so it is kept for inspection instead of
+    # being discarded with the exception.
+    raw_response: str | None = None
 
-    @model_validator(mode="after")
-    def _require_scores_on_live_positive(self, info: ValidationInfo) -> "NoveltyResult":
-        if not (info.context or {}).get("live_llm_output") or not self.has_new_info:
-            return self
-        missing = [name for name in _SCORE_FIELDS if name not in self.model_fields_set]
-        if missing:
-            raise ValueError(
-                f"{' and '.join(missing)} must be set explicitly when has_new_info is true "
-                "(they decide whether the user is notified); do not omit them."
-            )
-        return self
+
+def _to_novelty_result(response: NoveltyResponse) -> NoveltyResult:
+    """Carry a live provider response over into the internal/stored shape.
+
+    Field-by-field rather than a dict splat: ``error`` and ``raw_response`` are
+    ours alone, and copying only what the model actually answers is what
+    guarantees a successful run can never arrive with ``error`` set (which the
+    checker would stamp as ``analysis_failed``).
+    """
+    return NoveltyResult(
+        reasoning=response.reasoning,
+        has_new_info=response.has_new_info,
+        summary=response.summary,
+        key_facts=list(response.key_facts),
+        source_urls=list(response.source_urls),
+        confidence=response.confidence,
+        relevance=response.relevance,
+        importance=response.importance,
+    )
 
 
 class KnowledgeStateUpdate(BaseModel):
@@ -317,6 +335,49 @@ def _iter_error_chain(exc: BaseException) -> Iterator[BaseException]:
         for nxt in (cur.__cause__, cur.__context__):
             if nxt is not None:
                 queue.append(nxt)
+
+
+# Cap on the salvaged provider text stored alongside ``error``. It goes into the
+# check's ``llm_response`` blob, which the dashboard reads per row, so a runaway
+# completion cannot bloat the row it is attached to.
+_RAW_RESPONSE_MAX_CHARS = 4000
+
+
+def _completion_text(completion: Any) -> str:
+    """Best-effort message text of a raw completion: content, else tool arguments.
+
+    Every access is defensive: this runs on an error path, over whatever shape a
+    provider or gateway happened to return, and must not raise there.
+    """
+    for choice in getattr(completion, "choices", None) or []:
+        message = getattr(choice, "message", None)
+        if message is None:
+            continue
+        content = getattr(message, "content", None)
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        for call in getattr(message, "tool_calls", None) or []:
+            arguments = getattr(getattr(call, "function", None), "arguments", None)
+            if isinstance(arguments, str) and arguments.strip():
+                return arguments.strip()
+    return ""
+
+
+def _salvage_raw_response(exc: BaseException) -> str | None:
+    """The provider text behind a failed structured-output call, if any.
+
+    Instructor keeps the final unsuccessful completion on
+    ``InstructorRetryException.last_completion``. When the live contract is what
+    rejected it, that completion holds the model's own finding — possibly a
+    POSITIVE one — and dropping it with the exception leaves no copy anywhere
+    (the analysis returns the safe default). Returns None for transport failures,
+    where there is no response to keep.
+    """
+    for candidate in _iter_error_chain(exc):
+        text = _completion_text(getattr(candidate, "last_completion", None))
+        if text:
+            return text[:_RAW_RESPONSE_MAX_CHARS]
+    return None
 
 
 def _unwrap_rate_limit(exc: BaseException) -> litellm.RateLimitError | None:
@@ -739,7 +800,6 @@ async def _create_structured(
     response_model: type[T],
     build_messages: Callable[[], list[dict[str, Any]]],
     timeout: int,
-    validation_context: dict[str, Any] | None = None,
 ) -> tuple[T, Any]:
     """Run one structured-output call, falling back TOOLS -> JSON -> MD_JSON.
 
@@ -751,13 +811,15 @@ async def _create_structured(
 
     The starting mode comes from the TTL hint above rather than always being TOOLS,
     so a fallback-only provider pays the rejection once per TTL instead of on every
-    call — including after a mid-chain rate-limit retry, which used to restart the
-    whole chain from TOOLS. The fallback order itself is unchanged.
+    call. The fallback order itself is unchanged.
 
-    ``validation_context`` reaches the response model's validators as pydantic's
-    validation context, and instructor re-prompts on whatever they reject — that
-    is how the live-output contract (see ``NoveltyResult``) is enforced against
-    the provider rather than merely detected after the fact.
+    NOTHING is passed as instructor's ``context``. That kwarg doubles as the
+    Jinja2 templating context: a non-empty one makes instructor render EVERY
+    message through a sandboxed Jinja environment, so a ``{{`` in an article title
+    or body raises TemplateSyntaxError before any LLM call, ``{{ 'A' * N }}``
+    expands on the event loop, and ``{{ undefined }}`` / ``{# ... #}`` silently
+    rewrite the prompt. Response-model contracts are therefore expressed in the
+    model itself (see ``NoveltyResponse``), never through a validation context.
     """
     hint_key = _mode_hint_key(settings, response_model)
     mode: instructor.Mode = _starting_mode(hint_key)
@@ -768,7 +830,6 @@ async def _create_structured(
                 model=settings.llm.model,
                 response_model=response_model,
                 messages=build_messages(),  # type: ignore[arg-type]
-                context=validation_context,
                 max_retries=_instructor_retries(settings.llm_max_retries),
                 api_key=settings.llm.api_key,
                 api_base=_effective_base_url(settings),
@@ -875,10 +936,10 @@ async def analyze_articles(
     """
 
     try:
-        result, completion = await _call_with_transport_retry(
+        response, completion = await _call_with_transport_retry(
             lambda: _create_structured(
                 settings,
-                response_model=NoveltyResult,
+                response_model=NoveltyResponse,
                 build_messages=lambda: _fit_article_prompt(
                     lambda arts, chars, summary: build_novelty_messages(arts, summary, topic, chars),
                     articles,
@@ -887,37 +948,22 @@ async def analyze_articles(
                     topic.name,
                 ),
                 timeout=settings.llm_analysis_timeout,
-                # Decode under the LIVE contract: a positive result that omits its
-                # own relevance/importance is rejected and re-prompted, instead of
-                # inheriting stored-blob defaults that mute it (AUG-159).
-                validation_context=_LIVE_OUTPUT_CONTEXT,
             ),
             max_retries=settings.llm_max_retries,
         )
     except Exception as exc:
         logger.warning("LLM analysis failed for topic '%s'", topic.name, exc_info=True)
-        return NoveltyResult(has_new_info=False, confidence=0.0, error=_summarize_exc(exc))
-
-    novelty: NoveltyResult = result
-    # ``error`` is in the LLM's structured-output schema, so a model can populate
-    # it on a clean run. Force it None here so ONLY the except-branch above ever
-    # sets it; otherwise the checker mis-stamps a healthy run as analysis_failed.
-    novelty.error = None
-    # ``relevance``/``importance`` carry stored-blob defaults (see NoveltyResult),
-    # and ``NoveltyResponse`` only *requires* them on a positive result. A provider
-    # that omits them on negatives is still worth one line per check: the same
-    # habit is what would mute a later positive, and the default scores are what
-    # the checker's gates read.
-    omitted = [name for name in _SCORE_FIELDS if name not in novelty.model_fields_set]
-    if omitted:
-        logger.warning(
-            "LLM omitted %s for topic '%s'; using the stored-blob default(s) (relevance=%.2f, importance=%d). "
-            "A threshold above the default will suppress notifications with this model.",
-            " and ".join(f"'{name}'" for name in omitted),
-            topic.name,
-            novelty.relevance,
-            novelty.importance,
+        # Keep the provider's own text when there is one: a response rejected by
+        # the live contract may well have been a POSITIVE finding, and this is the
+        # only copy of it left once the exception is swallowed.
+        return NoveltyResult(
+            has_new_info=False,
+            confidence=0.0,
+            error=_summarize_exc(exc),
+            raw_response=_salvage_raw_response(exc),
         )
+
+    novelty = _to_novelty_result(response)
     usage = _extract_usage(completion)
     novelty.prompt_tokens = usage.prompt_tokens
     novelty.completion_tokens = usage.completion_tokens

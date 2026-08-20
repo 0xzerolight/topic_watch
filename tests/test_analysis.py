@@ -1,7 +1,6 @@
 """Tests for the LLM analysis module: prompts, structured output, knowledge management."""
 
 import json
-import logging
 import re
 import sqlite3
 from contextlib import contextmanager
@@ -18,10 +17,10 @@ from pydantic import ValidationError
 from app.analysis.citations import strip_index_citations, strip_reliability_notes
 from app.analysis.knowledge import initialize_knowledge, update_knowledge
 from app.analysis.llm import (
-    _LIVE_OUTPUT_CONTEXT,
     _OUTPUT_TOKEN_CAP,
     CompressedKnowledge,
     KnowledgeStateUpdate,
+    NoveltyResponse,
     NoveltyResult,
     _bounded_max_tokens,
     _filter_restated_key_facts,
@@ -250,41 +249,44 @@ class TestNoveltyResult:
 # ============================================================
 
 
-def _live(data: dict) -> NoveltyResult:
-    """Decode ``data`` under the LIVE contract, as analyze_articles does."""
-    return NoveltyResult.model_validate(data, context=_LIVE_OUTPUT_CONTEXT)
-
-
 class TestLiveNoveltyDecode:
-    """Live output must carry its own scores on a POSITIVE result.
+    """Live output must carry its own scores; stored blobs stay permissive.
 
-    The permissive defaults exist for stored blobs only; live, ``relevance=0.0``
-    is below every usable threshold and ``importance=3`` is below a threshold of
-    4 or 5, so an omitted field would silently mute a genuine update.
+    ``relevance=0.0`` is below every usable threshold and ``importance=3`` is
+    below a threshold of 4 or 5, so a silently-defaulted score mutes a genuine
+    update. The live model declares both REQUIRED, so the provider is asked for
+    them in the schema instead of being rejected after the fact for following it.
     """
 
-    def test_positive_result_missing_relevance_is_rejected(self) -> None:
-        with pytest.raises(ValidationError, match="relevance"):
-            _live({"has_new_info": True, "summary": "x", "confidence": 0.9, "importance": 4})
+    def test_schema_requires_every_decision_field(self) -> None:
+        required = set(NoveltyResponse.model_json_schema()["required"])
+        assert required == {"has_new_info", "confidence", "relevance", "importance"}
 
-    def test_positive_result_missing_importance_is_rejected(self) -> None:
+    def test_missing_relevance_is_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="relevance"):
+            NoveltyResponse.model_validate({"has_new_info": True, "summary": "x", "confidence": 0.9, "importance": 4})
+
+    def test_missing_importance_is_rejected(self) -> None:
         with pytest.raises(ValidationError, match="importance"):
-            _live({"has_new_info": True, "summary": "x", "confidence": 0.9, "relevance": 0.8})
+            NoveltyResponse.model_validate({"has_new_info": True, "summary": "x", "confidence": 0.9, "relevance": 0.8})
 
     def test_explicit_zero_relevance_is_accepted(self) -> None:
         """A real 0.0 is the model's own judgement — only OMISSION is the defect."""
-        result = _live({"has_new_info": True, "summary": "x", "confidence": 0.9, "relevance": 0.0, "importance": 1})
+        result = NoveltyResponse.model_validate(
+            {"has_new_info": True, "summary": "x", "confidence": 0.9, "relevance": 0.0, "importance": 1}
+        )
         assert result.relevance == 0.0
         assert result.importance == 1
 
-    def test_negative_result_may_omit_scores(self) -> None:
-        """Nothing is gated on either score when has_new_info is false."""
-        result = _live({"has_new_info": False, "confidence": 0.4})
-        assert result.has_new_info is False
-        assert result.relevance == 0.0
+    def test_every_live_field_survives_the_conversion(self) -> None:
+        """The two models must not drift: everything the provider answers has a
+        home on the stored result, and the internal channels stay ours."""
+        assert set(NoveltyResponse.model_fields) <= set(NoveltyResult.model_fields)
+        assert "error" not in NoveltyResponse.model_fields
+        assert "raw_response" not in NoveltyResponse.model_fields
 
     def test_legacy_stored_blob_still_parses_permissively(self) -> None:
-        """The force-notify re-parse decodes WITHOUT the live context."""
+        """The force-notify re-parse decodes a blob written before both fields."""
         legacy_blob = '{"has_new_info": true, "summary": "x", "confidence": 0.9}'
         result = NoveltyResult.model_validate_json(legacy_blob)
         assert result.relevance == 0.0
@@ -615,11 +617,11 @@ class TestBuildNoveltyMessages:
         assert "in `summary`" in lowered or "in summary" in lowered
         assert "has_new_info is false" in lowered
 
-    def test_novelty_result_summary_field_has_description(self) -> None:
+    def test_novelty_response_summary_field_has_description(self) -> None:
         # OVH-026: instructor surfaces Field descriptions to the model, so the
         # summary field must carry one (the prompt instruction alone is not
         # enough — instructor builds the schema from the model).
-        field = NoveltyResult.model_fields["summary"]
+        field = NoveltyResponse.model_fields["summary"]
         assert field.description, "summary Field must have a description for instructor"
         assert "summary" in field.description.lower()
 
@@ -977,11 +979,12 @@ class TestAnalyzeArticles:
         mock_create.assert_called_once()
         call_kwargs = mock_create.call_args.kwargs
         assert call_kwargs["model"] == "openai/gpt-4o-mini"
-        assert call_kwargs["response_model"] is NoveltyResult
-        # Decoded under the strict LIVE contract, not the permissive stored-blob
-        # one (AUG-159): a positive result omitting relevance/importance is
-        # re-prompted instead of silently defaulted.
-        assert call_kwargs["context"] == _LIVE_OUTPUT_CONTEXT
+        # The strict LIVE model, not the permissive stored-blob one (AUG-159): a
+        # result omitting relevance/importance is re-prompted, never defaulted.
+        assert call_kwargs["response_model"] is NoveltyResponse
+        # No instructor ``context``: it doubles as the Jinja2 templating context
+        # and would render every article body as a template.
+        assert "context" not in call_kwargs
         assert call_kwargs["temperature"] == 0.2
         # Verify messages include the knowledge state and topic info
         messages = call_kwargs["messages"]
@@ -1042,12 +1045,10 @@ class TestAnalyzeArticles:
 
         assert mock_create.call_args.kwargs["temperature"] == 0.0
 
-    async def test_forces_error_none_on_success(self) -> None:
-        """A successful call must clear ``error`` even if the model populated it.
-
-        ``error`` is part of the structured-output schema, so a model could set
-        it on a clean run. Only the except-branch is allowed to set ``error``;
-        otherwise the checker mis-stamps a healthy run as ``analysis_failed``.
+    async def test_error_is_never_carried_over_from_the_model(self) -> None:
+        """Only the except-branch may set ``error``; otherwise the checker
+        mis-stamps a healthy run as ``analysis_failed``. The live model has no
+        such field, so a response carrying one cannot leak it through.
         """
         rogue = NoveltyResult(has_new_info=True, summary="X", confidence=0.9, error="model populated this on success")
         mock_client, _ = _mock_instructor_client(rogue)
@@ -1058,36 +1059,6 @@ class TestAnalyzeArticles:
 
         assert result.has_new_info is True
         assert result.error is None
-
-    async def test_warns_when_provider_omits_scores(self, caplog: pytest.LogCaptureFixture) -> None:
-        """The scoring fields have stored-blob defaults, so an omitting provider
-        scores everything relevance=0.0 / importance=3.
-
-        Silent, that turns any threshold above the default into a permanent mute
-        with nothing in the logs to explain it.
-        """
-        omitted = NoveltyResult.model_validate({"has_new_info": False, "confidence": 0.9})
-        mock_client, _ = _mock_instructor_client(omitted)
-        settings = _make_settings()
-
-        with patch("app.analysis.llm._get_client", return_value=mock_client), caplog.at_level(logging.WARNING):
-            result = await analyze_articles([_make_article()], "Known facts.", _make_topic(), settings)
-
-        assert result.importance == 3
-        assert any("'relevance' and 'importance'" in r.getMessage() for r in caplog.records)
-
-    async def test_no_warning_when_provider_sets_scores(self, caplog: pytest.LogCaptureFixture) -> None:
-        """An explicit score — including one equal to the default — is not a warning."""
-        scored = NoveltyResult.model_validate(
-            {"has_new_info": True, "summary": "X", "confidence": 0.9, "importance": 3, "relevance": 0.0}
-        )
-        mock_client, _ = _mock_instructor_client(scored)
-        settings = _make_settings()
-
-        with patch("app.analysis.llm._get_client", return_value=mock_client), caplog.at_level(logging.WARNING):
-            await analyze_articles([_make_article()], "Known facts.", _make_topic(), settings)
-
-        assert not any("LLM omitted" in r.getMessage() for r in caplog.records)
 
 
 # ============================================================
@@ -1103,12 +1074,17 @@ def _md_json_client(payloads):
     (the last is repeated once exhausted), so the genuine instructor parse +
     validation-retry layer runs against our response schema without any network
     call. MD_JSON mode is used because it parses plain message content.
+
+    Yields ``{"n": <call count>, "messages": [<messages per call>]}``; the
+    recorded messages are what instructor actually handed the provider, so a test
+    can assert on the bytes that left the process.
     """
-    calls = {"n": 0}
+    calls: dict = {"n": 0, "messages": []}
 
     async def _fake_acompletion(*_args, **_kwargs):
         payload = payloads[min(calls["n"], len(payloads) - 1)]
         calls["n"] += 1
+        calls["messages"].append(_kwargs.get("messages"))
         message = Message(content=json.dumps(payload), role="assistant")
         choice = Choices(message=message, index=0, finish_reason="stop")
         return ModelResponse(choices=[choice], usage=Usage(prompt_tokens=11, completion_tokens=7))
@@ -1179,15 +1155,79 @@ class TestLiveNoveltyContract:
         assert result.has_new_info is True
         assert result.relevance == 0.0
 
-    async def test_negative_result_may_omit_scores(self) -> None:
-        settings = _make_settings()
+    async def test_negative_result_must_also_carry_its_scores(self) -> None:
+        """The live schema marks both scores required, so an omission is a schema
+        violation the model can actually fix on the re-prompt."""
+        settings = _make_settings(llm_max_retries=2)
+        payloads = [
+            {"has_new_info": False, "confidence": 0.4},
+            {"has_new_info": False, "confidence": 0.4, "relevance": 0.1, "importance": 2},
+        ]
 
-        with _md_json_client([{"has_new_info": False, "confidence": 0.4}]) as calls:
+        with _md_json_client(payloads) as calls:
             result = await analyze_articles([_make_article()], "Known.", _make_topic(), settings)
 
-        assert calls["n"] == 1
+        assert calls["n"] == 2
         assert result.has_new_info is False
         assert result.error is None
+
+
+# ============================================================
+# TestNoPromptTemplating (P1 regression: instructor Jinja2 rendering)
+# ============================================================
+
+
+class TestNoPromptTemplating:
+    """Passing a ``context=`` to instructor renders EVERY message through Jinja2.
+
+    That turned ordinary article text into a template: a stray ``{{`` raised
+    TemplateSyntaxError before any LLM call, ``{{ 'A' * N }}`` expanded on the
+    event loop, and ``{{ price }}`` silently rewrote the prompt. No context is
+    passed any more, so prompt text reaches the provider verbatim.
+    """
+
+    _NEGATIVE = [{"has_new_info": False, "confidence": 0.4, "relevance": 0.0, "importance": 1}]
+
+    async def test_template_syntax_reaches_the_provider_verbatim(self) -> None:
+        article = _make_article(
+            title="Vue: {{ count }} items",
+            raw_content="Use {% for row in rows %}{{ row }}{% endfor %} plus {{ 'A' * 5 }} and {# a note #}.",
+        )
+
+        with _md_json_client(self._NEGATIVE) as calls:
+            result = await analyze_articles([article], "Known {{ price }} facts.", _make_topic(), _make_settings())
+
+        assert calls["n"] == 1
+        assert result.error is None
+        sent = "\n".join(m["content"] for m in calls["messages"][0])
+        assert "{{ count }}" in sent
+        assert "{% for row in rows %}{{ row }}{% endfor %}" in sent
+        assert "{{ 'A' * 5 }}" in sent
+        assert "{# a note #}" in sent
+        assert "AAAAA" not in sent
+        assert "Known {{ price }} facts." in sent
+
+    async def test_unbalanced_braces_do_not_abort_the_analysis(self) -> None:
+        """One ``{{`` in a feed body used to fail every check with ZERO LLM calls."""
+        article = _make_article(raw_content="The template syntax is {{ and the docs do not say more.")
+
+        with _md_json_client(self._NEGATIVE) as calls:
+            result = await analyze_articles([article], "Known facts.", _make_topic(), _make_settings())
+
+        assert calls["n"] == 1
+        assert result.error is None
+
+    async def test_expansion_bomb_in_an_article_is_inert(self) -> None:
+        """24 characters used to render a 200 MB message synchronously."""
+        article = _make_article(raw_content="Nested: {{ 'A' * 200000000 }}")
+
+        with _md_json_client(self._NEGATIVE) as calls:
+            result = await analyze_articles([article], "Known facts.", _make_topic(), _make_settings())
+
+        assert result.error is None
+        sent = "\n".join(m["content"] for m in calls["messages"][0])
+        assert "{{ 'A' * 200000000 }}" in sent
+        assert len(sent) < 100_000
 
 
 # ============================================================
