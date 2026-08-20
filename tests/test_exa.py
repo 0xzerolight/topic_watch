@@ -85,6 +85,25 @@ class TestMapExaResult:
         assert entry is not None
         assert entry.content is None
 
+    def test_whitespace_only_text_yields_none_content(self) -> None:
+        """AUG-308: blank text is truthy, so it would short-circuit the publisher fetch."""
+        entry = _map_exa_result({"url": "https://x.com/a", "title": "T", "text": "   \n\t "})
+        assert entry is not None
+        assert entry.content is None
+
+    def test_non_string_text_keeps_the_row(self) -> None:
+        """AUG-308: a structured ``text`` value must not discard a usable URL/title."""
+        entry = _map_exa_result({"url": "https://x.com/a", "title": "T", "text": {"value": "x"}})
+        assert entry is not None
+        assert entry.url == "https://x.com/a"
+        assert entry.content is None
+
+    def test_text_keeps_its_own_whitespace(self) -> None:
+        """Only the outer padding is trimmed; the body itself is untouched."""
+        entry = _map_exa_result({"url": "https://x.com/a", "title": "T", "text": "  one\n\ntwo  "})
+        assert entry is not None
+        assert entry.content == "one\n\ntwo"
+
 
 class TestFetchExaEntries:
     async def test_request_contract(self) -> None:
@@ -190,6 +209,35 @@ class TestFetchExaEntries:
             )
         assert resp.feeds_total == 0 and resp.feeds_failed == 0
         assert calls == []
+
+    async def test_spent_deadline_makes_no_request(self) -> None:
+        """TW-AUD-018: Exa draws on the topic's source budget like any other fetch."""
+        from unittest.mock import MagicMock
+
+        from app.scraping.source import DEADLINE_ERROR, Deadline
+
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(str(request.url))
+            return httpx.Response(200, json={"results": []})
+
+        callback = MagicMock()
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            resp = await fetch_exa_entries(
+                _EXA_TOPIC,
+                _ENABLED,
+                max_results=5,
+                timeout=5.0,
+                client=client,
+                health_callback=callback,
+                deadline=Deadline.after(-1.0),
+            )
+
+        assert resp.feeds_total == 1 and resp.feeds_failed == 1
+        assert resp.entries == []
+        assert calls == []
+        assert DEADLINE_ERROR in callback.call_args[0][2]
 
     async def test_http_4xx_fails_safe(self) -> None:
         transport = httpx.MockTransport(lambda r: httpx.Response(401, json={"error": "bad key"}))

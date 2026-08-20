@@ -105,6 +105,19 @@ class TestIsGoogleNewsUrl:
     def test_google_news_rss_search(self) -> None:
         assert is_google_news_url("https://news.google.com/rss/search?q=test") is False
 
+    def test_host_is_matched_not_the_raw_url(self) -> None:
+        """TW-AUD-031: a foreign host cannot borrow the brand from its path or query."""
+        assert is_google_news_url("https://evil.example/news.google.com/articles/CBMi123") is False
+        assert is_google_news_url("https://evil.example/x?ref=news.google.com/articles/CBMi123") is False
+
+    def test_lookalike_host_is_not_google_news(self) -> None:
+        """TW-AUD-031: a suffix lookalike is a different host."""
+        assert is_google_news_url("https://news.google.com.evil.example/articles/CBMi123") is False
+        assert is_google_news_url("https://notnews.google.com/articles/CBMi123") is False
+
+    def test_uppercase_host_still_matches(self) -> None:
+        assert is_google_news_url("https://NEWS.GOOGLE.COM/articles/CBMi123") is True
+
 
 # ============================================================
 # TestExtractArticleId

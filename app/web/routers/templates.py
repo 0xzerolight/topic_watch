@@ -18,6 +18,9 @@ from markupsafe import Markup, escape
 
 from app import __version__
 from app.log_redaction import redact_url
+from app.scraping.google_news import GOOGLE_NEWS_HOST
+from app.scraping.rss import BING_HOST
+from app.scraping.source import host_matches, url_hostname
 
 _TEMPLATE_DIR = Path(__file__).resolve().parent.parent.parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATE_DIR))
@@ -233,15 +236,19 @@ def _importance_score(llm_response: str | None) -> int | None:
 
 
 def _feed_source_name(feed_url: str) -> str:
-    """Convert a feed URL to a human-readable source name."""
-    try:
-        host = urlparse(feed_url).hostname or feed_url
-    except Exception:
+    """Convert a feed URL to a human-readable source name.
+
+    The brand labels are claimed by hostname, not by a substring of the URL
+    (TW-AUD-031): ``fake-google.com`` and ``news.google.com.example.net`` used to
+    display as Google News, as did any feed with ``bing.com`` anywhere in its
+    path or query. Everything else renders by canonical host.
+    """
+    host = url_hostname(feed_url)
+    if not host:
         return feed_url
-    host = host.lower()
-    if "google.com" in host:
+    if host_matches(host, GOOGLE_NEWS_HOST):
         return "Google News"
-    if "bing.com" in host:
+    if host_matches(host, BING_HOST):
         return "Bing News"
     # Strip common prefixes for other feeds
     for prefix in ("www.", "news.", "feeds.", "rss.", "feed."):

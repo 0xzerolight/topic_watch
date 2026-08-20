@@ -1,5 +1,6 @@
 """Tests for the scraping pipeline: RSS fetching, content extraction, orchestration."""
 
+import asyncio
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,6 +27,7 @@ from app.scraping.rss import (
     fetch_feed,
     fetch_feeds_for_topic,
 )
+from app.scraping.source import Deadline
 
 # --- Sample RSS/Atom XML for mocking ---
 
@@ -263,6 +265,44 @@ class TestParseEntry:
         assert entry is not None
         assert entry.summary == "Apple & Google <merge>"
 
+    def test_block_elements_keep_a_word_boundary(self) -> None:
+        """AUG-185: adjacent block-level text must not fuse into one token.
+
+        The OVH-112 stripper concatenated every text node, so ``<li>Alpha</li>
+        <li>Beta</li>`` became ``AlphaBeta`` — the exact value that becomes
+        raw_content when extraction fails, and then novelty-analysis input.
+        """
+        raw = {
+            "title": "List",
+            "link": "https://example.com/list",
+            "summary": "<ol><li>Alpha</li><li>Beta</li></ol><p>One</p><p>Two</p>Three<br>Four",
+        }
+        entry = _parse_entry(raw, "feed")
+        assert entry is not None
+        assert entry.summary == "Alpha Beta One Two Three Four"
+
+    def test_inline_elements_keep_adjacency(self) -> None:
+        """AUG-185: inline markup must NOT gain a space — only block boundaries do."""
+        raw = {
+            "title": "Inline",
+            "link": "https://example.com/inline",
+            "summary": "<p><b>Al</b><i>pha</i> is <em>one</em> word</p>",
+        }
+        entry = _parse_entry(raw, "feed")
+        assert entry is not None
+        assert entry.summary == "Alpha is one word"
+
+    def test_malformed_fragment_still_separates_blocks(self) -> None:
+        """AUG-185: unclosed block tags still produce boundaries (no fused tokens)."""
+        raw = {
+            "title": "Broken",
+            "link": "https://example.com/broken",
+            "summary": "<div>Alpha<div>Beta<li>Gamma",
+        }
+        entry = _parse_entry(raw, "feed")
+        assert entry is not None
+        assert entry.summary == "Alpha Beta Gamma"
+
     def test_plain_text_summary_is_unchanged(self) -> None:
         """OVH-112: a tag-free summary passes through verbatim (no false rewrites)."""
         raw = {
@@ -369,6 +409,123 @@ class TestFetchFeed:
         # The valid second entry survives; the malformed first one is skipped.
         assert [e.title for e in entries] == ["Article Two"]
         assert any("entry" in r.getMessage().lower() for r in caplog.records)
+
+
+# ============================================================
+# TestFeedParserInputs (TW-AUD-019)
+# ============================================================
+
+
+# Declared ISO-8859-1, served WITHOUT a charset parameter: decoding the bytes as
+# anything else corrupts the accented characters.
+_LATIN1_RSS = (
+    '<?xml version="1.0" encoding="ISO-8859-1"?>'
+    '<rss version="2.0"><channel><title>T</title>'
+    "<item><title>Caf\xe9 na\xefve</title><link>https://example.com/a</link>"
+    "<description>r\xe9sum\xe9</description></item>"
+    "</channel></rss>"
+).encode("iso-8859-1")
+
+# Atom feed whose entry link is document-relative — only resolvable against the
+# URL the document was actually retrieved from.
+_RELATIVE_ATOM = (
+    b'<?xml version="1.0" encoding="utf-8"?>'
+    b'<feed xmlns="http://www.w3.org/2005/Atom"><title>T</title>'
+    b'<entry><title>Relative</title><link href="/articles/one"/>'
+    b"<summary>s</summary></entry></feed>"
+)
+
+
+def _bytes_transport(body: bytes, content_type: str, status: int = 200) -> httpx.MockTransport:
+    """Transport serving raw bytes, so response decoding is the code's problem."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, content=body, headers={"content-type": content_type})
+
+    return httpx.MockTransport(handler)
+
+
+class TestFeedParserInputs:
+    """TW-AUD-019: feedparser gets the source bytes plus the document's base URI."""
+
+    async def test_declared_encoding_survives(self) -> None:
+        """A feed declaring ISO-8859-1 in its prolog parses without mojibake.
+
+        Handing feedparser ``response.text`` pre-decodes the body with httpx's
+        guess and throws the XML encoding declaration away, so ``Café`` arrives
+        as replacement characters.
+        """
+        transport = _bytes_transport(_LATIN1_RSS, "application/rss+xml")
+        async with httpx.AsyncClient(transport=transport) as client:
+            entries = await fetch_feed("https://example.com/feed.xml", client)
+
+        assert [e.title for e in entries] == ["Café naïve"]
+        assert entries[0].summary == "résumé"
+
+    async def test_relative_entry_link_resolves_against_the_feed_url(self) -> None:
+        """A document-relative entry link resolves instead of being dropped.
+
+        Without base metadata the link stays ``/articles/one``, fails the
+        http(s) scheme guard, and the feed reports a healthy empty fetch.
+        """
+        transport = _bytes_transport(_RELATIVE_ATOM, "application/atom+xml")
+        async with httpx.AsyncClient(transport=transport) as client:
+            entries = await fetch_feed("https://example.com/news/feed.xml", client)
+
+        assert [e.url for e in entries] == ["https://example.com/articles/one"]
+
+    async def test_relative_link_resolves_against_the_final_redirect_target(self) -> None:
+        """The base URI is the URL the document actually came from, not the request."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/feed.xml":
+                return httpx.Response(301, headers={"location": "https://cdn.example.com/v2/feed.xml"})
+            return httpx.Response(200, content=_RELATIVE_ATOM, headers={"content-type": "application/atom+xml"})
+
+        with patch("app.url_validation.is_private_url", return_value=False):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                entries = await fetch_feed("https://example.com/feed.xml", client)
+
+        assert [e.url for e in entries] == ["https://cdn.example.com/articles/one"]
+
+    async def test_mislabelled_empty_feed_stays_healthy(self) -> None:
+        """A real but empty feed served as text/plain is not a fetch failure.
+
+        Forwarding content-type activates feedparser's media-type check, which
+        flags every mislabelled feed. Only the label is wrong here, so the feed
+        must stay in the healthy-empty bucket instead of entering backoff.
+        """
+        from unittest.mock import MagicMock
+
+        from app.scraping.rss import fetch_feed_with_status
+
+        callback = MagicMock()
+        transport = _bytes_transport(_EMPTY_RSS.encode(), "text/plain; charset=utf-8")
+        async with httpx.AsyncClient(transport=transport) as client:
+            entries, fetch_ok = await fetch_feed_with_status(
+                "https://example.com/feed.xml", client, health_callback=callback
+            )
+
+        assert entries == []
+        assert fetch_ok is True
+        callback.assert_called_once_with("https://example.com/feed.xml", True, None, None, None)
+
+    async def test_html_error_page_is_still_a_failure(self) -> None:
+        """An HTML error page served as text/html stays an OVH-044 soft failure."""
+        from unittest.mock import MagicMock
+
+        from app.scraping.rss import fetch_feed_with_status
+
+        callback = MagicMock()
+        transport = _bytes_transport(b"<html><body><h1>404</h1></body></html>", "text/html")
+        async with httpx.AsyncClient(transport=transport) as client:
+            entries, fetch_ok = await fetch_feed_with_status(
+                "https://example.com/feed.xml", client, health_callback=callback
+            )
+
+        assert entries == []
+        assert fetch_ok is False
+        assert callback.call_args[0][1] is False
 
 
 # ============================================================
@@ -504,6 +661,25 @@ class TestResolveGoogleNewsUrl:
         result = _resolve_google_news_url(google_url, "No links here")
         assert result == google_url
 
+    def test_only_the_real_google_host_takes_the_fast_path(self) -> None:
+        """TW-AUD-031: a foreign feed cannot get its link rewritten from its own HTML.
+
+        The fast path used to trigger on the substring ``news.google.com/``
+        anywhere in the link, so any feed whose entry URL merely mentioned it
+        had its stored URL replaced by an arbitrary href from the description.
+        """
+        foreign = "https://evil.example/read?src=news.google.com/articles/x"
+        description = '<a href="https://attacker.example/payload">Title</a>'
+        assert _resolve_google_news_url(foreign, description) == foreign
+
+        lookalike = "https://news.google.com.evil.example/rss/articles/CBMi"
+        assert _resolve_google_news_url(lookalike, description) == lookalike
+
+    def test_subdomain_of_google_news_still_resolves(self) -> None:
+        google_url = "https://NEWS.GOOGLE.COM/rss/articles/CBMiQ2h0dHBz..."
+        description = '<a href="https://publisher.example/story">Title</a>'
+        assert _resolve_google_news_url(google_url, description) == "https://publisher.example/story"
+
     def test_empty_description(self) -> None:
         google_url = "https://news.google.com/rss/articles/CBMiQ2h0dHBz..."
         result = _resolve_google_news_url(google_url, "")
@@ -628,6 +804,249 @@ class TestBingStubRegression:
                 content = await extract_article_content(entry.url, fallback_summary=entry.summary, client=client)
         assert len(content) >= _STUB_CONTENT_MIN_CHARS
         assert _content_quality_tag(content) == ""
+
+
+class TestSourceDeadline:
+    """TW-AUD-018: one monotonic budget bounds a whole logical source attempt."""
+
+    def test_remaining_is_clamped_and_monotonic(self) -> None:
+        from app.scraping.source import Deadline
+
+        live = Deadline.after(30.0)
+        assert 0.0 < live.remaining() <= 30.0
+        assert live.expired() is False
+        assert live.slice(60.0) <= 30.0  # a per-request timeout never outlives the budget
+        assert live.slice(0.5) == 0.5
+
+        spent = Deadline.after(-1.0)
+        assert spent.remaining() == 0.0
+        assert spent.expired() is True
+        assert spent.slice(10.0) == 0.0
+
+    def test_check_raises_the_typed_outcome(self) -> None:
+        from app.scraping.source import Deadline, SourceDeadlineExceeded
+
+        Deadline.after(30.0).check("the feed request")  # does not raise
+        with pytest.raises(SourceDeadlineExceeded, match="deadline"):
+            Deadline.after(-1.0).check("the feed request")
+
+    async def test_spent_budget_makes_no_request_and_records_the_outcome(self) -> None:
+        """A feed whose budget is gone is a typed failure, not a silent empty fetch."""
+        from unittest.mock import MagicMock
+
+        from app.scraping.rss import fetch_feed_with_status
+        from app.scraping.source import DEADLINE_ERROR, Deadline
+
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(str(request.url))
+            return httpx.Response(200, text=_SAMPLE_RSS)
+
+        callback = MagicMock()
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            entries, fetch_ok = await fetch_feed_with_status(
+                "https://example.com/feed.xml",
+                client,
+                health_callback=callback,
+                deadline=Deadline.after(-1.0),
+            )
+
+        assert (entries, fetch_ok) == ([], False)
+        assert calls == []
+        args = callback.call_args[0]
+        assert args[1] is False
+        assert DEADLINE_ERROR in args[2]
+
+    async def test_a_hanging_feed_is_cut_off_and_not_retried(self) -> None:
+        """The budget, not the per-request timeout, ends a source that never answers."""
+        from unittest.mock import MagicMock
+
+        from app.scraping.rss import fetch_feed_with_status
+        from app.scraping.source import DEADLINE_ERROR, Deadline
+
+        calls: list[str] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(str(request.url))
+            await asyncio.Event().wait()  # never answers
+            raise AssertionError("unreachable")
+
+        callback = MagicMock()
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            entries, fetch_ok = await fetch_feed_with_status(
+                "https://example.com/feed.xml",
+                client,
+                timeout=600.0,
+                max_attempts=3,
+                health_callback=callback,
+                deadline=Deadline.after(0.05),
+            )
+
+        assert (entries, fetch_ok) == ([], False)
+        assert len(calls) == 1  # no retry once the budget is gone
+        assert DEADLINE_ERROR in callback.call_args[0][2]
+
+    async def test_manual_feeds_share_one_budget(self) -> None:
+        """Every feed of a topic draws on the same deadline instance."""
+        seen: list[object] = []
+
+        async def fake_fetch(url, client, *, deadline=None, **kwargs):
+            seen.append(deadline)
+            return ([], True)
+
+        topic = Topic(
+            name="T",
+            description="d",
+            feed_mode=FeedMode.MANUAL,
+            feed_urls=["https://a.example/feed", "https://b.example/feed"],
+        )
+        budget = Deadline.after(30.0)
+        with patch("app.scraping.rss.fetch_feed_with_status", side_effect=fake_fetch):
+            await fetch_feeds_for_topic(topic, deadline=budget)
+
+        assert seen == [budget, budget]
+
+    async def test_extraction_keeps_the_summary_instead_of_fetching(self) -> None:
+        """With the budget gone, extraction stops hitting the network (TW-AUD-018)."""
+        from app.scraping import _extract_contents
+
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(str(request.url))
+            return httpx.Response(200, text=_SAMPLE_HTML)
+
+        transport = httpx.MockTransport(handler)
+        entry = FeedEntry(
+            title="RSS", url="https://example.com/x", summary="the summary", source_feed="rss", content=None
+        )
+        original_init = httpx.AsyncClient.__init__
+
+        def patched_init(self_client, **kwargs):
+            kwargs["transport"] = transport
+            original_init(self_client, **kwargs)
+
+        with patch.object(httpx.AsyncClient, "__init__", patched_init):
+            contents = await _extract_contents(
+                [(entry, "h")], article_fetch_timeout=5.0, concurrency=2, deadline=Deadline.after(-1.0)
+            )
+
+        assert contents == ["the summary"]
+        assert calls == []
+
+    async def test_redirect_resolution_stops_when_the_budget_is_gone(self) -> None:
+        """Unresolved entries keep their redirect URL rather than spending more time."""
+        from app.scraping.google_news import resolve_google_news_urls
+
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(str(request.url))
+            return httpx.Response(200, text="")
+
+        transport = httpx.MockTransport(handler)
+        original_init = httpx.AsyncClient.__init__
+
+        def patched_init(self_client, **kwargs):
+            kwargs["transport"] = transport
+            original_init(self_client, **kwargs)
+
+        with patch.object(httpx.AsyncClient, "__init__", patched_init):
+            resolved = await resolve_google_news_urls(
+                ["https://news.google.com/rss/articles/ABC123"],
+                request_delay=0.0,
+                deadline=Deadline.after(-1.0),
+            )
+
+        assert resolved == {}
+        assert calls == []
+
+
+class TestSourceHostClassification:
+    """TW-AUD-031: source labels come from the parsed hostname, not URL substrings.
+
+    The display filter lives in the web layer, but what it classifies is source
+    identity, so its regression lives beside the other source-identity tests.
+    """
+
+    def test_documented_endpoints_get_their_brand(self) -> None:
+        from app.web.routers.templates import _feed_source_name
+
+        assert _feed_source_name("https://news.google.com/rss/search?q=x") == "Google News"
+        assert _feed_source_name("https://www.bing.com/news/search?q=x&format=rss") == "Bing News"
+        assert _feed_source_name("https://bing.com/news/search?q=x") == "Bing News"
+
+    def test_lookalike_hosts_render_as_themselves(self) -> None:
+        from app.web.routers.templates import _feed_source_name
+
+        assert _feed_source_name("https://fake-google.com/feed") == "fake-google.com"
+        assert _feed_source_name("https://notgoogle.com.evil.net/feed") == "notgoogle.com.evil.net"
+        assert _feed_source_name("https://mybing.com.evil.net/feed") == "mybing.com.evil.net"
+
+    def test_brand_in_path_or_query_is_not_identity(self) -> None:
+        from app.web.routers.templates import _feed_source_name
+
+        assert _feed_source_name("https://example.com/news.google.com/feed") == "example.com"
+        assert _feed_source_name("https://example.com/feed?ref=www.bing.com") == "example.com"
+
+    def test_other_google_properties_are_not_google_news(self) -> None:
+        from app.web.routers.templates import _feed_source_name
+
+        assert _feed_source_name("https://blog.google.com/feed") == "blog.google.com"
+
+    def test_ordinary_feed_hosts_keep_their_canonical_form(self) -> None:
+        from app.web.routers.templates import _feed_source_name
+
+        assert _feed_source_name("https://feeds.arstechnica.com/arstechnica/index") == "arstechnica.com"
+        assert _feed_source_name("not a url") == "not a url"
+
+    def test_unparseable_url_has_no_host(self) -> None:
+        """A malformed netloc yields no host rather than raising into a template."""
+        from app.scraping.source import host_matches, url_hostname
+
+        assert url_hostname("https://[oops/feed") == ""
+        assert host_matches(url_hostname("https://[oops/feed"), "google.com") is False
+
+
+class TestSourceRegistry:
+    """TW-AUD-022: sources register themselves; the dispatcher has no per-source branch."""
+
+    def test_every_feed_mode_has_a_source(self) -> None:
+        from app.scraping.source import _SOURCES
+
+        assert set(_SOURCES) == set(FeedMode)
+
+    async def test_a_registered_source_is_dispatched_to(self) -> None:
+        """Adding a source is a registration, not an edit to another source's module."""
+        from app.scraping.source import (
+            _SOURCES,
+            SourceIdentity,
+            SourceRequest,
+            register_source,
+        )
+        from app.scraping.source import (
+            FeedResponse as SourceFeedResponse,
+        )
+
+        seen: list[SourceRequest] = []
+
+        async def fake_source(topic: Topic, request: SourceRequest) -> SourceFeedResponse:
+            seen.append(request)
+            return SourceFeedResponse.from_source(SourceIdentity(name="stub", needs_url_resolution=True), feeds_total=1)
+
+        topic = Topic(name="T", description="d", feed_mode=FeedMode.MANUAL, feed_urls=[])
+        previous = _SOURCES[FeedMode.MANUAL]
+        register_source(FeedMode.MANUAL, fake_source)
+        try:
+            response = await fetch_feeds_for_topic(topic, timeout=3.0, max_results=4)
+        finally:
+            register_source(FeedMode.MANUAL, previous)
+
+        # Identity and capabilities ride on the response, not on a dispatcher branch.
+        assert response.provider_name == "stub"
+        assert response.needs_url_resolution is True
+        assert [(r.timeout, r.max_results) for r in seen] == [(3.0, 4)]
 
 
 class TestFetchFeedsForTopic:
@@ -1216,7 +1635,9 @@ class TestExtractContentsPrefetched:
             original_init(self_client, **kwargs)
 
         with patch.object(httpx.AsyncClient, "__init__", patched_init):
-            contents = await _extract_contents(batch, article_fetch_timeout=5.0, concurrency=2)
+            contents = await _extract_contents(
+                batch, article_fetch_timeout=5.0, concurrency=2, deadline=Deadline.after()
+            )
 
         assert contents[0] == "Prefetched A body"  # short-circuited
         assert calls == ["https://example.com/b"]  # only the content-less entry fetched
@@ -1448,6 +1869,7 @@ class TestFetchNewArticlesForTopic:
             backoff_cap_hours=24,
             exa_settings=None,
             max_results=10,
+            deadline=None,
         ):
             # Simulate a successful feed fetch that triggers a health write.
             if health_callback:
@@ -1999,7 +2421,7 @@ class TestResolveRedirectUrls:
         response = FeedResponse(provider_name="bing_news", needs_url_resolution=False)
 
         with patch("app.scraping.resolve_google_news_urls", new_callable=AsyncMock) as mock_resolve:
-            await _resolve_redirect_urls(fetch_batch, response, feed_fetch_timeout=5.0)
+            await _resolve_redirect_urls(fetch_batch, response, 5.0, Deadline.after())
         mock_resolve.assert_not_called()
         # URL left untouched.
         assert fetch_batch[0][0].url == gnews
@@ -2017,7 +2439,7 @@ class TestResolveRedirectUrls:
             new_callable=AsyncMock,
             return_value={gnews: "https://real.example/article"},
         ) as mock_resolve:
-            await _resolve_redirect_urls(fetch_batch, response, feed_fetch_timeout=5.0)
+            await _resolve_redirect_urls(fetch_batch, response, 5.0, Deadline.after())
 
         # Only the Google article URL was offered for resolution (not the plain one).
         mock_resolve.assert_awaited_once()
@@ -2034,7 +2456,7 @@ class TestResolveRedirectUrls:
         response = FeedResponse(provider_name="google_news", needs_url_resolution=True)
 
         with patch("app.scraping.resolve_google_news_urls", new_callable=AsyncMock) as mock_resolve:
-            await _resolve_redirect_urls(fetch_batch, response, feed_fetch_timeout=5.0)
+            await _resolve_redirect_urls(fetch_batch, response, 5.0, Deadline.after())
         mock_resolve.assert_not_called()
 
 
@@ -2165,7 +2587,7 @@ class TestManualBackoffAndValidators:
         attempted: list[str] = []
 
         async def fake_fetch(
-            url, client, *, timeout, max_attempts, health_callback=None, etag=None, last_modified=None
+            url, client, *, timeout, max_attempts, health_callback=None, etag=None, last_modified=None, deadline=None
         ):
             attempted.append(url)
             return ([FeedEntry(title="A", url="https://live.example/a", source_feed=url)], True)
@@ -2202,7 +2624,7 @@ class TestManualBackoffAndValidators:
         seen: list[tuple[str | None, str | None]] = []
 
         async def fake_fetch(
-            url, client, *, timeout, max_attempts, health_callback=None, etag=None, last_modified=None
+            url, client, *, timeout, max_attempts, health_callback=None, etag=None, last_modified=None, deadline=None
         ):
             seen.append((etag, last_modified))
             return ([FeedEntry(title="A", url="https://x/a", source_feed=url)], True)
@@ -2224,7 +2646,7 @@ class TestManualBackoffAndValidators:
         calls: list[tuple[str, str | None]] = []  # (url, etag)
 
         async def fake_fetch(
-            url, client, *, timeout, max_attempts, health_callback=None, etag=None, last_modified=None
+            url, client, *, timeout, max_attempts, health_callback=None, etag=None, last_modified=None, deadline=None
         ):
             calls.append((url, etag))
             if len(calls) == 1:  # primary: fetch failed, no entries -> cascade

@@ -11,8 +11,6 @@ import hashlib
 import logging
 import re
 from calendar import timegm
-from collections.abc import Callable
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from html.parser import HTMLParser
 from time import struct_time
@@ -21,67 +19,40 @@ from urllib.parse import ParseResult, parse_qs, urlparse
 
 import feedparser
 import httpx
-from pydantic import BaseModel
 
-from app.feed_backoff import BACKOFF_BASE_MINUTES, BACKOFF_CAP_HOURS, feed_backoff_until
+from app.feed_backoff import feed_backoff_until
 from app.log_redaction import redact_url
 from app.models import FeedMode, Topic
+from app.scraping.google_news import GOOGLE_NEWS_HOST
+from app.scraping.providers import provider_identity
+from app.scraping.source import (
+    DEADLINE_ERROR,
+    Deadline,
+    SourceDeadlineExceeded,
+    SourceRequest,
+    bounded,
+    host_matches,
+    register_source,
+    url_hostname,
+)
+from app.scraping.source import FeedEntry as FeedEntry
+from app.scraping.source import FeedHealthCallback as FeedHealthCallback
+from app.scraping.source import FeedResponse as FeedResponse
+from app.scraping.source import fetch_feeds_for_topic as fetch_feeds_for_topic
 from app.url_validation import is_private_url, safe_get
 
 if TYPE_CHECKING:
-    from app.config import ExaSettings
     from app.models import FeedHealth
-    from app.scraping.routing import ProviderRouter
 
 logger = logging.getLogger(__name__)
 
-FeedHealthCallback = Callable[
-    [str, bool, str | None, str | None, str | None], None
-]  # (feed_url, success, error_msg, etag, last_modified)
+_RETRY_BACKOFF_SECONDS = 2.0
+
+BING_HOST = "bing.com"
+"""Bing News RSS and its apiclick redirects are served from this domain."""
 
 _USER_AGENT = "TopicWatch/1.0.0 (RSS reader)"
 _FEED_FETCH_TIMEOUT = 15.0
-
-
-class FeedEntry(BaseModel):
-    """A single entry parsed from an RSS/Atom feed."""
-
-    title: str
-    url: str
-    published: datetime | None = None
-    summary: str = ""
-    source_feed: str
-    content: str | None = None
-    """Pre-extracted full text, when the source already provides it (e.g. Exa search).
-    ``None`` for RSS entries, whose text is fetched during content extraction. When set
-    and non-empty, it short-circuits the network fetch in ``extract_article_content``."""
-
-
-@dataclass
-class FeedResponse:
-    """Result of fetching feeds for a topic.
-
-    Wraps the parsed entries with metadata about which provider was
-    used, so downstream code can make provider-specific decisions
-    (e.g. Google News URL resolution) without importing provider classes.
-
-    ``feeds_total`` / ``feeds_failed`` expose per-fetch health so the check
-    pipeline can distinguish a healthy partial yield from a degraded check where
-    some sources silently dropped out (OVH-130). For AUTO mode a single provider
-    is fetched (with at most one cascade), so the counts reflect that attempt;
-    for MANUAL mode they count the topic's explicit feed URLs.
-    """
-
-    entries: list[FeedEntry] = field(default_factory=list)
-    provider_name: str | None = None
-    needs_url_resolution: bool = False
-    feeds_total: int = 0
-    feeds_failed: int = 0
-    feeds_skipped: int = 0
-    """MANUAL mode: feeds skipped this cycle because they are in a backoff window
-    (persistently failing). For MANUAL mode ``feeds_total`` counts feeds ATTEMPTED
-    (skipped feeds are excluded and surface here), so a backed-off feed is never
-    miscounted as a partial failure."""
 
 
 def compute_article_hash(url: str, title: str) -> str:
@@ -121,8 +92,13 @@ def _resolve_google_news_url(link: str, description: str) -> str:
     requests. When it fails (e.g. Google embeds the same redirect URL in the
     description), the async resolver in google_news.py handles it later in
     the pipeline.
+
+    Only entries whose link really is hosted on Google News take this path
+    (TW-AUD-031): a raw-URL substring test let any feed mentioning
+    ``news.google.com/`` in a path or query have its stored URL replaced by an
+    arbitrary href from its own description.
     """
-    if "news.google.com/" not in link:
+    if not host_matches(url_hostname(link), GOOGLE_NEWS_HOST):
         return link
     match = _GOOGLE_NEWS_HREF_RE.search(description)
     if match:
@@ -132,7 +108,7 @@ def _resolve_google_news_url(link: str, description: str) -> str:
         # safe Google redirect link rather than become the article URL.
         if (
             real_url
-            and not real_url.startswith("https://news.google.com/")
+            and not host_matches(url_hostname(real_url), GOOGLE_NEWS_HOST)
             and urlparse(real_url).scheme.lower() in ("http", "https")
         ):
             return real_url
@@ -146,7 +122,7 @@ def _is_bing_apiclick(parsed: ParseResult) -> bool:
     so a ``www.bing.com:80`` netloc still matches) and the case-folded path.
     """
     host = (parsed.hostname or "").lower()
-    return (host == "bing.com" or host.endswith(".bing.com")) and parsed.path.lower() == "/news/apiclick.aspx"
+    return host_matches(host, BING_HOST) and parsed.path.lower() == "/news/apiclick.aspx"
 
 
 def _resolve_bing_news_url(link: str) -> str:
@@ -176,12 +152,43 @@ def _resolve_bing_news_url(link: str) -> str:
     return link
 
 
+# Tags that render as their own line/box, so the text on either side of them is
+# two words, not one. Used to emit a boundary while stripping markup (AUG-185);
+# every other tag is treated as inline and keeps its neighbours adjacent.
+_BLOCK_LEVEL_TAGS = frozenset(
+    {
+        "address", "article", "aside", "blockquote", "br", "caption", "dd", "div", "dl", "dt",
+        "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6",
+        "header", "hr", "li", "main", "nav", "ol", "p", "pre", "section", "table", "tbody", "td",
+        "tfoot", "th", "thead", "tr", "ul",
+    }
+)  # fmt: skip
+
+
 class _HTMLTextExtractor(HTMLParser):
-    """Collect only the text nodes of an HTML fragment, discarding all markup."""
+    """Collect only the text nodes of an HTML fragment, discarding all markup.
+
+    Block-level tags emit a single space so adjacent blocks stay separate words
+    (AUG-185): ``<li>Alpha</li><li>Beta</li>`` is ``Alpha Beta``, not ``AlphaBeta``.
+    The boundary is emitted on both the start and the end tag, so an unclosed
+    block in a malformed fragment still separates. Inline tags emit nothing, so
+    ``<b>Al</b><i>pha</i>`` stays one word. The caller collapses the runs of
+    whitespace this introduces.
+    """
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self._parts: list[str] = []
+
+    def _boundary(self, tag: str) -> None:
+        if tag in _BLOCK_LEVEL_TAGS:
+            self._parts.append(" ")
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._boundary(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        self._boundary(tag)
 
     def handle_data(self, data: str) -> None:
         self._parts.append(data)
@@ -212,6 +219,48 @@ def _strip_html(value: str) -> str:
         logger.debug("HTML strip failed; keeping raw summary", exc_info=True)
         return value
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _parser_headers(response: httpx.Response) -> dict[str, str]:
+    """Transport metadata feedparser needs to decode and resolve the document (TW-AUD-019).
+
+    ``response.text`` pre-decodes the body with httpx's own guess, discarding the
+    XML encoding declaration, so a correctly declared non-UTF-8 feed arrives as
+    mojibake. Handing over ``response.content`` instead makes feedparser's
+    declaration/BOM detection authoritative, with ``content-type`` as the only
+    transport-level charset hint.
+
+    ``content-location`` is the base URI feedparser resolves document-relative
+    entry links against. It is the URL the document actually came from — the
+    final hop after redirects, already SSRF-validated per hop by ``safe_send`` —
+    so a relative Atom link becomes an absolute URL instead of being dropped by
+    the http(s) scheme guard. Resolved URLs still go through that guard.
+
+    Only the three headers feedparser reads are forwarded; passing the whole
+    response header set would hand it transport headers (e.g. ``content-encoding``
+    for a body httpx has already decompressed) that are no longer true of these
+    bytes.
+    """
+    headers = {"content-location": str(response.url)}
+    for name in ("content-type", "content-language"):
+        value = response.headers.get(name)
+        if value:
+            headers[name] = value
+    return headers
+
+
+def _is_wrong_media_type_only(parsed: object, bozo_exc: object) -> bool:
+    """True when the only complaint is a non-XML ``Content-Type`` on a real feed.
+
+    Forwarding ``content-type`` to feedparser (TW-AUD-019) also activates its
+    media-type check, which flags every feed a server mislabels as ``text/plain``
+    or ``text/html``. A legitimately empty one of those must stay in the
+    healthy-empty bucket rather than becoming an OVH-044 soft failure and
+    dragging the feed into backoff. ``parsed.version`` is set only when the
+    document really parsed as RSS/Atom, so an HTML error page (no version) and a
+    truncated feed (a SAX exception, not this one) are still failures.
+    """
+    return bool(isinstance(bozo_exc, feedparser.NonXMLContentType) and getattr(parsed, "version", ""))
 
 
 def _parse_entry(raw_entry: dict, source_feed: str) -> FeedEntry | None:
@@ -256,6 +305,25 @@ def _parse_entry(raw_entry: dict, source_feed: str) -> FeedEntry | None:
     )
 
 
+def _record_out_of_budget(feed_url: str, health_callback: FeedHealthCallback | None, reason: str) -> None:
+    """Record the typed timeout outcome for a feed that ran out of budget."""
+    logger.warning("Feed fetch out of budget: %s — %s", feed_url, reason)
+    if health_callback:
+        health_callback(feed_url, False, reason, None, None)
+
+
+async def _retry_pause(budget: Deadline) -> bool:
+    """Wait out the retry backoff; False when the budget cannot fund another try.
+
+    The pause itself is charged against the deadline, so a feed that has burned
+    its budget stops retrying instead of sleeping into the next scheduler tick.
+    """
+    if budget.expired():
+        return False
+    await asyncio.sleep(budget.slice(_RETRY_BACKOFF_SECONDS))
+    return not budget.expired()
+
+
 async def fetch_feed(
     feed_url: str,
     client: httpx.AsyncClient | None = None,
@@ -264,6 +332,7 @@ async def fetch_feed(
     health_callback: FeedHealthCallback | None = None,
     etag: str | None = None,
     last_modified: str | None = None,
+    deadline: Deadline | None = None,
 ) -> list[FeedEntry]:
     """Fetch and parse a single RSS/Atom feed. Returns [] on any error."""
     entries, _ = await fetch_feed_with_status(
@@ -274,6 +343,7 @@ async def fetch_feed(
         health_callback=health_callback,
         etag=etag,
         last_modified=last_modified,
+        deadline=deadline,
     )
     return entries
 
@@ -286,6 +356,7 @@ async def fetch_feed_with_status(
     health_callback: FeedHealthCallback | None = None,
     etag: str | None = None,
     last_modified: str | None = None,
+    deadline: Deadline | None = None,
 ) -> tuple[list[FeedEntry], bool]:
     """Fetch and parse a single feed, also reporting whether the fetch succeeded.
 
@@ -298,7 +369,18 @@ async def fetch_feed_with_status(
     ``etag`` / ``last_modified`` are the feed's stored conditional-GET validators;
     when present they are sent as ``If-None-Match`` / ``If-Modified-Since`` and a
     304 returns ``([], True)`` (the empty-but-OK bucket) without re-parsing.
+
+    ``deadline`` bounds this feed's whole share of the attempt — the DNS check,
+    every retry and the sleeps between them — rather than each transport wait
+    separately (TW-AUD-018). Running out is a typed outcome: the feed is recorded
+    as failed with ``DEADLINE_ERROR`` and no further attempt is made.
     """
+    budget = deadline if deadline is not None else Deadline.after()
+    if budget.expired():
+        _record_out_of_budget(feed_url, health_callback, f"{DEADLINE_ERROR} before the feed fetch")
+        return [], False
+    # The SSRF check resolves DNS, which is why it runs once per feed rather than
+    # once per attempt; it carries its own hard resolve cap (OVH-148).
     if await asyncio.to_thread(is_private_url, feed_url):
         logger.warning("Blocked fetch to private URL: %s", redact_url(feed_url))
         return [], False
@@ -318,7 +400,9 @@ async def fetch_feed_with_status(
     try:
         for attempt in range(max_attempts):
             try:
-                response = await safe_get(client, feed_url, headers=cond_headers or None)
+                response = await bounded(
+                    budget, "the feed request", safe_get(client, feed_url, headers=cond_headers or None)
+                )
                 # 304 Not Modified: validators still valid. Treat as an empty-but-
                 # successful fetch — the existing "([], True)" bucket that
                 # _fetch_auto/_fetch_manual already handle. Pass (None, None) so the
@@ -328,7 +412,7 @@ async def fetch_feed_with_status(
                         health_callback(feed_url, True, None, None, None)
                     return [], True
                 response.raise_for_status()
-                parsed = feedparser.parse(response.text)
+                parsed = feedparser.parse(response.content, response_headers=_parser_headers(response))
                 entries = []
                 for raw in parsed.entries:
                     # OVH-024: isolate each entry so one malformed entry does not
@@ -347,7 +431,7 @@ async def fetch_feed_with_status(
                 # but entries were still recovered, just note it and proceed.
                 if getattr(parsed, "bozo", 0):
                     bozo_exc = getattr(parsed, "bozo_exception", None)
-                    if not entries:
+                    if not entries and not _is_wrong_media_type_only(parsed, bozo_exc):
                         logger.warning("Feed parse error (bozo) with no entries: %s — %s", feed_url, bozo_exc)
                         if health_callback:
                             health_callback(feed_url, False, f"Feed parse error: {bozo_exc}", None, None)
@@ -364,35 +448,35 @@ async def fetch_feed_with_status(
                         response.headers.get("last-modified"),
                     )
                 return entries, True
+            except SourceDeadlineExceeded as exc:
+                _record_out_of_budget(feed_url, health_callback, str(exc))
+                return [], False
             except httpx.TimeoutException as exc:
-                if attempt < max_attempts - 1:
+                if attempt < max_attempts - 1 and await _retry_pause(budget):
                     logger.debug("Timeout fetching feed (attempt %d): %s", attempt + 1, feed_url)
-                    await asyncio.sleep(2)
                     continue
                 logger.warning("Timeout fetching feed after %d attempts: %s", max_attempts, feed_url)
                 if health_callback:
                     health_callback(feed_url, False, f"Timeout after {max_attempts} attempts: {exc}", None, None)
                 return [], False
             except httpx.HTTPStatusError as exc:
-                if exc.response.status_code >= 500 and attempt < max_attempts - 1:
+                if exc.response.status_code >= 500 and attempt < max_attempts - 1 and await _retry_pause(budget):
                     logger.debug(
                         "HTTP %d fetching feed (attempt %d): %s", exc.response.status_code, attempt + 1, feed_url
                     )
-                    await asyncio.sleep(2)
                     continue
                 logger.warning("HTTP %d fetching feed: %s", exc.response.status_code, feed_url)
                 if health_callback:
                     health_callback(feed_url, False, f"HTTP {exc.response.status_code}", None, None)
                 return [], False
             except httpx.NetworkError as exc:
-                if attempt < max_attempts - 1:
+                if attempt < max_attempts - 1 and await _retry_pause(budget):
                     logger.debug(
                         "Network error fetching feed (attempt %d): %s — %s",
                         attempt + 1,
                         feed_url,
                         type(exc).__name__,
                     )
-                    await asyncio.sleep(2)
                     continue
                 logger.warning(
                     "Network error fetching feed after %d attempts: %s — %s",
@@ -414,56 +498,14 @@ async def fetch_feed_with_status(
             await client.aclose()
 
 
-async def fetch_feeds_for_topic(
-    topic: Topic,
-    timeout: float = _FEED_FETCH_TIMEOUT,
-    max_attempts: int = 2,
-    health_callback: FeedHealthCallback | None = None,
-    router: ProviderRouter | None = None,
-    feed_state_loader: Callable[[str], FeedHealth | None] | None = None,
-    backoff_base_minutes: int = BACKOFF_BASE_MINUTES,
-    backoff_cap_hours: int = BACKOFF_CAP_HOURS,
-    exa_settings: ExaSettings | None = None,
-    max_results: int = 10,
-) -> FeedResponse:
-    """Fetch all feeds for a topic, deduplicated by URL.
-
-    For AUTO mode: uses the router to select a provider, with within-cycle
-    fallback (max 1 retry with the next provider). For MANUAL mode: fetches all
-    explicit feed URLs concurrently, skipping any in a backoff window. For EXA
-    mode: queries the Exa search API (``exa_settings`` required; ``max_results``
-    bounds the paid result count).
-
-    ``feed_state_loader`` supplies the stored ``FeedHealth`` per URL — used to
-    send conditional-GET validators (both RSS modes) and to skip backed-off feeds
-    (MANUAL only; AUTO provider backoff is owned by ``ProviderRouter``).
-    """
-    if topic.feed_mode == FeedMode.EXA:
-        # Lazy import avoids an exa <-> rss module cycle (mirrors _fetch_auto's router import).
-        from app.scraping.exa import fetch_exa_entries
-
-        if exa_settings is None:
-            logger.warning("Topic '%s' uses Exa mode but no Exa settings were supplied", topic.name)
-            return FeedResponse(provider_name="exa", feeds_total=0, feeds_failed=0)
-        return await fetch_exa_entries(
-            topic, exa_settings, max_results=max_results, timeout=timeout, health_callback=health_callback
-        )
-    if topic.feed_mode == FeedMode.AUTO:
-        return await _fetch_auto(topic, timeout, max_attempts, health_callback, router, feed_state_loader)
-    return await _fetch_manual(
-        topic, timeout, max_attempts, health_callback, feed_state_loader, backoff_base_minutes, backoff_cap_hours
-    )
-
-
-async def _fetch_auto(
-    topic: Topic,
-    timeout: float,
-    max_attempts: int,
-    health_callback: FeedHealthCallback | None,
-    router: ProviderRouter | None,
-    feed_state_loader: Callable[[str], FeedHealth | None] | None = None,
-) -> FeedResponse:
+async def _fetch_auto(topic: Topic, request: SourceRequest) -> FeedResponse:
     """AUTO mode: try provider, fallback to next on empty/error."""
+    timeout = request.timeout
+    max_attempts = request.max_attempts
+    health_callback = request.health_callback
+    feed_state_loader = request.feed_state_loader
+    deadline = request.deadline
+    router = request.router
     if router is None:
         from app.scraping.routing import router as default_router
 
@@ -489,15 +531,15 @@ async def _fetch_auto(
             health_callback=health_callback,
             etag=p_etag,
             last_modified=p_last_modified,
+            deadline=deadline,
         )
 
         if entries:
             if router.mark_healthy(provider.name, observed_epoch=provider_epoch):
                 logger.info("Provider %s recovered (back to healthy)", provider.name)
-            return FeedResponse(
+            return FeedResponse.from_source(
+                provider_identity(provider),
                 entries=entries,
-                provider_name=provider.name,
-                needs_url_resolution=provider.needs_url_resolution(),
                 feeds_total=1,
                 feeds_failed=0,
             )
@@ -512,12 +554,22 @@ async def _fetch_auto(
         next_provider = router.get_next_provider(provider)
         if next_provider is None:
             logger.warning("Provider %s %s; no fallback provider available", provider.name, reason)
-            return FeedResponse(
-                entries=[],
-                provider_name=provider.name,
-                needs_url_resolution=False,
+            return FeedResponse.from_source(
+                provider_identity(provider),
                 feeds_total=1,
                 feeds_failed=1 if not fetch_ok else 0,
+                needs_url_resolution=False,
+            )
+
+        if deadline.expired():
+            # The cascade is a second full fetch; starting one with no budget left
+            # only pushes the topic further past its slot.
+            logger.warning("Provider %s %s; no budget left to cascade to %s", provider.name, reason, next_provider.name)
+            return FeedResponse.from_source(
+                provider_identity(provider),
+                feeds_total=1,
+                feeds_failed=1 if not fetch_ok else 0,
+                needs_url_resolution=False,
             )
 
         logger.info("Provider %s %s, cascading to %s", provider.name, reason, next_provider.name)
@@ -532,16 +584,16 @@ async def _fetch_auto(
             health_callback=health_callback,
             etag=f_etag,
             last_modified=f_last_modified,
+            deadline=deadline,
         )
         first_failed = 1 if not fetch_ok else 0
 
         if entries:
             if router.mark_healthy(next_provider.name, observed_epoch=next_epoch):
                 logger.info("Provider %s recovered (back to healthy)", next_provider.name)
-            return FeedResponse(
+            return FeedResponse.from_source(
+                provider_identity(next_provider),
                 entries=entries,
-                provider_name=next_provider.name,
-                needs_url_resolution=next_provider.needs_url_resolution(),
                 feeds_total=2,
                 feeds_failed=first_failed,
             )
@@ -556,25 +608,23 @@ async def _fetch_auto(
             next_provider.name,
             next_reason,
         )
-        return FeedResponse(
-            entries=[],
-            provider_name=next_provider.name,
-            needs_url_resolution=False,
+        return FeedResponse.from_source(
+            provider_identity(next_provider),
             feeds_total=2,
             feeds_failed=first_failed + (1 if not next_fetch_ok else 0),
+            needs_url_resolution=False,
         )
 
 
-async def _fetch_manual(
-    topic: Topic,
-    timeout: float,
-    max_attempts: int,
-    health_callback: FeedHealthCallback | None,
-    feed_state_loader: Callable[[str], FeedHealth | None] | None = None,
-    backoff_base_minutes: int = BACKOFF_BASE_MINUTES,
-    backoff_cap_hours: int = BACKOFF_CAP_HOURS,
-) -> FeedResponse:
+async def _fetch_manual(topic: Topic, request: SourceRequest) -> FeedResponse:
     """MANUAL mode: fetch explicit feed URLs concurrently, skipping backed-off ones."""
+    timeout = request.timeout
+    max_attempts = request.max_attempts
+    health_callback = request.health_callback
+    feed_state_loader = request.feed_state_loader
+    backoff_base_minutes = request.backoff_base_minutes
+    backoff_cap_hours = request.backoff_cap_hours
+    deadline = request.deadline
     if not topic.feed_urls:
         return FeedResponse()
 
@@ -614,6 +664,7 @@ async def _fetch_manual(
                 health_callback=health_callback,
                 etag=etag,
                 last_modified=last_modified,
+                deadline=deadline,
             )
             for (url, etag, last_modified) in attempted
         ]
@@ -639,3 +690,9 @@ async def _fetch_manual(
     return FeedResponse(
         entries=entries, feeds_total=feeds_total, feeds_failed=feeds_failed, feeds_skipped=feeds_skipped
     )
+
+
+# Registered at import: the package's __init__ imports this module (and exa), so
+# every mode has a fetcher before the first dispatch.
+register_source(FeedMode.AUTO, _fetch_auto)
+register_source(FeedMode.MANUAL, _fetch_manual)

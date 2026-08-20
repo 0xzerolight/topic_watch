@@ -22,6 +22,10 @@ VALID_RSS = """<?xml version="1.0"?>
 def _make_response(text: str, status_code: int = 200) -> MagicMock:
     response = MagicMock()
     response.text = text
+    # The parser is fed the raw bytes plus the document's own metadata (TW-AUD-019).
+    response.content = text.encode()
+    response.url = "https://example.com/feed.xml"
+    response.headers = {"content-type": "application/rss+xml"}
     response.status_code = status_code
     response.raise_for_status = MagicMock()
     return response
