@@ -4,10 +4,23 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import app
+
+
+@pytest.fixture(autouse=True)
+def _yaml_owned_llm_credentials(monkeypatch: pytest.MonkeyPatch):
+    """Let the wizard own the LLM block.
+
+    conftest (like CI) exports TOPIC_WATCH_LLM__MODEL / __API_KEY so the app counts as
+    configured; while they are set the environment owns those fields and setup leaves
+    them alone (AUG-241), which is not what the wizard's own tests are about.
+    """
+    monkeypatch.delenv("TOPIC_WATCH_LLM__MODEL", raising=False)
+    monkeypatch.delenv("TOPIC_WATCH_LLM__API_KEY", raising=False)
 
 
 @pytest.fixture
@@ -435,3 +448,127 @@ class TestVerifyLLMCredentials:
         ):
             await verify_llm_credentials(model="openai/gpt-4o-mini", api_key="sk-leak", base_url=None)
         assert "sk-leak" not in str(ei.value)
+
+
+class TestSetupPublication:
+    """AUG-199/292: setup publishes disk, state and scheduler as one ordered transition."""
+
+    def _post(self, client: TestClient, **data):
+        csrf_token = client.get("/setup").cookies.get("csrf_token")
+        payload = {
+            "llm_model": "openai/gpt-4o-mini",
+            "llm_api_key": "sk-good-key",
+            "llm_base_url": "",
+            "csrf_token": csrf_token,
+        }
+        payload.update(data)
+        return client.post("/setup", data=payload, follow_redirects=False)
+
+    def test_scheduler_failure_leaves_setup_retryable(self, unconfigured_app: TestClient) -> None:
+        """A scheduler that fails to start must not leave a configured app with no monitoring."""
+        previous = app.state.settings
+        with (
+            patch("app.scheduler.start_scheduler", side_effect=RuntimeError("no event loop")),
+            patch("app.scheduler.stop_scheduler") as mock_stop,
+            patch("app.web.routers.settings.verify_llm_credentials", return_value=None),
+        ):
+            response = self._post(unconfigured_app)
+
+        assert response.status_code == 422
+        # The gate is still open, so the user can fix and retry.
+        assert app.state.setup_required is True
+        # The partial scheduler is torn down and the prior live settings restored.
+        mock_stop.assert_called_once()
+        assert app.state.settings is previous
+
+    def test_gate_closes_only_after_the_scheduler_is_running(self, unconfigured_app: TestClient) -> None:
+        """setup_required is still True while start_scheduler runs."""
+        seen: list[bool] = []
+
+        def record(*_args, **_kwargs):
+            seen.append(app.state.setup_required)
+
+        with (
+            patch("app.scheduler.start_scheduler", side_effect=record),
+            patch("app.web.routers.settings.verify_llm_credentials", return_value=None),
+        ):
+            self._post(unconfigured_app)
+
+        assert seen == [True]
+        assert app.state.setup_required is False
+
+    def test_preserves_configured_notifications_and_exa(self, unconfigured_app: TestClient, tmp_path: Path) -> None:
+        """Completing LLM setup must not erase configuration the user already had."""
+        from app.config import ExaSettings, NotificationSettings, Settings
+
+        config_file = tmp_path / "config.yml"
+        app.state.config_path = config_file
+        app.state.settings = Settings(  # type: ignore[call-arg]
+            notifications=NotificationSettings(urls=["ntfy://already-configured"]),
+            exa=ExaSettings(enabled=True, api_key="exa-already-set"),
+            check_interval="12h",
+        )
+
+        with (
+            patch("app.scheduler.start_scheduler"),
+            patch("app.web.routers.settings.verify_llm_credentials", return_value=None),
+        ):
+            response = self._post(unconfigured_app)
+
+        assert response.status_code == 303
+        assert app.state.settings.notifications.urls == ["ntfy://already-configured"]
+        assert app.state.settings.exa.enabled is True
+        assert app.state.settings.check_interval == "12h"
+
+        data = yaml.safe_load(config_file.read_text())
+        assert data["notifications"]["urls"] == ["ntfy://already-configured"]
+        assert data["exa"]["api_key"] == "exa-already-set"
+
+
+class TestSetupSerialization:
+    """AUG-292: two first-run submissions cannot both pass the gate and publish."""
+
+    async def test_concurrent_submissions_publish_once(self, tmp_path: Path) -> None:
+        import asyncio
+
+        import httpx
+
+        from app.config import Settings
+        from app.database import init_db
+
+        db_path = tmp_path / "test.db"
+        init_db(db_path)
+        app.state.settings = Settings()  # type: ignore[call-arg]
+        app.state.db_path = db_path
+        app.state.config_path = tmp_path / "config.yml"
+        app.state.setup_required = True
+
+        async def slow_preflight(**_kwargs):
+            await asyncio.sleep(0.05)  # both requests are in flight across this await
+
+        token = "csrf-setup-race"
+        with (
+            patch("app.scheduler.start_scheduler") as mock_sched,
+            patch("app.web.routers.settings.save_settings_to_yaml") as mock_save,
+            patch("app.web.routers.settings.verify_llm_credentials", side_effect=slow_preflight),
+        ):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://test",
+                cookies={"csrf_token": token},
+                headers={"X-CSRF-Token": token},
+            ) as ac:
+                payloads = [
+                    {
+                        "llm_model": f"openai/model-{index}",
+                        "llm_api_key": f"sk-key-{index}",
+                        "llm_base_url": "",
+                        "csrf_token": token,
+                    }
+                    for index in range(2)
+                ]
+                await asyncio.gather(*(ac.post("/setup", data=p, follow_redirects=False) for p in payloads))
+
+        assert mock_save.call_count == 1
+        assert mock_sched.call_count == 1
+        assert app.state.setup_required is False

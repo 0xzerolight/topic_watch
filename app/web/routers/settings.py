@@ -1,5 +1,6 @@
 """Setup wizard, settings editor, and notification-test routes."""
 
+import asyncio
 import logging
 import re
 
@@ -27,6 +28,10 @@ from app.web.routers.templates import _mask_url, templates
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Serializes the one-shot setup transition: gate check, persistence and scheduler
+# start are one critical section, so two first-run submissions cannot interleave.
+_setup_lock = asyncio.Lock()
 
 # Seconds to wait for the pre-flight credential ping before giving up.
 _PREFLIGHT_TIMEOUT = 15.0
@@ -229,6 +234,47 @@ async def verify_llm_credentials(model: str, api_key: str, base_url: str | None)
         ) from exc
 
 
+def _setup_settings(request: Request, model: str, api_key: str, base_url: str | None) -> Settings:
+    """The live settings with only the setup-owned LLM block replaced.
+
+    Setup runs whenever LLM credentials are incomplete, which says nothing about the
+    rest of the configuration: notification targets and Exa can already be set in YAML
+    or the environment, and building a fresh ``Settings`` erased them (AUG-200). Any
+    environment-owned LLM field is left alone for the same reason the settings form
+    leaves it alone — the environment would win again at the next load anyway.
+    """
+    from app.config import LLMSettings
+
+    current: Settings = request.app.state.settings
+    submitted = strip_env_owned({"llm": {"model": model, "api_key": api_key, "base_url": base_url}}).get("llm", {})
+    return current.model_copy(update={"llm": LLMSettings(**{**current.llm.model_dump(), **submitted})})
+
+
+def _publish_setup(request: Request, new_settings: Settings) -> None:
+    """Persist, start the scheduler, and only then open the app for business.
+
+    The setup gate is single-shot, so closing it before the scheduler exists left an
+    application that looked configured, refused further setup attempts, and monitored
+    nothing until a restart (AUG-199/292). Ordering here is the fix: on failure the
+    partial scheduler is stopped and the previous live settings restored, so setup
+    stays retryable. The written file is deliberately left in place — it holds the
+    credentials the user just gave, and a retry rewrites it.
+    """
+    from app.scheduler import start_scheduler, stop_scheduler
+
+    previous_settings = request.app.state.settings
+    save_settings_to_yaml(new_settings, request.app.state.config_path)
+    # Wire the app so scheduler jobs read live settings from app.state (OVH-015/036).
+    request.app.state.settings = new_settings
+    try:
+        start_scheduler(new_settings, db_path=request.app.state.db_path, app=request.app)
+    except BaseException:
+        stop_scheduler()
+        request.app.state.settings = previous_settings
+        raise
+    request.app.state.setup_required = False
+
+
 @router.get("/setup", response_class=HTMLResponse)
 async def setup_view(request: Request):
     """Display the first-run setup wizard, or redirect to dashboard if already configured."""
@@ -253,9 +299,6 @@ async def complete_setup(
     """Process setup form and start the application."""
     from pydantic import ValidationError
 
-    from app.config import ExaSettings, LLMSettings, NotificationSettings
-    from app.scheduler import start_scheduler
-
     # Single-shot setup (OVH-059): once configured, a replay/double-submit/stale-bookmark
     # POST must not re-run setup — that would clobber live credentials and start a second
     # scheduler (orphaning the running one). Ongoing changes go through /settings.
@@ -275,33 +318,27 @@ async def complete_setup(
     }
     _provider_ctx = {"cloud_providers": sorted(CLOUD_PROVIDERS), "local_provider_defaults": LOCAL_PROVIDER_DEFAULTS}
     try:
-        new_settings = Settings(  # type: ignore[call-arg]
-            llm=LLMSettings(
-                model=llm_model,
-                api_key=llm_api_key,
-                base_url=effective_base_url,
-            ),
-            notifications=NotificationSettings(),
-            # Pass exa explicitly (mirrors notifications) so a TOPIC_WATCH_EXA__API_KEY env
-            # secret is not env-sourced into new_settings and then written to plaintext YAML
-            # by the default preserve_exa_key=False (OVH-003). Env still wins at load.
-            exa=ExaSettings(),
-        )
-        # Pre-flight: confirm the credentials actually work before completing setup,
-        # so a bad key/model/base_url is caught here instead of failing silently later.
-        # The "Save anyway" escape hatch (skip_validation) bypasses this so a transient
-        # provider error or a stale default model string can't trap a brand-new user at
-        # /setup. It is safe: is_configured() only needs a non-placeholder key, and a bad
-        # key then degrades gracefully — analyze_articles() returns has_new_info=False on
-        # any LLM failure (no crash, no spurious notification). The user fixes it later in
-        # Settings, and Feed Health / `doctor` surface the failing checks.
-        if skip_validation != "true":
-            await verify_llm_credentials(model=llm_model, api_key=llm_api_key, base_url=effective_base_url)
-        save_settings_to_yaml(new_settings, request.app.state.config_path)
-        request.app.state.settings = new_settings
-        request.app.state.setup_required = False
-        # Wire the app so scheduler jobs read live settings from app.state (OVH-015/036).
-        start_scheduler(new_settings, db_path=request.app.state.db_path, app=request.app)
+        # One setup at a time (AUG-292). The gate above is checked before an awaited
+        # credential probe, so two first-run submissions could both pass it and both
+        # publish; inside the lock it is re-checked after every await instead.
+        async with _setup_lock:
+            if not getattr(request.app.state, "setup_required", False):
+                return RedirectResponse(url="/", status_code=303)
+
+            new_settings = _setup_settings(request, llm_model, llm_api_key, effective_base_url)
+            # Pre-flight: confirm the credentials actually work before completing setup,
+            # so a bad key/model/base_url is caught here instead of failing silently later.
+            # The "Save anyway" escape hatch (skip_validation) bypasses this so a transient
+            # provider error or a stale default model string can't trap a brand-new user at
+            # /setup. It is safe: is_configured() only needs a non-placeholder key, and a bad
+            # key then degrades gracefully — analyze_articles() returns has_new_info=False on
+            # any LLM failure (no crash, no spurious notification). The user fixes it later in
+            # Settings, and Feed Health / `doctor` surface the failing checks.
+            if skip_validation != "true":
+                await verify_llm_credentials(model=llm_model, api_key=llm_api_key, base_url=effective_base_url)
+                if not getattr(request.app.state, "setup_required", False):
+                    return RedirectResponse(url="/", status_code=303)
+            _publish_setup(request, new_settings)
     except LLMValidationError as exc:
         return _render(
             request,
