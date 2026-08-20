@@ -448,14 +448,23 @@ async def update_settings(request: Request):
 
     # llm_model is required; an empty value has no Pydantic constraint to trip, so guard it
     # explicitly to keep the previous "blank model → 422" behavior (preserved across OVH-069).
+    # Enabling Exa without a key is refused the same way: the model would quietly disable
+    # it again, and a silent revert on a save the user asked for is worse than an error.
+    field_errors = []
     if not llm_model.strip():
+        field_errors.append("llm_model: Field required")
+    if enable_exa and not effective_exa_key.strip():
+        field_errors.append(
+            "exa_api_key: Enter an Exa API key to enable the Exa source. Without one, Exa topics cannot fetch."
+        )
+    if field_errors:
         return _render(
             request,
             "settings.html",
             _settings_template_ctx(
                 request,
                 settings=request.app.state.settings,
-                errors=["llm_model: Field required"],
+                errors=field_errors,
                 form=form_values,
             ),
             status_code=422,

@@ -705,3 +705,35 @@ class TestAtomicPermissionSafeWrite:
         before = config.stat().st_ino
         save_settings_to_yaml(Settings(llm={"model": "openai/m", "api_key": "sk"}), config)
         assert config.stat().st_ino != before
+
+
+class TestExaRequiresAKey:
+    """AUG-099: enabled means usable — a keyless Exa source can never fetch."""
+
+    def test_enabled_without_a_key_is_disabled(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING, logger="app.config"):
+            settings = Settings(llm={"model": "openai/m", "api_key": "sk"}, exa={"enabled": True, "api_key": ""})
+        assert settings.exa.enabled is False
+        assert any("Exa is enabled but no API key" in r.message for r in caplog.records)
+
+    def test_whitespace_key_does_not_count(self) -> None:
+        settings = Settings(llm={"model": "openai/m", "api_key": "sk"}, exa={"enabled": True, "api_key": "   "})
+        assert settings.exa.enabled is False
+
+    def test_enabled_with_a_key_stays_enabled(self) -> None:
+        settings = Settings(llm={"model": "openai/m", "api_key": "sk"}, exa={"enabled": True, "api_key": "exa-key"})
+        assert settings.exa.enabled is True
+
+    def test_keyless_yaml_config_still_loads(self, tmp_path: Path) -> None:
+        """A hand-edited config is corrected, not rejected — startup must survive it."""
+        config = tmp_path / "config.yml"
+        config.write_text('llm:\n  model: "openai/m"\n  api_key: "sk"\nexa:\n  enabled: true\n')
+        settings = load_settings(config_path=config)
+        assert settings.exa.enabled is False
+
+    def test_env_supplied_key_enables_it(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("TOPIC_WATCH_EXA__API_KEY", "exa-env-key")
+        config = tmp_path / "config.yml"
+        config.write_text('llm:\n  model: "openai/m"\n  api_key: "sk"\nexa:\n  enabled: true\n')
+        settings = load_settings(config_path=config)
+        assert settings.exa.enabled is True

@@ -1174,3 +1174,40 @@ class TestExaSettingsWeb:
         response = await client.get("/settings")
         assert response.status_code == 200
         assert "TOPIC_WATCH_EXA__API_KEY" in response.text
+
+
+class TestExaEnableRequiresKey:
+    """AUG-099 at the form boundary: enabling Exa without a key is an error, not a no-op."""
+
+    async def test_enable_without_key_is_rejected(self, client: httpx.AsyncClient) -> None:
+        app.state.settings = _make_settings(exa=ExaSettings(enabled=False, api_key=""))
+        response = await client.post(
+            "/settings",
+            data=valid_form_data(enable_exa="true", exa_api_key=""),
+            follow_redirects=False,
+        )
+        assert response.status_code == 422
+        assert "Exa API key" in response.text
+        assert app.state.settings.exa.enabled is False
+
+    async def test_enable_with_key_is_accepted(self, client: httpx.AsyncClient) -> None:
+        with patch("app.web.routers.settings.save_settings_to_yaml"):
+            response = await client.post(
+                "/settings",
+                data=valid_form_data(enable_exa="true", exa_api_key="exa-key-123"),
+                follow_redirects=False,
+            )
+        assert response.status_code == 303
+        assert app.state.settings.exa.enabled is True
+
+    async def test_enable_with_existing_key_is_accepted(self, client: httpx.AsyncClient) -> None:
+        """A blank field means "keep the current key", which satisfies the requirement."""
+        app.state.settings = _make_settings(exa=ExaSettings(enabled=True, api_key="already-set"))
+        with patch("app.web.routers.settings.save_settings_to_yaml"):
+            response = await client.post(
+                "/settings",
+                data=valid_form_data(enable_exa="true", exa_api_key=""),
+                follow_redirects=False,
+            )
+        assert response.status_code == 303
+        assert app.state.settings.exa.enabled is True

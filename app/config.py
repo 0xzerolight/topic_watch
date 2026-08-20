@@ -234,6 +234,21 @@ class ExaSettings(BaseModel):
         description="Optional Exa API base URL override (advanced/proxy; defaults to https://api.exa.ai)",
     )
 
+    @model_validator(mode="after")
+    def enabled_requires_a_key(self) -> Self:
+        """``enabled`` means usable: without a key the source can never fetch.
+
+        Everything downstream reads ``enabled`` alone as availability, so a keyless
+        enabled state produced EXA topics that fail their first initialization with a
+        generic "no articles found" (AUG-099). Held here rather than raised, so a
+        hand-edited or half-migrated config still starts; the settings form rejects
+        the same combination up front with a message the user can act on.
+        """
+        if self.enabled and not self.api_key.strip():
+            logger.warning("Exa is enabled but no API key is configured — disabling the Exa source")
+            self.enabled = False
+        return self
+
 
 class Settings(BaseSettings):
     """Application settings loaded from YAML with env var overrides.
