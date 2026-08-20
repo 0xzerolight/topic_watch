@@ -622,3 +622,53 @@ class TestSetupSerialization:
         assert mock_save.call_count == 1
         assert mock_sched.call_count == 1
         assert app.state.setup_required is False
+
+
+class TestKeylessLocalProvider:
+    """AUG-107: the documented keyless Ollama path completes setup."""
+
+    def _post(self, client: TestClient, **data):
+        csrf_token = client.get("/setup").cookies.get("csrf_token")
+        payload = {"llm_model": "ollama/llama3.3", "llm_api_key": "", "llm_base_url": "", "csrf_token": csrf_token}
+        payload.update(data)
+        return client.post("/setup", data=payload, follow_redirects=False)
+
+    def test_blank_key_completes_setup_for_ollama(self, unconfigured_app: TestClient) -> None:
+        with (
+            patch("app.scheduler.start_scheduler"),
+            patch("app.web.routers.settings.verify_llm_credentials", return_value=None),
+        ):
+            response = self._post(unconfigured_app, llm_base_url="http://localhost:11434")
+
+        assert response.status_code == 303
+        assert app.state.setup_required is False
+        assert app.state.settings.llm.api_key == ""
+        assert app.state.settings.is_configured()
+
+    def test_blank_key_is_refused_for_a_hosted_provider(self, unconfigured_app: TestClient) -> None:
+        """The server enforces it; client-side `required` is not a contract."""
+        with (
+            patch("app.scheduler.start_scheduler") as mock_sched,
+            patch("app.web.routers.settings.verify_llm_credentials", return_value=None),
+        ):
+            response = self._post(unconfigured_app, llm_model="openai/gpt-4o-mini")
+
+        assert response.status_code == 422
+        assert "API key is required" in response.text
+        assert app.state.setup_required is True
+        mock_sched.assert_not_called()
+
+    def test_key_field_is_not_unconditionally_required(self, unconfigured_app: TestClient) -> None:
+        page = unconfigured_app.get("/setup")
+        assert 'id="llm_api_key" name="llm_api_key"' in page.text
+        assert 'name="llm_api_key" required' not in page.text
+        assert "needs no key" in page.text
+
+
+class TestProviderSwitchDropsInjectedBaseUrl:
+    """AUG-100: the local default the script injected does not survive a switch."""
+
+    def test_setup_page_tracks_its_own_autofill(self, unconfigured_app: TestClient) -> None:
+        page = unconfigured_app.get("/setup")
+        assert "var autofilled = null;" in page.text
+        assert "function dropAutofilledUrl()" in page.text

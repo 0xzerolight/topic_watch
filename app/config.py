@@ -115,6 +115,16 @@ LOCAL_PROVIDER_DEFAULTS: dict[str, str] = {
 }
 
 
+def is_keyless_llm_provider(model: str) -> bool:
+    """True for a self-hosted provider that authenticates nothing.
+
+    ``LOCAL_PROVIDER_DEFAULTS`` is the registry of providers running on the user's own
+    machine, so there is no credential to supply and none should be demanded (AUG-107).
+    """
+    provider = model.split("/", 1)[0].strip().lower() if "/" in model else ""
+    return provider in LOCAL_PROVIDER_DEFAULTS
+
+
 # Env var that supplies the LLM API key (env > YAML; see settings_customise_sources).
 _API_KEY_ENV_VAR = "TOPIC_WATCH_LLM__API_KEY"
 # Env var that supplies the Exa API key (same env > YAML precedence).
@@ -357,8 +367,17 @@ class Settings(BaseSettings):
     )
 
     def is_configured(self) -> bool:
-        """Return True if minimal required configuration is present."""
-        return bool(self.llm.model and self.llm.api_key and self.llm.api_key != "your-api-key-here")
+        """Return True if minimal required configuration is present.
+
+        Key requiredness is provider-aware: a self-hosted provider authenticates
+        nothing, and the documented keyless Ollama path was unreachable while an
+        empty key counted as unconfigured (AUG-107).
+        """
+        if not self.llm.model:
+            return False
+        if is_keyless_llm_provider(self.llm.model):
+            return True
+        return bool(self.llm.api_key and self.llm.api_key != "your-api-key-here")
 
     @model_validator(mode="before")
     @classmethod

@@ -737,3 +737,22 @@ class TestExaRequiresAKey:
         config.write_text('llm:\n  model: "openai/m"\n  api_key: "sk"\nexa:\n  enabled: true\n')
         settings = load_settings(config_path=config)
         assert settings.exa.enabled is True
+
+
+class TestKeylessProviders:
+    """AUG-107: key requiredness is provider-aware."""
+
+    def test_ollama_without_a_key_is_configured(self) -> None:
+        settings = Settings(llm={"model": "ollama/llama3.3", "api_key": ""})
+        assert settings.is_configured()
+
+    def test_cloud_provider_without_a_key_is_not_configured(self) -> None:
+        settings = Settings(llm={"model": "openai/gpt-4o-mini", "api_key": ""})
+        assert not settings.is_configured()
+
+    def test_provider_match_is_case_insensitive(self) -> None:
+        from app.config import is_keyless_llm_provider
+
+        assert is_keyless_llm_provider("Ollama/Llama3.3")
+        assert not is_keyless_llm_provider("openai/gpt-4o-mini")
+        assert not is_keyless_llm_provider("ollama")  # no provider prefix at all

@@ -15,6 +15,7 @@ from app.config import (
     config_revision,
     is_api_key_env_sourced,
     is_exa_key_env_sourced,
+    is_keyless_llm_provider,
     load_settings,
     save_settings_to_yaml,
     strip_env_owned,
@@ -345,7 +346,10 @@ async def setup_view(request: Request):
 async def complete_setup(
     request: Request,
     llm_model: str = Form(...),
-    llm_api_key: str = Form(...),
+    # Optional at the transport level: an empty form value reads as "missing" and would
+    # 422 with a generic error page before the handler could explain anything. Whether a
+    # key is actually required is provider-aware and enforced below (AUG-107).
+    llm_api_key: str = Form(""),
     llm_base_url: str = Form(""),
     skip_validation: str = Form(""),
 ):
@@ -377,6 +381,14 @@ async def complete_setup(
         async with _setup_lock:
             if not getattr(request.app.state, "setup_required", False):
                 return RedirectResponse(url="/", status_code=303)
+
+            # Provider-aware key requirement (AUG-107): a hosted provider needs one,
+            # a local one never did and the wizard used to demand it anyway.
+            if not llm_api_key.strip() and not is_keyless_llm_provider(llm_model):
+                raise LLMValidationError(
+                    f"An API key is required for '{llm_model}'. Only a local provider "
+                    f"({', '.join(sorted(LOCAL_PROVIDER_DEFAULTS))}) can be left blank."
+                )
 
             new_settings = _setup_settings(request, llm_model, llm_api_key, effective_base_url)
             # Pre-flight: confirm the credentials actually work before completing setup,
