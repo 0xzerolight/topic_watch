@@ -254,6 +254,80 @@ def test_run_artifact_save_load_round_trip(tmp_path) -> None:
     assert loaded.scenario.topic.name == "T"
 
 
+def _minimal_artifact(name: str = "s"):
+    from evals.scenario import RunArtifact, Scenario, ScenarioTopic
+
+    return RunArtifact(
+        name=name,
+        kind="novelty",
+        scenario=Scenario(topic=ScenarioTopic(name="T", description="d")),
+    )
+
+
+def test_save_run_uses_restrictive_permissions(tmp_path) -> None:
+    """AUG-297: artifacts embed raw article bodies, prompts, and topic
+    instructions; an ambient umask must not make them world/group readable
+    on a shared self-hosting machine."""
+    import stat
+
+    from evals.scenario import save_run
+
+    runs = tmp_path / "runs"
+    path = save_run(_minimal_artifact(), runs)
+
+    dir_mode = stat.S_IMODE(runs.stat().st_mode)
+    file_mode = stat.S_IMODE(path.stat().st_mode)
+    assert dir_mode == 0o700
+    assert file_mode == 0o600
+
+
+def test_dump_scenario_uses_restrictive_permissions(tmp_path) -> None:
+    """The same private writer applies to frozen scenarios (--freeze), which
+    also carry article bodies and topic instructions (AUG-297)."""
+    import stat
+
+    from evals.scenario import Scenario, ScenarioTopic, dump_scenario
+
+    p = tmp_path / "frozen.yml"
+    dump_scenario(Scenario(topic=ScenarioTopic(name="T", description="d")), p)
+
+    assert stat.S_IMODE(p.stat().st_mode) == 0o600
+
+
+def test_save_run_rejects_path_traversal_via_scenario_name(tmp_path) -> None:
+    """AUG-298: Scenario.name is attacker/author-controlled (a hand-authored
+    YAML `name:` field), and must never let a run escape runs_dir."""
+    from evals.scenario import save_run
+
+    runs = tmp_path / "runs"
+    path = save_run(_minimal_artifact(name="../../etc/passwd"), runs)
+
+    assert path.resolve().parent == runs.resolve()
+    assert ".." not in path.name
+
+
+def test_save_run_slugifies_absolute_scenario_name(tmp_path) -> None:
+    from evals.scenario import save_run
+
+    runs = tmp_path / "runs"
+    path = save_run(_minimal_artifact(name="/etc/passwd"), runs)
+
+    assert path.resolve().parent == runs.resolve()
+
+
+def test_save_run_prunes_old_artifacts_beyond_cap(tmp_path, monkeypatch) -> None:
+    """AUG-298: unbounded artifact storage — cap saved runs so an unattended
+    habit of eval invocations does not grow runs_dir without bound."""
+    import evals.scenario as scenario_mod
+
+    monkeypatch.setattr(scenario_mod, "_MAX_SAVED_RUNS", 3)
+    runs = tmp_path / "runs"
+    for i in range(5):
+        scenario_mod.save_run(_minimal_artifact(name=f"s{i}"), runs)
+
+    assert len(list(runs.glob("*.json"))) == 3
+
+
 # --- runner: run_scenario ---
 
 
