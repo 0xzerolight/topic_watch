@@ -848,6 +848,79 @@ class TestTopicDetail:
         assert response.status_code == 200
         assert "default criteria" in response.text
 
+    async def test_detail_routine_actions_in_masthead_above_history(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-115: Check Now/Edit/Enable-Disable live in the masthead, above Check History."""
+        topic = _make_topic(db_conn, name="Routine Actions")
+        for _ in range(3):
+            create_check_result(db_conn, CheckResult(topic_id=topic.id))
+        db_conn.commit()
+
+        response = await client.get(f"/topics/{topic.id}")
+        assert response.status_code == 200
+        text = response.text
+
+        check_now_pos = text.index(f'action="/topics/{topic.id}/check"')
+        edit_pos = text.index(f'href="/topics/{topic.id}/edit"')
+        toggle_pos = text.index(f'action="/topics/{topic.id}/toggle-active"')
+        history_pos = text.index("<h2>Check History</h2>")
+        maintenance_pos = text.index("<h2>Maintenance</h2>")
+
+        assert check_now_pos < history_pos
+        assert edit_pos < history_pos
+        assert toggle_pos < history_pos
+        assert check_now_pos < maintenance_pos
+
+    async def test_detail_maintenance_block_keeps_secondary_actions(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-115: reinitialize/export/delete stay grouped as Maintenance, below history."""
+        topic = _make_topic(db_conn, name="Maintenance Actions")
+        response = await client.get(f"/topics/{topic.id}")
+        text = response.text
+
+        assert "<h2>Maintenance</h2>" in text
+        assert "<h2>Actions</h2>" not in text
+        maintenance_pos = text.index("<h2>Maintenance</h2>")
+        reinit_pos = text.index("Re-initialize")
+        export_pos = text.index("Export JSON")
+        delete_pos = text.index("Delete Topic")
+        assert maintenance_pos < reinit_pos < export_pos
+        assert maintenance_pos < delete_pos
+
+    async def test_detail_novelty_policy_is_one_labeled_block(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-121: instruction + confidence/relevance/importance gates render as one card."""
+        topic = _make_topic(
+            db_conn,
+            name="Policy Card",
+            novelty_instruction="Official announcements only.",
+            confidence_threshold=0.75,
+            relevance_threshold=0.6,
+            importance_threshold=3,
+        )
+        response = await client.get(f"/topics/{topic.id}")
+        text = response.text
+
+        kicker_pos = text.index('card-kicker">Novelty Policy')
+        card_close_pos = text.index("</section>", kicker_pos)
+        instruction_pos = text.index("Official announcements only.")
+        confidence_pos = text.index("Confidence threshold")
+        relevance_pos = text.index("Relevance threshold")
+        importance_pos = text.index("Importance threshold")
+
+        # All four live inside the same <section class="card">...</section> block.
+        assert kicker_pos < instruction_pos < card_close_pos
+        assert kicker_pos < confidence_pos < card_close_pos
+        assert kicker_pos < relevance_pos < card_close_pos
+        assert kicker_pos < importance_pos < card_close_pos
+        # Not duplicated into the top-level at-a-glance meta-grid anymore.
+        assert text.count("Confidence threshold") == 1
+        top_meta_grid_close = text.index("</dl>")
+        assert top_meta_grid_close < confidence_pos
+
     async def test_detail_check_history_shows_importance(
         self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
     ) -> None:
