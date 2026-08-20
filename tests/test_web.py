@@ -18,7 +18,7 @@ from app.crud import (
     create_knowledge_state,
     create_topic,
 )
-from app.main import app
+from app.main import REQUEST_ID_PATTERN, app
 from app.models import (
     CheckResult,
     FeedMode,
@@ -119,6 +119,37 @@ class TestRequestId:
         """A client-supplied X-Request-ID is preserved and echoed back."""
         response = await client.get("/", headers={"X-Request-ID": "client-supplied-123"})
         assert response.headers.get("X-Request-ID") == "client-supplied-123"
+
+    async def test_oversized_inbound_id_is_replaced(self, client: httpx.AsyncClient) -> None:
+        """AUG-331: an unbounded client id is neither trusted nor echoed."""
+        oversized = "a" * 4096
+        response = await client.get("/", headers={"X-Request-ID": oversized})
+        echoed = response.headers["X-Request-ID"]
+        assert echoed != oversized
+        assert len(echoed) <= 128
+
+    @pytest.mark.parametrize("hostile", ["with space", "tab\there", "semi;colon", 'quote"here', ""])
+    async def test_ids_outside_the_grammar_are_replaced(self, client: httpx.AsyncClient, hostile: str) -> None:
+        response = await client.get("/", headers={"X-Request-ID": hostile})
+        assert response.headers["X-Request-ID"] != hostile
+
+    @pytest.mark.parametrize("hostile", [b"\x9bcsi-here", b"\xc2\xadsoft-hyphen", b"\x7fdel"])
+    async def test_non_ascii_bytes_are_replaced(self, client: httpx.AsyncClient, hostile: bytes) -> None:
+        """Bytes the plain formatter would emit raw never become the correlation id."""
+        response = await client.get("/", headers={"X-Request-ID": hostile})
+        echoed = response.headers["X-Request-ID"]
+        assert echoed != hostile.decode("latin-1")
+        assert REQUEST_ID_PATTERN.match(echoed)
+
+    async def test_max_length_id_is_still_accepted(self, client: httpx.AsyncClient) -> None:
+        at_limit = "b" * 128
+        response = await client.get("/", headers={"X-Request-ID": at_limit})
+        assert response.headers["X-Request-ID"] == at_limit
+
+    @pytest.mark.parametrize("proxy_id", ["9c1b2f4e8a", "trace-1-5759e988-bd862e3f", "req.42_ok"])
+    async def test_ordinary_proxy_ids_are_preserved(self, client: httpx.AsyncClient, proxy_id: str) -> None:
+        response = await client.get("/", headers={"X-Request-ID": proxy_id})
+        assert response.headers["X-Request-ID"] == proxy_id
 
     async def test_request_id_set_in_context_during_request(self) -> None:
         """While a request is in flight, request_id_var (and thus logs) carries the inbound id."""
