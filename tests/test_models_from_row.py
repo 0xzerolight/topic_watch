@@ -9,6 +9,7 @@ import logging
 from datetime import datetime
 
 import pytest
+from pydantic import ValidationError
 
 from app.models import (
     Article,
@@ -185,6 +186,25 @@ class TestTopicImportanceThresholdClamping:
             topic = Topic(name="T", description="d", importance_threshold=0)
         assert topic.importance_threshold == 1
         assert any("importance_threshold" in r.message for r in caplog.records)
+
+    @pytest.mark.parametrize("value", [4.9, 1.5, "4.9", -0.5])
+    def test_fractional_values_are_rejected_not_truncated(self, value: object) -> None:
+        """AUG-156: SQLite INTEGER affinity keeps a REAL 4.9, ``int()`` made it a 4.
+
+        Truncating broadens notification eligibility (>= 4 passes far more than
+        >= 5) with nothing in the logs, and a later unrelated save writes the
+        fabricated value back permanently. The scale is whole numbers, so a
+        fractional threshold is corrupt data and says so.
+        """
+        with pytest.raises(ValidationError):
+            Topic(name="T", description="d", importance_threshold=value)
+
+    def test_integral_floats_still_load(self) -> None:
+        """A REAL 4.0 is the same threshold as a 4 — only the fraction is corrupt."""
+        assert Topic(name="T", description="d", importance_threshold=4.0).importance_threshold == 4
+        assert Topic(name="T", description="d", importance_threshold="4").importance_threshold == 4
+        # Out of range but integral: still clamped, as before.
+        assert Topic(name="T", description="d", importance_threshold=9.0).importance_threshold == 5
 
 
 class TestArticleFromRow:

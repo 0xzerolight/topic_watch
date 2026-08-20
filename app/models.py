@@ -290,13 +290,25 @@ class Topic(SQLiteModel):
         would make ``novelty.importance >= importance_threshold`` always false,
         silently suppressing ALL notifications for the topic. Clamp and warn
         rather than raise so loading a corrupt row degrades gracefully.
+
+        A FRACTIONAL value is the one thing not clamped but rejected (AUG-156).
+        SQLite's INTEGER affinity keeps a REAL 4.9 as 4.9, and ``int()`` turned it
+        into a silent 4 — a different, broader threshold than anything a user
+        could have chosen, which a later unrelated save then persisted for good.
+        Importance is a whole-number 1-to-5 scale, so there is no correct value to
+        clamp a fraction to; handing it back untouched lets Pydantic reject it the
+        same way it rejects any other non-integer.
         """
         if value is None:
             return None
         try:
-            parsed = int(value)  # type: ignore[call-overload]
+            numeric = float(value)  # type: ignore[arg-type]
         except (TypeError, ValueError):
             return value  # let Pydantic raise its standard type error
+        if not numeric.is_integer():
+            logger.warning("Fractional importance_threshold %r rejected (the scale is whole numbers 1-5)", value)
+            return value  # let Pydantic raise its standard integer error
+        parsed = int(numeric)
         if parsed < 1 or parsed > 5:
             clamped = min(max(parsed, 1), 5)
             logger.warning("Out-of-range importance_threshold %r clamped to %s", parsed, clamped)
