@@ -1353,6 +1353,20 @@ class TestHtmxErrorSurfacing:
         assert "toast" in js.lower()
         assert "retry" in js.lower()
 
+    def test_retry_replays_only_safe_verbs(self) -> None:
+        """AUG-218: a failed POST is never re-issued — its outcome is unknown."""
+        from pathlib import Path
+
+        js = (Path(__file__).resolve().parent.parent / "app" / "static" / "notifications.js").read_text()
+        # The retry path decides on the verb before touching htmx.ajax.
+        ajax_idx = js.find("window.htmx.ajax(")
+        assert ajax_idx != -1
+        guard = js[:ajax_idx]
+        assert "isSafeVerb" in guard
+        # Unsafe failures offer a reload to verify state instead.
+        assert "Reload" in js
+        assert "may or may not" in js
+
 
 # --- Browser-notification robustness (OVH-117 / OVH-118 / OVH-119) ---
 
