@@ -6,6 +6,7 @@ ready to be passed to the LLM via instructor/litellm.
 
 import re
 import secrets
+import unicodedata
 
 from app.models import Article, Topic
 
@@ -46,12 +47,21 @@ _FRAMING_PREFIXES = (
 # A line that opens with a bracketed integer index ("[1]", "[ 2 ]") forges the
 # numbered-article header _format_articles emits.
 _INDEX_MARKER_RE = re.compile(r"^\s*\[\s*\d+\s*\]")
-# Zero-width characters an attacker could use to slip a forged delimiter past a
-# naive line-start check. The Unicode LINE/PARAGRAPH SEPARATORs used to be
-# deleted here too; they are line boundaries, so they now go through
-# _LINE_SEPARATOR_RE below and get the same quote guard as any other line
-# start instead of silently welding two words together (AUG-161).
-_INVISIBLE_RE = re.compile(r"[​‌‍﻿]")
+# Characters that render as nothing and so can split a framing keyword in two —
+# "Curr<U+00AD>ent Knowledge State:" reads as a clean delimiter to the model but
+# walks past a literal line-start check. The set is the Unicode FORMAT category
+# (Cf: zero-width space/joiners, word joiner, BOM, the bidi and Arabic controls,
+# language tags) plus the two invisible marks that sit outside it, rather than a
+# hand-written list that the next unlisted code point defeats. The Unicode
+# LINE/PARAGRAPH SEPARATORs are deliberately NOT here: they are line boundaries,
+# so they go through _LINE_SEPARATOR_RE below and get the same quote guard as any
+# other line start instead of silently welding two words together (AUG-161).
+_EXTRA_INVISIBLE = frozenset("͏᠎")  # CGJ (Mn), MONGOLIAN VOWEL SEPARATOR
+
+
+def _strip_invisible(text: str) -> str:
+    """Delete every character the model renders as nothing."""
+    return "".join(ch for ch in text if ch not in _EXTRA_INVISIBLE and unicodedata.category(ch) != "Cf")
 
 
 # EVERY character a renderer may treat as a line boundary, not just LF: bare CR
@@ -74,7 +84,7 @@ def _neutralize_framing(text: str) -> str:
     longer be read as a section boundary. Ordinary content is returned unchanged
     apart from that line-ending canonicalization.
     """
-    cleaned = _INVISIBLE_RE.sub("", text)
+    cleaned = _strip_invisible(text)
     out: list[str] = []
     for line in _LINE_SEPARATOR_RE.split(cleaned):
         stripped = line.lstrip()
