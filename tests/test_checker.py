@@ -1431,7 +1431,9 @@ class TestMultiRoundInitialization:
         with patch(
             "app.checker.fetch_new_articles_for_topic",
             new_callable=AsyncMock,
-            return_value=FetchResult(articles=[], total_feed_entries=0),
+            # A source did run (feeds_total=1) and had nothing new to give — the
+            # only shape that still earns the generic message (AUG-135).
+            return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=1),
         ):
             await initialize_new_topic(topic, settings, db_path=db_path)
         return get_topic(db_conn, topic.id)
@@ -1928,10 +1930,28 @@ class TestSourcesFailedSurfacing:
         assert updated.error_message.startswith("All feed source(s) failed")
 
     async def test_init_empty_result_keeps_generic_message(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
-        """A genuinely empty first init (feeds_total=0) keeps the generic message."""
+        """A healthy source that returned nothing keeps the generic message."""
         from app.checker import initialize_new_topic
 
         topic = _make_topic(db_conn, name="ExaInitEmpty", feed_mode=FeedMode.EXA, feed_urls=[], status=TopicStatus.NEW)
+        settings = _make_settings()
+        with patch(
+            "app.checker.fetch_new_articles_for_topic",
+            new_callable=AsyncMock,
+            return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=1, feeds_failed=0),
+        ):
+            await initialize_new_topic(topic, settings, db_path=db_path)
+        updated = get_topic(db_conn, topic.id)
+        assert updated.status == TopicStatus.ERROR
+        assert updated.error_message == "No articles found during initialization"
+
+    async def test_init_with_no_source_attempted_says_so(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
+        """Nothing ran, so the error must not blame an empty source (AUG-135)."""
+        from app.checker import initialize_new_topic
+
+        topic = _make_topic(
+            db_conn, name="ExaInitNoSource", feed_mode=FeedMode.EXA, feed_urls=[], status=TopicStatus.NEW
+        )
         settings = _make_settings()
         with patch(
             "app.checker.fetch_new_articles_for_topic",
@@ -1941,7 +1961,23 @@ class TestSourcesFailedSurfacing:
             await initialize_new_topic(topic, settings, db_path=db_path)
         updated = get_topic(db_conn, topic.id)
         assert updated.status == TopicStatus.ERROR
-        assert updated.error_message == "No articles found during initialization"
+        assert updated.error_message == "No source attempted during initialization (no source configured or enabled)"
+
+    async def test_init_names_backed_off_feeds(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
+        """Every feed sitting in a backoff window is a diagnosis, not an empty result."""
+        from app.checker import initialize_new_topic
+
+        topic = _make_topic(db_conn, name="ManualInitBackoff", status=TopicStatus.NEW)
+        settings = _make_settings()
+        with patch(
+            "app.checker.fetch_new_articles_for_topic",
+            new_callable=AsyncMock,
+            return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=0, feeds_failed=0, feeds_skipped=2),
+        ):
+            await initialize_new_topic(topic, settings, db_path=db_path)
+        updated = get_topic(db_conn, topic.id)
+        assert updated.status == TopicStatus.ERROR
+        assert updated.error_message == "No source attempted during initialization (2 feed(s) in backoff)"
 
 
 class TestSilenceHeartbeatPipeline:

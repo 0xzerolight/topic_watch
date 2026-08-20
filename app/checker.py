@@ -56,7 +56,7 @@ from app.models import (
     TopicStatus,
 )
 from app.notifications import format_notification, redact_url, send_notification, send_notification_per_url
-from app.scraping import all_sources_failed, fetch_new_articles_for_topic
+from app.scraping import FetchResult, all_sources_failed, fetch_new_articles_for_topic
 from app.web.state import _checking_state
 from app.webhooks import retry_pending_webhooks, send_webhooks
 
@@ -150,6 +150,21 @@ def _snapshot_topic(conn: sqlite3.Connection, topic_id: int) -> TopicSnapshot | 
         knowledge_version=knowledge.version if knowledge else 0,
         knowledge_summary=knowledge.summary_text if knowledge else "",
     )
+
+
+def _no_source_detail(fetch_result: FetchResult) -> str:
+    """Say why no source ran: everything backed off, or nothing configured."""
+    skipped = fetch_result.feeds_skipped
+    return f"{skipped} feed(s) in backoff" if skipped else "no source configured or enabled"
+
+
+def _init_empty_error(fetch_result: FetchResult) -> str:
+    """Name the reason a first initialization fetch came back empty."""
+    if all_sources_failed(fetch_result.feeds_total, fetch_result.feeds_failed):
+        return "All feed source(s) failed during initialization (check credentials/connectivity; see logs)"
+    if fetch_result.feeds_total == 0:
+        return f"No source attempted during initialization ({_no_source_detail(fetch_result)})"
+    return "No articles found during initialization"
 
 
 def _analysis_batch(
@@ -396,9 +411,7 @@ async def _check_topic_inner(
             # feed URLs, or every feed inside a backoff window. Not a fetch failure —
             # hence not ``sources_failed`` — but equally a check that cannot see news,
             # so it must not read as healthy silence (Silence Heartbeat).
-            skipped = fetch_result.feeds_skipped
-            detail = f"{skipped} feed(s) in backoff" if skipped else "no source configured or enabled"
-            result.stage_error = f"sources_unavailable: no source attempted ({detail})"
+            result.stage_error = f"sources_unavailable: no source attempted ({_no_source_detail(fetch_result)})"
 
     # --- P1c: the analysis batch is this cycle's fetch PLUS any article an earlier
     # cycle stored but never finished with. The scraper dedups against stored
@@ -1137,14 +1150,13 @@ async def initialize_new_topic(
                     topic.init_attempts,
                 )
                 return
-            # A total source failure on the first init (e.g. a bad Exa key, or every
-            # RSS feed down) is distinct from a genuinely empty result — surface the
-            # real cause so the operator knows to check credentials/connectivity.
-            init_error = (
-                "All feed source(s) failed during initialization (check credentials/connectivity; see logs)"
-                if all_sources_failed(fetch_result.feeds_total, fetch_result.feeds_failed)
-                else "No articles found during initialization"
-            )
+            # Three different empty results, three different diagnoses — the same
+            # vocabulary a normal check uses (AUG-135). A total source failure (bad
+            # Exa key, every RSS feed down) is not the same as no source having run
+            # at all (Exa disabled or keyless, no feed URLs, every feed in a backoff
+            # window), and neither is the same as a healthy source with nothing to
+            # say. Only the last deserves the generic message.
+            init_error = _init_empty_error(fetch_result)
             _set_init_status(
                 TopicStatus.ERROR,
                 error_message=init_error,
