@@ -41,8 +41,15 @@ def _yaml_owned_llm_credentials(monkeypatch: pytest.MonkeyPatch):
 
 
 def valid_form_data(**overrides) -> dict:
-    """A complete, valid POST /settings form payload (override individual fields)."""
+    """A complete, valid POST /settings form payload (override individual fields).
+
+    ``config_revision`` mirrors what GET /settings would have rendered for the
+    config file this app state points at (AUG-291); a stale one is refused.
+    """
+    from app.config import config_revision
+
     data = {
+        "config_revision": config_revision(app.state.config_path),
         "llm_model": "openai/gpt-4o-mini",
         "llm_api_key": "",
         "llm_base_url": "",
@@ -92,8 +99,10 @@ async def client(
     app.dependency_overrides[get_db_conn] = override_db
     app.dependency_overrides[get_settings] = override_settings
 
-    # GET /settings calls load_settings() directly instead of using Depends
-    with patch("app.web.routers.settings.load_settings", return_value=settings):
+    # Both /settings routes read the config file through load_settings() instead of
+    # Depends; with no real file here, stand in the app's own state for the disk
+    # generation so a test can drive both by assigning app.state.settings.
+    with patch("app.web.routers.settings.load_settings", side_effect=lambda *_a, **_kw: app.state.settings):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app),
             base_url="http://test",
@@ -916,6 +925,86 @@ class TestEnvSourcedSecretSafety:
         response = await client.get("/settings")
         assert response.status_code == 200
         assert "set via environment" in response.text.lower()
+
+
+class TestConfigGenerationCheck:
+    """AUG-291: a save is applied to the generation the page rendered, or refused."""
+
+    @pytest.fixture
+    def config_file(self, tmp_path: Path) -> Path:
+        from app.config import load_settings
+
+        config = tmp_path / "config.yml"
+        config.write_text('llm:\n  model: "openai/gpt-4o-mini"\n  api_key: "sk-on-disk"\ncheck_interval: "6h"\n')
+        app.state.config_path = config
+        app.state.settings = load_settings(config_path=config)
+        return config
+
+    @pytest.fixture
+    async def disk_client(
+        self, db_conn: sqlite3.Connection, config_file: Path
+    ) -> AsyncGenerator[httpx.AsyncClient, None]:
+        """A client whose /settings routes read the real file, not a patched stand-in."""
+
+        def override_db():
+            yield db_conn
+
+        app.dependency_overrides[get_db_conn] = override_db
+        app.dependency_overrides[get_settings] = lambda: app.state.settings
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+            cookies={"csrf_token": CSRF_TEST_TOKEN},
+            headers={"X-CSRF-Token": CSRF_TEST_TOKEN},
+        ) as ac:
+            yield ac
+        app.dependency_overrides.clear()
+
+    async def test_get_renders_the_current_revision(self, disk_client: httpx.AsyncClient, config_file: Path) -> None:
+        from app.config import config_revision
+
+        page = await disk_client.get("/settings")
+        assert f'name="config_revision" value="{config_revision(config_file)}"' in page.text
+
+    async def test_matching_revision_saves(self, disk_client: httpx.AsyncClient, config_file: Path) -> None:
+        response = await disk_client.post(
+            "/settings", data=valid_form_data(check_interval="8h"), follow_redirects=False
+        )
+        assert response.status_code == 303
+        assert yaml.safe_load(config_file.read_text())["check_interval"] == "8h"
+
+    async def test_stale_revision_is_refused(self, disk_client: httpx.AsyncClient, config_file: Path) -> None:
+        """A tab opened before an external edit cannot overwrite that edit."""
+        form = valid_form_data(check_interval="8h")  # revision of the file as it is now
+        config_file.write_text(
+            'llm:\n  model: "openai/gpt-4o-mini"\n  api_key: "sk-rotated"\ncheck_interval: "6h"\n'
+        )  # someone edits the file underneath the open tab
+
+        response = await disk_client.post("/settings", data=form, follow_redirects=False)
+
+        assert response.status_code == 409
+        assert "changed on disk" in response.text
+        data = yaml.safe_load(config_file.read_text())
+        assert data["llm"]["api_key"] == "sk-rotated"
+        assert data["check_interval"] == "6h"
+
+    async def test_submission_without_a_revision_is_refused(self, disk_client: httpx.AsyncClient) -> None:
+        form = valid_form_data()
+        form.pop("config_revision")
+        response = await disk_client.post("/settings", data=form, follow_redirects=False)
+        assert response.status_code == 409
+
+    async def test_blank_key_keeps_the_key_the_file_has(
+        self, disk_client: httpx.AsyncClient, config_file: Path
+    ) -> None:
+        """A key rotated on disk is not overwritten by the stale in-memory one."""
+        config_file.write_text('llm:\n  model: "openai/gpt-4o-mini"\n  api_key: "sk-rotated"\n')
+        app.state.settings = _make_settings(llm=LLMSettings(model="openai/gpt-4o-mini", api_key="sk-stale"))
+
+        response = await disk_client.post("/settings", data=valid_form_data(), follow_redirects=False)
+
+        assert response.status_code == 303
+        assert yaml.safe_load(config_file.read_text())["llm"]["api_key"] == "sk-rotated"
 
 
 class TestEnvOwnedValuesAreNeverPersisted:

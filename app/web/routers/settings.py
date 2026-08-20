@@ -11,6 +11,7 @@ from app.config import (
     CLOUD_PROVIDERS,
     LOCAL_PROVIDER_DEFAULTS,
     Settings,
+    config_revision,
     is_api_key_env_sourced,
     is_exa_key_env_sourced,
     load_settings,
@@ -125,10 +126,33 @@ def restore_masked_targets(submitted: list[str], stored: list[str], *, field: st
     return restored
 
 
+_STALE_CONFIG_ERROR = (
+    "The configuration file changed on disk after this page was loaded, so nothing was saved. "
+    "The form below shows the current values — reapply your change and save again."
+)
+
+
+def _disk_settings(request: Request) -> Settings:
+    """Settings as the config file currently reads.
+
+    Falls back to the live object when the file cannot be parsed, so a config
+    corrupted outside the app still renders an editable page instead of a 500.
+    """
+    try:
+        return load_settings(config_path=request.app.state.config_path)
+    except Exception:
+        logger.warning("Could not read %s; using the live settings", request.app.state.config_path, exc_info=True)
+        settings: Settings = request.app.state.settings
+        return settings
+
+
 def _settings_template_ctx(request: Request, **extra: object) -> dict:
     """Shared template context for the settings page (provider lists + env-key state)."""
     ctx: dict = {
         "config_path": str(request.app.state.config_path),
+        # The generation this page is editing. Carried in the form so a save against a
+        # file that changed underneath it is refused instead of silently winning (AUG-291).
+        "config_revision": config_revision(request.app.state.config_path),
         "cloud_providers": sorted(CLOUD_PROVIDERS),
         "local_provider_defaults": LOCAL_PROVIDER_DEFAULTS,
         "api_key_env_sourced": is_api_key_env_sourced(),
@@ -360,9 +384,29 @@ async def update_settings(request: Request):
     for field in _SCALAR_FORM_FIELDS:
         form_values[field] = _get(field)
 
+    # Optimistic concurrency (AUG-291): the form carries the generation it rendered.
+    # Refuse a save built on anything else — a second tab, an external edit, or a key
+    # rotated on disk — rather than overwriting the whole document with stale values.
+    if _get("config_revision") != config_revision(request.app.state.config_path):
+        return _render(
+            request,
+            "settings.html",
+            _settings_template_ctx(
+                request,
+                settings=_disk_settings(request),
+                errors=[_STALE_CONFIG_ERROR],
+            ),
+            status_code=409,
+        )
+
+    # Everything preserved rather than submitted (blank keys, infra-only fields, the
+    # URLs behind the masked placeholders) comes from the generation just verified,
+    # not from app.state, which can be older than the file (AUG-291).
+    disk_settings = _disk_settings(request)
+
     # Saved targets reach the form as masked placeholders (AUG-127); resolve the ones
     # the user left untouched back to the URLs they stand for.
-    current_notifications = request.app.state.settings.notifications
+    current_notifications = disk_settings.notifications
     try:
         parsed_notification_urls = restore_masked_targets(
             [u.strip() for u in notification_urls.splitlines() if u.strip()],
@@ -390,11 +434,11 @@ async def update_settings(request: Request):
     # API key special-case: a blank field retains the current key (OVH-081). An
     # env-sourced key is dropped from the submitted data below, so it is neither
     # persisted nor editable here (OVH-003/AUG-241).
-    effective_api_key = llm_api_key.strip() or request.app.state.settings.llm.api_key
+    effective_api_key = llm_api_key.strip() or disk_settings.llm.api_key
     # Exa key mirrors the LLM key: blank retains the current one.
-    effective_exa_key = exa_api_key.strip() or request.app.state.settings.exa.api_key
+    effective_exa_key = exa_api_key.strip() or disk_settings.exa.api_key
     # exa base_url is infra/proxy-only (not a form field); preserve the current value like db_path.
-    exa_base_url = request.app.state.settings.exa.base_url
+    exa_base_url = disk_settings.exa.base_url
     # Shared normalization (OVH-153): blank -> None. base_url is honored for every
     # provider (OVH-104 reversal); setup and settings share this seam.
     effective_base_url = normalize_base_url(llm_base_url)
@@ -438,7 +482,7 @@ async def update_settings(request: Request):
         },
         "secure_cookies": secure_cookies,
         # db_path is infra-only (read-only in the UI); preserve current value.
-        "db_path": request.app.state.settings.db_path,
+        "db_path": disk_settings.db_path,
         **scalar_kwargs,
     }
 

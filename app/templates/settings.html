@@ -30,6 +30,9 @@
 
 <form method="post" action="/settings">
     <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
+    <!-- The config generation this page rendered. A save against a different one is
+         refused, so an external edit or a second tab is never silently overwritten. -->
+    <input type="hidden" name="config_revision" value="{{ config_revision }}">
 
     <section class="card">
         <span class="card-kicker">LLM</span>
