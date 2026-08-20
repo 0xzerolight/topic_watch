@@ -346,11 +346,15 @@ async def _check_topic_inner(
             topic.name,
             topic.status,
         )
-        # No heartbeat here: a paused or errored topic is not being monitored, so
-        # it must neither alert nor claim recovery. The row it records carries no
-        # stage_error, so it also breaks any running streak — harmless, since this
-        # path is only reachable from a manual CLI/UI check.
-        return _record_result(db_path, result)
+        # Nothing is recorded: no fetch and no analysis ran, so a stored row would
+        # claim monitoring work that never happened — a clean zero-valued check
+        # breaks a source-failure streak and its fresh ``checked_at`` postpones the
+        # first real check once the topic becomes READY (AUG-134). No heartbeat
+        # either: a paused or errored topic must neither alert nor claim recovery.
+        return CheckResult(
+            topic_id=topic_id,
+            stage_error=f"skipped: topic not ready (status: {topic.status.value})",
+        )
 
     # --- P1: fetch new articles. Opens and closes its own short connections.
     try:

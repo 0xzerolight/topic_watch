@@ -219,14 +219,23 @@ class TestCheckTopic:
         assert result.id is not None
 
     async def test_skips_non_ready_topic(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
-        """Topics not in READY status should be skipped."""
+        """A non-READY topic is skipped, and the skip is not filed as a check.
+
+        Nothing was fetched or analyzed, so persisting a clean zero-valued row
+        claimed monitoring that never happened: it broke source-failure streaks
+        and its fresh ``checked_at`` pushed the first real check further out
+        (AUG-134).
+        """
         topic = _make_topic(db_conn, name="Researching", status=TopicStatus.RESEARCHING)
         settings = _make_settings()
 
         result = await check_topic(topic, settings, db_path=db_path)
 
         assert result.articles_found == 0
-        assert result.id is not None
+        assert result.id is None
+        assert result.stage_error is not None
+        assert result.stage_error.startswith("skipped: topic not ready")
+        assert db_conn.execute("SELECT COUNT(*) FROM check_results").fetchone()[0] == 0
 
     async def test_notification_failure_captured_and_queued(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         """Notification failure should be recorded and queued for retry.
