@@ -8,13 +8,18 @@
 # branch with no commit pin, tag, signature, or checksum, so a repo/branch
 # compromise or a MITM proxy means arbitrary code runs as you. To reduce trust:
 #   1. Review this script before piping it to a shell, or download + run it.
-#   2. Pin a specific commit or release tag instead of "main":
-#        TOPIC_WATCH_REF=v1.1.2 curl -fsSL \
-#          https://raw.githubusercontent.com/0xzerolight/topic_watch/v1.1.2/scripts/install.sh | bash
+#   2. Pin a specific commit or release tag instead of "main". TOPIC_WATCH_REF
+#      must reach the `bash` process, not the `curl` process ahead of it in
+#      the pipe — a "VAR=val curl ... | bash" prefix does not propagate
+#      across the pipe, so set it on bash's side instead:
+#        curl -fsSL \
+#          https://raw.githubusercontent.com/0xzerolight/topic_watch/v1.1.2/scripts/install.sh \
+#          | TOPIC_WATCH_REF=v1.1.2 bash
 #      TOPIC_WATCH_REF also pins the docker-compose file this script downloads.
 set -euo pipefail
 
 REPO="0xzerolight/topic_watch"
+IMAGE_REPO="ghcr.io/${REPO}"
 # Pin to a commit SHA or release tag for a verifiable install (OVH-146).
 # Defaults to "main" (mutable) — see the supply-chain note above.
 BRANCH="${TOPIC_WATCH_REF:-main}"
@@ -176,6 +181,16 @@ COMPOSE_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}/docker-compose.
 info "Downloading docker-compose.yml..."
 curl -fsSL "$COMPOSE_URL" -o "$INSTALL_DIR/docker-compose.yml"
 
+# Also fetch the Ollama/local-LLM override example so the README's documented
+# `cp docker-compose.override.example.yml docker-compose.override.yml` step
+# works from a script install too, not only a source checkout. Optional (only
+# needed for local LLM providers), so a failure here warns instead of aborting
+# the install.
+OVERRIDE_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}/docker-compose.override.example.yml"
+if ! curl -fsSL "$OVERRIDE_URL" -o "$INSTALL_DIR/docker-compose.override.example.yml"; then
+    warn "Could not download docker-compose.override.example.yml (only needed for Ollama/local LLM setups)."
+fi
+
 # --- Write PUID/PGID so bind-mounted ./data is writable by this host user ---
 # Docker bind mounts keep host ownership. If this user's UID/GID is not the
 # image default (1000), the container must chown ./data to match. The compose
@@ -238,7 +253,7 @@ info "Pulling Docker image..."
 # not being publicly pullable. set -e would abort anyway, but with only Docker's
 # raw "denied"/network error and no pointer to the fix.
 if ! docker compose pull; then
-    error "Could not pull the Docker image (ghcr.io/${REPO})."
+    error "Could not pull the Docker image (${IMAGE_REPO})."
     echo ""
     echo "  Most likely the image is not publicly accessible, or ghcr.io is unreachable."
     echo "  - Check your network and that https://ghcr.io is reachable."
@@ -247,20 +262,39 @@ if ! docker compose pull; then
     exit 1
 fi
 
+# Pin the exact digest just pulled into .env (TW-AUD-032): docker-compose.yml
+# reads TOPIC_WATCH_IMAGE for its image reference, so once this is set, a
+# later restart (reboot, systemd, `docker compose up`) reruns this specific,
+# already-verified image instead of silently re-resolving the movable
+# "latest" tag to whatever the registry has by then. Skipped, not fatal, if
+# the digest can't be resolved — `up -d` then falls back to `:latest`.
+IMAGE_DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "${IMAGE_REPO}:latest" 2>/dev/null || true)"
+if [ -n "$IMAGE_DIGEST" ]; then
+    upsert_env "TOPIC_WATCH_IMAGE" "$IMAGE_DIGEST" "${ENV_FILE}"
+fi
+
 info "Starting Topic Watch..."
 docker compose up -d
 
 # --- Wait for health check ---
 info "Waiting for Topic Watch to start..."
+HEALTHY=0
 for i in $(seq 1 30); do
     if curl -sf "http://localhost:${PORT}/health" >/dev/null 2>&1; then
+        HEALTHY=1
         break
     fi
     sleep 1
 done
 
-if ! curl -sf "http://localhost:${PORT}/health" >/dev/null 2>&1; then
-    warn "Health check not responding yet. Check: docker compose -f ${INSTALL_DIR}/docker-compose.yml logs"
+# AUG-059: a failed health check must not be reported as a successful
+# install — stop here, before desktop integration, autostart, or the
+# "running!" message, so a broken install never looks like a working one.
+if [ "$HEALTHY" != "1" ]; then
+    error "Health check did not pass after starting Topic Watch."
+    echo ""
+    echo "  Diagnose with: docker compose -f ${INSTALL_DIR}/docker-compose.yml logs"
+    exit 1
 fi
 
 # --- Desktop integration (Linux only) ---

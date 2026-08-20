@@ -34,10 +34,12 @@ __pycache__/
 htmlcov/
 .coverage
 
-# Documentation (keep README.md for hatchling metadata)
+# Documentation (keep README.md for hatchling metadata; THIRD_PARTY_NOTICES.md
+# is copied into the image at /usr/share/licenses/topic-watch/ — AUG-341)
 docs/
 *.md
 !README.md
+!THIRD_PARTY_NOTICES.md
 
 # Dev tooling configs
 .pre-commit-config.yaml

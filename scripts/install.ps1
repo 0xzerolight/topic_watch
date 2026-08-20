@@ -16,6 +16,7 @@
 $ErrorActionPreference = 'Stop'
 
 $Repo = "0xzerolight/topic_watch"
+$ImageRepo = "ghcr.io/$Repo"
 # Pin to a commit SHA or release tag for a verifiable install (OVH-146).
 # Defaults to "main" (mutable) — see the supply-chain note above.
 $Branch = if ($env:TOPIC_WATCH_REF) { $env:TOPIC_WATCH_REF } else { "main" }
@@ -133,6 +134,18 @@ $ComposeDest = Join-Path $InstallDir "docker-compose.yml"
 Write-Info "Downloading docker-compose.yml..."
 Invoke-WebRequest -Uri $ComposeUrl -OutFile $ComposeDest -UseBasicParsing
 
+# Also fetch the Ollama/local-LLM override example so the README's documented
+# override-file step works from a script install too, not only a source
+# checkout. Optional (only needed for local LLM providers), so a failure here
+# warns instead of aborting the install.
+try {
+    $OverrideUrl = "https://raw.githubusercontent.com/$Repo/$Branch/docker-compose.override.example.yml"
+    $OverrideDest = Join-Path $InstallDir "docker-compose.override.example.yml"
+    Invoke-WebRequest -Uri $OverrideUrl -OutFile $OverrideDest -UseBasicParsing
+} catch {
+    Write-Warn "Could not download docker-compose.override.example.yml (only needed for Ollama/local LLM setups)."
+}
+
 # --- Persist the answers to .env ---
 # The compose file reads these. Writing them here is what makes the answers above
 # survive a later `docker compose up -d` and any future re-run of this installer:
@@ -159,7 +172,7 @@ try {
     Write-Info "Pulling Docker image..."
     & docker compose pull
     if ($LASTEXITCODE -ne 0) {
-        Write-Err "Could not pull the Docker image (ghcr.io/$Repo)."
+        Write-Err "Could not pull the Docker image ($ImageRepo)."
         Write-Host ""
         Write-Host "  Most likely the image is not publicly accessible, or ghcr.io is unreachable."
         Write-Host "  - Check your network and that https://ghcr.io is reachable."
@@ -167,6 +180,18 @@ try {
         Write-Host "  - Pin a known release instead of latest: set TOPIC_WATCH_REF=<tag> and re-run."
         throw "docker compose pull failed"
     }
+
+    # Pin the exact digest just pulled into .env (TW-AUD-032): docker-compose.yml
+    # reads TOPIC_WATCH_IMAGE for its image reference, so a later restart
+    # (reboot, `docker compose up`) reruns this specific, already-verified
+    # image instead of silently re-resolving the movable "latest" tag.
+    # Skipped, not fatal, if the digest can't be resolved.
+    try {
+        $imageDigest = (& docker inspect --format '{{index .RepoDigests 0}}' "${ImageRepo}:latest" 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $imageDigest) {
+            Set-EnvVar "TOPIC_WATCH_IMAGE" $imageDigest $EnvFile
+        }
+    } catch {}
 
     Write-Info "Starting Topic Watch..."
     & docker compose up -d
@@ -189,8 +214,13 @@ for ($i = 0; $i -lt 30; $i++) {
     Start-Sleep -Seconds 1
 }
 
+# AUG-059: a failed health check must not be reported as a successful
+# install — stop here, before Start Menu/startup shortcuts or the "running!"
+# message, so a broken install never looks like a working one.
 if (-not $healthy) {
-    Write-Warn "Health check not responding yet. Check: docker compose -f `"$ComposeDest`" logs"
+    Write-Err "Health check did not pass after starting Topic Watch."
+    Write-Host "  Diagnose with: docker compose -f `"$ComposeDest`" logs"
+    exit 1
 }
 
 # --- Desktop integration ---
