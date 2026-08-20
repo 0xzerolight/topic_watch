@@ -307,9 +307,15 @@ class Topic(SQLiteModel):
     def from_row(cls, row: sqlite3.Row) -> Self:
         """Construct a Topic from a database row."""
         data = cls._coerce_row(row)
-        # Backwards compatibility: if check_interval_minutes is absent but
-        # check_interval_hours is present, convert hours to minutes.
-        if data.get("check_interval_minutes") is None and data.get("check_interval_hours") is not None:
+        # Backwards compatibility for a row shape that predates the minute column:
+        # convert the legacy hours only when the current column is ABSENT, never
+        # when it is present and NULL (AUG-145). m008 copied the legacy value into
+        # minutes but kept the old column populated, so treating NULL as "missing"
+        # made an intentionally CLEARED override resurrect the stale hours — and a
+        # later unrelated edit wrote that obsolete schedule back. NULL in the
+        # current column means "inherit the global interval", which is the only
+        # value a cleared field can have.
+        if "check_interval_minutes" not in data and data.get("check_interval_hours") is not None:
             data["check_interval_minutes"] = data["check_interval_hours"] * 60
         data.pop("check_interval_hours", None)
         return cls(**data)
