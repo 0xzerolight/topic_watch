@@ -698,9 +698,6 @@ class TestInitialPlanCarriesTheAnalyzedSubset:
         from app.analysis.llm import KnowledgeStateUpdate
         from app.models import Article
 
-        class _PartialInit(KnowledgeStateUpdate):
-            analyzed_article_ids: list[int] = []
-
         topic = _seed_topic(db_conn, "Fitted Init")
         articles = [
             Article(
@@ -713,7 +710,7 @@ class TestInitialPlanCarriesTheAnalyzedSubset:
             )
             for i in (1, 2)
         ]
-        result = _PartialInit(
+        result = KnowledgeStateUpdate(
             updated_summary="Baseline.",
             token_count=3,
             confidence=0.9,
@@ -731,11 +728,19 @@ class TestInitialPlanCarriesTheAnalyzedSubset:
         assert plan.analyzed_article_ids == [1]
 
     async def test_silent_llm_leaves_the_plan_unconstrained(self, db_conn: sqlite3.Connection) -> None:
+        """An LLM layer that reports no subset still means "the whole input was used"."""
+        from unittest.mock import AsyncMock, patch
+
         from app.analysis.knowledge import prepare_initial_knowledge
-        from tests.helpers import make_knowledge_update, stub_llm_boundary
+        from app.analysis.llm import KnowledgeStateUpdate
 
         topic = _seed_topic(db_conn, "Silent Init")
-        with stub_llm_boundary(knowledge_init=make_knowledge_update("Baseline.")):
+        result = KnowledgeStateUpdate(updated_summary="Baseline.", token_count=3, confidence=0.9, sufficient_data=True)
+        with patch(
+            "app.analysis.knowledge.generate_initial_knowledge",
+            new_callable=AsyncMock,
+            return_value=result,
+        ):
             plan = await prepare_initial_knowledge(topic, [], _revision_settings())
 
         assert plan.analyzed_article_ids is None

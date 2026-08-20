@@ -3,12 +3,12 @@
 import json
 import sqlite3
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from app.analysis.knowledge import KnowledgeUpdatePlan
-from app.analysis.llm import NoveltyResult, TokenUsage
+from app.analysis.llm import NoveltyResponse, NoveltyResult, TokenUsage
 from app.checker import check_all_topics, check_topic, retry_pending_notifications
 from app.config import LLMSettings, NotificationSettings, Settings
 from app.crud import (
@@ -2375,16 +2375,6 @@ class TestInsufficientKnowledgeIsRecorded:
         assert result.stage_error.startswith("knowledge_insufficient")
 
 
-class _PartialNovelty(NoveltyResult):
-    """A novelty result that reports which of its input articles it actually read.
-
-    Mirrors the contract ``analyze_articles`` must provide once it surfaces what
-    ``_fit_article_prompt`` dropped to fit the model's context window.
-    """
-
-    analyzed_article_ids: list[int] = []
-
-
 class TestOnlyAnalyzedArticlesAreProcessed:
     """Articles trimmed out of an over-budget prompt were never evaluated."""
 
@@ -2399,7 +2389,7 @@ class TestOnlyAnalyzedArticlesAreProcessed:
         )
         db_conn.commit()
 
-        partial = _PartialNovelty(has_new_info=False, confidence=0.9, analyzed_article_ids=[kept.id])
+        partial = NoveltyResult(has_new_info=False, confidence=0.9, analyzed_article_ids=[kept.id])
         with (
             patch(
                 "app.checker.fetch_new_articles_for_topic",
@@ -2494,3 +2484,76 @@ class TestOnlyAnalyzedArticlesAreProcessed:
         rows = {row["id"]: row["processed"] for row in db_conn.execute("SELECT id, processed FROM articles")}
         assert rows[used.id] == 1
         assert rows[unused.id] == 0
+
+    async def test_a_real_context_overrun_leaves_the_dropped_article_for_next_cycle(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """End to end through the real analysis layer, on a genuinely small model.
+
+        gpt-4's 8k window minus the requested output and the schema reserve leaves
+        an input budget this batch cannot fit, so the fit ladder drops real
+        articles — no hand-built subset anywhere in this test.
+        """
+        settings = _make_settings(
+            llm=LLMSettings(model="openai/gpt-4", api_key="test-key"),
+            max_articles_per_check=16,
+        )
+        topic = _make_topic(db_conn, name="Overrun")
+        create_knowledge_state(db_conn, KnowledgeState(topic_id=topic.id, summary_text="Known.", token_count=2))
+        body = " ".join(f"word{i}" for i in range(4_000))
+        batch = [
+            create_article(
+                db_conn,
+                _make_article(
+                    id=None,
+                    topic_id=topic.id,
+                    content_hash=f"o{i}",
+                    url=f"https://example.com/overrun-{i}",
+                    raw_content=body,
+                ),
+            )
+            for i in range(12)
+        ]
+        db_conn.commit()
+
+        client = MagicMock()
+        client.chat.completions.create_with_completion = AsyncMock(
+            return_value=(
+                NoveltyResponse(has_new_info=False, confidence=0.9, relevance=0.1, importance=1),
+                MagicMock(usage=None),
+            )
+        )
+        fetched = FetchResult(articles=batch, total_feed_entries=len(batch))
+        with (
+            patch("app.checker.fetch_new_articles_for_topic", new_callable=AsyncMock, return_value=fetched),
+            patch("app.analysis.llm._get_client", return_value=client),
+            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)),
+        ):
+            await check_topic(get_topic(db_conn, topic.id), settings, db_path=db_path)
+
+        sent = client.chat.completions.create_with_completion.await_args.kwargs["messages"][1]["content"]
+        analyzed = [a for a in batch if a.url in sent]
+        dropped = [a for a in batch if a.url not in sent]
+        assert analyzed and dropped  # the ladder genuinely dropped articles
+
+        rows = {row["id"]: row["processed"] for row in db_conn.execute("SELECT id, processed FROM articles")}
+        assert all(rows[a.id] == 1 for a in analyzed)
+        assert all(rows[a.id] == 0 for a in dropped)
+
+        # Next cycle: the articles the model never saw are the ones it is handed.
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=1),
+            ),
+            patch(
+                "app.checker.analyze_articles",
+                new_callable=AsyncMock,
+                return_value=NoveltyResult(has_new_info=False, confidence=0.9),
+            ) as mock_analyze,
+            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)),
+        ):
+            await check_topic(get_topic(db_conn, topic.id), settings, db_path=db_path)
+
+        assert sorted(a.id for a in mock_analyze.await_args.args[0]) == sorted(a.id for a in dropped)
