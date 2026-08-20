@@ -36,7 +36,13 @@ import re
 # ("(Articles [3], [5])" -> "([5])").
 _CONNECTOR = r"(?:per|see|according to|reported in|reported by)\s+"
 _INDEX = r"\[\s*\d+\s*\]"
-_CITE = rf"(?:{_CONNECTOR})?articles?\s*{_INDEX}(?>(?:\s*(?:,|and|through|to)\s*{_INDEX})*)"
+# One list separator. The comma branch absorbs an Oxford ", and": without it the
+# run stopped at the comma and left "(and [3])" behind for "Articles [1], [2], and
+# [3]" (AUG-169).
+_SEPARATOR = r"(?:\s*,\s*(?:and\s+)?|\s+(?:and|through|to)\s+)"
+# ``(?<!\w)`` is the left word boundary the pattern lacked: "particle [7]" matched
+# on its "article" tail and was rewritten to "p" (AUG-169).
+_CITE = rf"(?<!\w)(?:{_CONNECTOR})?articles?\s*{_INDEX}(?>(?:{_SEPARATOR}{_INDEX})*)"
 
 # Trailing position — a separator precedes the cite ("June 10; Article [1]" -> "June 10").
 _CITE_TRAILING = re.compile(rf"\s*[;,]\s*{_CITE}", re.IGNORECASE)
@@ -140,14 +146,25 @@ _BULLET_PREFIX = re.compile(r"^(\s*(?:[-*]\s+)?)(.*)$", re.DOTALL)
 
 def _is_reliability_paren(inner: str) -> bool:
     """True when a parenthetical's inner text is a reliability aside."""
-    if _STRONG_SIGNAL.search(inner):
+    return _has_reliability_signal(inner)
+
+
+def _has_reliability_signal(text: str) -> bool:
+    """True when ``text`` carries an actual source-quality signal."""
+    if _STRONG_SIGNAL.search(text):
         return True
-    return bool(_WEAK_SIGNAL.search(inner) and (_INDEX_TOKEN.search(inner) or _RELIABILITY_TAG.search(inner)))
+    return bool(_WEAK_SIGNAL.search(text) and (_INDEX_TOKEN.search(text) or _RELIABILITY_TAG.search(text)))
 
 
 def _is_note_sentence(sentence: str) -> bool:
-    """True when a whole sentence is standalone reliability narration."""
-    if _NOTE_LABEL.match(sentence):
+    """True when a whole sentence is standalone reliability narration.
+
+    A "Note...:" label is only a CANDIDATE — the sentence still has to carry a
+    reliability signal. On its own the label matched ordinary content, so a real
+    fact like "Note: The launch is delayed to 2027." was deleted from novelty
+    output and from persisted knowledge (AUG-167).
+    """
+    if _NOTE_LABEL.match(sentence) and _has_reliability_signal(sentence):
         return True
     if _ARTICLE_SUBJECT.match(sentence) and (_STRONG_SIGNAL.search(sentence) or _WEAK_SIGNAL.search(sentence)):
         return True
