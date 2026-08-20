@@ -245,6 +245,48 @@ def _strip_html(value: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _parser_headers(response: httpx.Response) -> dict[str, str]:
+    """Transport metadata feedparser needs to decode and resolve the document (TW-AUD-019).
+
+    ``response.text`` pre-decodes the body with httpx's own guess, discarding the
+    XML encoding declaration, so a correctly declared non-UTF-8 feed arrives as
+    mojibake. Handing over ``response.content`` instead makes feedparser's
+    declaration/BOM detection authoritative, with ``content-type`` as the only
+    transport-level charset hint.
+
+    ``content-location`` is the base URI feedparser resolves document-relative
+    entry links against. It is the URL the document actually came from — the
+    final hop after redirects, already SSRF-validated per hop by ``safe_send`` —
+    so a relative Atom link becomes an absolute URL instead of being dropped by
+    the http(s) scheme guard. Resolved URLs still go through that guard.
+
+    Only the three headers feedparser reads are forwarded; passing the whole
+    response header set would hand it transport headers (e.g. ``content-encoding``
+    for a body httpx has already decompressed) that are no longer true of these
+    bytes.
+    """
+    headers = {"content-location": str(response.url)}
+    for name in ("content-type", "content-language"):
+        value = response.headers.get(name)
+        if value:
+            headers[name] = value
+    return headers
+
+
+def _is_wrong_media_type_only(parsed: object, bozo_exc: object) -> bool:
+    """True when the only complaint is a non-XML ``Content-Type`` on a real feed.
+
+    Forwarding ``content-type`` to feedparser (TW-AUD-019) also activates its
+    media-type check, which flags every feed a server mislabels as ``text/plain``
+    or ``text/html``. A legitimately empty one of those must stay in the
+    healthy-empty bucket rather than becoming an OVH-044 soft failure and
+    dragging the feed into backoff. ``parsed.version`` is set only when the
+    document really parsed as RSS/Atom, so an HTML error page (no version) and a
+    truncated feed (a SAX exception, not this one) are still failures.
+    """
+    return bool(isinstance(bozo_exc, feedparser.NonXMLContentType) and getattr(parsed, "version", ""))
+
+
 def _parse_entry(raw_entry: dict, source_feed: str) -> FeedEntry | None:
     """Convert a feedparser entry dict to a FeedEntry, or None if invalid."""
     title = raw_entry.get("title", "").strip()
@@ -359,7 +401,7 @@ async def fetch_feed_with_status(
                         health_callback(feed_url, True, None, None, None)
                     return [], True
                 response.raise_for_status()
-                parsed = feedparser.parse(response.text)
+                parsed = feedparser.parse(response.content, response_headers=_parser_headers(response))
                 entries = []
                 for raw in parsed.entries:
                     # OVH-024: isolate each entry so one malformed entry does not
@@ -378,7 +420,7 @@ async def fetch_feed_with_status(
                 # but entries were still recovered, just note it and proceed.
                 if getattr(parsed, "bozo", 0):
                     bozo_exc = getattr(parsed, "bozo_exception", None)
-                    if not entries:
+                    if not entries and not _is_wrong_media_type_only(parsed, bozo_exc):
                         logger.warning("Feed parse error (bozo) with no entries: %s — %s", feed_url, bozo_exc)
                         if health_callback:
                             health_callback(feed_url, False, f"Feed parse error: {bozo_exc}", None, None)

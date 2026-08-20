@@ -410,6 +410,123 @@ class TestFetchFeed:
 
 
 # ============================================================
+# TestFeedParserInputs (TW-AUD-019)
+# ============================================================
+
+
+# Declared ISO-8859-1, served WITHOUT a charset parameter: decoding the bytes as
+# anything else corrupts the accented characters.
+_LATIN1_RSS = (
+    '<?xml version="1.0" encoding="ISO-8859-1"?>'
+    '<rss version="2.0"><channel><title>T</title>'
+    "<item><title>Caf\xe9 na\xefve</title><link>https://example.com/a</link>"
+    "<description>r\xe9sum\xe9</description></item>"
+    "</channel></rss>"
+).encode("iso-8859-1")
+
+# Atom feed whose entry link is document-relative — only resolvable against the
+# URL the document was actually retrieved from.
+_RELATIVE_ATOM = (
+    b'<?xml version="1.0" encoding="utf-8"?>'
+    b'<feed xmlns="http://www.w3.org/2005/Atom"><title>T</title>'
+    b'<entry><title>Relative</title><link href="/articles/one"/>'
+    b"<summary>s</summary></entry></feed>"
+)
+
+
+def _bytes_transport(body: bytes, content_type: str, status: int = 200) -> httpx.MockTransport:
+    """Transport serving raw bytes, so response decoding is the code's problem."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, content=body, headers={"content-type": content_type})
+
+    return httpx.MockTransport(handler)
+
+
+class TestFeedParserInputs:
+    """TW-AUD-019: feedparser gets the source bytes plus the document's base URI."""
+
+    async def test_declared_encoding_survives(self) -> None:
+        """A feed declaring ISO-8859-1 in its prolog parses without mojibake.
+
+        Handing feedparser ``response.text`` pre-decodes the body with httpx's
+        guess and throws the XML encoding declaration away, so ``Café`` arrives
+        as replacement characters.
+        """
+        transport = _bytes_transport(_LATIN1_RSS, "application/rss+xml")
+        async with httpx.AsyncClient(transport=transport) as client:
+            entries = await fetch_feed("https://example.com/feed.xml", client)
+
+        assert [e.title for e in entries] == ["Café naïve"]
+        assert entries[0].summary == "résumé"
+
+    async def test_relative_entry_link_resolves_against_the_feed_url(self) -> None:
+        """A document-relative entry link resolves instead of being dropped.
+
+        Without base metadata the link stays ``/articles/one``, fails the
+        http(s) scheme guard, and the feed reports a healthy empty fetch.
+        """
+        transport = _bytes_transport(_RELATIVE_ATOM, "application/atom+xml")
+        async with httpx.AsyncClient(transport=transport) as client:
+            entries = await fetch_feed("https://example.com/news/feed.xml", client)
+
+        assert [e.url for e in entries] == ["https://example.com/articles/one"]
+
+    async def test_relative_link_resolves_against_the_final_redirect_target(self) -> None:
+        """The base URI is the URL the document actually came from, not the request."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/feed.xml":
+                return httpx.Response(301, headers={"location": "https://cdn.example.com/v2/feed.xml"})
+            return httpx.Response(200, content=_RELATIVE_ATOM, headers={"content-type": "application/atom+xml"})
+
+        with patch("app.url_validation.is_private_url", return_value=False):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                entries = await fetch_feed("https://example.com/feed.xml", client)
+
+        assert [e.url for e in entries] == ["https://cdn.example.com/articles/one"]
+
+    async def test_mislabelled_empty_feed_stays_healthy(self) -> None:
+        """A real but empty feed served as text/plain is not a fetch failure.
+
+        Forwarding content-type activates feedparser's media-type check, which
+        flags every mislabelled feed. Only the label is wrong here, so the feed
+        must stay in the healthy-empty bucket instead of entering backoff.
+        """
+        from unittest.mock import MagicMock
+
+        from app.scraping.rss import fetch_feed_with_status
+
+        callback = MagicMock()
+        transport = _bytes_transport(_EMPTY_RSS.encode(), "text/plain; charset=utf-8")
+        async with httpx.AsyncClient(transport=transport) as client:
+            entries, fetch_ok = await fetch_feed_with_status(
+                "https://example.com/feed.xml", client, health_callback=callback
+            )
+
+        assert entries == []
+        assert fetch_ok is True
+        callback.assert_called_once_with("https://example.com/feed.xml", True, None, None, None)
+
+    async def test_html_error_page_is_still_a_failure(self) -> None:
+        """An HTML error page served as text/html stays an OVH-044 soft failure."""
+        from unittest.mock import MagicMock
+
+        from app.scraping.rss import fetch_feed_with_status
+
+        callback = MagicMock()
+        transport = _bytes_transport(b"<html><body><h1>404</h1></body></html>", "text/html")
+        async with httpx.AsyncClient(transport=transport) as client:
+            entries, fetch_ok = await fetch_feed_with_status(
+                "https://example.com/feed.xml", client, health_callback=callback
+            )
+
+        assert entries == []
+        assert fetch_ok is False
+        assert callback.call_args[0][1] is False
+
+
+# ============================================================
 # TestFeedBozoHandling (OVH-044)
 # ============================================================
 
