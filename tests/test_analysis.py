@@ -2156,6 +2156,78 @@ class TestStripIndexCitations:
 
 
 # ============================================================
+# TestCitationGrammarEdgeCases (AUG-169)
+# ============================================================
+
+
+class TestCitationGrammarEdgeCases:
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            # Oxford list: the run used to stop at the comma and leave "(and [3])".
+            ("fans (Articles [1], [2], and [3]) **Timeline:**", "fans **Timeline:**"),
+            ("arc (reported in articles [2], [5], and [9]). Note", "arc. Note"),
+            ("deal (Articles [1] and [2]) closed", "deal closed"),
+            ("range (Articles [1] through [3]) covered", "range covered"),
+            ("mixed (Articles [1], [2] through [4]) noted", "mixed noted"),
+        ],
+    )
+    def test_list_separators_are_consumed_whole(self, text: str, expected: str) -> None:
+        assert strip_index_citations(text) == expected
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            # No left word boundary: "particle [7]" was rewritten to "p".
+            "physics (particle [7]) detected",
+            "the (subarticle [2]) note",
+        ],
+    )
+    def test_embedded_word_is_not_a_citation(self, text: str) -> None:
+        assert strip_index_citations(text) == text
+
+
+# ============================================================
+# TestNoteSentencesKeepRealFacts (AUG-167)
+# ============================================================
+
+
+class TestNoteSentencesKeepRealFacts:
+    """A "Note:" label is a candidate, not a verdict.
+
+    The scrub runs across novelty, initialization, compression and update egress,
+    so a label-only rule silently deleted real facts from notifications and from
+    the persisted baseline that later novelty decisions are made against.
+    """
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Note: The launch is delayed to 2027.",
+            "Note on pricing: The standard edition costs $59.99.",
+            "Note: Two studios are now credited.",
+        ],
+    )
+    def test_ordinary_note_prefixed_facts_survive(self, text: str) -> None:
+        assert strip_reliability_notes(text) == text
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Note: Articles [1], [2] are marked [STUB] with minimal content.",
+            "Note: this claim is drawn primarily from stub articles.",
+            "Note on sourcing: Article [3] provides the most substantive information.",
+        ],
+    )
+    def test_note_with_a_reliability_signal_is_still_dropped(self, text: str) -> None:
+        assert strip_reliability_notes(text) == ""
+
+    def test_note_fact_survives_alongside_a_dropped_note(self) -> None:
+        text = "Note: The launch is delayed to 2027. Note: Article [2] is marked [STUB]."
+        assert strip_reliability_notes(text) == "Note: The launch is delayed to 2027."
+
+
+# ============================================================
 # TestStripReliabilityNotes (leaked [STUB]/[NO CONTENT] bookkeeping)
 # ============================================================
 
