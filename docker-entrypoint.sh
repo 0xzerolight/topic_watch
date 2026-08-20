@@ -30,6 +30,7 @@ case "$db_path" in
     /*) db_dir="$(dirname "$db_path")" ;;        # absolute → use as-is
     *)  db_dir="/app/$(dirname "$db_path")" ;;   # relative → resolved from /app
 esac
+db_basename="$(basename "$db_path")"
 # When the DB dir already lives inside the data volume, the /app/data handling
 # covers it — collapse to DATA_DIR so the common case touches a single path.
 case "$db_dir/" in
@@ -47,6 +48,44 @@ esac
 # Warn loudly when asked to run as root (privilege drop would be a no-op).
 if [ "$PUID" = "0" ]; then
     echo "WARNING: PUID=0 — the app will run as root, which defeats privilege drop." >&2
+fi
+
+# Resolve a directory to its real, symlink-free absolute path. Requires the
+# directory to already exist. Prints nothing and returns non-zero if it
+# cannot be resolved (missing, or not traversable).
+canon_dir() {
+    ( cd "$1" 2>/dev/null && pwd -P )
+}
+
+# AUG-007: a relocated TOPIC_WATCH_DB_PATH can resolve its parent to the
+# filesystem root or another broad system directory — e.g. "/topic_watch.db"
+# resolves to "/", and "../topic_watch.db" resolves to the directory above
+# /app. Refuse to treat any of these as a database directory at all, so
+# neither the chown nor the writability probe below ever touches them.
+is_forbidden_chown_target() {
+    case "$1" in
+        ""|/) return 0 ;;
+        /bin|/boot|/dev|/etc|/home|/lib|/lib64|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+if [ "$db_dir" != "$DATA_DIR" ]; then
+    mkdir -p "$db_dir" 2>/dev/null || true
+    resolved_db_dir="$(canon_dir "$db_dir" 2>/dev/null || true)"
+    if [ -n "$resolved_db_dir" ]; then
+        if is_forbidden_chown_target "$resolved_db_dir"; then
+            echo "ERROR: TOPIC_WATCH_DB_PATH ('$db_path') resolves its directory to" >&2
+            echo "       '$resolved_db_dir', a filesystem root or system directory." >&2
+            echo "       Refusing to touch it. Point TOPIC_WATCH_DB_PATH at a dedicated" >&2
+            echo "       subdirectory (e.g. a mounted volume) instead." >&2
+            exit 1
+        fi
+        db_dir="$resolved_db_dir"
+    fi
+    # else: directory could not be resolved yet (e.g. not writable as a
+    # non-root user) — fall through and let the probe/chown below produce
+    # their own actionable error.
 fi
 
 # Probe one directory for writability by the current user, failing with an
@@ -95,11 +134,12 @@ if [ "$current_uid" != "$PUID" ]; then
     usermod -o -u "$PUID" appuser
 fi
 
-# Ensure a directory exists and is owned by the runtime user. Skip the
-# recursive chown when ownership already matches — it is expensive on large
-# bind-mounted volumes and unnecessary when the UID/GID haven't changed. Check
-# BOTH owner UID and group GID so a GID-only change is not missed.
-chown_runtime() {
+# Ensure a directory exists and is owned by the runtime user, recursively.
+# Skip the recursive walk when directory-level ownership already matches — it
+# is expensive on large bind-mounted volumes and unnecessary when the UID/GID
+# haven't changed. Only ever called on DATA_DIR or a known-bounded
+# subdirectory of it (never on an arbitrary configured db_dir — AUG-007).
+chown_dir_recursive() {
     target_dir="$1"
     mkdir -p "$target_dir"
     dir_uid="$(stat -c %u "$target_dir")"
@@ -109,12 +149,53 @@ chown_runtime() {
     fi
 }
 
-# Ensure the data volume is writable by the runtime user.
-chown_runtime "$DATA_DIR"
-# When the DB lives outside the data volume (absolute/relocated db_path), its
-# parent is not covered above and would stay root-owned — chown it too (OVH-121).
-if [ "$db_dir" != "$DATA_DIR" ]; then
-    chown_runtime "$db_dir"
+# Chown a single existing path (file or directory entry) if its ownership
+# doesn't already match. Never recursive, so it is safe to call on a path
+# inside an arbitrary configured directory.
+chown_path_if_needed() {
+    p="$1"
+    [ -e "$p" ] || return 0
+    p_uid="$(stat -c %u "$p")"
+    p_gid="$(stat -c %g "$p")"
+    if [ "$p_uid" != "$PUID" ] || [ "$p_gid" != "$PGID" ]; then
+        chown "$PUID:$PGID" "$p"
+    fi
+}
+
+# Repair ownership of the exact database + sidecar files under a directory,
+# regardless of whether the containing directory's own ownership already
+# matches (AUG-057: a directory created with the right owner can still hold
+# root-owned files copied/restored in afterwards). Never recursive.
+chown_db_files() {
+    dir="$1"
+    base="$2"
+    chown_path_if_needed "$dir/$base"
+    chown_path_if_needed "$dir/$base-wal"
+    chown_path_if_needed "$dir/$base-shm"
+    chown_path_if_needed "$dir/$base-journal"
+}
+
+# Ensure the data volume itself is writable by the runtime user, and that the
+# config file and database (+ sidecars) it holds are individually correctly
+# owned even when the directory ownership already matched (AUG-057).
+chown_dir_recursive "$DATA_DIR"
+chown_path_if_needed "$DATA_DIR/config.yml"
+if [ "$db_dir" = "$DATA_DIR" ]; then
+    chown_db_files "$DATA_DIR" "$db_basename"
+else
+    # When the DB lives outside the data volume (absolute/relocated db_path),
+    # its parent is not covered above and would stay root-owned (OVH-121). Fix
+    # it WITHOUT recursing an arbitrary configured directory (AUG-007): chown
+    # only the directory entry itself and the exact database + sidecar files.
+    chown_path_if_needed "$db_dir"
+    chown_db_files "$db_dir" "$db_basename"
+fi
+# Backups live alongside the database file (app/database.py _backup_db) and
+# are capped at 5 files by the app itself, so recursing just this
+# app-managed subdirectory is cheap and safe regardless of where the
+# database lives.
+if [ -d "$db_dir/backups" ]; then
+    chown_dir_recursive "$db_dir/backups"
 fi
 
 # Drop privileges and run the app as the (now host-aligned) appuser.

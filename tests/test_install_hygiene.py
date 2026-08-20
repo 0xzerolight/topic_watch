@@ -66,3 +66,44 @@ def test_env_example_has_no_uncommented_llm_key() -> None:
     for line in (_ROOT / ".env.example").read_text().splitlines():
         stripped = line.strip()
         assert not stripped.startswith("TOPIC_WATCH_LLM__"), f"uncommented LLM env line: {line!r}"
+
+
+def test_entrypoint_refuses_root_and_system_chown_targets() -> None:
+    """AUG-007: a relocated TOPIC_WATCH_DB_PATH (e.g. ``/topic_watch.db`` or
+    ``../topic_watch.db``) must never resolve to a directory the entrypoint
+    will recursively chown. The guard must canonicalize the resolved
+    directory and refuse the filesystem root and other broad system dirs."""
+    entrypoint = (_ROOT / "docker-entrypoint.sh").read_text()
+    assert "canon_dir" in entrypoint, "db_dir must be canonicalized before use"
+    assert "is_forbidden_chown_target" in entrypoint
+    # The guard must actually run before any chown of db_dir happens.
+    guard_pos = entrypoint.index("is_forbidden_chown_target")
+    chown_pos = entrypoint.index('chown_path_if_needed "$db_dir"')
+    assert guard_pos < chown_pos, "the forbidden-target guard must precede the db_dir chown"
+    # Must reject "/" itself, not just its named children.
+    forbidden_block = entrypoint[entrypoint.index("is_forbidden_chown_target()") :][:400]
+    assert '""|/) return 0' in forbidden_block
+
+
+def test_entrypoint_never_recursively_chowns_the_configured_db_dir() -> None:
+    """AUG-007's core fix: an arbitrary configured database directory must be
+    touched with plain (non-recursive) ``chown``, never ``chown -R`` — only
+    the fixed, bounded ``/app/data`` (and its own ``backups`` subdirectory)
+    may be recursed."""
+    entrypoint = (_ROOT / "docker-entrypoint.sh").read_text()
+    assert 'chown -R "$PUID:$PGID" "$db_dir"' not in entrypoint
+    assert 'chown_path_if_needed "$db_dir"' in entrypoint, "db_dir itself must use the non-recursive helper"
+
+
+def test_entrypoint_repairs_existing_required_files_not_just_the_directory() -> None:
+    """AUG-057: ownership repair must not skip existing config/database files
+    just because the containing directory's owner already matches — a
+    restored/copied-in file can still be root-owned."""
+    entrypoint = (_ROOT / "docker-entrypoint.sh").read_text()
+    assert "chown_db_files" in entrypoint
+    assert 'chown_path_if_needed "$DATA_DIR/config.yml"' in entrypoint
+    # The per-file repair must run unconditionally, not nested inside the
+    # directory-level "ownership already matches" skip branch.
+    dir_check_pos = entrypoint.index('if [ "$dir_uid" != "$PUID" ]')
+    file_repair_pos = entrypoint.index('chown_path_if_needed "$DATA_DIR/config.yml"')
+    assert file_repair_pos > dir_check_pos
