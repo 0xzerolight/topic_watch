@@ -1135,6 +1135,45 @@ class TestLiveNoveltyContract:
         assert result.error is not None
         assert "relevance" in result.error
 
+    async def test_rejected_response_is_kept_for_inspection(self) -> None:
+        """The safe default drops the model's finding, which may have been a real
+        POSITIVE. The provider's own text is the only copy left, so it rides
+        along on ``raw_response`` instead of dying with the exception."""
+        settings = _make_settings(llm_max_retries=1)
+        payloads = [{"has_new_info": True, "summary": "Date announced", "confidence": 0.9, "importance": 4}]
+
+        with _md_json_client(payloads):
+            result = await analyze_articles([_make_article()], "Known.", _make_topic(), settings)
+
+        assert result.has_new_info is False
+        assert result.raw_response is not None
+        assert "Date announced" in result.raw_response
+        # It travels with the check: the checker stores the whole result blob.
+        assert "Date announced" in result.model_dump_json()
+
+    async def test_transport_failure_has_no_response_to_keep(self) -> None:
+        """A call that never produced a response leaves ``raw_response`` unset."""
+        mock_client, mock_create = _mock_instructor_client(None)
+        mock_create.side_effect = Exception("LLM API error")
+
+        with patch("app.analysis.llm._get_client", return_value=mock_client):
+            result = await analyze_articles([_make_article()], "Known.", _make_topic(), _make_settings())
+
+        assert result.error is not None
+        assert result.raw_response is None
+
+    async def test_successful_analysis_keeps_no_raw_response(self) -> None:
+        settings = _make_settings()
+        payloads = [
+            {"has_new_info": True, "summary": "Date announced", "confidence": 0.9, "relevance": 0.8, "importance": 4}
+        ]
+
+        with _md_json_client(payloads):
+            result = await analyze_articles([_make_article()], "Known.", _make_topic(), settings)
+
+        assert result.has_new_info is True
+        assert result.raw_response is None
+
     async def test_explicit_zero_relevance_is_not_a_violation(self) -> None:
         """Omission is the defect; a model that deliberately scores 0.0 is obeyed."""
         settings = _make_settings()
