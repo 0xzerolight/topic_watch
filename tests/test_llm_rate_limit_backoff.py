@@ -474,6 +474,7 @@ def _real_instructor_raising(exc_factory):
     real_client = instructor.from_litellm(_fake_acompletion)
     prev = dict(llm_module._clients)
     llm_module._clients.clear()
+    llm_module._mode_hints.clear()
     try:
         with patch("app.analysis.llm._get_client", return_value=real_client):
             yield counter
@@ -751,15 +752,19 @@ def _completion_for(model_instance) -> ModelResponse:
 
 
 @contextmanager
-def _fake_acompletion(handler):
+def _fake_acompletion(handler, *, keep_mode_hints: bool = False):
     """Patch ``litellm.acompletion`` with ``handler`` and reset the per-mode cache.
 
     ``handler(kwargs)`` returns a ``ModelResponse`` (success) or raises (provider
     error). Clearing ``_clients`` forces the real ``_get_client`` to rebuild one
     instructor client per mode over the fake, so the mode fallback runs for real.
-    Yields the list of per-call kwargs for assertions on ``tool_choice`` /
-    ``response_format`` and the (instructor-mutated) messages.
+    The sticky mode hints (AUG-032) are cleared too unless ``keep_mode_hints`` —
+    they are module-global, so a hint left by one test would change where the
+    next one starts. Yields the list of per-call kwargs for assertions on
+    ``tool_choice`` / ``response_format`` and the (instructor-mutated) messages.
     """
+    if not keep_mode_hints:
+        llm_module._mode_hints.clear()
     calls: list[dict] = []
 
     async def _acompletion(*_args, **kwargs):
@@ -781,6 +786,7 @@ class TestStructuredOutputModeFallback:
         # Net-new reset: the per-mode cache is module-global, so wipe it before
         # each test so a client built over a prior fake never leaks in.
         llm_module._clients.clear()
+        llm_module._mode_hints.clear()
 
     async def test_tools_400_falls_back_to_json(self) -> None:
         """Test 1: TOOLS tool_choice 400 -> retry in JSON mode -> success."""
@@ -866,9 +872,13 @@ class TestStructuredOutputModeFallback:
         assert result.error is not None
         assert "structured output rejected" in result.error
 
-    async def test_rate_limit_mid_chain_reruns_from_tools(self) -> None:
-        """Test 5: TOOLS 400 -> JSON 429 -> backoff -> rerun TOOLS 400 -> JSON ok."""
-        expected = NoveltyResult(has_new_info=True, confidence=0.7)
+    async def test_rate_limit_mid_chain_resumes_from_the_working_mode(self) -> None:
+        """Test 5: TOOLS 400 -> JSON 429 -> backoff -> JSON ok.
+
+        The rate-limit retry re-enters ``_create_structured``; before AUG-032 it
+        restarted from TOOLS and paid the same rejection again.
+        """
+        expected = NoveltyResult(has_new_info=True, confidence=0.7, relevance=0.8, importance=4)
         state = {"json_calls": 0}
 
         def handler(kwargs: dict) -> ModelResponse:
@@ -895,9 +905,57 @@ class TestStructuredOutputModeFallback:
 
         assert result.has_new_info is True
         assert result.error is None
-        # run1: TOOLS(400) + JSON(429); run2: TOOLS(400) + JSON(ok) = 4 calls, 1 sleep.
-        assert len(calls) == 4
+        # TOOLS(400) + JSON(429), backoff, JSON(ok) = 3 calls, 1 sleep.
+        assert len(calls) == 3
         assert len(sleeps) == 1
+        assert "tool_choice" not in calls[2]
+
+    async def test_working_mode_is_reused_by_the_next_call(self) -> None:
+        """AUG-032: a fallback-only provider pays the rejection once per TTL, not
+        once per analysis / initialization / compression / update."""
+        expected = NoveltyResult(has_new_info=True, confidence=0.9, relevance=0.8, importance=4)
+
+        def handler(kwargs: dict) -> ModelResponse:
+            if "tool_choice" in kwargs:
+                raise _tool_choice_error()
+            return _completion_for(expected)
+
+        settings = _make_settings(llm=LLMSettings(model="deepseek/deepseek-reasoner", api_key="k"))
+
+        with _fake_acompletion(handler) as calls:
+            await analyze_articles([_make_article()], "Known facts.", _make_topic(), settings)
+            first_round = len(calls)
+            await analyze_articles([_make_article()], "Known facts.", _make_topic(), settings)
+
+        assert first_round == 2  # TOOLS rejected, JSON accepted
+        assert len(calls) == 3  # the second analysis starts straight at JSON
+        assert "tool_choice" not in calls[2]
+
+    async def test_mode_hint_expires_and_reprobes_the_preferred_mode(self) -> None:
+        """The hint is a TTL hint: a provider that gains TOOLS support is picked
+        up on the next probe, without a restart."""
+        expected = NoveltyResult(has_new_info=True, confidence=0.9, relevance=0.8, importance=4)
+        state = {"reject_tools": True}
+
+        def handler(kwargs: dict) -> ModelResponse:
+            if "tool_choice" in kwargs and state["reject_tools"]:
+                raise _tool_choice_error()
+            return _completion_for(expected)
+
+        settings = _make_settings(llm=LLMSettings(model="deepseek/deepseek-reasoner", api_key="k"))
+        clock = {"now": 0.0}
+
+        with (
+            _fake_acompletion(handler) as calls,
+            patch("app.analysis.llm.time.monotonic", side_effect=lambda: clock["now"]),
+        ):
+            await analyze_articles([_make_article()], "Known facts.", _make_topic(), settings)
+            clock["now"] += llm_module._MODE_HINT_TTL_SECONDS + 1
+            state["reject_tools"] = False
+            await analyze_articles([_make_article()], "Known facts.", _make_topic(), settings)
+
+        assert len(calls) == 3  # TOOLS(400) + JSON(ok), then TOOLS probed again
+        assert "tool_choice" in calls[2]
 
 
 # ============================================================

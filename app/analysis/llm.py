@@ -589,6 +589,38 @@ async def _call_with_transport_retry(
     raise last_exc
 
 
+# Last mode known to work, per (model, base URL, response-model name), with the
+# monotonic clock reading it expires at. A provider that permanently supports only
+# JSON or MD_JSON (DeepSeek thinking mode) otherwise eats one or two predictably
+# rejected requests before EVERY analysis, initialization, compression and update
+# (AUG-032). The TTL is what keeps the hint a hint: after it lapses the preferred
+# mode is probed again, so a provider that gains TOOLS support is picked up
+# without a restart, and a wrong entry costs one extra call at most.
+_MODE_HINT_TTL_SECONDS = 900.0
+_mode_hints: dict[tuple[str, str, str], tuple[instructor.Mode, float]] = {}
+
+
+def _mode_hint_key(settings: Settings, response_model: type[BaseModel]) -> tuple[str, str, str]:
+    """Hint identity: the three things that decide whether a mode is accepted."""
+    return (settings.llm.model, _effective_base_url(settings) or "", response_model.__name__)
+
+
+def _remember_mode(key: tuple[str, str, str], mode: instructor.Mode) -> None:
+    _mode_hints[key] = (mode, time.monotonic() + _MODE_HINT_TTL_SECONDS)
+
+
+def _starting_mode(key: tuple[str, str, str]) -> instructor.Mode:
+    """Hinted mode if the hint is still fresh, else the preferred mode (TOOLS)."""
+    hint = _mode_hints.get(key)
+    if hint is None:
+        return instructor.Mode.TOOLS
+    mode, expires_at = hint
+    if time.monotonic() >= expires_at:
+        del _mode_hints[key]
+        return instructor.Mode.TOOLS
+    return mode
+
+
 async def _create_structured(
     settings: Settings,
     *,
@@ -605,15 +637,18 @@ async def _create_structured(
     preserves the rebuild-per-attempt invariant and avoids instructor's in-place
     message mutation leaking a doubled schema block across mode hops.
 
-    Stateless by design — no per-model memory, so a false-positive fallback costs
-    one call and never downgrades the process.
+    The starting mode comes from the TTL hint above rather than always being TOOLS,
+    so a fallback-only provider pays the rejection once per TTL instead of on every
+    call — including after a mid-chain rate-limit retry, which used to restart the
+    whole chain from TOOLS. The fallback order itself is unchanged.
 
     ``validation_context`` reaches the response model's validators as pydantic's
     validation context, and instructor re-prompts on whatever they reject — that
     is how the live-output contract (see ``NoveltyResult``) is enforced against
     the provider rather than merely detected after the fact.
     """
-    mode: instructor.Mode = instructor.Mode.TOOLS
+    hint_key = _mode_hint_key(settings, response_model)
+    mode: instructor.Mode = _starting_mode(hint_key)
     while True:
         client = _get_client(settings, mode)
         try:
@@ -639,8 +674,12 @@ async def _create_structured(
                 settings.llm.model,
                 next_mode.value,
             )
+            # Remember the hop immediately: a rate-limit retry re-enters this
+            # helper, and without this it would replay the same rejected mode.
+            _remember_mode(hint_key, next_mode)
             mode = next_mode
         else:
+            _remember_mode(hint_key, mode)
             return cast(tuple[T, Any], result)
 
 
