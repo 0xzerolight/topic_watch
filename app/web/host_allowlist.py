@@ -93,6 +93,13 @@ def host_is_allowed(host: str, patterns: Sequence[str]) -> bool:
     return False
 
 
+def _host_header(scope: Scope) -> str:
+    for key, value in scope.get("headers", []):
+        if key == b"host":
+            return str(value.decode("latin-1"))
+    return ""
+
+
 class HostAllowlistMiddleware:
     """Rejects requests whose Host header is not on the allowlist."""
 
@@ -109,12 +116,7 @@ class HostAllowlistMiddleware:
             await self.app(scope, receive, send)
             return
 
-        raw_host = ""
-        for key, value in scope.get("headers", []):
-            if key == b"host":
-                raw_host = value.decode("latin-1")
-                break
-
+        raw_host = _host_header(scope)
         if host_is_allowed(split_host(raw_host), self.allowed_hosts):
             await self.app(scope, receive, send)
             return
@@ -126,5 +128,8 @@ class HostAllowlistMiddleware:
             raw_host[:200],
             ALLOWED_HOSTS_ENV,
         )
+        if scope["type"] == "websocket":
+            await send({"type": "websocket.close", "code": 1008})
+            return
         response = PlainTextResponse(_REJECTION_BODY, status_code=400)
         await response(scope, receive, send)

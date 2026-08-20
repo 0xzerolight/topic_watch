@@ -94,7 +94,7 @@ class CSRFMiddleware(BaseHTTPMiddleware):
         # flipping secure_cookies rewrites the attribute on a cookie the browser
         # already holds instead of waiting for it to expire (AUG-018). Static
         # assets are skipped: they are cacheable and carry no token.
-        if not request.url.path.startswith("/static"):
+        if not request.url.path.startswith("/static/"):
             secure = getattr(getattr(request.app.state, "settings", None), "secure_cookies", False)
             response.set_cookie(
                 COOKIE_NAME,
