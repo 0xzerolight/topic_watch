@@ -9,6 +9,7 @@ from typing import Protocol
 from urllib.parse import quote_plus
 
 from app.models import Topic
+from app.scraping.source import SourceIdentity
 
 
 def _build_search_query(topic: Topic) -> str:
@@ -35,6 +36,16 @@ class NewsProvider(Protocol):
     def build_feed_url(self, topic: Topic) -> str: ...
 
     def needs_url_resolution(self) -> bool: ...
+
+
+def provider_identity(provider: NewsProvider) -> SourceIdentity:
+    """The identity and capabilities a provider's responses are stamped with.
+
+    Providers are URL builders; the pipeline only ever learns which one answered
+    from the response, because AUTO mode can cascade to a second provider
+    mid-fetch. This is the one place that conversion happens.
+    """
+    return SourceIdentity(name=provider.name, needs_url_resolution=provider.needs_url_resolution())
 
 
 class BingNewsProvider:

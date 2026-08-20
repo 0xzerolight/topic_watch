@@ -11,8 +11,6 @@ import hashlib
 import logging
 import re
 from calendar import timegm
-from collections.abc import Callable
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from html.parser import HTMLParser
 from time import struct_time
@@ -21,67 +19,25 @@ from urllib.parse import ParseResult, parse_qs, urlparse
 
 import feedparser
 import httpx
-from pydantic import BaseModel
 
-from app.feed_backoff import BACKOFF_BASE_MINUTES, BACKOFF_CAP_HOURS, feed_backoff_until
+from app.feed_backoff import feed_backoff_until
 from app.log_redaction import redact_url
 from app.models import FeedMode, Topic
+from app.scraping.providers import provider_identity
+from app.scraping.source import FeedEntry as FeedEntry
+from app.scraping.source import FeedHealthCallback as FeedHealthCallback
+from app.scraping.source import FeedResponse as FeedResponse
+from app.scraping.source import SourceRequest, register_source
+from app.scraping.source import fetch_feeds_for_topic as fetch_feeds_for_topic
 from app.url_validation import is_private_url, safe_get
 
 if TYPE_CHECKING:
-    from app.config import ExaSettings
     from app.models import FeedHealth
-    from app.scraping.routing import ProviderRouter
 
 logger = logging.getLogger(__name__)
 
-FeedHealthCallback = Callable[
-    [str, bool, str | None, str | None, str | None], None
-]  # (feed_url, success, error_msg, etag, last_modified)
-
 _USER_AGENT = "TopicWatch/1.0.0 (RSS reader)"
 _FEED_FETCH_TIMEOUT = 15.0
-
-
-class FeedEntry(BaseModel):
-    """A single entry parsed from an RSS/Atom feed."""
-
-    title: str
-    url: str
-    published: datetime | None = None
-    summary: str = ""
-    source_feed: str
-    content: str | None = None
-    """Pre-extracted full text, when the source already provides it (e.g. Exa search).
-    ``None`` for RSS entries, whose text is fetched during content extraction. When set
-    and non-empty, it short-circuits the network fetch in ``extract_article_content``."""
-
-
-@dataclass
-class FeedResponse:
-    """Result of fetching feeds for a topic.
-
-    Wraps the parsed entries with metadata about which provider was
-    used, so downstream code can make provider-specific decisions
-    (e.g. Google News URL resolution) without importing provider classes.
-
-    ``feeds_total`` / ``feeds_failed`` expose per-fetch health so the check
-    pipeline can distinguish a healthy partial yield from a degraded check where
-    some sources silently dropped out (OVH-130). For AUTO mode a single provider
-    is fetched (with at most one cascade), so the counts reflect that attempt;
-    for MANUAL mode they count the topic's explicit feed URLs.
-    """
-
-    entries: list[FeedEntry] = field(default_factory=list)
-    provider_name: str | None = None
-    needs_url_resolution: bool = False
-    feeds_total: int = 0
-    feeds_failed: int = 0
-    feeds_skipped: int = 0
-    """MANUAL mode: feeds skipped this cycle because they are in a backoff window
-    (persistently failing). For MANUAL mode ``feeds_total`` counts feeds ATTEMPTED
-    (skipped feeds are excluded and surface here), so a backed-off feed is never
-    miscounted as a partial failure."""
 
 
 def compute_article_hash(url: str, title: str) -> str:
@@ -487,56 +443,13 @@ async def fetch_feed_with_status(
             await client.aclose()
 
 
-async def fetch_feeds_for_topic(
-    topic: Topic,
-    timeout: float = _FEED_FETCH_TIMEOUT,
-    max_attempts: int = 2,
-    health_callback: FeedHealthCallback | None = None,
-    router: ProviderRouter | None = None,
-    feed_state_loader: Callable[[str], FeedHealth | None] | None = None,
-    backoff_base_minutes: int = BACKOFF_BASE_MINUTES,
-    backoff_cap_hours: int = BACKOFF_CAP_HOURS,
-    exa_settings: ExaSettings | None = None,
-    max_results: int = 10,
-) -> FeedResponse:
-    """Fetch all feeds for a topic, deduplicated by URL.
-
-    For AUTO mode: uses the router to select a provider, with within-cycle
-    fallback (max 1 retry with the next provider). For MANUAL mode: fetches all
-    explicit feed URLs concurrently, skipping any in a backoff window. For EXA
-    mode: queries the Exa search API (``exa_settings`` required; ``max_results``
-    bounds the paid result count).
-
-    ``feed_state_loader`` supplies the stored ``FeedHealth`` per URL — used to
-    send conditional-GET validators (both RSS modes) and to skip backed-off feeds
-    (MANUAL only; AUTO provider backoff is owned by ``ProviderRouter``).
-    """
-    if topic.feed_mode == FeedMode.EXA:
-        # Lazy import avoids an exa <-> rss module cycle (mirrors _fetch_auto's router import).
-        from app.scraping.exa import fetch_exa_entries
-
-        if exa_settings is None:
-            logger.warning("Topic '%s' uses Exa mode but no Exa settings were supplied", topic.name)
-            return FeedResponse(provider_name="exa", feeds_total=0, feeds_failed=0)
-        return await fetch_exa_entries(
-            topic, exa_settings, max_results=max_results, timeout=timeout, health_callback=health_callback
-        )
-    if topic.feed_mode == FeedMode.AUTO:
-        return await _fetch_auto(topic, timeout, max_attempts, health_callback, router, feed_state_loader)
-    return await _fetch_manual(
-        topic, timeout, max_attempts, health_callback, feed_state_loader, backoff_base_minutes, backoff_cap_hours
-    )
-
-
-async def _fetch_auto(
-    topic: Topic,
-    timeout: float,
-    max_attempts: int,
-    health_callback: FeedHealthCallback | None,
-    router: ProviderRouter | None,
-    feed_state_loader: Callable[[str], FeedHealth | None] | None = None,
-) -> FeedResponse:
+async def _fetch_auto(topic: Topic, request: SourceRequest) -> FeedResponse:
     """AUTO mode: try provider, fallback to next on empty/error."""
+    timeout = request.timeout
+    max_attempts = request.max_attempts
+    health_callback = request.health_callback
+    feed_state_loader = request.feed_state_loader
+    router = request.router
     if router is None:
         from app.scraping.routing import router as default_router
 
@@ -567,10 +480,9 @@ async def _fetch_auto(
         if entries:
             if router.mark_healthy(provider.name, observed_epoch=provider_epoch):
                 logger.info("Provider %s recovered (back to healthy)", provider.name)
-            return FeedResponse(
+            return FeedResponse.from_source(
+                provider_identity(provider),
                 entries=entries,
-                provider_name=provider.name,
-                needs_url_resolution=provider.needs_url_resolution(),
                 feeds_total=1,
                 feeds_failed=0,
             )
@@ -585,12 +497,11 @@ async def _fetch_auto(
         next_provider = router.get_next_provider(provider)
         if next_provider is None:
             logger.warning("Provider %s %s; no fallback provider available", provider.name, reason)
-            return FeedResponse(
-                entries=[],
-                provider_name=provider.name,
-                needs_url_resolution=False,
+            return FeedResponse.from_source(
+                provider_identity(provider),
                 feeds_total=1,
                 feeds_failed=1 if not fetch_ok else 0,
+                needs_url_resolution=False,
             )
 
         logger.info("Provider %s %s, cascading to %s", provider.name, reason, next_provider.name)
@@ -611,10 +522,9 @@ async def _fetch_auto(
         if entries:
             if router.mark_healthy(next_provider.name, observed_epoch=next_epoch):
                 logger.info("Provider %s recovered (back to healthy)", next_provider.name)
-            return FeedResponse(
+            return FeedResponse.from_source(
+                provider_identity(next_provider),
                 entries=entries,
-                provider_name=next_provider.name,
-                needs_url_resolution=next_provider.needs_url_resolution(),
                 feeds_total=2,
                 feeds_failed=first_failed,
             )
@@ -629,25 +539,22 @@ async def _fetch_auto(
             next_provider.name,
             next_reason,
         )
-        return FeedResponse(
-            entries=[],
-            provider_name=next_provider.name,
-            needs_url_resolution=False,
+        return FeedResponse.from_source(
+            provider_identity(next_provider),
             feeds_total=2,
             feeds_failed=first_failed + (1 if not next_fetch_ok else 0),
+            needs_url_resolution=False,
         )
 
 
-async def _fetch_manual(
-    topic: Topic,
-    timeout: float,
-    max_attempts: int,
-    health_callback: FeedHealthCallback | None,
-    feed_state_loader: Callable[[str], FeedHealth | None] | None = None,
-    backoff_base_minutes: int = BACKOFF_BASE_MINUTES,
-    backoff_cap_hours: int = BACKOFF_CAP_HOURS,
-) -> FeedResponse:
+async def _fetch_manual(topic: Topic, request: SourceRequest) -> FeedResponse:
     """MANUAL mode: fetch explicit feed URLs concurrently, skipping backed-off ones."""
+    timeout = request.timeout
+    max_attempts = request.max_attempts
+    health_callback = request.health_callback
+    feed_state_loader = request.feed_state_loader
+    backoff_base_minutes = request.backoff_base_minutes
+    backoff_cap_hours = request.backoff_cap_hours
     if not topic.feed_urls:
         return FeedResponse()
 
@@ -712,3 +619,9 @@ async def _fetch_manual(
     return FeedResponse(
         entries=entries, feeds_total=feeds_total, feeds_failed=feeds_failed, feeds_skipped=feeds_skipped
     )
+
+
+# Registered at import: the package's __init__ imports this module (and exa), so
+# every mode has a fetcher before the first dispatch.
+register_source(FeedMode.AUTO, _fetch_auto)
+register_source(FeedMode.MANUAL, _fetch_manual)

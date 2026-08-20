@@ -19,7 +19,15 @@ from urllib.parse import urlparse
 import httpx
 
 from app.log_redaction import redact_url
-from app.scraping.rss import FeedEntry, FeedHealthCallback, FeedResponse
+from app.models import FeedMode
+from app.scraping.source import (
+    FeedEntry,
+    FeedHealthCallback,
+    FeedResponse,
+    SourceIdentity,
+    SourceRequest,
+    register_source,
+)
 from app.url_validation import is_private_url
 
 if TYPE_CHECKING:
@@ -30,6 +38,9 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_EXA_BASE_URL = "https://api.exa.ai"
 _EXA_TEXT_MAX_CHARS = 5000
+
+EXA_SOURCE = SourceIdentity(name="exa")
+"""Exa returns publisher URLs directly, so no async URL resolution is needed."""
 
 
 def _map_exa_result(raw: dict[str, Any]) -> FeedEntry | None:
@@ -72,7 +83,7 @@ def _map_exa_result(raw: dict[str, Any]) -> FeedEntry | None:
         url=url,
         published=published,
         summary="",
-        source_feed="exa",
+        source_feed=EXA_SOURCE.name,
         content=(text or None),
     )
 
@@ -101,7 +112,7 @@ async def fetch_exa_entries(
         # Nothing attempted (no HTTP). feeds_total=0 keeps _log_feed_coverage from
         # reporting an "all sources failed" line for a self-inflicted disabled state.
         logger.warning("Exa source requested for topic '%s' but Exa is disabled or has no API key", topic.name)
-        return FeedResponse(provider_name="exa", feeds_total=0, feeds_failed=0)
+        return FeedResponse.from_source(EXA_SOURCE, feeds_total=0, feeds_failed=0)
 
     endpoint = f"{(exa_settings.base_url or _DEFAULT_EXA_BASE_URL).rstrip('/')}/search"
 
@@ -111,17 +122,17 @@ async def fetch_exa_entries(
             logger.warning("Blocked Exa request to non-http(s) endpoint: %s", redact_url(endpoint))
             if health_callback:
                 health_callback(endpoint, False, "Non-http(s) endpoint", None, None)
-            return FeedResponse(provider_name="exa", feeds_total=1, feeds_failed=1)
+            return FeedResponse.from_source(EXA_SOURCE, feeds_total=1, feeds_failed=1)
         if await asyncio.to_thread(is_private_url, endpoint):
             logger.warning("Blocked Exa request to private/reserved endpoint: %s", redact_url(endpoint))
             if health_callback:
                 health_callback(endpoint, False, "Private/reserved endpoint", None, None)
-            return FeedResponse(provider_name="exa", feeds_total=1, feeds_failed=1)
+            return FeedResponse.from_source(EXA_SOURCE, feeds_total=1, feeds_failed=1)
     except Exception:
         logger.warning("Blocked Exa request to malformed endpoint: %s", redact_url(endpoint), exc_info=True)
         if health_callback:
             health_callback(endpoint, False, "Malformed endpoint", None, None)
-        return FeedResponse(provider_name="exa", feeds_total=1, feeds_failed=1)
+        return FeedResponse.from_source(EXA_SOURCE, feeds_total=1, feeds_failed=1)
 
     query = f"{topic.name} {topic.description}".strip()
     body: dict[str, Any] = {
@@ -145,18 +156,18 @@ async def fetch_exa_entries(
         logger.warning("Exa request timed out for topic '%s'", topic.name)
         if health_callback:
             health_callback(endpoint, False, "Request timed out", None, None)
-        return FeedResponse(provider_name="exa", feeds_total=1, feeds_failed=1)
+        return FeedResponse.from_source(EXA_SOURCE, feeds_total=1, feeds_failed=1)
     except httpx.HTTPStatusError as exc:
         logger.warning("Exa returned HTTP %d for topic '%s'", exc.response.status_code, topic.name)
         if health_callback:
             health_callback(endpoint, False, f"HTTP {exc.response.status_code}", None, None)
-        return FeedResponse(provider_name="exa", feeds_total=1, feeds_failed=1)
+        return FeedResponse.from_source(EXA_SOURCE, feeds_total=1, feeds_failed=1)
     except Exception as exc:
         # NetworkError, JSON-decode (ValueError), and any other failure: never raise.
         logger.warning("Exa request failed for topic '%s'", topic.name, exc_info=True)
         if health_callback:
             health_callback(endpoint, False, f"{type(exc).__name__}: {exc}", None, None)
-        return FeedResponse(provider_name="exa", feeds_total=1, feeds_failed=1)
+        return FeedResponse.from_source(EXA_SOURCE, feeds_total=1, feeds_failed=1)
     finally:
         if owns_client:
             await client.aclose()
@@ -175,10 +186,26 @@ async def fetch_exa_entries(
 
     if health_callback:
         health_callback(endpoint, True, None, None, None)
-    return FeedResponse(
-        entries=entries,
-        provider_name="exa",
-        needs_url_resolution=False,
-        feeds_total=1,
-        feeds_failed=0,
+    return FeedResponse.from_source(EXA_SOURCE, entries=entries, feeds_total=1, feeds_failed=0)
+
+
+async def fetch_exa_source(topic: Topic, request: SourceRequest) -> FeedResponse:
+    """Registry adapter: EXA-mode topics fetch through the Exa search API.
+
+    Exa is the only source with a hard configuration prerequisite, so the
+    missing-settings case is answered here rather than by a branch in the
+    dispatcher. Nothing is attempted, hence ``feeds_total=0``.
+    """
+    if request.exa_settings is None:
+        logger.warning("Topic '%s' uses Exa mode but no Exa settings were supplied", topic.name)
+        return FeedResponse.from_source(EXA_SOURCE, feeds_total=0, feeds_failed=0)
+    return await fetch_exa_entries(
+        topic,
+        request.exa_settings,
+        max_results=request.max_results,
+        timeout=request.timeout,
+        health_callback=request.health_callback,
     )
+
+
+register_source(FeedMode.EXA, fetch_exa_source)

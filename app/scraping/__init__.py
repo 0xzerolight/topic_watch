@@ -25,6 +25,7 @@ from app.crud import (
 from app.database import get_connection, get_db
 from app.models import Article, FeedHealth, Topic
 from app.scraping.content import extract_article_content
+from app.scraping.exa import fetch_exa_source as fetch_exa_source
 from app.scraping.google_news import is_google_news_url, resolve_google_news_urls
 from app.scraping.rss import FeedEntry, compute_article_hash, fetch_feeds_for_topic
 from app.scraping.rss import FeedResponse as FeedResponse

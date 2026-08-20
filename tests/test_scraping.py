@@ -785,6 +785,46 @@ class TestBingStubRegression:
         assert _content_quality_tag(content) == ""
 
 
+class TestSourceRegistry:
+    """TW-AUD-022: sources register themselves; the dispatcher has no per-source branch."""
+
+    def test_every_feed_mode_has_a_source(self) -> None:
+        from app.scraping.source import _SOURCES
+
+        assert set(_SOURCES) == set(FeedMode)
+
+    async def test_a_registered_source_is_dispatched_to(self) -> None:
+        """Adding a source is a registration, not an edit to another source's module."""
+        from app.scraping.source import (
+            _SOURCES,
+            SourceIdentity,
+            SourceRequest,
+            register_source,
+        )
+        from app.scraping.source import (
+            FeedResponse as SourceFeedResponse,
+        )
+
+        seen: list[SourceRequest] = []
+
+        async def fake_source(topic: Topic, request: SourceRequest) -> SourceFeedResponse:
+            seen.append(request)
+            return SourceFeedResponse.from_source(SourceIdentity(name="stub", needs_url_resolution=True), feeds_total=1)
+
+        topic = Topic(name="T", description="d", feed_mode=FeedMode.MANUAL, feed_urls=[])
+        previous = _SOURCES[FeedMode.MANUAL]
+        register_source(FeedMode.MANUAL, fake_source)
+        try:
+            response = await fetch_feeds_for_topic(topic, timeout=3.0, max_results=4)
+        finally:
+            register_source(FeedMode.MANUAL, previous)
+
+        # Identity and capabilities ride on the response, not on a dispatcher branch.
+        assert response.provider_name == "stub"
+        assert response.needs_url_resolution is True
+        assert [(r.timeout, r.max_results) for r in seen] == [(3.0, 4)]
+
+
 class TestFetchFeedsForTopic:
     async def test_combines_multiple_feeds(self) -> None:
         transport = _mock_transport(
