@@ -304,7 +304,7 @@
     <span id="test-spinner" class="htmx-indicator">
         <span class="spinner"></span> Sending...
     </span>
-    <div id="notification-test-result" style="margin-top: 1rem;"></div>
+    <div id="notification-test-result" style="margin-top: 1rem;" role="status" aria-live="polite" aria-atomic="true"></div>
 </section>
 
 <section class="card">
@@ -317,7 +317,7 @@
                    onchange="toggleBrowserNotifications(this.checked)">
             Enable browser notifications
         </label>
-        <span id="browser-notif-status" style="font-size: 0.875rem;"></span>
+        <span id="browser-notif-status" style="font-size: 0.875rem;" role="status" aria-live="polite" aria-atomic="true"></span>
     </div>
     <div id="browser-notif-denied" style="display: none; margin-top: 0.5rem;">
         <small style="color: var(--pico-del-color, #c62828);">

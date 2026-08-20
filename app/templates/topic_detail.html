@@ -110,12 +110,34 @@
     </div>
 </dl>
 
+{# AUG-236: visually hidden live region, SIBLING of #status-area (never nested —
+   see the CRITICAL note below). Announces the concise terminal outcome once the
+   researching poll lands on a data-status-terminal fragment; see the afterSwap
+   handler below. #}
+<div id="status-announce" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+
 {# CRITICAL: #status-area is a leaf. Its ONLY child is the status include — the
    researching poll does hx-swap=innerHTML on it every 3s. Headings, breadcrumb,
    and meta-grid above are SIBLINGS, never children. #}
 <div id="status-area">
     {% include "topic_status.html" %}
 </div>
+
+<script>
+document.body.addEventListener("htmx:afterSwap", function (event) {
+    var target = event.detail && event.detail.target;
+    if (!target || target.id !== "status-area") return;
+    var terminal = target.querySelector("[data-status-terminal]");
+    var announce = document.getElementById("status-announce");
+    if (!terminal || !announce) return;
+    var messages = {
+        ready: "Research complete. Knowledge state updated.",
+        error: "Research failed.",
+        removed: "Topic removed."
+    };
+    announce.textContent = messages[terminal.getAttribute("data-status-terminal")] || "";
+});
+</script>
 
 {% include "_knowledge_history.html" %}
 
