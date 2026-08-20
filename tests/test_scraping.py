@@ -263,6 +263,44 @@ class TestParseEntry:
         assert entry is not None
         assert entry.summary == "Apple & Google <merge>"
 
+    def test_block_elements_keep_a_word_boundary(self) -> None:
+        """AUG-185: adjacent block-level text must not fuse into one token.
+
+        The OVH-112 stripper concatenated every text node, so ``<li>Alpha</li>
+        <li>Beta</li>`` became ``AlphaBeta`` — the exact value that becomes
+        raw_content when extraction fails, and then novelty-analysis input.
+        """
+        raw = {
+            "title": "List",
+            "link": "https://example.com/list",
+            "summary": "<ol><li>Alpha</li><li>Beta</li></ol><p>One</p><p>Two</p>Three<br>Four",
+        }
+        entry = _parse_entry(raw, "feed")
+        assert entry is not None
+        assert entry.summary == "Alpha Beta One Two Three Four"
+
+    def test_inline_elements_keep_adjacency(self) -> None:
+        """AUG-185: inline markup must NOT gain a space — only block boundaries do."""
+        raw = {
+            "title": "Inline",
+            "link": "https://example.com/inline",
+            "summary": "<p><b>Al</b><i>pha</i> is <em>one</em> word</p>",
+        }
+        entry = _parse_entry(raw, "feed")
+        assert entry is not None
+        assert entry.summary == "Alpha is one word"
+
+    def test_malformed_fragment_still_separates_blocks(self) -> None:
+        """AUG-185: unclosed block tags still produce boundaries (no fused tokens)."""
+        raw = {
+            "title": "Broken",
+            "link": "https://example.com/broken",
+            "summary": "<div>Alpha<div>Beta<li>Gamma",
+        }
+        entry = _parse_entry(raw, "feed")
+        assert entry is not None
+        assert entry.summary == "Alpha Beta Gamma"
+
     def test_plain_text_summary_is_unchanged(self) -> None:
         """OVH-112: a tag-free summary passes through verbatim (no false rewrites)."""
         raw = {

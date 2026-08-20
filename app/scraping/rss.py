@@ -176,12 +176,43 @@ def _resolve_bing_news_url(link: str) -> str:
     return link
 
 
+# Tags that render as their own line/box, so the text on either side of them is
+# two words, not one. Used to emit a boundary while stripping markup (AUG-185);
+# every other tag is treated as inline and keeps its neighbours adjacent.
+_BLOCK_LEVEL_TAGS = frozenset(
+    {
+        "address", "article", "aside", "blockquote", "br", "caption", "dd", "div", "dl", "dt",
+        "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6",
+        "header", "hr", "li", "main", "nav", "ol", "p", "pre", "section", "table", "tbody", "td",
+        "tfoot", "th", "thead", "tr", "ul",
+    }
+)  # fmt: skip
+
+
 class _HTMLTextExtractor(HTMLParser):
-    """Collect only the text nodes of an HTML fragment, discarding all markup."""
+    """Collect only the text nodes of an HTML fragment, discarding all markup.
+
+    Block-level tags emit a single space so adjacent blocks stay separate words
+    (AUG-185): ``<li>Alpha</li><li>Beta</li>`` is ``Alpha Beta``, not ``AlphaBeta``.
+    The boundary is emitted on both the start and the end tag, so an unclosed
+    block in a malformed fragment still separates. Inline tags emit nothing, so
+    ``<b>Al</b><i>pha</i>`` stays one word. The caller collapses the runs of
+    whitespace this introduces.
+    """
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self._parts: list[str] = []
+
+    def _boundary(self, tag: str) -> None:
+        if tag in _BLOCK_LEVEL_TAGS:
+            self._parts.append(" ")
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._boundary(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        self._boundary(tag)
 
     def handle_data(self, data: str) -> None:
         self._parts.append(data)
