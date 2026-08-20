@@ -19,7 +19,7 @@ from instructor import Mode
 from instructor.core import AsyncValidationError as InstructorAsyncValidationError
 from instructor.core import InstructorRetryException
 from instructor.core import ResponseParsingError as InstructorResponseParsingError
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, ValidationInfo, model_validator
 from pydantic import ValidationError as PydanticValidationError
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt
 
@@ -96,15 +96,35 @@ def _extract_usage(completion: Any) -> TokenUsage:
 # --- Response models (structured output) ---
 
 
-class NoveltyResult(BaseModel):
-    """Stored/legacy novelty record — the PERMISSIVE half of the contract.
+# Validation-context flag marking a decode as LIVE provider output rather than a
+# stored blob being re-read. The two have opposite needs — see NoveltyResult —
+# and the context is the seam that lets one class serve both.
+_LIVE_OUTPUT_CONTEXT = {"live_llm_output": True}
+_SCORE_FIELDS = ("relevance", "importance")
 
-    Every scoring field carries a default so a stored ``llm_response`` blob
-    written before that field existed still re-parses (the force-notify handler
-    calls ``model_validate_json`` on those blobs). ``NoveltyResponse`` below is
-    the strict live-output schema; ``analyze_articles`` asks the provider for
-    that one, so a defaulted score can only ever come from a genuinely old
-    stored blob, never from a live call (AUG-159 / TW-AUD-009).
+
+class NoveltyResult(BaseModel):
+    """LLM response for novelty detection, decoded under one of two contracts.
+
+    STORED (default): every scoring field has a default, so an ``llm_response``
+    blob written before that field existed still re-parses — the force-notify
+    handler calls ``model_validate_json`` on exactly those blobs.
+
+    LIVE (``context=_LIVE_OUTPUT_CONTEXT``, used by ``analyze_articles``): a
+    POSITIVE result must carry its own ``relevance`` and ``importance``. Those
+    defaults are load-bearing downstream — ``relevance=0.0`` is below every usable
+    threshold and ``importance=3`` is below a threshold of 4 or 5 — so a provider
+    that simply omits the field would silently mute a genuine update with nothing
+    in the logs (AUG-159 / TW-AUD-009). Omission is told apart from a real zero via
+    ``model_fields_set``: an explicit ``relevance: 0.0`` is the model's own
+    judgement and passes.
+
+    A live violation raises ``ValidationError``, which instructor re-prompts with
+    the message (the model usually complies, so the update is DELIVERED rather
+    than suppressed); if it never complies, ``analyze_articles`` maps it through
+    the settled safe-false path with ``error`` populated, so the checker records
+    ``analysis_failed`` instead of a silent skip. The requirement is scoped to
+    ``has_new_info=true`` because nothing is gated on either score otherwise.
 
     ``prompt_tokens`` / ``completion_tokens`` are NOT filled by the LLM — they
     default to 0 and are populated from the raw completion's usage after the
@@ -157,38 +177,9 @@ class NoveltyResult(BaseModel):
         description="Internal error channel; the model must always leave this null.",
     )
 
-
-_SCORE_FIELDS = ("relevance", "importance")
-
-
-class NoveltyResponse(NoveltyResult):
-    """Live structured-output schema — the STRICT half of the contract.
-
-    Same fields as ``NoveltyResult`` (so the JSON schema the provider sees is
-    unchanged), plus the one invariant a live call must satisfy: a POSITIVE
-    result has to carry its own ``relevance`` and ``importance``. Both fields
-    have permissive defaults on the parent for stored-blob compatibility, and
-    those defaults are load-bearing downstream — ``relevance=0.0`` is below every
-    usable threshold and ``importance=3`` is below a threshold of 4 or 5 — so a
-    provider that simply omits the field would silently mute a genuine update
-    with nothing in the logs (AUG-159 / TW-AUD-009).
-
-    Omission is distinguished from a real zero via ``model_fields_set``: an
-    explicit ``relevance: 0.0`` is the model's own judgement and passes. A
-    violation raises ``ValidationError``, which instructor re-prompts (the model
-    usually complies on the retry, so the update is delivered rather than
-    suppressed); if it never complies, ``analyze_articles`` maps it through the
-    settled safe-false path with ``error`` populated, so the checker records
-    ``analysis_failed`` instead of a silent skip.
-
-    The requirement is scoped to ``has_new_info=true`` on purpose: on a negative
-    result nothing is gated on either score, so demanding them there would turn
-    a harmless provider quirk into a failed check.
-    """
-
     @model_validator(mode="after")
-    def _require_scores_on_positive(self) -> "NoveltyResponse":
-        if not self.has_new_info:
+    def _require_scores_on_live_positive(self, info: ValidationInfo) -> "NoveltyResult":
+        if not (info.context or {}).get("live_llm_output") or not self.has_new_info:
             return self
         missing = [name for name in _SCORE_FIELDS if name not in self.model_fields_set]
         if missing:
@@ -604,26 +595,33 @@ async def _create_structured(
     response_model: type[T],
     build_messages: Callable[[], list[dict[str, Any]]],
     timeout: int,
+    validation_context: dict[str, Any] | None = None,
 ) -> tuple[T, Any]:
     """Run one structured-output call, falling back TOOLS -> JSON -> MD_JSON.
 
     On a structured-output-fixable 400 (see ``_fallback_mode``) the call is retried
     in the next mode; a mode-invariant error re-raises immediately, and MD_JSON is
     the terminal. ``build_messages`` is a factory invoked FRESH per attempt: this
-    preserves the rebuild-per-attempt invariant (also under 429 retries, since the
-    whole helper re-runs from TOOLS) and avoids instructor's in-place message
-    mutation leaking a doubled schema block across mode hops. Stateless by design —
-    no per-model memory, so a false-positive fallback costs one call and never
-    downgrades the process; it self-heals if the provider fixes its API.
+    preserves the rebuild-per-attempt invariant and avoids instructor's in-place
+    message mutation leaking a doubled schema block across mode hops.
+
+    Stateless by design — no per-model memory, so a false-positive fallback costs
+    one call and never downgrades the process.
+
+    ``validation_context`` reaches the response model's validators as pydantic's
+    validation context, and instructor re-prompts on whatever they reject — that
+    is how the live-output contract (see ``NoveltyResult``) is enforced against
+    the provider rather than merely detected after the fact.
     """
     mode: instructor.Mode = instructor.Mode.TOOLS
     while True:
         client = _get_client(settings, mode)
         try:
-            return await client.chat.completions.create_with_completion(  # type: ignore[no-any-return]
+            result = await client.chat.completions.create_with_completion(
                 model=settings.llm.model,
                 response_model=response_model,
                 messages=build_messages(),  # type: ignore[arg-type]
+                context=validation_context,
                 max_retries=_instructor_retries(settings.llm_max_retries),
                 api_key=settings.llm.api_key,
                 api_base=_effective_base_url(settings),
@@ -642,6 +640,8 @@ async def _create_structured(
                 next_mode.value,
             )
             mode = next_mode
+        else:
+            return cast(tuple[T, Any], result)
 
 
 # --- key_facts restatement filtering ---
@@ -696,9 +696,13 @@ async def analyze_articles(
         result, completion = await _call_with_transport_retry(
             lambda: _create_structured(
                 settings,
-                response_model=NoveltyResponse,
+                response_model=NoveltyResult,
                 build_messages=lambda: build_novelty_messages(articles, knowledge_summary, topic),
                 timeout=settings.llm_analysis_timeout,
+                # Decode under the LIVE contract: a positive result that omits its
+                # own relevance/importance is rejected and re-prompted, instead of
+                # inheriting stored-blob defaults that mute it (AUG-159).
+                validation_context=_LIVE_OUTPUT_CONTEXT,
             ),
             max_retries=settings.llm_max_retries,
         )

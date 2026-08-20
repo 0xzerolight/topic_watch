@@ -17,10 +17,10 @@ from pydantic import ValidationError
 from app.analysis.citations import strip_index_citations, strip_reliability_notes
 from app.analysis.knowledge import initialize_knowledge, update_knowledge
 from app.analysis.llm import (
+    _LIVE_OUTPUT_CONTEXT,
     _OUTPUT_TOKEN_CAP,
     CompressedKnowledge,
     KnowledgeStateUpdate,
-    NoveltyResponse,
     NoveltyResult,
     _bounded_max_tokens,
     analyze_articles,
@@ -243,49 +243,45 @@ class TestNoveltyResult:
 
 
 # ============================================================
-# TestNoveltyResponse (AUG-159 / TW-AUD-009: strict live schema)
+# TestLiveNoveltyDecode (AUG-159 / TW-AUD-009: strict live contract)
 # ============================================================
 
 
-class TestNoveltyResponse:
-    """The live schema requires the two scoring fields on a POSITIVE result.
+def _live(data: dict) -> NoveltyResult:
+    """Decode ``data`` under the LIVE contract, as analyze_articles does."""
+    return NoveltyResult.model_validate(data, context=_LIVE_OUTPUT_CONTEXT)
 
-    Their permissive defaults exist for stored blobs only; live, ``relevance=0.0``
+
+class TestLiveNoveltyDecode:
+    """Live output must carry its own scores on a POSITIVE result.
+
+    The permissive defaults exist for stored blobs only; live, ``relevance=0.0``
     is below every usable threshold and ``importance=3`` is below a threshold of
     4 or 5, so an omitted field would silently mute a genuine update.
     """
 
     def test_positive_result_missing_relevance_is_rejected(self) -> None:
         with pytest.raises(ValidationError, match="relevance"):
-            NoveltyResponse.model_validate({"has_new_info": True, "summary": "x", "confidence": 0.9, "importance": 4})
+            _live({"has_new_info": True, "summary": "x", "confidence": 0.9, "importance": 4})
 
     def test_positive_result_missing_importance_is_rejected(self) -> None:
         with pytest.raises(ValidationError, match="importance"):
-            NoveltyResponse.model_validate({"has_new_info": True, "summary": "x", "confidence": 0.9, "relevance": 0.8})
+            _live({"has_new_info": True, "summary": "x", "confidence": 0.9, "relevance": 0.8})
 
     def test_explicit_zero_relevance_is_accepted(self) -> None:
         """A real 0.0 is the model's own judgement — only OMISSION is the defect."""
-        result = NoveltyResponse.model_validate(
-            {"has_new_info": True, "summary": "x", "confidence": 0.9, "relevance": 0.0, "importance": 1}
-        )
+        result = _live({"has_new_info": True, "summary": "x", "confidence": 0.9, "relevance": 0.0, "importance": 1})
         assert result.relevance == 0.0
         assert result.importance == 1
 
     def test_negative_result_may_omit_scores(self) -> None:
         """Nothing is gated on either score when has_new_info is false."""
-        result = NoveltyResponse.model_validate({"has_new_info": False, "confidence": 0.4})
+        result = _live({"has_new_info": False, "confidence": 0.4})
         assert result.has_new_info is False
         assert result.relevance == 0.0
 
-    def test_is_a_novelty_result(self) -> None:
-        """Consumers (checker, notifications, webhooks) keep the same type."""
-        result = NoveltyResponse.model_validate(
-            {"has_new_info": True, "summary": "x", "confidence": 0.9, "relevance": 0.7, "importance": 4}
-        )
-        assert isinstance(result, NoveltyResult)
-
     def test_legacy_stored_blob_still_parses_permissively(self) -> None:
-        """The force-notify re-parse uses NoveltyResult, which stays permissive."""
+        """The force-notify re-parse decodes WITHOUT the live context."""
         legacy_blob = '{"has_new_info": true, "summary": "x", "confidence": 0.9}'
         result = NoveltyResult.model_validate_json(legacy_blob)
         assert result.relevance == 0.0
@@ -915,8 +911,11 @@ class TestAnalyzeArticles:
         mock_create.assert_called_once()
         call_kwargs = mock_create.call_args.kwargs
         assert call_kwargs["model"] == "openai/gpt-4o-mini"
-        # The strict live schema, not the permissive stored-blob one (AUG-159).
-        assert call_kwargs["response_model"] is NoveltyResponse
+        assert call_kwargs["response_model"] is NoveltyResult
+        # Decoded under the strict LIVE contract, not the permissive stored-blob
+        # one (AUG-159): a positive result omitting relevance/importance is
+        # re-prompted instead of silently defaulted.
+        assert call_kwargs["context"] == _LIVE_OUTPUT_CONTEXT
         assert call_kwargs["temperature"] == 0.2
         # Verify messages include the knowledge state and topic info
         messages = call_kwargs["messages"]
