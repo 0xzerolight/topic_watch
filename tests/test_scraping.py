@@ -1001,6 +1001,13 @@ class TestSourceHostClassification:
         assert _feed_source_name("https://feeds.arstechnica.com/arstechnica/index") == "arstechnica.com"
         assert _feed_source_name("not a url") == "not a url"
 
+    def test_unparseable_url_has_no_host(self) -> None:
+        """A malformed netloc yields no host rather than raising into a template."""
+        from app.scraping.source import host_matches, url_hostname
+
+        assert url_hostname("https://[oops/feed") == ""
+        assert host_matches(url_hostname("https://[oops/feed"), "google.com") is False
+
 
 class TestSourceRegistry:
     """TW-AUD-022: sources register themselves; the dispatcher has no per-source branch."""
