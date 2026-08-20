@@ -26,9 +26,30 @@ def _make_settings(**overrides) -> Settings:
 CSRF_TEST_TOKEN = "test-csrf-token-for-settings-tests"
 
 
+@pytest.fixture(autouse=True)
+def _yaml_owned_llm_credentials(monkeypatch: pytest.MonkeyPatch):
+    """Make the LLM block YAML-owned for these tests.
+
+    conftest (like CI) exports TOPIC_WATCH_LLM__MODEL / __API_KEY so the app counts
+    as configured. Those exports make both fields environment-owned, which correctly
+    keeps them out of the file (AUG-241) — but the subject of most tests here is the
+    ordinary YAML-owned path. Tests that are about env ownership set the variable
+    they need themselves.
+    """
+    monkeypatch.delenv("TOPIC_WATCH_LLM__MODEL", raising=False)
+    monkeypatch.delenv("TOPIC_WATCH_LLM__API_KEY", raising=False)
+
+
 def valid_form_data(**overrides) -> dict:
-    """A complete, valid POST /settings form payload (override individual fields)."""
+    """A complete, valid POST /settings form payload (override individual fields).
+
+    ``config_revision`` mirrors what GET /settings would have rendered for the
+    config file this app state points at (AUG-291); a stale one is refused.
+    """
+    from app.config import config_revision
+
     data = {
+        "config_revision": config_revision(app.state.config_path),
         "llm_model": "openai/gpt-4o-mini",
         "llm_api_key": "",
         "llm_base_url": "",
@@ -78,8 +99,10 @@ async def client(
     app.dependency_overrides[get_db_conn] = override_db
     app.dependency_overrides[get_settings] = override_settings
 
-    # GET /settings calls load_settings() directly instead of using Depends
-    with patch("app.web.routers.settings.load_settings", return_value=settings):
+    # Both /settings routes read the config file through load_settings() instead of
+    # Depends; with no real file here, stand in the app's own state for the disk
+    # generation so a test can drive both by assigning app.state.settings.
+    with patch("app.web.routers.settings.load_settings", side_effect=lambda *_a, **_kw: app.state.settings):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app),
             base_url="http://test",
@@ -186,16 +209,21 @@ class TestSaveSettingsToYaml:
         data = yaml.safe_load(config_file.read_text())
         assert data["notifications"]["urls"] == ["ntfy://alerts", "discord://webhook/123"]
 
-    async def test_empty_notification_urls_omitted(self, tmp_path: Path) -> None:
-        """Empty notification URLs list is omitted from the YAML."""
+    async def test_empty_notification_urls_written_as_empty_list(self, tmp_path: Path) -> None:
+        """An emptied URL list is written, not omitted.
+
+        The writer patches the existing document (TW-AUD-028), so omitting the key
+        would leave the previous targets on disk and resurrect them at the next load.
+        """
         from app.config import save_settings_to_yaml
 
-        settings = _make_settings(notifications=NotificationSettings(urls=[]))
         config_file = tmp_path / "config.yml"
+        config_file.write_text('notifications:\n  urls:\n    - "ntfy://previous"\n')
+        settings = _make_settings(notifications=NotificationSettings(urls=[]))
         save_settings_to_yaml(settings, config_file)
 
         data = yaml.safe_load(config_file.read_text())
-        assert "urls" not in data.get("notifications", {})
+        assert data["notifications"]["urls"] == []
 
     async def test_writes_scalar_settings(self, tmp_path: Path) -> None:
         """Scalar settings (interval, max articles, etc.) are written correctly."""
@@ -301,35 +329,39 @@ class TestExaSettingsPersistence:
         data = yaml.safe_load(config_file.read_text())
         assert data["exa"]["base_url"] == "https://proxy.example/exa"
 
-    async def test_preserve_exa_key_keeps_on_disk_value(self, tmp_path: Path) -> None:
-        """preserve_exa_key=True writes the on-disk key, not settings.exa.api_key (OVH-003)."""
+    async def test_env_exa_key_keeps_on_disk_value(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An env-sourced Exa key leaves the on-disk key alone (OVH-003/AUG-241)."""
         from app.config import save_settings_to_yaml
 
+        monkeypatch.setenv("TOPIC_WATCH_EXA__API_KEY", "exa-env-secret")
         config_file = tmp_path / "config.yml"
         config_file.write_text('exa:\n  enabled: true\n  api_key: "exa-on-disk"\n')
         settings = _make_settings(exa=ExaSettings(enabled=True, api_key="exa-env-secret"))
-        save_settings_to_yaml(settings, config_file, preserve_exa_key=True)
+        save_settings_to_yaml(settings, config_file)
 
         data = yaml.safe_load(config_file.read_text())
         assert data["exa"]["api_key"] == "exa-on-disk"
         assert data["exa"]["api_key"] != "exa-env-secret"
 
-    async def test_corrupt_config_preserve_does_not_raise(self, tmp_path: Path) -> None:
-        """_read_existing_secret swallows a corrupt file: both preserved keys blank, no raise."""
+    async def test_corrupt_config_does_not_raise(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A corrupt file still saves, and an env-owned secret is left out entirely."""
         from app.config import save_settings_to_yaml
 
+        monkeypatch.setenv("TOPIC_WATCH_LLM__API_KEY", "llm-env-secret")
+        monkeypatch.setenv("TOPIC_WATCH_EXA__API_KEY", "exa-env-secret")
         config_file = tmp_path / "config.yml"
-        # Unparseable YAML — the preserve read must degrade to "" for both sections.
+        # Unparseable YAML — there is no prior value to preserve, so the key is
+        # simply not written. Writing it would materialize the env secret.
         config_file.write_text("llm: [unterminated\n  exa: :::\n")
         settings = _make_settings(
             llm=LLMSettings(model="openai/gpt-4o-mini", api_key="llm-env-secret"),
             exa=ExaSettings(enabled=True, api_key="exa-env-secret"),
         )
-        save_settings_to_yaml(settings, config_file, preserve_api_key=True, preserve_exa_key=True)
+        save_settings_to_yaml(settings, config_file)
 
         data = yaml.safe_load(config_file.read_text())
-        assert data["llm"]["api_key"] == ""
-        assert data["exa"]["api_key"] == ""
+        assert "api_key" not in data["llm"]
+        assert "api_key" not in data["exa"]
 
 
 # ---------------------------------------------------------------------------
@@ -895,6 +927,178 @@ class TestEnvSourcedSecretSafety:
         assert "set via environment" in response.text.lower()
 
 
+class TestConfigGenerationCheck:
+    """AUG-291: a save is applied to the generation the page rendered, or refused."""
+
+    @pytest.fixture
+    def config_file(self, tmp_path: Path) -> Path:
+        from app.config import load_settings
+
+        config = tmp_path / "config.yml"
+        config.write_text('llm:\n  model: "openai/gpt-4o-mini"\n  api_key: "sk-on-disk"\ncheck_interval: "6h"\n')
+        app.state.config_path = config
+        app.state.settings = load_settings(config_path=config)
+        return config
+
+    @pytest.fixture
+    async def disk_client(
+        self, db_conn: sqlite3.Connection, config_file: Path
+    ) -> AsyncGenerator[httpx.AsyncClient, None]:
+        """A client whose /settings routes read the real file, not a patched stand-in."""
+
+        def override_db():
+            yield db_conn
+
+        app.dependency_overrides[get_db_conn] = override_db
+        app.dependency_overrides[get_settings] = lambda: app.state.settings
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+            cookies={"csrf_token": CSRF_TEST_TOKEN},
+            headers={"X-CSRF-Token": CSRF_TEST_TOKEN},
+        ) as ac:
+            yield ac
+        app.dependency_overrides.clear()
+
+    async def test_get_renders_the_current_revision(self, disk_client: httpx.AsyncClient, config_file: Path) -> None:
+        from app.config import config_revision
+
+        page = await disk_client.get("/settings")
+        assert f'name="config_revision" value="{config_revision(config_file)}"' in page.text
+
+    async def test_matching_revision_saves(self, disk_client: httpx.AsyncClient, config_file: Path) -> None:
+        response = await disk_client.post(
+            "/settings", data=valid_form_data(check_interval="8h"), follow_redirects=False
+        )
+        assert response.status_code == 303
+        assert yaml.safe_load(config_file.read_text())["check_interval"] == "8h"
+
+    async def test_stale_revision_is_refused(self, disk_client: httpx.AsyncClient, config_file: Path) -> None:
+        """A tab opened before an external edit cannot overwrite that edit."""
+        form = valid_form_data(check_interval="8h")  # revision of the file as it is now
+        config_file.write_text(
+            'llm:\n  model: "openai/gpt-4o-mini"\n  api_key: "sk-rotated"\ncheck_interval: "6h"\n'
+        )  # someone edits the file underneath the open tab
+
+        response = await disk_client.post("/settings", data=form, follow_redirects=False)
+
+        assert response.status_code == 409
+        assert "changed on disk" in response.text
+        data = yaml.safe_load(config_file.read_text())
+        assert data["llm"]["api_key"] == "sk-rotated"
+        assert data["check_interval"] == "6h"
+
+    async def test_submission_without_a_revision_is_refused(self, disk_client: httpx.AsyncClient) -> None:
+        form = valid_form_data()
+        form.pop("config_revision")
+        response = await disk_client.post("/settings", data=form, follow_redirects=False)
+        assert response.status_code == 409
+
+    async def test_blank_key_keeps_the_key_the_file_has(
+        self, disk_client: httpx.AsyncClient, config_file: Path
+    ) -> None:
+        """A key rotated on disk is not overwritten by the stale in-memory one."""
+        config_file.write_text('llm:\n  model: "openai/gpt-4o-mini"\n  api_key: "sk-rotated"\n')
+        app.state.settings = _make_settings(llm=LLMSettings(model="openai/gpt-4o-mini", api_key="sk-stale"))
+
+        response = await disk_client.post("/settings", data=valid_form_data(), follow_redirects=False)
+
+        assert response.status_code == 303
+        assert yaml.safe_load(config_file.read_text())["llm"]["api_key"] == "sk-rotated"
+
+
+class TestEnvOwnedValuesAreNeverPersisted:
+    """AUG-241: provenance covers every field, not just the two API keys."""
+
+    @staticmethod
+    def _save_to(config_file: Path):
+        def save_real(settings, config_path=None, **kwargs):
+            from app.config import save_settings_to_yaml as _real_save
+
+            _real_save(settings, config_path or config_file, **kwargs)
+
+        return save_real
+
+    async def test_env_scalar_is_not_written_and_still_wins_live(
+        self, client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An env-supplied interval neither reaches the file nor loses to the form."""
+        config_file = tmp_path / "config.yml"
+        config_file.write_text('llm:\n  model: "openai/gpt-4o-mini"\n  api_key: "sk"\ncheck_interval: "3h"\n')
+        monkeypatch.setenv("TOPIC_WATCH_CHECK_INTERVAL", "12h")
+        app.state.config_path = config_file
+
+        with patch("app.web.routers.settings.save_settings_to_yaml", side_effect=self._save_to(config_file)):
+            await client.post("/settings", data=valid_form_data(check_interval="6h"), follow_redirects=False)
+
+        # The file keeps its own value; the env value was never materialized.
+        assert yaml.safe_load(config_file.read_text())["check_interval"] == "3h"
+        # And the live object reflects the environment, not the ignored form value.
+        assert app.state.settings.check_interval == "12h"
+
+    async def test_env_notification_urls_are_not_written(
+        self, client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Env-supplied delivery URLs carry tokens and must stay out of the file."""
+        config_file = tmp_path / "config.yml"
+        config_file.write_text('notifications:\n  urls:\n    - "ntfy://from-yaml"\n')
+        monkeypatch.setenv("TOPIC_WATCH_NOTIFICATIONS__URLS", '["ntfy://user:env-token@example.com/x"]')
+        app.state.config_path = config_file
+        app.state.settings = _make_settings(
+            notifications=NotificationSettings(urls=["ntfy://user:env-token@example.com/x"])
+        )
+
+        with patch("app.web.routers.settings.save_settings_to_yaml", side_effect=self._save_to(config_file)):
+            await client.post(
+                "/settings",
+                data=valid_form_data(notification_urls="ntfy://**** [1]"),
+                follow_redirects=False,
+            )
+
+        written = config_file.read_text()
+        assert "env-token" not in written
+        assert yaml.safe_load(written)["notifications"]["urls"] == ["ntfy://from-yaml"]
+
+    async def test_env_base_url_is_not_written(
+        self, client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A non-secret env value is env-owned too — the form cannot overwrite it."""
+        config_file = tmp_path / "config.yml"
+        config_file.write_text('llm:\n  model: "openai/gpt-4o-mini"\n  api_key: "sk"\n')
+        monkeypatch.setenv("TOPIC_WATCH_LLM__BASE_URL", "http://gateway.internal:8080")
+        app.state.config_path = config_file
+
+        with patch("app.web.routers.settings.save_settings_to_yaml", side_effect=self._save_to(config_file)):
+            await client.post(
+                "/settings",
+                data=valid_form_data(llm_base_url="http://typed-by-user"),
+                follow_redirects=False,
+            )
+
+        assert "base_url" not in yaml.safe_load(config_file.read_text())["llm"]
+        assert app.state.settings.llm.base_url == "http://gateway.internal:8080"
+
+    async def test_empty_env_var_still_owns_the_field(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Presence, not truthiness: an empty env var still outranks YAML."""
+        from app.config import env_owned_field_paths, is_api_key_env_sourced
+
+        monkeypatch.setenv("TOPIC_WATCH_LLM__API_KEY", "")
+        assert ("llm", "api_key") in env_owned_field_paths()
+        assert is_api_key_env_sourced() is True
+
+    async def test_unrelated_env_vars_are_not_field_paths(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A prefixed variable that maps to no field never suppresses a real one."""
+        from app.config import env_owned_field_paths
+
+        monkeypatch.setenv("TOPIC_WATCH_CONFIG_PATH", str(tmp_path / "elsewhere.yml"))
+        monkeypatch.setenv("TOPIC_WATCH_LLM__NOT_A_FIELD", "x")
+        owned = env_owned_field_paths()
+        assert ("config_path",) not in owned
+        assert ("llm", "not_a_field") not in owned
+
+
 class TestExaSettingsWeb:
     """POST /settings and GET /settings wiring for the Exa Search card."""
 
@@ -970,3 +1174,40 @@ class TestExaSettingsWeb:
         response = await client.get("/settings")
         assert response.status_code == 200
         assert "TOPIC_WATCH_EXA__API_KEY" in response.text
+
+
+class TestExaEnableRequiresKey:
+    """AUG-099 at the form boundary: enabling Exa without a key is an error, not a no-op."""
+
+    async def test_enable_without_key_is_rejected(self, client: httpx.AsyncClient) -> None:
+        app.state.settings = _make_settings(exa=ExaSettings(enabled=False, api_key=""))
+        response = await client.post(
+            "/settings",
+            data=valid_form_data(enable_exa="true", exa_api_key=""),
+            follow_redirects=False,
+        )
+        assert response.status_code == 422
+        assert "Exa API key" in response.text
+        assert app.state.settings.exa.enabled is False
+
+    async def test_enable_with_key_is_accepted(self, client: httpx.AsyncClient) -> None:
+        with patch("app.web.routers.settings.save_settings_to_yaml"):
+            response = await client.post(
+                "/settings",
+                data=valid_form_data(enable_exa="true", exa_api_key="exa-key-123"),
+                follow_redirects=False,
+            )
+        assert response.status_code == 303
+        assert app.state.settings.exa.enabled is True
+
+    async def test_enable_with_existing_key_is_accepted(self, client: httpx.AsyncClient) -> None:
+        """A blank field means "keep the current key", which satisfies the requirement."""
+        app.state.settings = _make_settings(exa=ExaSettings(enabled=True, api_key="already-set"))
+        with patch("app.web.routers.settings.save_settings_to_yaml"):
+            response = await client.post(
+                "/settings",
+                data=valid_form_data(enable_exa="true", exa_api_key=""),
+                follow_redirects=False,
+            )
+        assert response.status_code == 303
+        assert app.state.settings.exa.enabled is True

@@ -4,10 +4,23 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import app
+
+
+@pytest.fixture(autouse=True)
+def _yaml_owned_llm_credentials(monkeypatch: pytest.MonkeyPatch):
+    """Let the wizard own the LLM block.
+
+    conftest (like CI) exports TOPIC_WATCH_LLM__MODEL / __API_KEY so the app counts as
+    configured; while they are set the environment owns those fields and setup leaves
+    them alone (AUG-241), which is not what the wizard's own tests are about.
+    """
+    monkeypatch.delenv("TOPIC_WATCH_LLM__MODEL", raising=False)
+    monkeypatch.delenv("TOPIC_WATCH_LLM__API_KEY", raising=False)
 
 
 @pytest.fixture
@@ -371,15 +384,37 @@ class TestSetupPreflight:
 
 
 class TestVerifyLLMCredentials:
-    """Unit tests for the verify_llm_credentials preflight helper."""
+    """Unit tests for the verify_llm_credentials preflight helper (AUG-335)."""
+
+    @staticmethod
+    def _patch_probe(**kwargs):
+        """Patch the live structured-output call the preflight goes through."""
+        return patch("app.analysis.llm._create_structured", **kwargs)
 
     async def test_success_returns_none(self) -> None:
-        """A successful acompletion ping returns without raising."""
         from app.web.routers.settings import verify_llm_credentials
 
-        with patch("app.web.routers.settings.litellm.acompletion", return_value=object()) as mock_call:
+        with self._patch_probe(return_value=(object(), object())) as mock_call:
             await verify_llm_credentials(model="openai/gpt-4o-mini", api_key="sk-test", base_url=None)
         mock_call.assert_awaited_once()
+
+    async def test_probe_uses_the_live_call_shape(self) -> None:
+        """Same response model, same settings-derived deadline as analysis itself."""
+        from app.analysis.llm import NoveltyResponse
+        from app.web.routers.settings import verify_llm_credentials
+
+        with self._patch_probe(return_value=(object(), object())) as mock_call:
+            await verify_llm_credentials(model="ollama/llama3", api_key="unused", base_url="http://localhost:11434")
+
+        probe_settings = mock_call.await_args.args[0]
+        kwargs = mock_call.await_args.kwargs
+        assert kwargs["response_model"] is NoveltyResponse
+        assert kwargs["timeout"] == probe_settings.llm_analysis_timeout
+        assert probe_settings.llm.model == "ollama/llama3"
+        assert probe_settings.llm.api_key == "unused"
+        assert probe_settings.llm.base_url == "http://localhost:11434"
+        # The messages are built by a factory, per the live rebuild-per-attempt contract.
+        assert kwargs["build_messages"]()
 
     async def test_auth_error_friendly_message(self) -> None:
         """An authentication error maps to a friendly, key-free message."""
@@ -388,14 +423,24 @@ class TestVerifyLLMCredentials:
         from app.web.routers.settings import LLMValidationError, verify_llm_credentials
 
         exc = litellm.AuthenticationError(message="bad key sk-secret", llm_provider="openai", model="gpt-4o-mini")
-        with (
-            patch("app.web.routers.settings.litellm.acompletion", side_effect=exc),
-            pytest.raises(LLMValidationError) as ei,
-        ):
+        with self._patch_probe(side_effect=exc), pytest.raises(LLMValidationError) as ei:
             await verify_llm_credentials(model="openai/gpt-4o-mini", api_key="sk-secret", base_url=None)
         msg = str(ei.value)
         assert "sk-secret" not in msg
         assert "key" in msg.lower()
+
+    async def test_wrapped_auth_error_is_still_recognized(self) -> None:
+        """instructor re-raises its own type with the provider error chained."""
+        import litellm
+
+        from app.web.routers.settings import LLMValidationError, verify_llm_credentials
+
+        cause = litellm.AuthenticationError(message="bad key", llm_provider="openai", model="gpt-4o-mini")
+        wrapper = RuntimeError("retries exhausted")
+        wrapper.__cause__ = cause
+        with self._patch_probe(side_effect=wrapper), pytest.raises(LLMValidationError) as ei:
+            await verify_llm_credentials(model="openai/gpt-4o-mini", api_key="sk-secret", base_url=None)
+        assert "Authentication failed" in str(ei.value)
 
     async def test_connection_error_friendly_message(self) -> None:
         """A connection error mentions the base URL / reachability, not the key."""
@@ -404,10 +449,7 @@ class TestVerifyLLMCredentials:
         from app.web.routers.settings import LLMValidationError, verify_llm_credentials
 
         exc = litellm.APIConnectionError(message="conn refused", llm_provider="ollama", model="llama3")
-        with (
-            patch("app.web.routers.settings.litellm.acompletion", side_effect=exc),
-            pytest.raises(LLMValidationError) as ei,
-        ):
+        with self._patch_probe(side_effect=exc), pytest.raises(LLMValidationError) as ei:
             await verify_llm_credentials(model="ollama/llama3", api_key="unused", base_url="http://localhost:11434")
         assert "reach" in str(ei.value).lower() or "url" in str(ei.value).lower()
 
@@ -418,20 +460,215 @@ class TestVerifyLLMCredentials:
         from app.web.routers.settings import LLMValidationError, verify_llm_credentials
 
         exc = litellm.NotFoundError(message="model not found", llm_provider="openai", model="gpt-nope")
-        with (
-            patch("app.web.routers.settings.litellm.acompletion", side_effect=exc),
-            pytest.raises(LLMValidationError) as ei,
-        ):
+        with self._patch_probe(side_effect=exc), pytest.raises(LLMValidationError) as ei:
             await verify_llm_credentials(model="openai/gpt-nope", api_key="sk-test", base_url=None)
         assert "model" in str(ei.value).lower()
+
+    async def test_unstructured_reply_is_reported_as_a_format_problem(self) -> None:
+        """A model that answers but cannot follow the schema fails setup with a reason."""
+        from pydantic import ValidationError as PydanticValidationError
+
+        from app.analysis.llm import NoveltyResponse
+        from app.web.routers.settings import LLMValidationError, verify_llm_credentials
+
+        try:
+            NoveltyResponse.model_validate({})
+        except PydanticValidationError as parse_error:
+            exc: Exception = parse_error
+
+        with self._patch_probe(side_effect=exc), pytest.raises(LLMValidationError) as ei:
+            await verify_llm_credentials(model="ollama/tiny", api_key="", base_url="http://localhost:11434")
+        assert "structured format" in str(ei.value)
+
+    async def test_structured_output_rejection_is_reported(self) -> None:
+        """An endpoint that refuses the request shape is named as such, not as a bad key."""
+        import litellm
+
+        from app.web.routers.settings import LLMValidationError, verify_llm_credentials
+
+        exc = litellm.BadRequestError(message="tools unsupported", llm_provider="openai", model="gw/model")
+        with self._patch_probe(side_effect=exc), pytest.raises(LLMValidationError) as ei:
+            await verify_llm_credentials(model="openai/gw-model", api_key="sk", base_url="https://gw.example/v1")
+        assert "structured output" in str(ei.value)
 
     async def test_generic_error_never_leaks_key(self) -> None:
         """An unexpected error still produces a key-free LLMValidationError."""
         from app.web.routers.settings import LLMValidationError, verify_llm_credentials
 
-        with (
-            patch("app.web.routers.settings.litellm.acompletion", side_effect=RuntimeError("boom sk-leak")),
-            pytest.raises(LLMValidationError) as ei,
-        ):
+        with self._patch_probe(side_effect=RuntimeError("boom sk-leak")), pytest.raises(LLMValidationError) as ei:
             await verify_llm_credentials(model="openai/gpt-4o-mini", api_key="sk-leak", base_url=None)
         assert "sk-leak" not in str(ei.value)
+
+
+class TestSetupPublication:
+    """AUG-199/292: setup publishes disk, state and scheduler as one ordered transition."""
+
+    def _post(self, client: TestClient, **data):
+        csrf_token = client.get("/setup").cookies.get("csrf_token")
+        payload = {
+            "llm_model": "openai/gpt-4o-mini",
+            "llm_api_key": "sk-good-key",
+            "llm_base_url": "",
+            "csrf_token": csrf_token,
+        }
+        payload.update(data)
+        return client.post("/setup", data=payload, follow_redirects=False)
+
+    def test_scheduler_failure_leaves_setup_retryable(self, unconfigured_app: TestClient) -> None:
+        """A scheduler that fails to start must not leave a configured app with no monitoring."""
+        previous = app.state.settings
+        with (
+            patch("app.scheduler.start_scheduler", side_effect=RuntimeError("no event loop")),
+            patch("app.scheduler.stop_scheduler") as mock_stop,
+            patch("app.web.routers.settings.verify_llm_credentials", return_value=None),
+        ):
+            response = self._post(unconfigured_app)
+
+        assert response.status_code == 422
+        # The gate is still open, so the user can fix and retry.
+        assert app.state.setup_required is True
+        # The partial scheduler is torn down and the prior live settings restored.
+        mock_stop.assert_called_once()
+        assert app.state.settings is previous
+
+    def test_gate_closes_only_after_the_scheduler_is_running(self, unconfigured_app: TestClient) -> None:
+        """setup_required is still True while start_scheduler runs."""
+        seen: list[bool] = []
+
+        def record(*_args, **_kwargs):
+            seen.append(app.state.setup_required)
+
+        with (
+            patch("app.scheduler.start_scheduler", side_effect=record),
+            patch("app.web.routers.settings.verify_llm_credentials", return_value=None),
+        ):
+            self._post(unconfigured_app)
+
+        assert seen == [True]
+        assert app.state.setup_required is False
+
+    def test_preserves_configured_notifications_and_exa(self, unconfigured_app: TestClient, tmp_path: Path) -> None:
+        """Completing LLM setup must not erase configuration the user already had."""
+        from app.config import ExaSettings, NotificationSettings, Settings
+
+        config_file = tmp_path / "config.yml"
+        app.state.config_path = config_file
+        app.state.settings = Settings(  # type: ignore[call-arg]
+            notifications=NotificationSettings(urls=["ntfy://already-configured"]),
+            exa=ExaSettings(enabled=True, api_key="exa-already-set"),
+            check_interval="12h",
+        )
+
+        with (
+            patch("app.scheduler.start_scheduler"),
+            patch("app.web.routers.settings.verify_llm_credentials", return_value=None),
+        ):
+            response = self._post(unconfigured_app)
+
+        assert response.status_code == 303
+        assert app.state.settings.notifications.urls == ["ntfy://already-configured"]
+        assert app.state.settings.exa.enabled is True
+        assert app.state.settings.check_interval == "12h"
+
+        data = yaml.safe_load(config_file.read_text())
+        assert data["notifications"]["urls"] == ["ntfy://already-configured"]
+        assert data["exa"]["api_key"] == "exa-already-set"
+
+
+class TestSetupSerialization:
+    """AUG-292: two first-run submissions cannot both pass the gate and publish."""
+
+    async def test_concurrent_submissions_publish_once(self, tmp_path: Path) -> None:
+        import asyncio
+
+        import httpx
+
+        from app.config import Settings
+        from app.database import init_db
+
+        db_path = tmp_path / "test.db"
+        init_db(db_path)
+        app.state.settings = Settings()  # type: ignore[call-arg]
+        app.state.db_path = db_path
+        app.state.config_path = tmp_path / "config.yml"
+        app.state.setup_required = True
+
+        async def slow_preflight(**_kwargs):
+            await asyncio.sleep(0.05)  # both requests are in flight across this await
+
+        token = "csrf-setup-race"
+        with (
+            patch("app.scheduler.start_scheduler") as mock_sched,
+            patch("app.web.routers.settings.save_settings_to_yaml") as mock_save,
+            patch("app.web.routers.settings.verify_llm_credentials", side_effect=slow_preflight),
+        ):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://test",
+                cookies={"csrf_token": token},
+                headers={"X-CSRF-Token": token},
+            ) as ac:
+                payloads = [
+                    {
+                        "llm_model": f"openai/model-{index}",
+                        "llm_api_key": f"sk-key-{index}",
+                        "llm_base_url": "",
+                        "csrf_token": token,
+                    }
+                    for index in range(2)
+                ]
+                await asyncio.gather(*(ac.post("/setup", data=p, follow_redirects=False) for p in payloads))
+
+        assert mock_save.call_count == 1
+        assert mock_sched.call_count == 1
+        assert app.state.setup_required is False
+
+
+class TestKeylessLocalProvider:
+    """AUG-107: the documented keyless Ollama path completes setup."""
+
+    def _post(self, client: TestClient, **data):
+        csrf_token = client.get("/setup").cookies.get("csrf_token")
+        payload = {"llm_model": "ollama/llama3.3", "llm_api_key": "", "llm_base_url": "", "csrf_token": csrf_token}
+        payload.update(data)
+        return client.post("/setup", data=payload, follow_redirects=False)
+
+    def test_blank_key_completes_setup_for_ollama(self, unconfigured_app: TestClient) -> None:
+        with (
+            patch("app.scheduler.start_scheduler"),
+            patch("app.web.routers.settings.verify_llm_credentials", return_value=None),
+        ):
+            response = self._post(unconfigured_app, llm_base_url="http://localhost:11434")
+
+        assert response.status_code == 303
+        assert app.state.setup_required is False
+        assert app.state.settings.llm.api_key == ""
+        assert app.state.settings.is_configured()
+
+    def test_blank_key_is_refused_for_a_hosted_provider(self, unconfigured_app: TestClient) -> None:
+        """The server enforces it; client-side `required` is not a contract."""
+        with (
+            patch("app.scheduler.start_scheduler") as mock_sched,
+            patch("app.web.routers.settings.verify_llm_credentials", return_value=None),
+        ):
+            response = self._post(unconfigured_app, llm_model="openai/gpt-4o-mini")
+
+        assert response.status_code == 422
+        assert "API key is required" in response.text
+        assert app.state.setup_required is True
+        mock_sched.assert_not_called()
+
+    def test_key_field_is_not_unconditionally_required(self, unconfigured_app: TestClient) -> None:
+        page = unconfigured_app.get("/setup")
+        assert 'id="llm_api_key" name="llm_api_key"' in page.text
+        assert 'name="llm_api_key" required' not in page.text
+        assert "needs no key" in page.text
+
+
+class TestProviderSwitchDropsInjectedBaseUrl:
+    """AUG-100: the local default the script injected does not survive a switch."""
+
+    def test_setup_page_tracks_its_own_autofill(self, unconfigured_app: TestClient) -> None:
+        page = unconfigured_app.get("/setup")
+        assert "var autofilled = null;" in page.text
+        assert "function dropAutofilledUrl()" in page.text

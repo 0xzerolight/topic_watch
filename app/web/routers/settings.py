@@ -1,5 +1,6 @@
 """Setup wizard, settings editor, and notification-test routes."""
 
+import asyncio
 import logging
 import re
 
@@ -11,10 +12,13 @@ from app.config import (
     CLOUD_PROVIDERS,
     LOCAL_PROVIDER_DEFAULTS,
     Settings,
+    config_revision,
     is_api_key_env_sourced,
     is_exa_key_env_sourced,
+    is_keyless_llm_provider,
     load_settings,
     save_settings_to_yaml,
+    strip_env_owned,
 )
 from app.notifications import send_notification
 from app.web.csrf import verify_csrf
@@ -26,8 +30,10 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Seconds to wait for the pre-flight credential ping before giving up.
-_PREFLIGHT_TIMEOUT = 15.0
+# Serializes the one-shot setup transition: gate check, persistence and scheduler
+# start are one critical section, so two first-run submissions cannot interleave.
+_setup_lock = asyncio.Lock()
+
 
 # A masked delivery target the settings page rendered: "scheme://**** [3]".
 _MASKED_TARGET = re.compile(r"^(?P<mask>\S+) \[(?P<index>\d+)\]$")
@@ -124,10 +130,33 @@ def restore_masked_targets(submitted: list[str], stored: list[str], *, field: st
     return restored
 
 
+_STALE_CONFIG_ERROR = (
+    "The configuration file changed on disk after this page was loaded, so nothing was saved. "
+    "The form below shows the current values — reapply your change and save again."
+)
+
+
+def _disk_settings(request: Request) -> Settings:
+    """Settings as the config file currently reads.
+
+    Falls back to the live object when the file cannot be parsed, so a config
+    corrupted outside the app still renders an editable page instead of a 500.
+    """
+    try:
+        return load_settings(config_path=request.app.state.config_path)
+    except Exception:
+        logger.warning("Could not read %s; using the live settings", request.app.state.config_path, exc_info=True)
+        settings: Settings = request.app.state.settings
+        return settings
+
+
 def _settings_template_ctx(request: Request, **extra: object) -> dict:
     """Shared template context for the settings page (provider lists + env-key state)."""
     ctx: dict = {
         "config_path": str(request.app.state.config_path),
+        # The generation this page is editing. Carried in the form so a save against a
+        # file that changed underneath it is refused instead of silently winning (AUG-291).
+        "config_revision": config_revision(request.app.state.config_path),
         "cloud_providers": sorted(CLOUD_PROVIDERS),
         "local_provider_defaults": LOCAL_PROVIDER_DEFAULTS,
         "api_key_env_sourced": is_api_key_env_sourced(),
@@ -160,48 +189,144 @@ class LLMValidationError(Exception):
     """
 
 
-async def verify_llm_credentials(model: str, api_key: str, base_url: str | None) -> None:
-    """Make a minimal LLM call to confirm the supplied credentials actually work.
+def _preflight_messages() -> list[dict[str, str]]:
+    """The smallest request that still asks for the live response schema."""
+    return [
+        {
+            "role": "system",
+            "content": "You are a monitoring assistant. Answer only with the requested structured output.",
+        },
+        {
+            "role": "user",
+            "content": (
+                "Connectivity check, no articles to review. Answer with has_new_info false, "
+                "summary null, empty key_facts and source_urls, confidence 0, relevance 0, importance 1."
+            ),
+        },
+    ]
 
-    Sends a tiny ``litellm.acompletion`` ping. Returns ``None`` on success. On any
-    failure, raises :class:`LLMValidationError` with a friendly, key-free message.
-    The api_key is never included in raised messages.
+
+def _preflight_error(exc: BaseException, model: str, base_url: str | None) -> LLMValidationError:
+    """Map a probe failure to a user-safe message; the API key is never in it.
+
+    The live call path wraps provider errors (instructor re-raises its own type with
+    the real one chained), so the classification walks the whole chain the same way
+    ``app.analysis.llm`` does rather than matching only the outermost type.
     """
-    try:
-        await litellm.acompletion(
-            model=model,
-            messages=[{"role": "user", "content": "ping"}],
-            api_key=api_key,
-            api_base=base_url,
-            max_tokens=1,
-            timeout=_PREFLIGHT_TIMEOUT,
-        )
-    except litellm.AuthenticationError as exc:
+    from pydantic import ValidationError as PydanticValidationError
+
+    from app.analysis.llm import _iter_error_chain
+
+    chain = list(_iter_error_chain(exc))
+
+    def found(*types: type[BaseException]) -> bool:
+        return any(isinstance(inner, types) for inner in chain)
+
+    if found(litellm.AuthenticationError, litellm.PermissionDeniedError):
         logger.warning("Setup pre-flight: authentication rejected for model %s", model)
-        raise LLMValidationError(
+        return LLMValidationError(
             "Authentication failed: the API key was rejected by the provider. "
             "Double-check the key for the correct provider and account."
-        ) from exc
-    except litellm.NotFoundError as exc:
+        )
+    if found(litellm.NotFoundError):
         logger.warning("Setup pre-flight: model not found for %s", model)
-        raise LLMValidationError(
+        return LLMValidationError(
             f"The model '{model}' was not found. Check the model string uses the "
             "LiteLLM 'provider/model-name' format and that the model exists."
-        ) from exc
-    except litellm.APIConnectionError as exc:
+        )
+    if found(litellm.APIConnectionError, litellm.Timeout):
         logger.warning("Setup pre-flight: connection failed for model %s", model)
         target = base_url or "the provider's endpoint"
-        raise LLMValidationError(
+        return LLMValidationError(
             f"Could not reach {target}. Check the base URL is correct and the server "
             "is running and reachable from this machine."
-        ) from exc
+        )
+    if found(PydanticValidationError):
+        logger.warning("Setup pre-flight: model answered outside the required schema for %s", model)
+        return LLMValidationError(
+            f"The model '{model}' replied, but not in the structured format Topic Watch needs. "
+            "Pick a model that supports tool calling or JSON output."
+        )
+    if found(litellm.BadRequestError):
+        logger.warning("Setup pre-flight: request shape rejected for model %s", model)
+        return LLMValidationError(
+            f"The provider rejected the request Topic Watch makes for '{model}'. "
+            "The endpoint may not support structured output for this model."
+        )
+    logger.warning("Setup pre-flight: validation failed for model %s (%s)", model, type(exc).__name__)
+    return LLMValidationError(
+        f"The LLM credential check failed ({type(exc).__name__}). Verify the model, "
+        "API key, and base URL, then try again."
+    )
+
+
+async def verify_llm_credentials(model: str, api_key: str, base_url: str | None) -> None:
+    """Confirm the supplied credentials satisfy the call analysis actually makes.
+
+    The probe goes through the live structured-output path — same client, same
+    response model, same TOOLS -> JSON -> MD_JSON fallback, same temperature, token
+    ceiling and analysis timeout. A raw one-token ping tested a different contract
+    on a much shorter deadline (AUG-335): a slow but compatible local Ollama failed
+    setup, while an endpoint that answers a plain completion but cannot produce the
+    structured response passed and then failed every check.
+
+    Returns ``None`` on success; raises :class:`LLMValidationError` with a friendly,
+    key-free message otherwise.
+    """
+    from app.analysis.llm import NoveltyResponse, _create_structured
+    from app.config import LLMSettings
+
+    probe = Settings(llm=LLMSettings(model=model, api_key=api_key, base_url=base_url))  # type: ignore[call-arg]
+    try:
+        await _create_structured(
+            probe,
+            response_model=NoveltyResponse,
+            build_messages=_preflight_messages,
+            timeout=probe.llm_analysis_timeout,
+        )
     except Exception as exc:
-        # Catch-all: never leak the api_key, never crash the request.
-        logger.warning("Setup pre-flight: validation failed for model %s (%s)", model, type(exc).__name__)
-        raise LLMValidationError(
-            f"The LLM credential check failed ({type(exc).__name__}). Verify the model, "
-            "API key, and base URL, then try again."
-        ) from exc
+        raise _preflight_error(exc, model, base_url) from exc
+
+
+def _setup_settings(request: Request, model: str, api_key: str, base_url: str | None) -> Settings:
+    """The live settings with only the setup-owned LLM block replaced.
+
+    Setup runs whenever LLM credentials are incomplete, which says nothing about the
+    rest of the configuration: notification targets and Exa can already be set in YAML
+    or the environment, and building a fresh ``Settings`` erased them (AUG-200). Any
+    environment-owned LLM field is left alone for the same reason the settings form
+    leaves it alone — the environment would win again at the next load anyway.
+    """
+    from app.config import LLMSettings
+
+    current: Settings = request.app.state.settings
+    submitted = strip_env_owned({"llm": {"model": model, "api_key": api_key, "base_url": base_url}}).get("llm", {})
+    return current.model_copy(update={"llm": LLMSettings(**{**current.llm.model_dump(), **submitted})})
+
+
+def _publish_setup(request: Request, new_settings: Settings) -> None:
+    """Persist, start the scheduler, and only then open the app for business.
+
+    The setup gate is single-shot, so closing it before the scheduler exists left an
+    application that looked configured, refused further setup attempts, and monitored
+    nothing until a restart (AUG-199/292). Ordering here is the fix: on failure the
+    partial scheduler is stopped and the previous live settings restored, so setup
+    stays retryable. The written file is deliberately left in place — it holds the
+    credentials the user just gave, and a retry rewrites it.
+    """
+    from app.scheduler import start_scheduler, stop_scheduler
+
+    previous_settings = request.app.state.settings
+    save_settings_to_yaml(new_settings, request.app.state.config_path)
+    # Wire the app so scheduler jobs read live settings from app.state (OVH-015/036).
+    request.app.state.settings = new_settings
+    try:
+        start_scheduler(new_settings, db_path=request.app.state.db_path, app=request.app)
+    except BaseException:
+        stop_scheduler()
+        request.app.state.settings = previous_settings
+        raise
+    request.app.state.setup_required = False
 
 
 @router.get("/setup", response_class=HTMLResponse)
@@ -221,15 +346,15 @@ async def setup_view(request: Request):
 async def complete_setup(
     request: Request,
     llm_model: str = Form(...),
-    llm_api_key: str = Form(...),
+    # Optional at the transport level: an empty form value reads as "missing" and would
+    # 422 with a generic error page before the handler could explain anything. Whether a
+    # key is actually required is provider-aware and enforced below (AUG-107).
+    llm_api_key: str = Form(""),
     llm_base_url: str = Form(""),
     skip_validation: str = Form(""),
 ):
     """Process setup form and start the application."""
     from pydantic import ValidationError
-
-    from app.config import ExaSettings, LLMSettings, NotificationSettings
-    from app.scheduler import start_scheduler
 
     # Single-shot setup (OVH-059): once configured, a replay/double-submit/stale-bookmark
     # POST must not re-run setup — that would clobber live credentials and start a second
@@ -250,33 +375,35 @@ async def complete_setup(
     }
     _provider_ctx = {"cloud_providers": sorted(CLOUD_PROVIDERS), "local_provider_defaults": LOCAL_PROVIDER_DEFAULTS}
     try:
-        new_settings = Settings(  # type: ignore[call-arg]
-            llm=LLMSettings(
-                model=llm_model,
-                api_key=llm_api_key,
-                base_url=effective_base_url,
-            ),
-            notifications=NotificationSettings(),
-            # Pass exa explicitly (mirrors notifications) so a TOPIC_WATCH_EXA__API_KEY env
-            # secret is not env-sourced into new_settings and then written to plaintext YAML
-            # by the default preserve_exa_key=False (OVH-003). Env still wins at load.
-            exa=ExaSettings(),
-        )
-        # Pre-flight: confirm the credentials actually work before completing setup,
-        # so a bad key/model/base_url is caught here instead of failing silently later.
-        # The "Save anyway" escape hatch (skip_validation) bypasses this so a transient
-        # provider error or a stale default model string can't trap a brand-new user at
-        # /setup. It is safe: is_configured() only needs a non-placeholder key, and a bad
-        # key then degrades gracefully — analyze_articles() returns has_new_info=False on
-        # any LLM failure (no crash, no spurious notification). The user fixes it later in
-        # Settings, and Feed Health / `doctor` surface the failing checks.
-        if skip_validation != "true":
-            await verify_llm_credentials(model=llm_model, api_key=llm_api_key, base_url=effective_base_url)
-        save_settings_to_yaml(new_settings, request.app.state.config_path)
-        request.app.state.settings = new_settings
-        request.app.state.setup_required = False
-        # Wire the app so scheduler jobs read live settings from app.state (OVH-015/036).
-        start_scheduler(new_settings, db_path=request.app.state.db_path, app=request.app)
+        # One setup at a time (AUG-292). The gate above is checked before an awaited
+        # credential probe, so two first-run submissions could both pass it and both
+        # publish; inside the lock it is re-checked after every await instead.
+        async with _setup_lock:
+            if not getattr(request.app.state, "setup_required", False):
+                return RedirectResponse(url="/", status_code=303)
+
+            # Provider-aware key requirement (AUG-107): a hosted provider needs one,
+            # a local one never did and the wizard used to demand it anyway.
+            if not llm_api_key.strip() and not is_keyless_llm_provider(llm_model):
+                raise LLMValidationError(
+                    f"An API key is required for '{llm_model}'. Only a local provider "
+                    f"({', '.join(sorted(LOCAL_PROVIDER_DEFAULTS))}) can be left blank."
+                )
+
+            new_settings = _setup_settings(request, llm_model, llm_api_key, effective_base_url)
+            # Pre-flight: confirm the credentials actually work before completing setup,
+            # so a bad key/model/base_url is caught here instead of failing silently later.
+            # The "Save anyway" escape hatch (skip_validation) bypasses this so a transient
+            # provider error or a stale default model string can't trap a brand-new user at
+            # /setup. It is safe: is_configured() only needs a non-placeholder key, and a bad
+            # key then degrades gracefully — analyze_articles() returns has_new_info=False on
+            # any LLM failure (no crash, no spurious notification). The user fixes it later in
+            # Settings, and Feed Health / `doctor` surface the failing checks.
+            if skip_validation != "true":
+                await verify_llm_credentials(model=llm_model, api_key=llm_api_key, base_url=effective_base_url)
+                if not getattr(request.app.state, "setup_required", False):
+                    return RedirectResponse(url="/", status_code=303)
+            _publish_setup(request, new_settings)
     except LLMValidationError as exc:
         return _render(
             request,
@@ -325,8 +452,6 @@ async def update_settings(request: Request):
     """
     from pydantic import ValidationError
 
-    from app.config import ExaSettings, LLMSettings, NotificationSettings
-
     form = await request.form()
 
     def _get(name: str, default: str = "") -> str:
@@ -361,9 +486,29 @@ async def update_settings(request: Request):
     for field in _SCALAR_FORM_FIELDS:
         form_values[field] = _get(field)
 
+    # Optimistic concurrency (AUG-291): the form carries the generation it rendered.
+    # Refuse a save built on anything else — a second tab, an external edit, or a key
+    # rotated on disk — rather than overwriting the whole document with stale values.
+    if _get("config_revision") != config_revision(request.app.state.config_path):
+        return _render(
+            request,
+            "settings.html",
+            _settings_template_ctx(
+                request,
+                settings=_disk_settings(request),
+                errors=[_STALE_CONFIG_ERROR],
+            ),
+            status_code=409,
+        )
+
+    # Everything preserved rather than submitted (blank keys, infra-only fields, the
+    # URLs behind the masked placeholders) comes from the generation just verified,
+    # not from app.state, which can be older than the file (AUG-291).
+    disk_settings = _disk_settings(request)
+
     # Saved targets reach the form as masked placeholders (AUG-127); resolve the ones
     # the user left untouched back to the URLs they stand for.
-    current_notifications = request.app.state.settings.notifications
+    current_notifications = disk_settings.notifications
     try:
         parsed_notification_urls = restore_masked_targets(
             [u.strip() for u in notification_urls.splitlines() if u.strip()],
@@ -388,16 +533,14 @@ async def update_settings(request: Request):
             status_code=422,
         )
 
-    # API key special-case: a blank field retains the current key (OVH-081). When the key
-    # is env-sourced we must not persist the env secret to plaintext YAML (OVH-003), so the
-    # field is read-only in the UI and the on-disk value is preserved on save.
-    api_key_env_sourced = is_api_key_env_sourced()
-    effective_api_key = llm_api_key.strip() or request.app.state.settings.llm.api_key
-    # Exa key mirrors the LLM key: blank retains current, env-sourced key is preserved (OVH-003).
-    exa_key_env_sourced = is_exa_key_env_sourced()
-    effective_exa_key = exa_api_key.strip() or request.app.state.settings.exa.api_key
+    # API key special-case: a blank field retains the current key (OVH-081). An
+    # env-sourced key is dropped from the submitted data below, so it is neither
+    # persisted nor editable here (OVH-003/AUG-241).
+    effective_api_key = llm_api_key.strip() or disk_settings.llm.api_key
+    # Exa key mirrors the LLM key: blank retains the current one.
+    effective_exa_key = exa_api_key.strip() or disk_settings.exa.api_key
     # exa base_url is infra/proxy-only (not a form field); preserve the current value like db_path.
-    exa_base_url = request.app.state.settings.exa.base_url
+    exa_base_url = disk_settings.exa.base_url
     # Shared normalization (OVH-153): blank -> None. base_url is honored for every
     # provider (OVH-104 reversal); setup and settings share this seam.
     effective_base_url = normalize_base_url(llm_base_url)
@@ -407,46 +550,59 @@ async def update_settings(request: Request):
 
     # llm_model is required; an empty value has no Pydantic constraint to trip, so guard it
     # explicitly to keep the previous "blank model → 422" behavior (preserved across OVH-069).
+    # Enabling Exa without a key is refused the same way: the model would quietly disable
+    # it again, and a silent revert on a save the user asked for is worse than an error.
+    field_errors = []
     if not llm_model.strip():
+        field_errors.append("llm_model: Field required")
+    if enable_exa and not effective_exa_key.strip():
+        field_errors.append(
+            "exa_api_key: Enter an Exa API key to enable the Exa source. Without one, Exa topics cannot fetch."
+        )
+    if field_errors:
         return _render(
             request,
             "settings.html",
             _settings_template_ctx(
                 request,
                 settings=request.app.state.settings,
-                errors=["llm_model: Field required"],
+                errors=field_errors,
                 form=form_values,
             ),
             status_code=422,
         )
 
+    # Everything the form decides, as plain data so pydantic-settings can merge it
+    # per field. Environment-owned paths are then removed: init outranks env, so
+    # leaving them in would let an edit override an env-owned value until restart
+    # (AUG-241). What is left is exactly the YAML-owned half of the document.
+    submitted: dict = {
+        "llm": {
+            "model": llm_model,
+            "api_key": effective_api_key,
+            "base_url": effective_base_url,
+        },
+        "notifications": {
+            "urls": parsed_notification_urls,
+            "webhook_urls": parsed_webhook_urls,
+        },
+        "exa": {
+            "enabled": enable_exa,
+            "api_key": effective_exa_key,
+            "base_url": exa_base_url,
+        },
+        "secure_cookies": secure_cookies,
+        # db_path is infra-only (read-only in the UI); preserve current value.
+        "db_path": disk_settings.db_path,
+        **scalar_kwargs,
+    }
+
     try:
-        new_settings = Settings(  # type: ignore[call-arg]
-            llm=LLMSettings(
-                model=llm_model,
-                api_key=effective_api_key,
-                base_url=effective_base_url,
-            ),
-            notifications=NotificationSettings(
-                urls=parsed_notification_urls,
-                webhook_urls=parsed_webhook_urls,
-            ),
-            exa=ExaSettings(
-                enabled=enable_exa,
-                api_key=effective_exa_key,
-                base_url=exa_base_url,
-            ),
-            secure_cookies=secure_cookies,
-            # db_path is infra-only (read-only in the UI); preserve current value.
-            db_path=request.app.state.settings.db_path,
-            **scalar_kwargs,
-        )
-        save_settings_to_yaml(
-            new_settings,
-            request.app.state.config_path,
-            preserve_api_key=api_key_env_sourced,
-            preserve_exa_key=exa_key_env_sourced,
-        )
+        # The result is the canonical merged object — the form's values for what YAML
+        # owns, the environment's for what it owns — so app.state and the next page
+        # render agree with what a restart would produce.
+        new_settings = Settings(**strip_env_owned(submitted))  # type: ignore[call-arg]
+        save_settings_to_yaml(new_settings, request.app.state.config_path)
         request.app.state.settings = new_settings
     except ValidationError as exc:
         return _render(

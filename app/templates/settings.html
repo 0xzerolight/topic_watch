@@ -30,6 +30,9 @@
 
 <form method="post" action="/settings">
     <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
+    <!-- The config generation this page rendered. A save against a different one is
+         refused, so an external edit or a second tab is never silently overwritten. -->
+    <input type="hidden" name="config_revision" value="{{ config_revision }}">
 
     <section class="card">
         <span class="card-kicker">LLM</span>
@@ -454,10 +457,21 @@ document.body.addEventListener("htmx:afterSwap", function(event) {
     var group = document.getElementById("base-url-group");
     var urlInput = document.getElementById("llm_base_url");
     var hint = document.getElementById("base-url-hint");
+    // The exact value this script put in the URL field, if any. Only that value is
+    // ever cleared on a provider switch, so a saved or user-typed gateway URL stays.
+    var autofilled = null;
+    urlInput.addEventListener("input", function () { autofilled = null; });
 
     function getProvider(s) {
         var i = s.indexOf("/");
         return i > 0 ? s.substring(0, i).toLowerCase().trim() : "";
+    }
+
+    function dropAutofilledUrl() {
+        if (autofilled !== null && urlInput.value === autofilled) {
+            urlInput.value = "";
+        }
+        autofilled = null;
     }
 
     function update() {
@@ -465,15 +479,19 @@ document.body.addEventListener("htmx:afterSwap", function(event) {
         // Field is always shown; base_url is honored for every provider (OVH-104
         // reversal). Only the hint text is provider-aware.
         group.style.display = "";
-        if (!p) {
-            hint.textContent = "Optional. Set for a self-hosted provider or an OpenAI-compatible gateway.";
-            return;
-        }
         if (LOCAL_DEFAULTS[p]) {
-            if (!urlInput.value) {
+            if (!urlInput.value || urlInput.value === autofilled) {
                 urlInput.value = LOCAL_DEFAULTS[p];
+                autofilled = LOCAL_DEFAULTS[p];
             }
             hint.textContent = "Make sure your " + p + " server is running at this address.";
+            return;
+        }
+        // Leaving a local provider: the localhost URL this script injected would
+        // otherwise be saved and route every cloud call at localhost (AUG-100).
+        dropAutofilledUrl();
+        if (!p) {
+            hint.textContent = "Optional. Set for a self-hosted provider or an OpenAI-compatible gateway.";
             return;
         }
         if (CLOUD.indexOf(p) !== -1) {

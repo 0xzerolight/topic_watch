@@ -36,9 +36,10 @@
     </label>
 
     <label for="llm_api_key">
-        API Key
-        <input type="password" id="llm_api_key" name="llm_api_key" required
+        API Key <small id="api-key-optional" hidden>(not needed for this provider)</small>
+        <input type="password" id="llm_api_key" name="llm_api_key"
                placeholder="Your LLM provider API key">
+        <small id="api-key-hint">Required for a hosted provider. A local provider such as Ollama needs no key — leave it blank.</small>
         {% if form %}
         <small>For security, the API key is not echoed back — re-enter it.</small>
         {% endif %}
@@ -76,26 +77,51 @@
     var group = document.getElementById("base-url-group");
     var urlInput = document.getElementById("llm_base_url");
     var hint = document.getElementById("base-url-hint");
+    var keyInput = document.getElementById("llm_api_key");
+    var keyOptional = document.getElementById("api-key-optional");
+    // The exact value this script put in the URL field, if any. Only that value is
+    // ever cleared on a provider switch, so a URL the user typed is never touched.
+    var autofilled = null;
+    urlInput.addEventListener("input", function () { autofilled = null; });
 
     function getProvider(s) {
         var i = s.indexOf("/");
         return i > 0 ? s.substring(0, i).toLowerCase().trim() : "";
     }
 
+    function dropAutofilledUrl() {
+        if (autofilled !== null && urlInput.value === autofilled) {
+            urlInput.value = "";
+        }
+        autofilled = null;
+    }
+
+    function updateKeyRequirement(p) {
+        // A local provider authenticates nothing, so the key is genuinely optional.
+        var keyless = Object.prototype.hasOwnProperty.call(LOCAL_DEFAULTS, p);
+        keyInput.required = !keyless;
+        keyOptional.hidden = !keyless;
+    }
+
     function update() {
         var p = getProvider(modelInput.value);
+        updateKeyRequirement(p);
         // Field is always shown; base_url is honored for every provider (OVH-104
         // reversal). Only the hint text is provider-aware.
         group.style.display = "";
-        if (!p) {
-            hint.textContent = "Optional. Set for a self-hosted provider or an OpenAI-compatible gateway.";
-            return;
-        }
         if (LOCAL_DEFAULTS[p]) {
-            if (!urlInput.value) {
+            if (!urlInput.value || urlInput.value === autofilled) {
                 urlInput.value = LOCAL_DEFAULTS[p];
+                autofilled = LOCAL_DEFAULTS[p];
             }
             hint.textContent = "Make sure your " + p + " server is running at this address.";
+            return;
+        }
+        // Leaving a local provider: the localhost URL this script injected would
+        // otherwise be saved and route every cloud call at localhost (AUG-100).
+        dropAutofilledUrl();
+        if (!p) {
+            hint.textContent = "Optional. Set for a self-hosted provider or an OpenAI-compatible gateway.";
             return;
         }
         if (CLOUD.indexOf(p) !== -1) {

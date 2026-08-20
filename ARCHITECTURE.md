@@ -246,10 +246,24 @@ Settings are managed by Pydantic `BaseSettings` in `app/config.py`.
 
 On first run, `config.example.yml` is auto-copied to `data/config.yml`.
 
+**State root.** `resolve_state_root()` decides where `config.yml` and the default database
+live, and both resolve through it so they cannot diverge: `TOPIC_WATCH_CONFIG_PATH` wins if
+set, otherwise an existing `data/` directory beside the package (repo checkout, worktree,
+the container's `/app/data`), otherwise a user-level state directory (`$XDG_STATE_HOME` or
+`~/.local/state`, `%LOCALAPPDATA%` on Windows) for an installed wheel. `TOPIC_WATCH_DB_PATH`
+stays authoritative for the database on top of that.
+
 **Runtime access:**
 - Web routes: `request.app.state.settings`
 - CLI / scheduler: `load_settings()`
 - Settings page: writes back to YAML via `save_settings_to_yaml()`
+
+**Writing YAML.** `save_settings_to_yaml()` patches the model's own dump onto the existing
+document rather than rebuilding a hand-maintained key list: keys this version does not know
+are preserved (they warn on load), a cleared optional value deletes its key, and any field
+the environment currently supplies is skipped entirely so an env-derived value is never
+materialized into the file. The write goes to a same-directory temp file and one atomic
+rename, owner-readable only.
 
 ### Configuration Key Reference
 
