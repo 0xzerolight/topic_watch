@@ -227,6 +227,11 @@ class TestArticleIdentity:
     def test_unparseable_url_still_compares_equal_to_itself(self) -> None:
         assert article_identity(self._entry(url="not a url")) == article_identity(self._entry(url="not a url"))
 
+    def test_a_malformed_netloc_still_compares_equal_to_itself(self) -> None:
+        """An invalid port makes urlparse raise; identity must survive it."""
+        broken = "https://publisher.example:notaport/story"
+        assert article_identity(self._entry(url=broken)) == article_identity(self._entry(url=broken))
+
 
 # ============================================================
 # TestCollapseDuplicateEntries
