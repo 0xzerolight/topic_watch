@@ -183,3 +183,16 @@ def test_image_is_pinned_and_recorded_across_install_and_update() -> None:
     # Rollback must restore the previously recorded digest, not just retry
     # the now-current (possibly broken) image reference.
     assert 'upsert_env "TOPIC_WATCH_IMAGE" "$PREV_IMAGE"' in update_sh
+
+
+def test_dockerfile_ships_vendored_asset_licenses() -> None:
+    """AUG-341: the runtime image copies Pico CSS and htmx into
+    app/static/vendor/ but shipped no license bundle for them or the
+    project's own GPL text."""
+    dockerfile = (_ROOT / "Dockerfile").read_text()
+    assert "THIRD_PARTY_NOTICES.md" in dockerfile
+    assert "LICENSE" in dockerfile
+    assert "/usr/share/licenses/topic-watch" in dockerfile
+    notices = (_ROOT / "THIRD_PARTY_NOTICES.md").read_text()
+    assert "Pico CSS" in notices
+    assert "MIT" in notices
