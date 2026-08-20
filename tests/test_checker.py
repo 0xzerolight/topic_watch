@@ -2373,3 +2373,124 @@ class TestInsufficientKnowledgeIsRecorded:
         assert result.notify_disposition == NotifyDisposition.SUPPRESSED_IMPORTANCE
         assert result.stage_error is not None
         assert result.stage_error.startswith("knowledge_insufficient")
+
+
+class _PartialNovelty(NoveltyResult):
+    """A novelty result that reports which of its input articles it actually read.
+
+    Mirrors the contract ``analyze_articles`` must provide once it surfaces what
+    ``_fit_article_prompt`` dropped to fit the model's context window.
+    """
+
+    analyzed_article_ids: list[int] = []
+
+
+class TestOnlyAnalyzedArticlesAreProcessed:
+    """Articles trimmed out of an over-budget prompt were never evaluated."""
+
+    async def test_dropped_articles_stay_queued_and_are_re_analyzed(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        topic = _make_topic(db_conn, name="BigBatch")
+        kept = create_article(db_conn, _make_article(id=None, topic_id=topic.id, content_hash="k1"))
+        dropped = create_article(
+            db_conn,
+            _make_article(id=None, topic_id=topic.id, content_hash="d1", url="https://example.com/article-2"),
+        )
+        db_conn.commit()
+
+        partial = _PartialNovelty(has_new_info=False, confidence=0.9, analyzed_article_ids=[kept.id])
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[kept, dropped], total_feed_entries=2),
+            ),
+            patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=partial),
+            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)),
+        ):
+            await check_topic(get_topic(db_conn, topic.id), _make_settings(), db_path=db_path)
+
+        rows = {
+            row["id"]: row
+            for row in db_conn.execute("SELECT id, processed, analysis_attempts FROM articles").fetchall()
+        }
+        assert rows[kept.id]["processed"] == 1
+        assert rows[dropped.id]["processed"] == 0
+        assert rows[dropped.id]["analysis_attempts"] == 1
+
+        # And the next cycle actually feeds it back to the model.
+        novelty = NoveltyResult(has_new_info=False, confidence=0.9)
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=1),
+            ),
+            patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty) as mock_analyze,
+            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)),
+        ):
+            await check_topic(get_topic(db_conn, topic.id), _make_settings(), db_path=db_path)
+
+        assert [a.id for a in mock_analyze.await_args.args[0]] == [dropped.id]
+
+    async def test_silent_analysis_still_processes_the_whole_batch(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """Without a reported subset the batch is assumed read, as before."""
+        topic = _make_topic(db_conn, name="NoSignal")
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
+        db_conn.commit()
+
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[article], total_feed_entries=1),
+            ),
+            patch(
+                "app.checker.analyze_articles",
+                new_callable=AsyncMock,
+                return_value=NoveltyResult(has_new_info=False, confidence=0.9),
+            ),
+            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)),
+        ):
+            await check_topic(get_topic(db_conn, topic.id), _make_settings(), db_path=db_path)
+
+        row = db_conn.execute("SELECT processed FROM articles WHERE id = ?", (article.id,)).fetchone()
+        assert row["processed"] == 1
+
+    async def test_initialization_only_processes_the_articles_it_used(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """A baseline built from a truncated corpus must not consume the rest."""
+        from app.checker import initialize_new_topic
+
+        topic = _make_topic(db_conn, name="TruncatedInit", status=TopicStatus.NEW)
+        used = create_article(db_conn, _make_article(id=None, topic_id=topic.id, content_hash="u1"))
+        unused = create_article(
+            db_conn,
+            _make_article(id=None, topic_id=topic.id, content_hash="x1", url="https://example.com/article-2"),
+        )
+        db_conn.commit()
+
+        plan = KnowledgeUpdatePlan(
+            summary_text="Baseline.",
+            token_count=3,
+            usage=TokenUsage(),
+            analyzed_article_ids=[used.id],
+        )
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[used, unused], total_feed_entries=2),
+            ),
+            patch("app.checker.prepare_initial_knowledge", new_callable=AsyncMock, return_value=plan),
+        ):
+            await initialize_new_topic(topic, _make_settings(), db_path=db_path)
+
+        assert get_topic(db_conn, topic.id).status == TopicStatus.READY
+        rows = {row["id"]: row["processed"] for row in db_conn.execute("SELECT id, processed FROM articles")}
+        assert rows[used.id] == 1
+        assert rows[unused.id] == 0

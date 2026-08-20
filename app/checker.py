@@ -17,6 +17,7 @@ from app.analysis.knowledge import (
     apply_knowledge_update,
     prepare_initial_knowledge,
     prepare_knowledge_update,
+    reported_article_ids,
 )
 from app.analysis.llm import analyze_articles
 from app.check_context import check_id_var, generate_check_id
@@ -190,6 +191,19 @@ def _analysis_batch(
         stored = list_articles_for_topic(conn, topic_id, unprocessed_only=True, limit=max_articles)
     stranded = [a for a in stored if a.id not in fresh_ids]
     return (stranded + new_articles)[:max_articles]
+
+
+def _split_batch(batch: list[Article], analyzed_ids: list[int] | None) -> tuple[list[int], list[int]]:
+    """Split a batch into the articles the LLM read and the ones it never saw.
+
+    ``analyzed_ids is None`` means the analysis layer reported nothing, so the
+    whole batch counts as read — the behaviour before the signal existed.
+    """
+    ids = [article.id for article in batch if article.id is not None]
+    if analyzed_ids is None:
+        return ids, []
+    seen = set(analyzed_ids)
+    return [i for i in ids if i in seen], [i for i in ids if i not in seen]
 
 
 def _commit_check_transition(
@@ -547,10 +561,13 @@ async def _check_topic_inner(
     # Either way they stay unprocessed and carry an attempt, so the next cycle
     # re-analyzes them and a permanently failing article is eventually abandoned
     # instead of retried forever (TW-AUD-001).
-    batch_ids = [a.id for a in articles if a.id is not None]
+    # Articles dropped to fit the model's context window are in the same position:
+    # they were paid for and stored, but never read. Marking them processed with
+    # the rest is how they used to disappear unanalyzed.
+    analyzed_ids, dropped_ids = _split_batch(articles, reported_article_ids(novelty))
     unfinished = bool(novelty.error) or knowledge_stale
-    article_ids = [] if unfinished else batch_ids
-    failed_article_ids = batch_ids if unfinished else []
+    article_ids = [] if unfinished else analyzed_ids
+    failed_article_ids = (analyzed_ids + dropped_ids) if unfinished else dropped_ids
 
     # --- C3: THE durable transition. Knowledge + revision + article disposition
     # + CheckResult in one commit, fenced by the P0 generation and knowledge
@@ -1167,7 +1184,10 @@ async def initialize_new_topic(
         # LLM phase, still connection-free; the plan is persisted below.
         plan = await prepare_initial_knowledge(topic, articles, settings)
 
-        article_ids = [a.id for a in articles if a.id is not None]
+        # Only what the baseline was actually built from is finished with: an
+        # over-budget corpus is fitted by dropping trailing articles, and those
+        # stay unprocessed for the first check to pick up.
+        article_ids, _ = _split_batch(articles, plan.analyzed_article_ids)
         with get_db(db_path) as conn:
             _commit_init_transition(conn, snapshot, plan, article_ids, settings)
         topic.status = TopicStatus.READY
