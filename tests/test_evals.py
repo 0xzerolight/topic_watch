@@ -743,6 +743,40 @@ async def test_run_live_uses_scratch_topic_and_reads_prod_readonly(tmp_path, mon
     assert art.scenario.articles[0].title == "fetched"
 
 
+async def test_run_live_passes_exa_settings_to_fetch(tmp_path, monkeypatch) -> None:
+    """AUG-046: production passes settings.exa into fetch_new_articles_for_topic
+    (app/checker.py); run_live omitted it, so the Exa branch always received
+    None and an Exa-mode live/frozen eval used an empty article corpus."""
+    import evals.runner as runner
+    from app.crud import create_topic
+    from app.database import get_connection, init_db
+    from app.models import Topic, TopicStatus
+    from app.scraping import FetchResult
+
+    prod = tmp_path / "prod.db"
+    init_db(prod)
+    conn = get_connection(prod)
+    create_topic(
+        conn,
+        Topic(name="Acme", description="track acme", feed_urls=["http://feed"], status=TopicStatus.READY),
+    )
+    conn.commit()
+    conn.close()
+
+    captured_kwargs: dict[str, object] = {}
+
+    async def fake_fetch(topic: Topic, conn, **kwargs: object) -> FetchResult:
+        captured_kwargs.update(kwargs)
+        return FetchResult(articles=[], total_feed_entries=0)
+
+    monkeypatch.setattr(runner, "fetch_new_articles_for_topic", fake_fetch)
+
+    settings = _settings()
+    await runner.run_live("Acme", settings, kind="novelty", inner=_mock_inner(novelty=_novelty()), prod_db_path=prod)
+
+    assert captured_kwargs.get("exa_settings") is settings.exa
+
+
 async def test_run_live_freeze_writes_replayable_scenario(tmp_path, monkeypatch) -> None:
     import evals.runner as runner
     from app.crud import create_topic

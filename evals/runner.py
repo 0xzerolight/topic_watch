@@ -358,6 +358,7 @@ async def run_live(
                 article_fetch_timeout=settings.article_fetch_timeout,
                 feed_max_retries=settings.feed_max_retries,
                 concurrency=settings.content_fetch_concurrency,
+                exa_settings=settings.exa,
             )
             articles = fetch_result.articles
         finally:
