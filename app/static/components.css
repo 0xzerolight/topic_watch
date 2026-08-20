@@ -245,7 +245,17 @@ a.chip:hover { background: var(--app-surface-sunken); }
 .data-table .row-problem {
   box-shadow: inset 2px 0 0 var(--app-bad);
 }
-.data-table .row-inactive { opacity: 0.55; }
+/* AUG-230: was `opacity: 0.55` on the whole row, which faded the still-operable
+   checkbox, topic link and Enable button to near-unreadable contrast alongside
+   the passive metadata. Signal inactivity with a border instead (same language
+   as .row-problem) and quiet only inherited-color text; links, badges and
+   buttons set their own color and are unaffected. */
+.data-table .row-inactive {
+  box-shadow: inset 2px 0 0 var(--app-idle);
+}
+.data-table .row-inactive td {
+  color: var(--app-ink-quiet);
+}
 
 /* Inline error text inside a row (cell body, clamped) */
 .row-error {

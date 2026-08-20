@@ -1,5 +1,5 @@
 {% if topic is none %}
-<article>
+<article data-status-terminal="removed">
     <header>Topic Removed</header>
     <p>This topic no longer exists — it may have been deleted in another tab.</p>
     <p><a href="/" role="button" class="contrast outline" style="font-size: 0.875rem;">Back to Dashboard</a></p>
@@ -31,7 +31,7 @@
 </article>
 
 {% elif topic.status.value == "error" %}
-<article>
+<article data-status-terminal="error">
     <header><span class="badge badge--bad"><span class="badge-dot"></span>Error</span></header>
     <p>
         {% if topic.error_message %}{{ topic.error_message | sanitize_error }}{% else %}Research failed.{% endif %}
@@ -43,7 +43,7 @@
 </article>
 
 {% elif knowledge %}
-<details open class="knowledge-state">
+<details open class="knowledge-state" data-status-terminal="ready">
     <summary>
         <strong>Knowledge State</strong>
         <small style="margin-left: 0.5em; font-weight: normal;">
@@ -55,17 +55,17 @@
         {% set usage_pct = (knowledge.token_count / knowledge_state_max_tokens * 100) | int if knowledge_state_max_tokens > 0 else 0 %}
         <div class="token-meter" style="margin-bottom: 1em;">
             <span class="token-meter-label">
-                <span>Token budget</span>
+                <span id="token-budget-label">Token budget</span>
                 <span class="num">{{ usage_pct }}% used</span>
             </span>
-            <progress value="{{ knowledge.token_count }}" max="{{ knowledge_state_max_tokens }}" style="width: 100%;"></progress>
+            <progress value="{{ knowledge.token_count }}" max="{{ knowledge_state_max_tokens }}" style="width: 100%;" aria-labelledby="token-budget-label"></progress>
         </div>
         <div class="knowledge-text">{{ knowledge.summary_text | markdown }}</div>
     </article>
 </details>
 
 {% else %}
-<article>
+<article data-status-terminal="ready">
     <p><strong>No knowledge state available.</strong></p>
     <p><small>The knowledge state is built during initial research and updated after each check. It will appear here once research completes.</small></p>
 </article>

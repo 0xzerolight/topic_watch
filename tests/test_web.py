@@ -242,6 +242,24 @@ class TestDashboard:
         response = await client.get("/")
         assert "Check Now" not in response.text
 
+    async def test_dashboard_notification_tag_is_per_topic_row(self, client: httpx.AsyncClient) -> None:
+        """AUG-219: the fresh-check browser notification is tagged with the row id.
+
+        A fixed shared tag let one topic's alert silently replace another's; the tag
+        must now be scoped to the row so distinct topics never collide.
+        """
+        response = await client.get("/")
+        assert "tag: detailTarget.id" in response.text
+        assert 'tag: "topic-watch"' not in response.text
+
+    async def test_dashboard_opml_file_input_has_accessible_name(self, client: httpx.AsyncClient) -> None:
+        """AUG-238: the OPML file picker has a programmatically associated label."""
+        response = await client.get("/")
+        assert '<label for="opml_file" class="sr-only">OPML File</label>' in response.text
+        assert 'id="opml_file"' in response.text
+        assert 'aria-describedby="opml-file-hint"' in response.text
+        assert 'id="opml-file-hint"' in response.text
+
 
 class TestDashboardStatsFreshness:
     """The Active/Total stat cards must reflect mutations on the very next load.
@@ -377,6 +395,19 @@ class TestAddTopic:
         assert response.status_code == 200
         assert "Add Topic" in response.text
         assert "<form" in response.text
+
+    async def test_add_form_feed_mode_fieldset_has_accessible_name(self, client: httpx.AsyncClient) -> None:
+        """AUG-237: the feed-mode radio group is labeled via the visible kicker."""
+        response = await client.get("/topics/new")
+        assert '<span class="card-kicker" id="feed-source-kicker">Feed Source</span>' in response.text
+        assert '<fieldset aria-labelledby="feed-source-kicker">' in response.text
+
+    async def test_add_form_feed_validation_results_is_live_region(self, client: httpx.AsyncClient) -> None:
+        """AUG-235: the feed-URL validation result target announces to screen readers."""
+        response = await client.get("/topics/new")
+        assert '<div id="feed-validation-results" role="status" aria-live="polite" aria-atomic="true"></div>' in (
+            response.text
+        )
 
     async def test_create_topic_redirects_to_detail(self, client: httpx.AsyncClient) -> None:
         """POST /topics creates a topic and redirects to its detail page."""
@@ -751,6 +782,25 @@ class TestTopicDetail:
         assert response.status_code == 200
         assert topic.name in response.text
 
+    async def test_detail_status_announce_is_sibling_live_region(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-236: a hidden live-region sibling of #status-area announces completion.
+
+        Must stay a SIBLING, never a child — #status-area is a leaf that the 3s
+        researching poll replaces wholesale via innerHTML.
+        """
+        topic = _make_topic(db_conn)
+        response = await client.get(f"/topics/{topic.id}")
+        assert (
+            '<div id="status-announce" class="sr-only" role="status" aria-live="polite" '
+            'aria-atomic="true"></div>' in response.text
+        )
+        # Sibling, not nested: the announce div closes before #status-area opens.
+        assert response.text.index('id="status-announce"') < response.text.index('id="status-area"')
+        assert 'target.id !== "status-area"' in response.text
+        assert "data-status-terminal" in response.text
+
     async def test_failing_sources_callout(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
         """The detail page warns when the most recent check found no usable source."""
         topic = _make_topic(db_conn, name="HBDetail")
@@ -981,6 +1031,35 @@ class TestTopicStatus:
         assert "Summary here." in response.text
         assert "hx-trigger" not in response.text
 
+    async def test_status_ready_marked_terminal_for_announce(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-236: the ready fragment carries the marker the afterSwap handler announces."""
+        topic = _make_topic(db_conn, status=TopicStatus.READY)
+        create_knowledge_state(
+            db_conn,
+            KnowledgeState(topic_id=topic.id, summary_text="Summary here.", token_count=20),
+        )
+        db_conn.commit()
+
+        response = await client.get(f"/topics/{topic.id}/status")
+        assert 'data-status-terminal="ready"' in response.text
+
+    async def test_status_token_meter_has_accessible_name(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-239: the token-budget <progress> element is linked to its visible label."""
+        topic = _make_topic(db_conn, status=TopicStatus.READY)
+        create_knowledge_state(
+            db_conn,
+            KnowledgeState(topic_id=topic.id, summary_text="Summary here.", token_count=20),
+        )
+        db_conn.commit()
+
+        response = await client.get(f"/topics/{topic.id}/status")
+        assert '<span id="token-budget-label">Token budget</span>' in response.text
+        assert 'aria-labelledby="token-budget-label"' in response.text
+
     async def test_status_renders_markdown_summary(
         self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
     ) -> None:
@@ -1012,6 +1091,8 @@ class TestTopicStatus:
         assert "Init failed" in response.text
         assert "Retry" in response.text
         assert "hx-trigger" not in response.text
+        # AUG-236: marker the detail page's afterSwap handler announces as failure.
+        assert 'data-status-terminal="error"' in response.text
 
     async def test_status_deleted_returns_terminal_fragment(self, client: httpx.AsyncClient) -> None:
         """Deleted/nonexistent topic returns a 200 terminal fragment that stops polling (OVH-048)."""
@@ -1022,6 +1103,8 @@ class TestTopicStatus:
         assert "hx-trigger" not in response.text
         # Surfaces the failure to the user.
         assert "no longer exists" in response.text.lower()
+        # AUG-236: marker the detail page's afterSwap handler announces as removal.
+        assert 'data-status-terminal="removed"' in response.text
 
     async def test_status_since_mismatch_sets_hx_refresh(
         self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
@@ -1253,6 +1336,24 @@ class TestBrowserNotificationRobustness:
         assert "data-just-checked" in html
         # The fire condition requires the just-checked marker alongside new-info.
         assert 'justChecked === "true"' in html
+
+    def test_show_reports_construction_failure(self) -> None:
+        """AUG-128: show() returns a boolean capability result instead of failing
+        silently, so callers can tell permission-granted from actually-displayed."""
+        js = self._notifications_js()
+        ctor_idx = js.find("n = new Notification(")
+        catch_idx = js.find("} catch", ctor_idx)
+        catch_body = js[catch_idx : catch_idx + 80]
+        assert "return false" in catch_body
+        # The success path returns true after scheduling the auto-close.
+        assert "return true;" in js[catch_idx:]
+
+    def test_notification_tag_is_not_hardcoded_shared(self) -> None:
+        """AUG-219: no fixed "topic-watch" tag — same tag replaces same-origin
+        notifications, so a shared literal collapsed alerts across topics."""
+        js = self._notifications_js()
+        assert 'tag: "topic-watch"' not in js
+        assert "options.tag" in js
 
 
 # --- Re-init ---
@@ -1491,6 +1592,31 @@ class TestSettings:
         assert response.status_code == 200
         assert "set via environment" in response.text.lower()
         assert "test-key-12345678" not in response.text
+
+    async def test_settings_notification_results_are_live_regions(self, client: httpx.AsyncClient) -> None:
+        """AUG-235: the test-notification result and browser-notif status are live regions."""
+        page = await client.get("/settings")
+        assert (
+            '<div id="notification-test-result" style="margin-top: 1rem;" role="status" '
+            'aria-live="polite" aria-atomic="true"></div>' in page.text
+        )
+        assert (
+            '<span id="browser-notif-status" style="font-size: 0.875rem;" role="status" '
+            'aria-live="polite" aria-atomic="true"></span>' in page.text
+        )
+
+    async def test_settings_browser_notif_reflects_display_failure(self, client: httpx.AsyncClient) -> None:
+        """AUG-128: enabling notifications checks show()'s return value before claiming Active."""
+        page = await client.get("/settings")
+        assert "var displayed = TopicWatchNotifications.show(" in page.text
+        assert "Notifications can't display on this device" in page.text
+        assert "updateBrowserNotifUI(true)" in page.text
+
+    async def test_settings_browser_notifications_use_distinct_tags(self, client: httpx.AsyncClient) -> None:
+        """AUG-219: settings-page test notifications no longer share the "topic-watch" tag."""
+        page = await client.get("/settings")
+        assert '{ tag: "topic-watch-enable-test" }' in page.text
+        assert '{ tag: "topic-watch-test-notification" }' in page.text
 
 
 # --- CSRF Protection ---
@@ -1779,6 +1905,25 @@ class TestTopicEdit:
         """Edit form for nonexistent topic returns 404."""
         response = await client.get("/topics/9999/edit")
         assert response.status_code == 404
+
+    async def test_edit_form_feed_mode_fieldset_has_accessible_name(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-237: the feed-mode radio group is labeled via the visible kicker."""
+        topic = _make_topic(db_conn)
+        response = await client.get(f"/topics/{topic.id}/edit")
+        assert '<span class="card-kicker" id="feed-source-kicker">Feed Source</span>' in response.text
+        assert '<fieldset aria-labelledby="feed-source-kicker">' in response.text
+
+    async def test_edit_form_feed_validation_results_is_live_region(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-235: the feed-URL validation result target announces to screen readers."""
+        topic = _make_topic(db_conn)
+        response = await client.get(f"/topics/{topic.id}/edit")
+        assert '<div id="feed-validation-results" role="status" aria-live="polite" aria-atomic="true"></div>' in (
+            response.text
+        )
 
     async def test_edit_updates_topic(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
         """POST to edit updates the topic's fields."""
