@@ -30,6 +30,23 @@
         <p>{% for tag in topic.tags %}<span class="chip">{{ tag }}</span> {% endfor %}</p>
         {% endif %}
     </hgroup>
+    {# AUG-115: routine actions live in the masthead (Quiet Desk pattern shared with
+       dashboard.html), a SIBLING of #status-area, so they render above check history
+       regardless of how long it is. Maintenance-weight actions (reinitialize, export,
+       delete) stay in their own block near the bottom of the page. #}
+    <div class="action-row">
+        {% if topic.is_active and topic.status.value == "ready" %}
+        <form method="post" action="/topics/{{ topic.id }}/check" style="margin: 0;">
+            <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
+            <button type="submit" style="margin: 0;">Check Now</button>
+        </form>
+        {% endif %}
+        <a href="/topics/{{ topic.id }}/edit" role="button" class="secondary" style="margin: 0;">Edit</a>
+        <form method="post" action="/topics/{{ topic.id }}/toggle-active" style="margin: 0;">
+            <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
+            <button type="submit" class="secondary" style="margin: 0;">{% if topic.is_active %}Disable{% else %}Enable{% endif %}</button>
+        </form>
+    </div>
 </div>
 
 {% if not topic.is_active %}
@@ -54,47 +71,6 @@
         <dd>{% if topic.feed_mode.value == "auto" %}Automatic{% elif topic.feed_mode.value == "exa" %}Exa AI search{% else %}Manual{% endif %}</dd>
     </div>
     <div>
-        <dt>Confidence threshold</dt>
-        <dd>
-            {% if topic.confidence_threshold is not none %}
-                {{ "%.2f"|format(topic.confidence_threshold) }}
-            {% else %}
-                {{ "%.2f"|format(global_confidence_threshold) }} <small class="quiet">(default)</small>
-            {% endif %}
-        </dd>
-    </div>
-    <div>
-        <dt>Relevance threshold</dt>
-        <dd>
-            {% if topic.relevance_threshold is not none %}
-                {{ "%.2f"|format(topic.relevance_threshold) }}
-            {% else %}
-                {{ "%.2f"|format(global_relevance_threshold) }} <small class="quiet">(default)</small>
-            {% endif %}
-        </dd>
-    </div>
-    <div>
-        <dt>Importance threshold</dt>
-        <dd>
-            {# No global fallback by design: importance suppression is per-topic only. #}
-            {% if topic.importance_threshold is not none %}
-                {{ topic.importance_threshold }}/5
-            {% else %}
-                off <small class="quiet">(notify on all)</small>
-            {% endif %}
-        </dd>
-    </div>
-    <div>
-        <dt>Novelty instruction</dt>
-        <dd>
-            {% if topic.novelty_instruction %}
-                {{ topic.novelty_instruction }}
-            {% else %}
-                none <small class="quiet">(default criteria)</small>
-            {% endif %}
-        </dd>
-    </div>
-    <div>
         <dt>Created</dt>
         <dd><span title="{{ topic.created_at.strftime('%Y-%m-%d %H:%M') }}">{{ topic.created_at | timeago }}</span></dd>
     </div>
@@ -109,6 +85,56 @@
         </dd>
     </div>
 </dl>
+
+{# AUG-121: the novelty policy (the instruction + its three gates) is what
+   decides whether the user hears about anything, so it gets its own labeled
+   block instead of blending into the scalar meta-grid above. Reuses the
+   existing .card/.card-kicker pattern (form sections, settings) — a SIBLING of
+   #status-area, never nested (see the CRITICAL note below). #}
+<section class="card">
+    <span class="card-kicker">Novelty Policy</span>
+    <p>
+        <strong>Novelty instruction:</strong>
+        {% if topic.novelty_instruction %}
+            {{ topic.novelty_instruction }}
+        {% else %}
+            none <small class="quiet">(default criteria)</small>
+        {% endif %}
+    </p>
+    <dl class="meta-grid">
+        <div>
+            <dt>Confidence threshold</dt>
+            <dd>
+                {% if topic.confidence_threshold is not none %}
+                    {{ "%.2f"|format(topic.confidence_threshold) }}
+                {% else %}
+                    {{ "%.2f"|format(global_confidence_threshold) }} <small class="quiet">(default)</small>
+                {% endif %}
+            </dd>
+        </div>
+        <div>
+            <dt>Relevance threshold</dt>
+            <dd>
+                {% if topic.relevance_threshold is not none %}
+                    {{ "%.2f"|format(topic.relevance_threshold) }}
+                {% else %}
+                    {{ "%.2f"|format(global_relevance_threshold) }} <small class="quiet">(default)</small>
+                {% endif %}
+            </dd>
+        </div>
+        <div>
+            <dt>Importance threshold</dt>
+            <dd>
+                {# No global fallback by design: importance suppression is per-topic only. #}
+                {% if topic.importance_threshold is not none %}
+                    {{ topic.importance_threshold }}/5
+                {% else %}
+                    off <small class="quiet">(notify on all)</small>
+                {% endif %}
+            </dd>
+        </div>
+    </dl>
+</section>
 
 {# AUG-236: visually hidden live region, SIBLING of #status-area (never nested —
    see the CRITICAL note below). Announces the concise terminal outcome once the
@@ -177,7 +203,7 @@ document.body.addEventListener("htmx:afterSwap", function (event) {
 {% else %}
 <div class="empty-state">
     <p>No articles fetched yet.</p>
-    <p class="empty-state-hint">Articles appear here after the first feed fetch. New topics are fetched on the next scheduler cycle (~1 minute), or use "Check Now" below.</p>
+    <p class="empty-state-hint">Articles appear here after the first feed fetch. New topics are fetched on the next scheduler cycle (~1 minute), or use "Check Now" above.</p>
 </div>
 {% endif %}
 
@@ -286,7 +312,10 @@ document.body.addEventListener("htmx:afterSwap", function (event) {
 </div>
 {% endif %}
 
-<h2>Actions</h2>
+{# AUG-115: only maintenance-weight actions remain here — reinitialize, export,
+   delete. Check Now / Edit / Enable-Disable moved to the masthead action-row
+   above so they stay above the check-history table regardless of its length. #}
+<h2>Maintenance</h2>
 <div class="action-row" style="margin-bottom: 1rem;">
     {% if topic.status.value == "error" %}
     <form method="post" action="/topics/{{ topic.id }}/init" style="margin: 0;">
@@ -301,17 +330,6 @@ document.body.addEventListener("htmx:afterSwap", function (event) {
         <button type="submit" class="secondary outline" style="margin: 0;">Re-initialize</button>
     </form>
     {% endif %}
-    {% if topic.is_active and topic.status.value == "ready" %}
-    <form method="post" action="/topics/{{ topic.id }}/check" style="margin: 0;">
-        <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
-        <button type="submit" style="margin: 0;">Check Now</button>
-    </form>
-    {% endif %}
-    <form method="post" action="/topics/{{ topic.id }}/toggle-active" style="margin: 0;">
-        <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
-        <button type="submit" class="secondary" style="margin: 0;">{% if topic.is_active %}Disable{% else %}Enable{% endif %}</button>
-    </form>
-    <a href="/topics/{{ topic.id }}/edit" role="button" class="secondary" style="margin: 0;">Edit</a>
 </div>
 <div class="action-row">
     <a href="/topics/{{ topic.id }}/export/json" role="button" class="outline secondary" style="font-size: 0.875rem; padding: 0.25rem 0.75rem; margin: 0;">Export JSON</a>
