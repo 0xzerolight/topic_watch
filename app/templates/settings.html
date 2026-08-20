@@ -108,13 +108,15 @@
         <div class="field-group">
             <label for="notification_urls">Notification URLs <small>(one per line, Apprise format)</small></label>
             <textarea id="notification_urls" name="notification_urls" rows="4"
-                      placeholder="ntfy://my-topic&#10;discord://webhook-id/token">{{ form.notification_urls if form else (settings.notifications.urls | join('\n')) }}</textarea>
+                      placeholder="ntfy://my-topic&#10;discord://webhook-id/token">{{ form.notification_urls if form else (masked_notification_urls | join('\n')) }}</textarea>
+            <small class="help">Saved URLs are masked because they carry tokens. Leave a masked line alone to keep it, delete it to remove that target, or type a full URL over it to replace it.</small>
         </div>
 
         <div class="field-group">
             <label for="webhook_urls">Webhook URLs <small>(one per line, JSON POST)</small></label>
             <textarea id="webhook_urls" name="webhook_urls" rows="3"
-                      placeholder="https://example.com/webhook">{{ form.webhook_urls if form else (settings.notifications.webhook_urls | join('\n')) }}</textarea>
+                      placeholder="https://example.com/webhook">{{ form.webhook_urls if form else (masked_webhook_urls | join('\n')) }}</textarea>
+            <small class="help">Masked the same way — keep, delete or overwrite each line.</small>
         </div>
     </section>
 

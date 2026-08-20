@@ -695,6 +695,94 @@ class TestApiKeyRetention:
         assert app.state.settings.llm.api_key == "sk-new-explicit"
 
 
+class TestDeliveryUrlMasking:
+    """AUG-127: saved Apprise/webhook URLs are never rendered in clear text."""
+
+    _SECRET_APPRISE = "ntfy://user:s3cr3t-token@ntfy.example.com/alerts"
+    _SECRET_WEBHOOK = "https://hooks.example.com/services/T000/B111/xoxb-secret"
+
+    def _with_targets(self) -> None:
+        app.state.settings = _make_settings(
+            notifications=NotificationSettings(
+                urls=[self._SECRET_APPRISE, "discord://id/other-token"],
+                webhook_urls=[self._SECRET_WEBHOOK],
+            )
+        )
+
+    async def test_get_settings_masks_saved_targets(self, client: httpx.AsyncClient) -> None:
+        self._with_targets()
+        # GET /settings renders from the on-disk config, not app.state.
+        with patch("app.web.routers.settings.load_settings", return_value=app.state.settings):
+            response = await client.get("/settings")
+        assert response.status_code == 200
+        assert "s3cr3t-token" not in response.text
+        assert "other-token" not in response.text
+        assert "xoxb-secret" not in response.text
+        assert "ntfy://**** [1]" in response.text
+        assert "discord://**** [2]" in response.text
+        assert "https://**** [1]" in response.text
+
+    async def test_untouched_masked_entries_are_preserved_on_save(self, client: httpx.AsyncClient) -> None:
+        """Saving an unrelated field does not wipe the delivery targets."""
+        self._with_targets()
+        with patch("app.web.routers.settings.save_settings_to_yaml"):
+            await client.post(
+                "/settings",
+                data=valid_form_data(
+                    notification_urls="ntfy://**** [1]\ndiscord://**** [2]",
+                    webhook_urls="https://**** [1]",
+                ),
+                follow_redirects=False,
+            )
+        assert app.state.settings.notifications.urls == [self._SECRET_APPRISE, "discord://id/other-token"]
+        assert app.state.settings.notifications.webhook_urls == [self._SECRET_WEBHOOK]
+
+    async def test_deleting_a_masked_line_removes_that_target(self, client: httpx.AsyncClient) -> None:
+        self._with_targets()
+        with patch("app.web.routers.settings.save_settings_to_yaml"):
+            await client.post(
+                "/settings",
+                data=valid_form_data(notification_urls="discord://**** [2]"),
+                follow_redirects=False,
+            )
+        assert app.state.settings.notifications.urls == ["discord://id/other-token"]
+
+    async def test_typing_a_real_url_replaces_the_masked_one(self, client: httpx.AsyncClient) -> None:
+        self._with_targets()
+        with patch("app.web.routers.settings.save_settings_to_yaml"):
+            await client.post(
+                "/settings",
+                data=valid_form_data(notification_urls="ntfy://replacement\ndiscord://**** [2]"),
+                follow_redirects=False,
+            )
+        assert app.state.settings.notifications.urls == ["ntfy://replacement", "discord://id/other-token"]
+
+    async def test_a_mask_that_does_not_match_its_index_is_rejected(self, client: httpx.AsyncClient) -> None:
+        """A placeholder pointing at a different scheme is never silently resolved."""
+        self._with_targets()
+        with patch("app.web.routers.settings.save_settings_to_yaml"):
+            response = await client.post(
+                "/settings",
+                data=valid_form_data(notification_urls="slack://**** [1]"),
+                follow_redirects=False,
+            )
+        assert response.status_code == 422
+        assert "does not match a saved URL" in response.text
+        assert app.state.settings.notifications.urls == [self._SECRET_APPRISE, "discord://id/other-token"]
+
+    async def test_out_of_range_index_is_rejected(self, client: httpx.AsyncClient) -> None:
+        """A placeholder is never stored as if it were a delivery URL."""
+        self._with_targets()
+        with patch("app.web.routers.settings.save_settings_to_yaml"):
+            response = await client.post(
+                "/settings",
+                data=valid_form_data(notification_urls="ntfy://**** [9]"),
+                follow_redirects=False,
+            )
+        assert response.status_code == 422
+        assert app.state.settings.notifications.urls == [self._SECRET_APPRISE, "discord://id/other-token"]
+
+
 class TestSecretEchoOnErrorPages:
     """AUG-017: a submitted key never survives into an error re-render."""
 
