@@ -16,6 +16,7 @@ import contextlib
 import os
 import re
 import tempfile
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -24,6 +25,13 @@ import yaml
 from pydantic import BaseModel, Field
 
 ScenarioKind = Literal["novelty", "knowledge_init", "knowledge_update", "compress"]
+
+# RunArtifact envelope version. Bump when a field is added/removed/repurposed
+# in a way that would make an old artifact's replay diff misleading;
+# load_run() rejects a file whose version is newer than this harness
+# understands rather than silently loading it under current field defaults
+# (AUG-295).
+_ARTIFACT_SCHEMA_VERSION = 1
 
 # Cap on saved run artifacts per runs_dir — oldest evicted first. Eval runs
 # persist full prompts and article bodies with no other retention, so an
@@ -118,8 +126,20 @@ class ExpectCheck(BaseModel):
 
 
 class RunArtifact(BaseModel):
-    """One recorded execution: inputs + captured prompts/results + verdicts."""
+    """One recorded execution: inputs + captured prompts/results + verdicts.
 
+    ``schema_version`` gates ``load_run``; ``run_id`` is this run's stable
+    identity; ``replay_parent`` (set by ``evals.__main__.replay``) links a
+    replay back to the run_id it replayed, so a chain of replays traces back
+    to its origin. ``code_version`` is the app version captured under
+    (``build_artifact``), so a replay diff can be attributed to a code change
+    vs a live model/provider change (AUG-295).
+    """
+
+    schema_version: int = _ARTIFACT_SCHEMA_VERSION
+    run_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
+    replay_parent: str | None = None
+    code_version: str | None = None
     name: str
     kind: str
     model: str | None = None
@@ -222,5 +242,16 @@ def save_run(artifact: RunArtifact, runs_dir: Path) -> Path:
 
 
 def load_run(path: Path) -> RunArtifact:
-    """Load a RunArtifact from its JSON file."""
-    return RunArtifact.model_validate_json(Path(path).read_text())
+    """Load a RunArtifact from its JSON file.
+
+    Raises ``ValueError`` if the file's ``schema_version`` is newer than this
+    harness understands — silently loading it under current field defaults
+    could make a replay diff misleading rather than just wrong (AUG-295).
+    """
+    art = RunArtifact.model_validate_json(Path(path).read_text())
+    if art.schema_version > _ARTIFACT_SCHEMA_VERSION:
+        raise ValueError(
+            f"{path}: artifact schema_version {art.schema_version} is newer than this harness "
+            f"supports ({_ARTIFACT_SCHEMA_VERSION}) — upgrade before replaying"
+        )
+    return art

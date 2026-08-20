@@ -162,9 +162,14 @@ def _exit_code(art: RunArtifact, *, strict: bool, diff: list[str] | None = None)
 
 
 async def replay(run_path: Path, settings: Settings, *, inner: Any = None) -> tuple[RunArtifact, list[str]]:
-    """Re-run a saved run's inputs against the current prompt/code and diff it."""
+    """Re-run a saved run's inputs against the current prompt/code and diff it.
+
+    The new artifact's ``replay_parent`` is set to the old run's ``run_id`` so
+    a chain of replays can be traced back to its origin (AUG-295).
+    """
     old = load_run(run_path)
     new = await run_scenario(old.scenario, settings, inner=inner)
+    new.replay_parent = old.run_id
     return new, diff_runs(old, new)
 
 

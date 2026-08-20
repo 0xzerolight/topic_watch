@@ -24,6 +24,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from app import __version__ as _app_version
 from app.analysis.llm import (
     NoveltyResult,
     analyze_articles,
@@ -219,6 +220,7 @@ def build_artifact(
     """
     final_error = error if error is not None else getattr(result, "error", None)
     return RunArtifact(
+        code_version=_app_version,
         name=scenario.name,
         kind=scenario.kind,
         model=settings.llm.model,

@@ -319,6 +319,35 @@ def test_run_artifact_save_load_round_trip(tmp_path) -> None:
     assert loaded.scenario.topic.name == "T"
 
 
+def test_run_artifact_carries_schema_version_and_run_id() -> None:
+    """AUG-295: artifacts had no schema version or stable identity, so replay
+    lineage could not be established and an old file silently loaded under
+    current field defaults."""
+    from evals.scenario import RunArtifact, Scenario, ScenarioTopic
+
+    art = RunArtifact(name="s", kind="novelty", scenario=Scenario(topic=ScenarioTopic(name="T", description="d")))
+
+    assert art.schema_version >= 1
+    assert isinstance(art.run_id, str) and art.run_id
+    art2 = RunArtifact(name="s", kind="novelty", scenario=Scenario(topic=ScenarioTopic(name="T", description="d")))
+    assert art.run_id != art2.run_id  # each run gets its own identity
+
+
+def test_load_run_rejects_a_newer_unsupported_schema_version(tmp_path) -> None:
+    import json
+
+    from evals.scenario import RunArtifact, Scenario, ScenarioTopic, load_run
+
+    art = RunArtifact(name="s", kind="novelty", scenario=Scenario(topic=ScenarioTopic(name="T", description="d")))
+    data = art.model_dump(mode="json")
+    data["schema_version"] = 999999
+    path = tmp_path / "future.json"
+    path.write_text(json.dumps(data))
+
+    with pytest.raises(ValueError, match="schema_version"):
+        load_run(path)
+
+
 def _minimal_artifact(name: str = "s"):
     from evals.scenario import RunArtifact, Scenario, ScenarioTopic
 
@@ -1023,3 +1052,45 @@ async def test_replay_reruns_scenario_and_diffs(tmp_path) -> None:
     assert new.final is not None
     assert new.final["has_new_info"] is False
     assert any("has_new_info" in line for line in diff)
+
+
+async def test_replay_sets_replay_parent_to_the_old_run_id(tmp_path) -> None:
+    """AUG-295: a replay artifact must record which run it replayed, so a
+    chain of replays can be traced back to the original scenario run."""
+    from evals.__main__ import replay
+    from evals.runner import run_scenario
+    from evals.scenario import Scenario, ScenarioArticle, ScenarioTopic, save_run
+
+    sc = Scenario(
+        kind="novelty",
+        topic=ScenarioTopic(name="T", description="d"),
+        articles=[ScenarioArticle(title="a", url="http://x", content="c", source_feed="http://f")],
+        name="s",
+    )
+    old = await run_scenario(sc, _settings(), inner=_mock_inner(novelty=_novelty()))
+    run_path = save_run(old, tmp_path / "runs")
+
+    new, _diff = await replay(run_path, _settings(), inner=_mock_inner(novelty=_novelty()))
+
+    assert new.replay_parent == old.run_id
+    assert new.run_id != old.run_id  # the replay is its own run, not the same identity
+
+
+async def test_build_artifact_records_code_version() -> None:
+    """AUG-295: an artifact should record the code revision it was captured
+    under, so a replay drift can be attributed to a code change vs a live
+    model/provider change."""
+    from evals.runner import run_scenario
+    from evals.scenario import Scenario, ScenarioArticle, ScenarioTopic
+
+    sc = Scenario(
+        kind="novelty",
+        topic=ScenarioTopic(name="T", description="d"),
+        articles=[ScenarioArticle(title="a", url="http://x", content="c", source_feed="http://f")],
+        name="s",
+    )
+    art = await run_scenario(sc, _settings(), inner=_mock_inner(novelty=_novelty()))
+
+    from app import __version__ as app_version
+
+    assert art.code_version == app_version
