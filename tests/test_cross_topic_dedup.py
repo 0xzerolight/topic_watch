@@ -17,6 +17,7 @@ from app.crud import create_article, create_topic, find_article_by_hash
 from app.models import Article, FeedMode, Topic
 from app.scraping import fetch_new_articles_for_topic
 from app.scraping.rss import FeedEntry, FeedResponse, compute_article_hash
+from app.scraping.source import article_identity
 
 # ============================================================
 # Helpers
@@ -539,6 +540,92 @@ class TestFetchNewArticlesCrossTopicDedup:
 
         # Only the new article needed an HTTP fetch
         extract_mock.assert_called_once()
+
+
+# ============================================================
+# Tests for article revisions at a stable URL (AUG-320)
+# ============================================================
+
+
+class TestRevisionsSurviveDedup:
+    """AUG-320: a corrected story at the same URL and headline is not the stored one.
+
+    Dedup used to key on URL and title alone, so a correction, retraction or
+    expansion published at a stable URL was skipped before anything read it —
+    the knowledge state kept the superseded facts and the user was never told.
+    """
+
+    _URL = "https://publisher.example/live-story"
+    _TITLE = "Minister resigns"
+
+    def _entry(self, **kwargs) -> FeedEntry:
+        fields = {
+            "title": self._TITLE,
+            "url": self._URL,
+            "summary": "Summary text",
+            "source_feed": "https://publisher.example/rss",
+            "published": datetime(2025, 1, 1, 9, 0, tzinfo=UTC),
+        }
+        fields.update(kwargs)
+        return FeedEntry(**fields)
+
+    def _store_existing(self, conn: sqlite3.Connection, topic_id: int, entry: FeedEntry) -> None:
+        create_article(
+            conn,
+            Article(
+                topic_id=topic_id,
+                title=entry.title,
+                url=entry.url,
+                content_hash=article_identity(entry),
+                raw_content="The minister resigned.",
+                source_feed=entry.source_feed,
+            ),
+        )
+        conn.commit()
+
+    async def _run(self, topic: Topic, db_path: Path, entry: FeedEntry) -> list[Article]:
+        with (
+            patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=[entry])),
+            patch("app.scraping.extract_article_content", AsyncMock(return_value="The minister did not resign.")),
+        ):
+            return (await fetch_new_articles_for_topic(topic, db_path=db_path)).articles
+
+    async def test_unchanged_article_is_still_skipped(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
+        topic = _make_topic(db_conn, "Topic A")
+        self._store_existing(db_conn, topic.id, self._entry())
+
+        assert await self._run(topic, db_path, self._entry()) == []
+
+    async def test_revised_article_is_stored_for_analysis(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
+        """The feed's own updated stamp moved, so the correction reaches novelty analysis."""
+        topic = _make_topic(db_conn, "Topic A")
+        original = self._entry()
+        self._store_existing(db_conn, topic.id, original)
+
+        revised = self._entry(
+            updated=datetime(2025, 1, 1, 14, 0, tzinfo=UTC),
+            summary="Correction: the minister did not resign.",
+        )
+        stored = await self._run(topic, db_path, revised)
+
+        assert len(stored) == 1
+        assert stored[0].url == self._URL
+        assert stored[0].content_hash != article_identity(original)
+        assert stored[0].raw_content == "The minister did not resign."
+
+    async def test_rewritten_prefetched_body_is_stored_for_analysis(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """A search source hands over the body itself, so a rewritten body is visible."""
+        topic = _make_topic(db_conn, "Topic A")
+        original = self._entry(content="The minister resigned.")
+        self._store_existing(db_conn, topic.id, original)
+
+        rewritten = self._entry(content="Correction: no resignation took place.")
+        stored = await self._run(topic, db_path, rewritten)
+
+        assert len(stored) == 1
+        assert stored[0].content_hash != article_identity(original)
 
 
 # ============================================================

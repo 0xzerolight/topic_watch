@@ -7,7 +7,6 @@ to FeedEntry models ready for dedup and storage.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
 import re
 from calendar import timegm
@@ -38,6 +37,7 @@ from app.scraping.source import (
 from app.scraping.source import FeedEntry as FeedEntry
 from app.scraping.source import FeedHealthCallback as FeedHealthCallback
 from app.scraping.source import FeedResponse as FeedResponse
+from app.scraping.source import compute_article_hash as compute_article_hash
 from app.scraping.source import fetch_feeds_for_topic as fetch_feeds_for_topic
 from app.url_validation import is_private_url, safe_get
 
@@ -55,12 +55,6 @@ _USER_AGENT = "TopicWatch/1.0.0 (RSS reader)"
 _FEED_FETCH_TIMEOUT = 15.0
 
 
-def compute_article_hash(url: str, title: str) -> str:
-    """Compute a deterministic, case-insensitive content hash."""
-    raw = f"{url}|{title}".lower()
-    return hashlib.sha256(raw.encode()).hexdigest()
-
-
 def _validators(state: FeedHealth | None) -> tuple[str | None, str | None]:
     """Return ``(etag, last_modified)`` for a feed-health row, or ``(None, None)``."""
     if state is None:
@@ -68,16 +62,36 @@ def _validators(state: FeedHealth | None) -> tuple[str | None, str | None]:
     return state.etag, state.last_modified
 
 
+def _struct_time_to_datetime(val: object) -> datetime | None:
+    """Convert one feedparser ``*_parsed`` field to UTC, or None if unusable."""
+    if not isinstance(val, struct_time):
+        return None
+    try:
+        return datetime.fromtimestamp(timegm(val), tz=UTC)
+    except (ValueError, OverflowError):
+        return None
+
+
 def _parse_feed_date(entry: dict) -> datetime | None:
     """Extract a datetime from a feedparser entry's date fields."""
     for date_field in ("published_parsed", "updated_parsed"):
-        val = entry.get(date_field)
-        if isinstance(val, struct_time):
-            try:
-                return datetime.fromtimestamp(timegm(val), tz=UTC)
-            except (ValueError, OverflowError):
-                continue
+        stamp = _struct_time_to_datetime(entry.get(date_field))
+        if stamp is not None:
+            return stamp
     return None
+
+
+def _parse_updated_date(entry: dict) -> datetime | None:
+    """The feed's own revision stamp for this entry, when it publishes one.
+
+    Read separately from ``_parse_feed_date`` (which falls back to it as a
+    publication date): as a revision marker it only means anything when the feed
+    states it in its own right (AUG-320). Read through ``dict.get`` rather than
+    feedparser's own lookup, because that answers with ``published_parsed`` when
+    an entry has no ``updated_parsed`` of its own — a deprecated fallback that
+    would give every plain RSS item a revision stamp it never published.
+    """
+    return _struct_time_to_datetime(dict.get(entry, "updated_parsed"))
 
 
 _GOOGLE_NEWS_HREF_RE = re.compile(r'<a[^>]+href=["\']([^"\']+)["\']', re.IGNORECASE)
@@ -300,6 +314,7 @@ def _parse_entry(raw_entry: dict, source_feed: str) -> FeedEntry | None:
         title=title,
         url=url,
         published=_parse_feed_date(raw_entry),
+        updated=_parse_updated_date(raw_entry),
         summary=summary,
         source_feed=source_feed,
     )

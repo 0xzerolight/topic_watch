@@ -9,6 +9,9 @@ the pipeline lives here rather than in any one source's module (TW-AUD-022):
   identity plus capabilities of whatever produced them. ``provider_name`` and
   ``needs_url_resolution`` are response-level because AUTO can cascade between
   providers mid-fetch, so only the response knows which one actually answered.
+- ``article_identity`` — what makes two entries the same article. One
+  definition for every source, so dedup does not depend on which provider
+  happened to answer.
 - ``FeedHealthCallback`` / ``FeedStateLoader`` — the health side-channel.
 - ``SourceRequest`` — the per-attempt inputs a fetcher needs beyond the topic.
 - ``register_source`` / ``fetch_feeds_for_topic`` — mode-to-fetcher dispatch.
@@ -21,13 +24,14 @@ module. This module imports no source, which is what keeps that possible.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, TypeVar
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from pydantic import BaseModel
 
@@ -155,12 +159,125 @@ class FeedEntry(BaseModel):
     title: str
     url: str
     published: datetime | None = None
+    updated: datetime | None = None
+    """When the source says this article was last revised, if it says so distinctly.
+
+    Kept apart from ``published`` because it is the one signal a feed gives that the
+    story at a stable URL is not the story it told last time (AUG-320): it feeds
+    ``article_identity`` and picks the winner when two entries describe one URL."""
     summary: str = ""
     source_feed: str
     content: str | None = None
     """Pre-extracted full text, when the source already provides it (e.g. Exa search).
     ``None`` for RSS entries, whose text is fetched during content extraction. When set
     and non-empty, it short-circuits the network fetch in ``extract_article_content``."""
+
+
+# --- Article identity ---------------------------------------------------------
+
+_TRACKING_PARAMS = frozenset(
+    {"fbclid", "gclid", "gbraid", "wbraid", "msclkid", "dclid", "yclid", "igshid", "mc_cid", "mc_eid"}
+)
+"""Query parameters that identify the click, not the article. Plus any ``utm_*``."""
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def as_utc(value: datetime | None) -> datetime | None:
+    """A feed datetime in UTC; a naive one is read as UTC rather than local time."""
+    if value is None:
+        return None
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+def _is_tracking_param(name: str) -> bool:
+    key = name.lower()
+    return key.startswith("utm_") or key in _TRACKING_PARAMS
+
+
+def canonical_url(url: str) -> str:
+    """The comparable form of an article URL.
+
+    Case is folded only where the URL grammar says it is insignificant — the
+    scheme and the host — because a path or query IS case-sensitive on many
+    publishers, and folding it made ``/A`` and ``/a`` the same article (AUG-183).
+    Beyond that: userinfo and default ports are dropped, the fragment is dropped
+    (it never reaches the server), and click-tracking parameters are removed so
+    the same story shared through two campaigns is one story (AUG-180).
+
+    A URL too malformed to parse is returned stripped, so it still compares
+    equal to itself.
+    """
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+        port = parsed.port
+    except ValueError:  # malformed netloc (bad port, unbalanced IPv6 brackets)
+        return url.strip()
+    if not host:
+        return url.strip()
+    scheme = parsed.scheme.lower()
+    netloc = host.rstrip(".")
+    if port is not None and port != _DEFAULT_PORTS.get(scheme):
+        netloc = f"{netloc}:{port}"
+    query = urlencode([(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if not _is_tracking_param(k)])
+    return urlunparse((scheme, netloc, parsed.path, parsed.params, query, ""))
+
+
+def _identity_digest(*parts: str) -> str:
+    """Hash a fixed field list so no two different field sets serialize alike.
+
+    Each field is length-prefixed rather than joined by a delimiter: with a plain
+    ``|`` join, a title containing a pipe could produce the same string as a
+    different URL/title pair (AUG-183).
+    """
+    payload = "\n".join(f"{len(part)}:{part}" for part in parts)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _revision_marker(entry: FeedEntry) -> str:
+    """What distinguishes this representation of a story from an earlier one.
+
+    Empty unless the source itself said the article changed: an ``updated`` stamp
+    that differs from ``published``, or prefetched full text (Exa) whose digest
+    moved. The entry summary is deliberately NOT in here — aggregator summaries
+    carry related-coverage lists and blurbs that churn on their own, and every
+    churn would cost a content fetch, a row and an LLM analysis for an article
+    nobody revised.
+    """
+    parts: list[str] = []
+    revised = as_utc(entry.updated)
+    if revised is not None and revised != as_utc(entry.published):
+        parts.append(revised.isoformat())
+    text = " ".join((entry.content or "").split())
+    if text:
+        parts.append(hashlib.sha256(text.encode()).hexdigest())
+    return "\x1f".join(parts)
+
+
+def article_identity(entry: FeedEntry) -> str:
+    """The dedup key for one article representation — the single definition.
+
+    Every source path keys off this: what is stored in ``articles.content_hash``,
+    what same-topic dedup skips on, and what cross-topic content reuse matches.
+
+    Identity is the story (canonical URL + title) AND the revision the source is
+    currently serving. Keying on the story alone meant a correction, retraction or
+    expansion published at the same URL under the same headline was indistinguishable
+    from the copy already stored, so it was skipped before anything could read it and
+    the knowledge state kept the superseded facts (AUG-320). With the revision in the
+    key, an unchanged article still deduplicates silently and only a changed one
+    reaches novelty analysis.
+    """
+    return _identity_digest(canonical_url(entry.url), entry.title.casefold(), _revision_marker(entry))
+
+
+def compute_article_hash(url: str, title: str) -> str:
+    """``article_identity`` for callers holding only a URL and a title.
+
+    Same serialization, no revision marker — one recipe, not a second one.
+    """
+    return _identity_digest(canonical_url(url), title.casefold(), "")
 
 
 @dataclass(frozen=True)

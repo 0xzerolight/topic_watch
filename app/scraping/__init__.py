@@ -27,10 +27,13 @@ from app.models import Article, FeedHealth, Topic
 from app.scraping.content import extract_article_content
 from app.scraping.exa import fetch_exa_source as fetch_exa_source
 from app.scraping.google_news import is_google_news_url, resolve_google_news_urls
-from app.scraping.rss import FeedEntry, compute_article_hash, fetch_feeds_for_topic
+from app.scraping.rss import FeedEntry, fetch_feeds_for_topic
 from app.scraping.rss import FeedResponse as FeedResponse
 from app.scraping.source import Deadline as Deadline
-from app.scraping.source import bounded
+from app.scraping.source import (
+    article_identity,
+    bounded,
+)
 
 if TYPE_CHECKING:
     from app.config import ExaSettings
@@ -236,7 +239,7 @@ def _split_dedup_candidates(
     new_entries: list[tuple[FeedEntry, str]] = []
     reuse_entries: list[tuple[FeedEntry, str, str, str | None]] = []
     for entry in entries:
-        content_hash = compute_article_hash(entry.url, entry.title)
+        content_hash = article_identity(entry)
         if article_hash_exists(conn, topic_id, content_hash):
             continue
         existing = find_article_by_hash(conn, content_hash)
@@ -287,8 +290,11 @@ async def _resolve_redirect_urls(
     response: FeedResponse,
     feed_fetch_timeout: float,
     deadline: Deadline,
-) -> None:
+) -> bool:
     """Resolve provider redirect URLs in-place for entries needing content fetch.
+
+    Returns whether any URL actually changed, which is what tells the caller the
+    identities computed before this point need re-checking.
 
     Gated by the provider's ``needs_url_resolution`` (carried on the FeedResponse)
     rather than a hardcoded host substring (OVH-157): only providers that emit
@@ -298,14 +304,48 @@ async def _resolve_redirect_urls(
     dedup+limiting to minimize requests (typically ~10 URLs, not 100).
     """
     if not response.needs_url_resolution:
-        return
+        return False
     to_resolve = [e.url for e, _ in fetch_batch if is_google_news_url(e.url)]
     if not to_resolve:
-        return
+        return False
     resolved = await resolve_google_news_urls(to_resolve, timeout=feed_fetch_timeout, deadline=deadline)
+    changed = False
     for entry, _ in fetch_batch:
         if entry.url in resolved:
             entry.url = resolved[entry.url]
+            changed = True
+    return changed
+
+
+def _rededuplicate_resolved(
+    fetch_batch: list[tuple[FeedEntry, str]],
+    reuse_batch: list[tuple[FeedEntry, str, str | None, str | None]],
+    conn: sqlite3.Connection,
+    topic_id: int,
+) -> list[tuple[FeedEntry, str]]:
+    """Re-key resolved entries to their publisher URL and drop what collapses (AUG-180).
+
+    Identity is computed from what the feed handed over, which for Google News is
+    an opaque wrapper that only becomes the publisher URL here. Bing hands the
+    publisher URL over directly, and a wrapper is not even stable between checks,
+    so the same story kept arriving under an identity nothing had ever stored:
+    fetched again, analyzed again, stored again. Re-keying it once the real URL is
+    known makes it the same article whichever provider answered.
+
+    Only entries whose URL actually moved are re-checked, and only against this
+    topic's stored rows and the batch itself — cross-topic content reuse already
+    ran on the pre-resolution identity.
+    """
+    seen = {content_hash for _, content_hash, _, _ in reuse_batch}
+    kept: list[tuple[FeedEntry, str]] = []
+    for entry, content_hash in fetch_batch:
+        identity = article_identity(entry)
+        if identity != content_hash and (identity in seen or article_hash_exists(conn, topic_id, identity)):
+            logger.info("Resolved URL matches an article already stored for this topic: %s", entry.url)
+            continue
+        seen.add(identity)
+        kept.append((entry, identity))
+    return kept
 
 
 async def _extract_contents(
@@ -501,7 +541,11 @@ async def fetch_new_articles_for_topic(
     reuse_batch, fetch_batch = _select_candidates(new_entries, reuse_entries, max_articles)
 
     # --- P1b: redirect resolution and content extraction, still connection-free.
-    await _resolve_redirect_urls(fetch_batch, response, feed_fetch_timeout, budget)
+    if await _resolve_redirect_urls(fetch_batch, response, feed_fetch_timeout, budget):
+        # Resolution changed what these articles are, so identity is re-decided
+        # before anything is fetched for them (AUG-180).
+        with get_db(db_path) as conn:
+            fetch_batch = _rededuplicate_resolved(fetch_batch, reuse_batch, conn, topic.id)
     contents = await _extract_contents(fetch_batch, article_fetch_timeout, concurrency, budget)
 
     # --- C2: one short connection normalizes both batches and inserts.
