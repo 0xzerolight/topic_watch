@@ -1,4 +1,4 @@
-.PHONY: dev test smoke lint format typecheck coverage docker docker-run run clean ci lock lock-tools lock-upgrade _require_pip_compile help
+.PHONY: dev test smoke lint format format-check typecheck verify-evals verify-locks coverage docker docker-run run clean ci lock lock-tools lock-upgrade _require_pip_compile help
 
 help: ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -53,8 +53,20 @@ format: ## Format code with Ruff
 	ruff format .
 	ruff check --fix .
 
+format-check: ## Check formatting without modifying files (matches hosted CI)
+	ruff format --check .
+
 typecheck: ## Run mypy type checker
 	mypy app/ evals/ --ignore-missing-imports
+
+verify-evals: ## Verify the evals harness package imports cleanly (matches hosted CI)
+	python -c "import evals"
+
+verify-locks: ## Confirm requirements.txt pins are a hash-identical subset of requirements-dev.txt (AUG-303)
+	@grep -Ev '^\s*#|^\s*$$' requirements.txt | while IFS= read -r line; do \
+		grep -qxF "$$line" requirements-dev.txt || { echo "requirements.txt line not found verbatim in requirements-dev.txt: $$line"; exit 1; }; \
+	done
+	@echo "requirements.txt pins verified as a subset of requirements-dev.txt"
 
 coverage: ## Run tests with detailed coverage report
 	pytest --cov=app --cov-report=term-missing --cov-report=html --tb=short
@@ -68,7 +80,7 @@ docker-run: ## Build and start the Docker container in background
 run: ## Start dev server with auto-reload
 	uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
-ci: lint test ## Run all CI checks locally (lint + test)
+ci: lint format-check verify-evals verify-locks test ## Run all CI checks locally (matches hosted CI gate)
 
 clean: ## Remove build artifacts and caches
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true

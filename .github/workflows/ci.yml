@@ -29,6 +29,12 @@ jobs:
       - name: Install dependencies
         run: pip install --require-hashes -r requirements-dev.txt && pip install --no-deps -e .
 
+      - name: Verify installed dependency metadata is consistent
+        run: pip check
+
+      - name: Verify runtime lock is a subset of the dev lock (AUG-303)
+        run: make verify-locks
+
       - name: Ruff lint check
         run: ruff check .
 
