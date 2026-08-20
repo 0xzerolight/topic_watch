@@ -371,8 +371,14 @@ async def _check_topic_inner(
             exa_settings=settings.exa,
         )
     except Exception as exc:
-        logger.warning("Scraping failed for topic '%s'", topic.name, exc_info=True)
-        result.stage_error = f"scrape_failed: {_summarize_exc(exc)}"
+        # An exception escaping the fetch is an internal failure, not a source
+        # outage: per-feed and per-provider errors are caught inside and reported
+        # through ``feeds_failed``/feed health, so what reaches here is storage,
+        # deduplication or extraction breaking on our side. Labelling those
+        # ``scrape_failed`` made the heartbeat announce failing sources and sent
+        # the operator after feeds, network and API keys (AUG-133).
+        logger.warning("Fetch pipeline failed for topic '%s'", topic.name, exc_info=True)
+        result.stage_error = f"pipeline_failed: {_summarize_exc(exc)}"
         return await _finish_check(db_path, topic, result, settings)
 
     new_articles = fetch_result.articles

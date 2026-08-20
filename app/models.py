@@ -412,10 +412,22 @@ SOURCE_FAILURE_PREFIXES: tuple[str, ...] = (
     "sources_unavailable:",
 )
 
+# The check broke inside Topic Watch — storage, deduplication, extraction — so it
+# never learned anything about the sources at all. Visible on the row, but neutral
+# to the Silence Heartbeat: counting it as an outage sends the operator hunting
+# for a dead feed or a bad API key, and counting it as health would announce a
+# recovery nobody observed (AUG-133).
+INTERNAL_FAILURE_PREFIXES: tuple[str, ...] = ("pipeline_failed:",)
+
 
 def is_source_failure(stage_error: str | None) -> bool:
     """True when a recorded stage_error means no source produced usable results."""
     return stage_error is not None and stage_error.startswith(SOURCE_FAILURE_PREFIXES)
+
+
+def is_internal_failure(stage_error: str | None) -> bool:
+    """True when a check failed inside the pipeline without observing its sources."""
+    return stage_error is not None and stage_error.startswith(INTERNAL_FAILURE_PREFIXES)
 
 
 class NotifyDisposition(StrEnum):
@@ -468,9 +480,12 @@ class CheckResult(SQLiteModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     # Machine-distinguishable failure stage for an otherwise-recorded check:
-    # 'scrape_failed' / 'analysis_failed' / 'knowledge_update_failed' (+ a short
-    # exception summary). NULL on clean runs. Distinct from notification_error,
-    # which only covers delivery.
+    # 'sources_failed' / 'sources_unavailable' / 'pipeline_failed' /
+    # 'analysis_failed' / 'knowledge_insufficient' / 'knowledge_update_failed'
+    # (+ a short exception summary). NULL on clean runs. Distinct from
+    # notification_error, which only covers delivery. 'scrape_failed' is retained
+    # in SOURCE_FAILURE_PREFIXES for rows written before AUG-133 split internal
+    # failures out of it.
     stage_error: str | None = None
     # Why this check did or did not notify (see ``NotifyDisposition``). NULL on
     # rows written before migration 026.

@@ -137,3 +137,30 @@ class TestEvaluateHeartbeat:
         action = evaluate_heartbeat(db_conn, topic, threshold=3)
         assert action is not None
         assert "several topics" in action.body
+
+
+class TestInternalFailuresAreNeutral:
+    """A crash inside our own pipeline says nothing about the sources (AUG-133)."""
+
+    def test_internal_failure_does_not_break_an_outage_streak(self, db_conn: sqlite3.Connection) -> None:
+        """The check never observed the feeds, so it neither confirms nor clears the outage."""
+        topic = _topic(db_conn)
+        _fail_run(db_conn, topic.id, 3, oldest_minutes=60)
+        _record(db_conn, topic.id, "pipeline_failed: OperationalError: database is locked", 10)
+        action = evaluate_heartbeat(db_conn, topic, threshold=3)
+        assert action is not None
+        assert action.kind == "alert"
+
+    def test_internal_failure_does_not_claim_recovery(self, db_conn: sqlite3.Connection) -> None:
+        topic = _topic(db_conn)
+        _fail_run(db_conn, topic.id, 3, oldest_minutes=60)
+        latched = _latched(db_conn, topic)
+        _record(db_conn, topic.id, "pipeline_failed: OperationalError: database is locked", 10)
+        assert evaluate_heartbeat(db_conn, latched, threshold=3) is None
+
+    def test_internal_failure_never_advances_the_streak(self, db_conn: sqlite3.Connection) -> None:
+        """Repeated storage failures must not be announced as failing sources."""
+        topic = _topic(db_conn)
+        for i in range(5):
+            _record(db_conn, topic.id, "pipeline_failed: OperationalError: database is locked", 50 - i * 5)
+        assert evaluate_heartbeat(db_conn, topic, threshold=3) is None

@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from app.crud import list_recent_check_stage_errors
-from app.models import Topic, is_source_failure
+from app.models import Topic, is_internal_failure, is_source_failure
 
 logger = logging.getLogger(__name__)
 
@@ -87,10 +87,15 @@ def evaluate_heartbeat(
     # only so the message can report a realistic outage length. The count is
     # reported as "at least N" because it saturates at this window.
     recent = list_recent_check_stage_errors(conn, topic.id, limit=max(threshold + 1, 50))
-    if not recent:
+    # Checks that broke inside the pipeline never reached the sources, so they are
+    # dropped rather than counted either way: keeping them would let a run of
+    # locked-database failures either announce a source outage or claim a recovery
+    # nobody observed (AUG-133).
+    observed = [stage_error for stage_error in recent if not is_internal_failure(stage_error)]
+    if not observed:
         return None
 
-    streak = _leading_failures(recent)
+    streak = _leading_failures(observed)
 
     if streak >= threshold and topic.heartbeat_alerted_at is None:
         logger.warning(
@@ -98,7 +103,7 @@ def evaluate_heartbeat(
             topic.name,
             streak,
         )
-        title, body = _format_alert(topic, streak, recent[0])
+        title, body = _format_alert(topic, streak, observed[0])
         return HeartbeatAction(kind="alert", title=title, body=body)
 
     if streak == 0 and topic.heartbeat_alerted_at is not None:

@@ -493,7 +493,12 @@ class TestCheckTopic:
         assert result.completion_tokens == 20
 
     async def test_scrape_failure_sets_stage_error(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
-        """A scrape failure records stage_error='scrape_failed' + summary (OVH-037)."""
+        """A raising fetch records stage_error='pipeline_failed' + summary (OVH-037/AUG-133).
+
+        Per-feed failures are caught inside the fetch and counted, so an exception
+        escaping it is our own storage/dedup/extraction breaking — an internal
+        failure, not a source outage.
+        """
         topic = _make_topic(db_conn, name="ScrapeFail")
         settings = _make_settings()
 
@@ -506,9 +511,9 @@ class TestCheckTopic:
 
         assert result.id is not None
         assert result.stage_error is not None
-        assert result.stage_error.startswith("scrape_failed")
+        assert result.stage_error.startswith("pipeline_failed")
         row = db_conn.execute("SELECT stage_error FROM check_results WHERE id = ?", (result.id,)).fetchone()
-        assert row["stage_error"].startswith("scrape_failed")
+        assert row["stage_error"].startswith("pipeline_failed")
 
     async def test_analysis_failure_sets_stage_error(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         """An LLM analysis failure (safe-default) records stage_error='analysis_failed'.
@@ -1983,12 +1988,12 @@ class TestSilenceHeartbeatPipeline:
             await self._failing_check(db_conn, topic, send)
         assert send.await_count == 1
 
-    async def test_scrape_exception_path_also_heartbeats(self, db_conn: sqlite3.Connection) -> None:
-        """The fetch-raised branch is a source failure too."""
+    async def test_fetch_exception_path_never_alerts_on_the_sources(self, db_conn: sqlite3.Connection) -> None:
+        """A pipeline crash is recorded, but it is not evidence about the feeds (AUG-133)."""
         topic = _make_topic(db_conn)
         send = _per_url_mock(ok=True)
         settings = _make_settings(silence_heartbeat_checks=2)
-        for _ in range(2):
+        for _ in range(3):
             with (
                 patch(
                     "app.checker.fetch_new_articles_for_topic",
@@ -1998,8 +2003,33 @@ class TestSilenceHeartbeatPipeline:
                 patch("app.checker.send_notification_per_url", send),
             ):
                 result = await check_topic(get_topic(db_conn, topic.id), settings, db_path=conn_db_path(db_conn))
-        assert result.stage_error.startswith("scrape_failed")
+        assert result.stage_error.startswith("pipeline_failed")
+        assert send.await_count == 0
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is None
+
+    async def test_pipeline_crash_does_not_clear_an_announced_outage(self, db_conn: sqlite3.Connection) -> None:
+        """The latch survives a check that never reached the sources."""
+        topic = _make_topic(db_conn)
+        send = _per_url_mock(ok=True)
+        for _ in range(3):
+            await self._failing_check(db_conn, topic, send)
         assert send.await_count == 1
+
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("boom"),
+            ),
+            patch("app.checker.send_notification_per_url", send),
+        ):
+            await check_topic(
+                get_topic(db_conn, topic.id),
+                _make_settings(silence_heartbeat_checks=3),
+                db_path=conn_db_path(db_conn),
+            )
+        assert send.await_count == 1
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is not None
 
     async def test_recovery_notice_after_the_outage(self, db_conn: sqlite3.Connection) -> None:
         topic = _make_topic(db_conn)
