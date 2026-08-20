@@ -33,8 +33,6 @@ router = APIRouter()
 # start are one critical section, so two first-run submissions cannot interleave.
 _setup_lock = asyncio.Lock()
 
-# Seconds to wait for the pre-flight credential ping before giving up.
-_PREFLIGHT_TIMEOUT = 15.0
 
 # A masked delivery target the settings page rendered: "scheme://**** [3]".
 _MASKED_TARGET = re.compile(r"^(?P<mask>\S+) \[(?P<index>\d+)\]$")
@@ -190,48 +188,103 @@ class LLMValidationError(Exception):
     """
 
 
-async def verify_llm_credentials(model: str, api_key: str, base_url: str | None) -> None:
-    """Make a minimal LLM call to confirm the supplied credentials actually work.
+def _preflight_messages() -> list[dict[str, str]]:
+    """The smallest request that still asks for the live response schema."""
+    return [
+        {
+            "role": "system",
+            "content": "You are a monitoring assistant. Answer only with the requested structured output.",
+        },
+        {
+            "role": "user",
+            "content": (
+                "Connectivity check, no articles to review. Answer with has_new_info false, "
+                "summary null, empty key_facts and source_urls, confidence 0, relevance 0, importance 1."
+            ),
+        },
+    ]
 
-    Sends a tiny ``litellm.acompletion`` ping. Returns ``None`` on success. On any
-    failure, raises :class:`LLMValidationError` with a friendly, key-free message.
-    The api_key is never included in raised messages.
+
+def _preflight_error(exc: BaseException, model: str, base_url: str | None) -> LLMValidationError:
+    """Map a probe failure to a user-safe message; the API key is never in it.
+
+    The live call path wraps provider errors (instructor re-raises its own type with
+    the real one chained), so the classification walks the whole chain the same way
+    ``app.analysis.llm`` does rather than matching only the outermost type.
     """
-    try:
-        await litellm.acompletion(
-            model=model,
-            messages=[{"role": "user", "content": "ping"}],
-            api_key=api_key,
-            api_base=base_url,
-            max_tokens=1,
-            timeout=_PREFLIGHT_TIMEOUT,
-        )
-    except litellm.AuthenticationError as exc:
+    from pydantic import ValidationError as PydanticValidationError
+
+    from app.analysis.llm import _iter_error_chain
+
+    chain = list(_iter_error_chain(exc))
+
+    def found(*types: type[BaseException]) -> bool:
+        return any(isinstance(inner, types) for inner in chain)
+
+    if found(litellm.AuthenticationError, litellm.PermissionDeniedError):
         logger.warning("Setup pre-flight: authentication rejected for model %s", model)
-        raise LLMValidationError(
+        return LLMValidationError(
             "Authentication failed: the API key was rejected by the provider. "
             "Double-check the key for the correct provider and account."
-        ) from exc
-    except litellm.NotFoundError as exc:
+        )
+    if found(litellm.NotFoundError):
         logger.warning("Setup pre-flight: model not found for %s", model)
-        raise LLMValidationError(
+        return LLMValidationError(
             f"The model '{model}' was not found. Check the model string uses the "
             "LiteLLM 'provider/model-name' format and that the model exists."
-        ) from exc
-    except litellm.APIConnectionError as exc:
+        )
+    if found(litellm.APIConnectionError, litellm.Timeout):
         logger.warning("Setup pre-flight: connection failed for model %s", model)
         target = base_url or "the provider's endpoint"
-        raise LLMValidationError(
+        return LLMValidationError(
             f"Could not reach {target}. Check the base URL is correct and the server "
             "is running and reachable from this machine."
-        ) from exc
+        )
+    if found(PydanticValidationError):
+        logger.warning("Setup pre-flight: model answered outside the required schema for %s", model)
+        return LLMValidationError(
+            f"The model '{model}' replied, but not in the structured format Topic Watch needs. "
+            "Pick a model that supports tool calling or JSON output."
+        )
+    if found(litellm.BadRequestError):
+        logger.warning("Setup pre-flight: request shape rejected for model %s", model)
+        return LLMValidationError(
+            f"The provider rejected the request Topic Watch makes for '{model}'. "
+            "The endpoint may not support structured output for this model."
+        )
+    logger.warning("Setup pre-flight: validation failed for model %s (%s)", model, type(exc).__name__)
+    return LLMValidationError(
+        f"The LLM credential check failed ({type(exc).__name__}). Verify the model, "
+        "API key, and base URL, then try again."
+    )
+
+
+async def verify_llm_credentials(model: str, api_key: str, base_url: str | None) -> None:
+    """Confirm the supplied credentials satisfy the call analysis actually makes.
+
+    The probe goes through the live structured-output path — same client, same
+    response model, same TOOLS -> JSON -> MD_JSON fallback, same temperature, token
+    ceiling and analysis timeout. A raw one-token ping tested a different contract
+    on a much shorter deadline (AUG-335): a slow but compatible local Ollama failed
+    setup, while an endpoint that answers a plain completion but cannot produce the
+    structured response passed and then failed every check.
+
+    Returns ``None`` on success; raises :class:`LLMValidationError` with a friendly,
+    key-free message otherwise.
+    """
+    from app.analysis.llm import NoveltyResponse, _create_structured
+    from app.config import LLMSettings
+
+    probe = Settings(llm=LLMSettings(model=model, api_key=api_key, base_url=base_url))  # type: ignore[call-arg]
+    try:
+        await _create_structured(
+            probe,
+            response_model=NoveltyResponse,
+            build_messages=_preflight_messages,
+            timeout=probe.llm_analysis_timeout,
+        )
     except Exception as exc:
-        # Catch-all: never leak the api_key, never crash the request.
-        logger.warning("Setup pre-flight: validation failed for model %s (%s)", model, type(exc).__name__)
-        raise LLMValidationError(
-            f"The LLM credential check failed ({type(exc).__name__}). Verify the model, "
-            "API key, and base URL, then try again."
-        ) from exc
+        raise _preflight_error(exc, model, base_url) from exc
 
 
 def _setup_settings(request: Request, model: str, api_key: str, base_url: str | None) -> Settings:

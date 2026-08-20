@@ -384,15 +384,37 @@ class TestSetupPreflight:
 
 
 class TestVerifyLLMCredentials:
-    """Unit tests for the verify_llm_credentials preflight helper."""
+    """Unit tests for the verify_llm_credentials preflight helper (AUG-335)."""
+
+    @staticmethod
+    def _patch_probe(**kwargs):
+        """Patch the live structured-output call the preflight goes through."""
+        return patch("app.analysis.llm._create_structured", **kwargs)
 
     async def test_success_returns_none(self) -> None:
-        """A successful acompletion ping returns without raising."""
         from app.web.routers.settings import verify_llm_credentials
 
-        with patch("app.web.routers.settings.litellm.acompletion", return_value=object()) as mock_call:
+        with self._patch_probe(return_value=(object(), object())) as mock_call:
             await verify_llm_credentials(model="openai/gpt-4o-mini", api_key="sk-test", base_url=None)
         mock_call.assert_awaited_once()
+
+    async def test_probe_uses_the_live_call_shape(self) -> None:
+        """Same response model, same settings-derived deadline as analysis itself."""
+        from app.analysis.llm import NoveltyResponse
+        from app.web.routers.settings import verify_llm_credentials
+
+        with self._patch_probe(return_value=(object(), object())) as mock_call:
+            await verify_llm_credentials(model="ollama/llama3", api_key="unused", base_url="http://localhost:11434")
+
+        probe_settings = mock_call.await_args.args[0]
+        kwargs = mock_call.await_args.kwargs
+        assert kwargs["response_model"] is NoveltyResponse
+        assert kwargs["timeout"] == probe_settings.llm_analysis_timeout
+        assert probe_settings.llm.model == "ollama/llama3"
+        assert probe_settings.llm.api_key == "unused"
+        assert probe_settings.llm.base_url == "http://localhost:11434"
+        # The messages are built by a factory, per the live rebuild-per-attempt contract.
+        assert kwargs["build_messages"]()
 
     async def test_auth_error_friendly_message(self) -> None:
         """An authentication error maps to a friendly, key-free message."""
@@ -401,14 +423,24 @@ class TestVerifyLLMCredentials:
         from app.web.routers.settings import LLMValidationError, verify_llm_credentials
 
         exc = litellm.AuthenticationError(message="bad key sk-secret", llm_provider="openai", model="gpt-4o-mini")
-        with (
-            patch("app.web.routers.settings.litellm.acompletion", side_effect=exc),
-            pytest.raises(LLMValidationError) as ei,
-        ):
+        with self._patch_probe(side_effect=exc), pytest.raises(LLMValidationError) as ei:
             await verify_llm_credentials(model="openai/gpt-4o-mini", api_key="sk-secret", base_url=None)
         msg = str(ei.value)
         assert "sk-secret" not in msg
         assert "key" in msg.lower()
+
+    async def test_wrapped_auth_error_is_still_recognized(self) -> None:
+        """instructor re-raises its own type with the provider error chained."""
+        import litellm
+
+        from app.web.routers.settings import LLMValidationError, verify_llm_credentials
+
+        cause = litellm.AuthenticationError(message="bad key", llm_provider="openai", model="gpt-4o-mini")
+        wrapper = RuntimeError("retries exhausted")
+        wrapper.__cause__ = cause
+        with self._patch_probe(side_effect=wrapper), pytest.raises(LLMValidationError) as ei:
+            await verify_llm_credentials(model="openai/gpt-4o-mini", api_key="sk-secret", base_url=None)
+        assert "Authentication failed" in str(ei.value)
 
     async def test_connection_error_friendly_message(self) -> None:
         """A connection error mentions the base URL / reachability, not the key."""
@@ -417,10 +449,7 @@ class TestVerifyLLMCredentials:
         from app.web.routers.settings import LLMValidationError, verify_llm_credentials
 
         exc = litellm.APIConnectionError(message="conn refused", llm_provider="ollama", model="llama3")
-        with (
-            patch("app.web.routers.settings.litellm.acompletion", side_effect=exc),
-            pytest.raises(LLMValidationError) as ei,
-        ):
+        with self._patch_probe(side_effect=exc), pytest.raises(LLMValidationError) as ei:
             await verify_llm_credentials(model="ollama/llama3", api_key="unused", base_url="http://localhost:11434")
         assert "reach" in str(ei.value).lower() or "url" in str(ei.value).lower()
 
@@ -431,21 +460,42 @@ class TestVerifyLLMCredentials:
         from app.web.routers.settings import LLMValidationError, verify_llm_credentials
 
         exc = litellm.NotFoundError(message="model not found", llm_provider="openai", model="gpt-nope")
-        with (
-            patch("app.web.routers.settings.litellm.acompletion", side_effect=exc),
-            pytest.raises(LLMValidationError) as ei,
-        ):
+        with self._patch_probe(side_effect=exc), pytest.raises(LLMValidationError) as ei:
             await verify_llm_credentials(model="openai/gpt-nope", api_key="sk-test", base_url=None)
         assert "model" in str(ei.value).lower()
+
+    async def test_unstructured_reply_is_reported_as_a_format_problem(self) -> None:
+        """A model that answers but cannot follow the schema fails setup with a reason."""
+        from pydantic import ValidationError as PydanticValidationError
+
+        from app.analysis.llm import NoveltyResponse
+        from app.web.routers.settings import LLMValidationError, verify_llm_credentials
+
+        try:
+            NoveltyResponse.model_validate({})
+        except PydanticValidationError as parse_error:
+            exc: Exception = parse_error
+
+        with self._patch_probe(side_effect=exc), pytest.raises(LLMValidationError) as ei:
+            await verify_llm_credentials(model="ollama/tiny", api_key="", base_url="http://localhost:11434")
+        assert "structured format" in str(ei.value)
+
+    async def test_structured_output_rejection_is_reported(self) -> None:
+        """An endpoint that refuses the request shape is named as such, not as a bad key."""
+        import litellm
+
+        from app.web.routers.settings import LLMValidationError, verify_llm_credentials
+
+        exc = litellm.BadRequestError(message="tools unsupported", llm_provider="openai", model="gw/model")
+        with self._patch_probe(side_effect=exc), pytest.raises(LLMValidationError) as ei:
+            await verify_llm_credentials(model="openai/gw-model", api_key="sk", base_url="https://gw.example/v1")
+        assert "structured output" in str(ei.value)
 
     async def test_generic_error_never_leaks_key(self) -> None:
         """An unexpected error still produces a key-free LLMValidationError."""
         from app.web.routers.settings import LLMValidationError, verify_llm_credentials
 
-        with (
-            patch("app.web.routers.settings.litellm.acompletion", side_effect=RuntimeError("boom sk-leak")),
-            pytest.raises(LLMValidationError) as ei,
-        ):
+        with self._patch_probe(side_effect=RuntimeError("boom sk-leak")), pytest.raises(LLMValidationError) as ei:
             await verify_llm_credentials(model="openai/gpt-4o-mini", api_key="sk-leak", base_url=None)
         assert "sk-leak" not in str(ei.value)
 
