@@ -23,8 +23,11 @@ jobs:
       - name: Read total downloads from the package page
         run: |
           set -euo pipefail
+          # Package name derived from the repo basename (OVH-123, AUG-068), same as
+          # docker-publish.yml's cleanup job, so a repository rename doesn't leave
+          # this badge scraping an obsolete package.
           curl -sSfL --max-time 30 -A topic-watch-badge \
-            "https://github.com/${{ github.repository }}/pkgs/container/topic_watch" \
+            "https://github.com/${{ github.repository }}/pkgs/container/${{ github.event.repository.name }}" \
             | python3 scripts/ghcr_downloads.py > "$RUNNER_TEMP/downloads.json"
           cat "$RUNNER_TEMP/downloads.json"
 

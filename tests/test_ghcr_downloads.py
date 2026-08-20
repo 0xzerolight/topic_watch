@@ -45,6 +45,17 @@ def test_falls_back_to_element_text_without_title(script: ModuleType) -> None:
     assert script.parse_count(html) == 428
 
 
+def test_zero_downloads_parses_as_zero_not_missing(script: ModuleType) -> None:
+    assert script.parse_count(_page("0", "0")) == 0
+
+
+def test_rejects_compact_fallback_text_instead_of_misparsing_it(script: ModuleType) -> None:
+    """No `title` attribute and a compact displayed count (e.g. "1.2k") must not be
+    stripped down to "12" — that silently reports a wildly wrong total (AUG-067)."""
+    html = "<span>Total downloads</span><h3>1.2k</h3>"
+    assert script.parse_count(html) is None
+
+
 def test_badge_labels_the_count_as_docker_pulls(script: ModuleType) -> None:
     assert script.build_badge(428) == {
         "schemaVersion": 1,
@@ -77,3 +88,12 @@ def test_main_writes_badge_json_to_stdout(
     monkeypatch.setattr("sys.stdin", io.StringIO(_page("428", "428")))
     assert script.main() == 0
     assert '"message": "428"' in capsys.readouterr().out
+
+
+def test_main_succeeds_on_a_legitimate_zero_count(
+    script: ModuleType, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A brand-new package with zero downloads must not be treated as a parse failure."""
+    monkeypatch.setattr("sys.stdin", io.StringIO(_page("0", "0")))
+    assert script.main() == 0
+    assert '"message": "0"' in capsys.readouterr().out
