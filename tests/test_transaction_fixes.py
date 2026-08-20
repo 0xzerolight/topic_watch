@@ -118,7 +118,8 @@ def mem_conn():
             relevance_threshold REAL DEFAULT NULL,
             novelty_instruction TEXT DEFAULT NULL,
             importance_threshold INTEGER DEFAULT NULL,
-            init_attempts INTEGER NOT NULL DEFAULT 0
+            init_attempts INTEGER NOT NULL DEFAULT 0,
+            generation TEXT NOT NULL DEFAULT ''
         );
         """
     )

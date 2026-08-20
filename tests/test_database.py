@@ -1,7 +1,7 @@
 """Tests for database operations: schema, CRUD, and dedup."""
 
 import sqlite3
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
@@ -28,7 +28,9 @@ from app.crud import (
     list_topics,
     mark_articles_processed,
     recover_stuck_topics,
+    topic_generation_matches,
     update_knowledge_state,
+    update_knowledge_state_cas,
     update_topic,
 )
 from app.database import run_migrations
@@ -401,6 +403,92 @@ class TestKnowledgeStateCRUD:
         assert state.token_count == 20
 
 
+class TestKnowledgeStateCAS:
+    """update_knowledge_state_cas rejects a write built on a stale snapshot."""
+
+    def _state(self, conn: sqlite3.Connection) -> tuple[int, int]:
+        topic = create_topic(conn, Topic(name="CAS", description="d"))
+        assert topic.id is not None
+        create_knowledge_state(conn, KnowledgeState(topic_id=topic.id, summary_text="v0"))
+        conn.commit()
+        stored = get_knowledge_state(conn, topic.id)
+        assert stored is not None
+        return topic.id, stored.version
+
+    def test_matching_version_writes_and_bumps(self, db_conn: sqlite3.Connection) -> None:
+        topic_id, version = self._state(db_conn)
+        assert update_knowledge_state_cas(db_conn, topic_id, summary_text="v1", token_count=7, expected_version=version)
+        db_conn.commit()
+        stored = get_knowledge_state(db_conn, topic_id)
+        assert stored is not None
+        assert stored.summary_text == "v1"
+        assert stored.token_count == 7
+        assert stored.version == version + 1
+
+    def test_stale_version_is_rejected_and_leaves_the_winner_intact(self, db_conn: sqlite3.Connection) -> None:
+        topic_id, version = self._state(db_conn)
+        # Winner writes first; the loser still holds the pre-write version.
+        assert update_knowledge_state_cas(
+            db_conn, topic_id, summary_text="winner", token_count=1, expected_version=version
+        )
+        assert not update_knowledge_state_cas(
+            db_conn, topic_id, summary_text="loser", token_count=2, expected_version=version
+        )
+        db_conn.commit()
+        stored = get_knowledge_state(db_conn, topic_id)
+        assert stored is not None
+        assert stored.summary_text == "winner"
+
+    def test_updated_at_is_written_as_canonical_utc(self, db_conn: sqlite3.Connection) -> None:
+        topic_id, version = self._state(db_conn)
+        local = datetime(2026, 8, 20, 14, 0, tzinfo=timezone(timedelta(hours=3)))
+        assert update_knowledge_state_cas(
+            db_conn, topic_id, summary_text="v1", token_count=1, expected_version=version, updated_at=local
+        )
+        db_conn.commit()
+        raw = db_conn.execute("SELECT updated_at FROM knowledge_states WHERE topic_id = ?", (topic_id,)).fetchone()[0]
+        assert raw == "2026-08-20T11:00:00+00:00"
+
+
+class TestTopicGenerationFence:
+    """topic_generation_matches is the fence for post-await durable writes."""
+
+    def test_matches_the_live_row(self, db_conn: sqlite3.Connection) -> None:
+        topic = create_topic(db_conn, Topic(name="Fenced", description="d"))
+        db_conn.commit()
+        assert topic.id is not None
+        assert topic_generation_matches(db_conn, topic.id, topic.generation)
+
+    def test_recycled_rowid_does_not_match_the_old_generation(self, db_conn: sqlite3.Connection) -> None:
+        topic = create_topic(db_conn, Topic(name="Original", description="d"))
+        db_conn.commit()
+        assert topic.id is not None
+        original_id, original_generation = topic.id, topic.generation
+
+        delete_topic(db_conn, original_id)
+        db_conn.commit()
+        # Force the replacement onto the freed rowid, the situation the fence exists for.
+        db_conn.execute(
+            "INSERT INTO topics (id, name, description, created_at, generation) VALUES (?, ?, ?, ?, ?)",
+            (original_id, "Replacement", "d", datetime.now(UTC).isoformat(), "replacement-generation"),
+        )
+        db_conn.commit()
+
+        assert not topic_generation_matches(db_conn, original_id, original_generation)
+        assert topic_generation_matches(db_conn, original_id, "replacement-generation")
+
+    def test_blank_generation_fails_closed(self, db_conn: sqlite3.Connection) -> None:
+        topic = create_topic(db_conn, Topic(name="Blank", description="d"))
+        db_conn.commit()
+        assert topic.id is not None
+        db_conn.execute("UPDATE topics SET generation = '' WHERE id = ?", (topic.id,))
+        db_conn.commit()
+        assert not topic_generation_matches(db_conn, topic.id, "")
+
+    def test_missing_topic_does_not_match(self, db_conn: sqlite3.Connection) -> None:
+        assert not topic_generation_matches(db_conn, 999_999, "anything")
+
+
 class TestCheckResultCRUD:
     """Test CRUD operations for check results."""
 
@@ -634,6 +722,62 @@ class TestMigrations:
         columns = {row[1]: row for row in db_conn.execute("PRAGMA table_info(topics)").fetchall()}
         assert "confidence_threshold" in columns
         assert "relevance_threshold" in columns
+
+    def test_migration_026_adds_every_wave_a_column(self, db_conn: sqlite3.Connection) -> None:
+        """m026 lands the whole wave-A schema in one pass."""
+        expected = {
+            "knowledge_states": {"version"},
+            "topics": {"generation"},
+            "articles": {"analysis_attempts"},
+            "check_results": {"notify_disposition"},
+            "pending_notifications": {
+                "status",
+                "kind",
+                "claim_token",
+                "next_attempt_at",
+                "latch_value",
+                "delivered_at",
+            },
+            "pending_webhooks": {"status", "claim_token", "next_attempt_at", "last_error", "delivered_at"},
+        }
+        for table, columns in expected.items():
+            actual = {row[1] for row in db_conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            assert columns <= actual, f"{table} missing {columns - actual}"
+
+        indexes = {row[0] for row in db_conn.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()}
+        assert "idx_pending_notifications_due" in indexes
+        assert "idx_pending_webhooks_due" in indexes
+
+    def test_migration_026_is_idempotent_and_backfills_generation(self, db_conn: sqlite3.Connection) -> None:
+        """Re-running m026 keeps data, and every topic row carries a distinct generation."""
+        from app.migrations.m026_wave_a_durability import up as m026_up
+
+        create_topic(db_conn, Topic(name="Gen A", description="d"))
+        create_topic(db_conn, Topic(name="Gen B", description="d"))
+        # Simulate pre-migration rows whose generation the backfill must mint.
+        db_conn.execute("UPDATE topics SET generation = ''")
+        db_conn.commit()
+
+        m026_up(db_conn)
+        m026_up(db_conn)
+
+        generations = [r[0] for r in db_conn.execute("SELECT generation FROM topics").fetchall()]
+        assert len(generations) == 2
+        assert all(g for g in generations)
+        assert len(set(generations)) == 2
+
+    def test_migration_026_defaults_existing_intents_to_pending(self, db_conn: sqlite3.Connection) -> None:
+        """Rows queued before the upgrade are undelivered, so 'pending' is correct."""
+        topic = create_topic(db_conn, Topic(name="Queued", description="d"))
+        assert topic.id is not None
+        db_conn.execute(
+            "INSERT INTO pending_notifications (topic_id, title, body, created_at) VALUES (?, ?, ?, ?)",
+            (topic.id, "t", "b", datetime.now(UTC).isoformat()),
+        )
+        db_conn.commit()
+        row = db_conn.execute("SELECT status, kind FROM pending_notifications").fetchone()
+        assert row["status"] == "pending"
+        assert row["kind"] == "novelty"
 
     def test_topic_novelty_instruction_column_exists(self, db_conn: sqlite3.Connection) -> None:
         """Migration m022 adds the nullable novelty_instruction column."""
