@@ -46,22 +46,37 @@ _FRAMING_PREFIXES = (
 # A line that opens with a bracketed integer index ("[1]", "[ 2 ]") forges the
 # numbered-article header _format_articles emits.
 _INDEX_MARKER_RE = re.compile(r"^\s*\[\s*\d+\s*\]")
-# Zero-width / line-separator characters an attacker could use to slip a forged
-# delimiter past a naive line-start check.
-_INVISIBLE_RE = re.compile(r"[​‌‍  ﻿]")
+# Zero-width characters an attacker could use to slip a forged delimiter past a
+# naive line-start check. The Unicode LINE/PARAGRAPH SEPARATORs used to be
+# deleted here too; they are line boundaries, so they now go through
+# _LINE_SEPARATOR_RE below and get the same quote guard as any other line
+# start instead of silently welding two words together (AUG-161).
+_INVISIBLE_RE = re.compile(r"[​‌‍﻿]")
+
+
+# EVERY character a renderer may treat as a line boundary, not just LF: bare CR
+# (feedparser hands back an RSS `&#13;` as one), CRLF, VT, FF, the file/group/
+# record separators, NEL, and the Unicode line/paragraph separators. Splitting on
+# LF alone let a crafted title keep a benign prefix while opening a model-visible
+# line that forges prompt framing (AUG-161); canonicalizing them all to LF is what
+# makes the line-start check below exhaustive.
+_LINE_SEPARATOR_RE = re.compile("\r\n|[\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]")
+# Remaining C0/C1 control characters (tab excluded - it is ordinary whitespace).
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0e-\x1f\x7f-\x9f]")
 
 
 def _neutralize_framing(text: str) -> str:
     """Defang lines in untrusted text that mimic our prompt framing.
 
-    Strips invisible separators, then prefixes any line that would otherwise
-    impersonate a prompt delimiter (framing keyword or ``[n]`` index marker)
-    with a ``|`` quote guard so it can no longer be read as a section boundary.
-    Ordinary content is returned unchanged.
+    Strips invisible separators, canonicalizes every recognized line separator to
+    LF, then prefixes any line that would otherwise impersonate a prompt delimiter
+    (framing keyword or ``[n]`` index marker) with a ``|`` quote guard so it can no
+    longer be read as a section boundary. Ordinary content is returned unchanged
+    apart from that line-ending canonicalization.
     """
     cleaned = _INVISIBLE_RE.sub("", text)
     out: list[str] = []
-    for line in cleaned.split("\n"):
+    for line in _LINE_SEPARATOR_RE.split(cleaned):
         stripped = line.lstrip()
         lowered = stripped.lower()
         if _INDEX_MARKER_RE.match(stripped) or any(lowered.startswith(p) for p in _FRAMING_PREFIXES):
@@ -69,6 +84,16 @@ def _neutralize_framing(text: str) -> str:
         else:
             out.append(line)
     return "\n".join(out)
+
+
+def _single_line(value: str) -> str:
+    """Collapse untrusted text onto one line for a trusted header field.
+
+    Every line separator becomes a space and the remaining control characters are
+    dropped, so the value cannot break out of its own header line however the
+    break is encoded (AUG-161).
+    """
+    return _CONTROL_CHAR_RE.sub("", _LINE_SEPARATOR_RE.sub(" ", value)).strip()
 
 
 # --- Shared output rules (one source of truth, interpolated into the prompts) ---
@@ -409,7 +434,7 @@ def _safe_header_field(value: str | None, fallback: str) -> str:
     """
     if not value:
         return fallback
-    return _neutralize_framing(value).replace("\n", " ").strip() or fallback
+    return _single_line(_neutralize_framing(value)) or fallback
 
 
 def _format_articles(articles: list[Article], max_content_chars: int = _PROMPT_ARTICLE_MAX_CHARS) -> str:
@@ -445,7 +470,7 @@ def _format_articles(articles: list[Article], max_content_chars: int = _PROMPT_A
                 content = truncated[:last_space] + "..." if last_space > 0 else truncated + "..."
         # Title is untrusted too: collapse newlines and defang forged framing so
         # it cannot inject a section boundary into the header block.
-        safe_title = _neutralize_framing(article.title).replace("\n", " ").strip()
+        safe_title = _single_line(_neutralize_framing(article.title))
         safe_content = _neutralize_framing(content)
         safe_url = _safe_header_field(article.url, "unknown")
         safe_source = _safe_header_field(article.source_feed, "unknown")
