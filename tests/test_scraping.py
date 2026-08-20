@@ -2,7 +2,7 @@
 
 import asyncio
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -31,6 +31,8 @@ from app.scraping.rss import (
 from app.scraping.source import (
     Deadline,
     article_identity,
+    collapse_duplicate_entries,
+    normalize_published,
 )
 
 # --- Sample RSS/Atom XML for mocking ---
@@ -224,6 +226,86 @@ class TestArticleIdentity:
 
     def test_unparseable_url_still_compares_equal_to_itself(self) -> None:
         assert article_identity(self._entry(url="not a url")) == article_identity(self._entry(url="not a url"))
+
+
+# ============================================================
+# TestCollapseDuplicateEntries
+# ============================================================
+
+
+class TestCollapseDuplicateEntries:
+    """AUG-179/AUG-322: repeats merge, and the surviving copy is the best one."""
+
+    def _entry(self, url: str, **kwargs) -> FeedEntry:
+        fields = {"title": "Headline", "url": url, "source_feed": "feed"}
+        fields.update(kwargs)
+        return FeedEntry(**fields)
+
+    def test_distinct_articles_are_all_kept_in_order(self) -> None:
+        entries = [self._entry("https://e.example/1"), self._entry("https://e.example/2")]
+        assert [e.url for e in collapse_duplicate_entries(entries)] == [
+            "https://e.example/1",
+            "https://e.example/2",
+        ]
+
+    def test_repeats_collapse_to_one(self) -> None:
+        entries = [self._entry("https://e.example/1"), self._entry("https://e.example/1?utm_source=x")]
+        assert len(collapse_duplicate_entries(entries)) == 1
+
+    def test_the_newest_revision_survives(self) -> None:
+        """AUG-322: not the copy whose feed the user happened to list first."""
+        stale = self._entry("https://e.example/1", summary="First wording", published=datetime(2025, 1, 1, tzinfo=UTC))
+        fresh = self._entry(
+            "https://e.example/1",
+            summary="Corrected wording",
+            published=datetime(2025, 1, 1, tzinfo=UTC),
+            updated=datetime(2025, 1, 3, tzinfo=UTC),
+        )
+        assert collapse_duplicate_entries([stale, fresh])[0].summary == "Corrected wording"
+
+    def test_the_copy_with_text_survives_a_tie(self) -> None:
+        empty = self._entry("https://e.example/1", summary="")
+        rich = self._entry("https://e.example/1", summary="The actual dek")
+        assert collapse_duplicate_entries([empty, rich])[0].summary == "The actual dek"
+
+    def test_the_surviving_copy_keeps_the_first_position(self) -> None:
+        first = self._entry("https://e.example/1", summary="")
+        second = self._entry("https://e.example/2")
+        better_first = self._entry("https://e.example/1", summary="text")
+        collapsed = collapse_duplicate_entries([first, second, better_first])
+        assert [e.url for e in collapsed] == ["https://e.example/1", "https://e.example/2"]
+        assert collapsed[0].summary == "text"
+
+    def test_ties_keep_the_first_copy(self) -> None:
+        first = self._entry("https://e.example/1", summary="one")
+        second = self._entry("https://e.example/1", summary="two")
+        assert collapse_duplicate_entries([first, second])[0].summary == "one"
+
+
+# ============================================================
+# TestNormalizePublished
+# ============================================================
+
+
+class TestNormalizePublished:
+    """AUG-184: a publisher's clock does not get to own the recency ranking."""
+
+    def test_a_past_date_is_kept(self) -> None:
+        stamp = datetime(2025, 1, 1, tzinfo=UTC)
+        assert normalize_published(stamp) == stamp
+
+    def test_a_naive_date_is_read_as_utc(self) -> None:
+        assert normalize_published(datetime(2025, 1, 1)) == datetime(2025, 1, 1, tzinfo=UTC)
+
+    def test_a_far_future_date_is_unknown(self) -> None:
+        assert normalize_published(datetime(2999, 1, 1, tzinfo=UTC)) is None
+
+    def test_a_small_clock_difference_is_tolerated(self) -> None:
+        now = datetime.now(UTC)
+        assert normalize_published(now + timedelta(minutes=5), now=now) is not None
+
+    def test_missing_stays_missing(self) -> None:
+        assert normalize_published(None) is None
 
 
 # ============================================================
@@ -1216,6 +1298,52 @@ class TestFetchFeedsForTopic:
 
         # Should dedup: both feeds have same 2 URLs
         assert len(response.entries) == 2
+
+    async def test_duplicate_feed_urls_are_fetched_once(self) -> None:
+        """AUG-188: a URL listed twice is one feed, not two requests and two health writes."""
+        topic = Topic(
+            name="T",
+            description="d",
+            feed_mode=FeedMode.MANUAL,
+            feed_urls=["https://example.com/feed.xml", "https://example.com/feed.xml"],
+        )
+        fetch = AsyncMock(return_value=([], True))
+        with patch("app.scraping.rss.fetch_feed_with_status", fetch):
+            response = await fetch_feeds_for_topic(topic)
+
+        assert fetch.await_count == 1
+        assert response.feeds_total == 1
+
+    async def test_manual_merge_keeps_the_revised_representation(self) -> None:
+        """AUG-322: the corrected copy survives, whichever feed is configured first."""
+        url = "https://publisher.example/story"
+        stale = FeedEntry(
+            title="Headline",
+            url=url,
+            summary="First wording",
+            source_feed="https://example.com/feed1.xml",
+            published=datetime(2025, 1, 1, tzinfo=UTC),
+        )
+        revised = FeedEntry(
+            title="Headline",
+            url=url,
+            summary="Corrected wording",
+            source_feed="https://example.com/feed2.xml",
+            published=datetime(2025, 1, 1, tzinfo=UTC),
+            updated=datetime(2025, 1, 2, tzinfo=UTC),
+        )
+        topic = Topic(
+            name="T",
+            description="d",
+            feed_mode=FeedMode.MANUAL,
+            feed_urls=["https://example.com/feed1.xml", "https://example.com/feed2.xml"],
+        )
+        fetch = AsyncMock(side_effect=[([stale], True), ([revised], True)])
+        with patch("app.scraping.rss.fetch_feed_with_status", fetch):
+            response = await fetch_feeds_for_topic(topic)
+
+        assert len(response.entries) == 1
+        assert response.entries[0].summary == "Corrected wording"
 
     async def test_empty_feed_urls_manual_mode(self) -> None:
         topic = Topic(name="T", description="d", feed_mode=FeedMode.MANUAL, feed_urls=[])
@@ -2628,6 +2756,96 @@ class TestResolvedIdentityDedup:
         assert len(stored) == 1
         assert stored[0].url == self._PUBLISHER
         assert stored[0].content_hash == compute_article_hash(self._PUBLISHER, "The Story")
+
+
+class TestCandidateSelection:
+    """AUG-179/AUG-184: which candidates get the bounded article slots."""
+
+    def _topic(self, conn: sqlite3.Connection) -> Topic:
+        topic = create_topic(conn, Topic(name="Selection", description="d"))
+        conn.commit()
+        return topic
+
+    async def _store(self, topic: Topic, db_path: Path, entries: list[FeedEntry], max_articles: int) -> list[Article]:
+        with (
+            patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=entries)),
+            patch("app.scraping.extract_article_content", AsyncMock(return_value="Content")),
+        ):
+            return (await fetch_new_articles_for_topic(topic, db_path=db_path, max_articles=max_articles)).articles
+
+    async def test_repeats_do_not_consume_article_slots(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
+        """AUG-179: a duplicate-duplicate-unique batch with a cap of 2 stores 2 stories."""
+        topic = self._topic(db_conn)
+        entries = [
+            FeedEntry(title="Repeat", url="https://e.example/repeat", summary="s", source_feed="feed"),
+            FeedEntry(title="Repeat", url="https://e.example/repeat", summary="s", source_feed="feed"),
+            FeedEntry(title="Unique", url="https://e.example/unique", summary="s", source_feed="feed"),
+        ]
+        stored = await self._store(topic, db_path, entries, max_articles=2)
+
+        assert sorted(a.url for a in stored) == ["https://e.example/repeat", "https://e.example/unique"]
+
+    async def test_an_impossible_date_does_not_crowd_out_current_stories(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """AUG-184: a year-2999 pubDate ranks as unknown, not as the newest story."""
+        topic = self._topic(db_conn)
+        recent = datetime.now(UTC) - timedelta(hours=1)
+        entries = [
+            FeedEntry(
+                title="Recent",
+                url="https://e.example/recent",
+                summary="s",
+                source_feed="feed",
+                published=recent,
+            ),
+            FeedEntry(
+                title="Impossible",
+                url="https://e.example/impossible",
+                summary="s",
+                source_feed="feed",
+                published=datetime(2999, 1, 1, tzinfo=UTC),
+            ),
+            FeedEntry(title="Undated", url="https://e.example/undated", summary="s", source_feed="feed"),
+        ]
+        stored = await self._store(topic, db_path, entries, max_articles=2)
+
+        # Undated and impossible-dated both rank at retrieval time, in feed order;
+        # the genuinely dated story is an hour old, so it ranks below them.
+        assert sorted(a.url for a in stored) == ["https://e.example/impossible", "https://e.example/undated"]
+
+    async def test_an_impossible_date_is_not_stored(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
+        topic = self._topic(db_conn)
+        entries = [
+            FeedEntry(
+                title="Impossible",
+                url="https://e.example/impossible",
+                summary="s",
+                source_feed="feed",
+                published=datetime(2999, 1, 1, tzinfo=UTC),
+            )
+        ]
+        stored = await self._store(topic, db_path, entries, max_articles=5)
+
+        assert stored[0].published_at is None
+
+    async def test_undated_entries_are_not_starved_by_dated_ones(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        topic = self._topic(db_conn)
+        entries = [
+            FeedEntry(title="Undated", url="https://e.example/undated", summary="s", source_feed="feed"),
+            FeedEntry(
+                title="Dated",
+                url="https://e.example/dated",
+                summary="s",
+                source_feed="feed",
+                published=datetime.now(UTC) - timedelta(minutes=30),
+            ),
+        ]
+        stored = await self._store(topic, db_path, entries, max_articles=1)
+
+        assert [a.url for a in stored] == ["https://e.example/undated"]
 
 
 class TestFeedStateHelpers:

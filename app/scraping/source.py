@@ -9,9 +9,9 @@ the pipeline lives here rather than in any one source's module (TW-AUD-022):
   identity plus capabilities of whatever produced them. ``provider_name`` and
   ``needs_url_resolution`` are response-level because AUTO can cascade between
   providers mid-fetch, so only the response knows which one actually answered.
-- ``article_identity`` — what makes two entries the same article. One
-  definition for every source, so dedup does not depend on which provider
-  happened to answer.
+- ``article_identity`` / ``collapse_duplicate_entries`` — what makes two entries
+  the same article. One definition for every source, so dedup does not depend on
+  which provider happened to answer.
 - ``FeedHealthCallback`` / ``FeedStateLoader`` — the health side-channel.
 - ``SourceRequest`` — the per-attempt inputs a fetcher needs beyond the topic.
 - ``register_source`` / ``fetch_feeds_for_topic`` — mode-to-fetcher dispatch.
@@ -29,7 +29,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, TypeVar
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -182,12 +182,35 @@ _TRACKING_PARAMS = frozenset(
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
+_MAX_CLOCK_SKEW = timedelta(hours=1)
+"""How far ahead of us a publisher's clock may plausibly be (AUG-184)."""
+
+_UNDATED = datetime.min.replace(tzinfo=UTC)
+
 
 def as_utc(value: datetime | None) -> datetime | None:
     """A feed datetime in UTC; a naive one is read as UTC rather than local time."""
     if value is None:
         return None
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+def normalize_published(value: datetime | None, *, now: datetime | None = None) -> datetime | None:
+    """UTC-normalize a publication date, discarding impossible ones (AUG-184).
+
+    A timestamp further ahead than a plausible clock difference is a publisher
+    defect, not a scoop. Trusting it puts that entry permanently at the head of
+    the recency ranking, where it displaces real stories from the article cap on
+    every check; returning ``None`` files it with the undated entries instead,
+    which are ranked by retrieval order.
+    """
+    stamp = as_utc(value)
+    if stamp is None:
+        return None
+    if stamp > (now or datetime.now(UTC)) + _MAX_CLOCK_SKEW:
+        logger.debug("Discarding impossible publication date %s", stamp.isoformat())
+        return None
+    return stamp
 
 
 def _is_tracking_param(name: str) -> bool:
@@ -278,6 +301,36 @@ def compute_article_hash(url: str, title: str) -> str:
     Same serialization, no revision marker — one recipe, not a second one.
     """
     return _identity_digest(canonical_url(url), title.casefold(), "")
+
+
+def _representation_rank(entry: FeedEntry) -> tuple[datetime, int]:
+    """Sort key deciding which of two entries for one URL is the better copy."""
+    stamps = [s for s in (as_utc(entry.updated), as_utc(entry.published)) if s is not None]
+    return (max(stamps) if stamps else _UNDATED, 1 if (entry.content or entry.summary).strip() else 0)
+
+
+def collapse_duplicate_entries(entries: list[FeedEntry]) -> list[FeedEntry]:
+    """One entry per canonical URL, keeping the best copy, in first-seen order.
+
+    Repeats reach the pipeline routinely — two configured feeds carrying one
+    story, an aggregator listing it twice. Left in, they occupy the bounded
+    article slots that unique stories needed and pay for the same content fetch
+    twice (AUG-179).
+
+    Which copy survives is decided by the entries themselves — newest revision
+    first, then the one that actually carries text — never by which feed was
+    configured first, which silently threw away the corrected or richer version
+    of an article (AUG-322).
+    """
+    best: dict[str, FeedEntry] = {}
+    for entry in entries:
+        key = canonical_url(entry.url)
+        current = best.get(key)
+        # dict keeps the first insertion's position when a value is replaced,
+        # so the surviving copy stays where the story first appeared.
+        if current is None or _representation_rank(entry) > _representation_rank(current):
+            best[key] = entry
+    return list(best.values())
 
 
 @dataclass(frozen=True)

@@ -179,8 +179,11 @@ class TestFetchExaEntries:
         assert len(resp.entries) == 4
         new_entries = [(e, compute_article_hash(e.url, e.title)) for e in resp.entries]
         reuse_batch, fetch_batch = _select_candidates(new_entries, [], 10)  # must not raise
-        # Newest-first: the full-Z 2024 entry sorts ahead of the date-only 2023 one.
-        assert fetch_batch[0][0].url == "https://x.com/2"
+        urls = [e.url for e, _ in fetch_batch]
+        # An undated entry ranks at retrieval time rather than at year 1 (AUG-184),
+        # so it leads; among dated ones the full-Z 2024 entry sorts ahead of 2023.
+        assert urls[0] == "https://x.com/3"
+        assert urls.index("https://x.com/2") < urls.index("https://x.com/1")
 
     async def test_not_enabled_makes_no_request(self) -> None:
         calls: list[str] = []

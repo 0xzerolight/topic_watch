@@ -32,7 +32,10 @@ from app.scraping.rss import FeedResponse as FeedResponse
 from app.scraping.source import Deadline as Deadline
 from app.scraping.source import (
     article_identity,
+    as_utc,
     bounded,
+    collapse_duplicate_entries,
+    normalize_published,
 )
 
 if TYPE_CHECKING:
@@ -222,6 +225,21 @@ def _log_feed_coverage(topic: Topic, feeds_total: int, feeds_failed: int) -> Non
         logger.warning("Topic '%s': all %d feed fetch(es) failed", topic.name, feeds_total)
 
 
+def _prepare_entries(entries: list[FeedEntry]) -> list[FeedEntry]:
+    """Normalize what the source returned before anything spends budget on it.
+
+    Two source-agnostic corrections, applied once for every provider rather than
+    per fetcher: impossible publication dates are discarded so they cannot own
+    the top of the recency ranking (AUG-184), and entries describing one article
+    collapse to their best copy so repeats stop consuming article slots and
+    content fetches (AUG-179).
+    """
+    now = datetime.now(UTC)
+    for entry in entries:
+        entry.published = normalize_published(entry.published, now=now)
+    return collapse_duplicate_entries(entries)
+
+
 def _split_dedup_candidates(
     entries: list[FeedEntry],
     conn: sqlite3.Connection,
@@ -270,12 +288,17 @@ def _select_candidates(
     the originating one for reused rows and ``None`` for fresh fetches (stamped with
     this topic's provider later). Returns ``(reuse_batch, fetch_batch)`` after the
     limit, where ``fetch_batch`` is the ``(entry, hash)`` subset still needing a fetch.
+
+    An entry with no usable date ranks at retrieval time, not at year 1 (AUG-184):
+    feeds list newest first, so an undated entry is a story just discovered, and
+    filing it below every dated one let a busy feed starve it out of the cap on
+    every check. Ties keep source order, since the sort is stable.
     """
-    datetime_min = datetime.min.replace(tzinfo=UTC)
+    now = datetime.now(UTC)
     all_candidates: list[tuple[FeedEntry, str, str | None, str | None]] = [
         (e, h, c, p) for e, h, c, p in reuse_entries
     ] + [(e, h, None, None) for e, h in new_entries]
-    all_candidates.sort(key=lambda t: t[0].published or datetime_min, reverse=True)
+    all_candidates.sort(key=lambda t: as_utc(t[0].published) or now, reverse=True)
     all_candidates = all_candidates[:max_articles]
 
     reuse_batch: list[tuple[FeedEntry, str, str | None, str | None]] = [
@@ -512,7 +535,7 @@ async def fetch_new_articles_for_topic(
         _commit_feed_health(db_path, health_outcomes)
         raise
 
-    entries = response.entries
+    entries = _prepare_entries(response.entries)
     feeds_total = response.feeds_total
     feeds_failed = response.feeds_failed
     _log_feed_coverage(topic, feeds_total, feeds_failed)

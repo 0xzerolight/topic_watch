@@ -30,6 +30,7 @@ from app.scraping.source import (
     SourceDeadlineExceeded,
     SourceRequest,
     bounded,
+    collapse_duplicate_entries,
     host_matches,
     register_source,
     url_hostname,
@@ -643,11 +644,13 @@ async def _fetch_manual(topic: Topic, request: SourceRequest) -> FeedResponse:
     if not topic.feed_urls:
         return FeedResponse()
 
-    # Decide skips and load validators from ONE health lookup per URL.
+    # Decide skips and load validators from ONE health lookup per URL. A URL listed
+    # twice is one feed: fetching it per occurrence duplicated the request, the
+    # health write and every per-feed counter (AUG-188).
     now = datetime.now(UTC)
     attempted: list[tuple[str, str | None, str | None]] = []  # (url, etag, last_modified)
     feeds_skipped = 0
-    for url in topic.feed_urls:
+    for url in dict.fromkeys(topic.feed_urls):
         state = feed_state_loader(url) if feed_state_loader else None
         until = feed_backoff_until(state, base_minutes=backoff_base_minutes, cap_hours=backoff_cap_hours)
         if until is not None and until > now:
@@ -685,7 +688,6 @@ async def _fetch_manual(topic: Topic, request: SourceRequest) -> FeedResponse:
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    seen_urls: set[str] = set()
     entries: list[FeedEntry] = []
     feeds_total = len(attempted)
     feeds_failed = 0
@@ -697,13 +699,16 @@ async def _fetch_manual(topic: Topic, request: SourceRequest) -> FeedResponse:
         feed_entries, fetch_ok = result
         if not fetch_ok:
             feeds_failed += 1
-        for entry in feed_entries:
-            if entry.url not in seen_urls:
-                seen_urls.add(entry.url)
-                entries.append(entry)
+        entries.extend(feed_entries)
 
+    # Two configured feeds carrying one story merge on the entries themselves —
+    # newest revision, then the copy with text — rather than on which feed the
+    # user happened to list first (AUG-322).
     return FeedResponse(
-        entries=entries, feeds_total=feeds_total, feeds_failed=feeds_failed, feeds_skipped=feeds_skipped
+        entries=collapse_duplicate_entries(entries),
+        feeds_total=feeds_total,
+        feeds_failed=feeds_failed,
+        feeds_skipped=feeds_skipped,
     )
 
 
