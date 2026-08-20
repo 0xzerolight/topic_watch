@@ -1120,3 +1120,82 @@ class TestKnowledgeCleanupFailuresAtTheTransition:
         assert result.stage_error is not None and result.stage_error.startswith("analysis_failed:")
         stored = db_conn.execute("SELECT notify_disposition FROM check_results WHERE id = ?", (result.id,)).fetchone()
         assert stored["notify_disposition"] == "analysis_failed"
+
+
+class TestTransitionIsAllOrNothing:
+    """One logical transition, one commit — no durable fragments (TW-AUD-002/AUG-253)."""
+
+    async def test_a_failed_result_insert_rolls_back_the_knowledge_write(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """Knowledge, its revision, the article disposition and the row live or die together.
+
+        The knowledge state used to commit before the CheckResult existed, so a
+        failure in between left a summary that had absorbed articles no check
+        ever recorded, and the revision append (a third commit) could vanish on
+        its own and silently bridge two states in the timeline.
+        """
+        topic = _ready_topic(db_conn, name="AllOrNothing")
+        create_knowledge_state(db_conn, KnowledgeState(topic_id=topic.id, summary_text="base"))
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
+        db_conn.commit()
+        settings = _pipeline_settings()
+
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[article], total_feed_entries=1),
+            ),
+            patch(
+                "app.checker.analyze_articles",
+                new_callable=AsyncMock,
+                return_value=NoveltyResult(has_new_info=True, summary="s", confidence=0.9, relevance=0.9, importance=1),
+            ),
+            patch("app.checker.prepare_knowledge_update", new_callable=AsyncMock, return_value=_write_result()),
+            patch("app.checker.create_check_result", side_effect=sqlite3.OperationalError("disk I/O error")),
+            patch("app.checker.send_notification_per_url", new_callable=AsyncMock, return_value=[]),
+            pytest.raises(sqlite3.OperationalError),
+        ):
+            await check_topic(topic, settings, db_path=db_path)
+
+        state = db_conn.execute(
+            "SELECT summary_text, version FROM knowledge_states WHERE topic_id = ?", (topic.id,)
+        ).fetchone()
+        assert state["summary_text"] == "base"
+        assert state["version"] == 0
+        assert db_conn.execute("SELECT COUNT(*) FROM knowledge_revisions").fetchone()[0] == 0
+        assert db_conn.execute("SELECT COUNT(*) FROM check_results").fetchone()[0] == 0
+        assert db_conn.execute("SELECT processed FROM articles WHERE id = ?", (article.id,)).fetchone()[0] == 0
+
+    async def test_a_failed_article_disposition_rolls_back_the_result(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """The attempt bookkeeping is part of the transition, not a follow-up write."""
+        topic = _ready_topic(db_conn, name="AttemptRollback")
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
+        db_conn.commit()
+        settings = _pipeline_settings()
+
+        failed = NoveltyResult(has_new_info=False, confidence=0.0, error="LLM analysis failed")
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[article], total_feed_entries=1),
+            ),
+            patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=failed),
+            patch(
+                "app.checker.record_article_analysis_failure",
+                side_effect=sqlite3.OperationalError("disk I/O error"),
+            ),
+            pytest.raises(sqlite3.OperationalError),
+        ):
+            await check_topic(topic, settings, db_path=db_path)
+
+        assert db_conn.execute("SELECT COUNT(*) FROM check_results").fetchone()[0] == 0
+        row = db_conn.execute(
+            "SELECT processed, analysis_attempts FROM articles WHERE id = ?", (article.id,)
+        ).fetchone()
+        assert row["processed"] == 0
+        assert row["analysis_attempts"] == 0
