@@ -12,6 +12,7 @@ from app.analysis.llm import NoveltyResult, TokenUsage
 from app.checker import check_all_topics, check_topic, retry_pending_notifications
 from app.config import LLMSettings, NotificationSettings, Settings
 from app.crud import (
+    MAX_ANALYSIS_ATTEMPTS,
     create_article,
     create_knowledge_state,
     create_pending_notification,
@@ -2108,3 +2109,92 @@ class TestSilenceHeartbeatPipeline:
             await check_topic(topic, _make_settings(silence_heartbeat_checks=3), db_path=conn_db_path(db_conn))
         assert send.await_count == 1
         assert get_topic(db_conn, topic.id).heartbeat_alerted_at is not None
+
+
+class TestAnalysisFailureIsResumable:
+    """A failed analysis leaves its articles retryable, and bounded (TW-AUD-001)."""
+
+    async def _failing_analysis_check(
+        self,
+        db_conn: sqlite3.Connection,
+        db_path: Path,
+        topic: Topic,
+        articles: list[Article],
+    ):
+        failed = NoveltyResult(has_new_info=False, confidence=0.0, error="LLM analysis failed")
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=articles, total_feed_entries=len(articles)),
+            ),
+            patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=failed),
+            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)),
+        ):
+            return await check_topic(get_topic(db_conn, topic.id), _make_settings(), db_path=db_path)
+
+    async def test_failed_analysis_leaves_the_article_unprocessed(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """The articles were never evaluated, so they must stay queued for the next cycle."""
+        topic = _make_topic(db_conn, name="RetryMe")
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
+        db_conn.commit()
+
+        await self._failing_analysis_check(db_conn, db_path, topic, [article])
+
+        row = db_conn.execute(
+            "SELECT processed, analysis_attempts FROM articles WHERE id = ?", (article.id,)
+        ).fetchone()
+        assert row["processed"] == 0
+        assert row["analysis_attempts"] == 1
+
+    async def test_repeated_failures_abandon_the_article_at_the_cap(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """An article that fails MAX_ANALYSIS_ATTEMPTS times is abandoned, not retried forever."""
+        topic = _make_topic(db_conn, name="GiveUp")
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
+        db_conn.commit()
+
+        for _ in range(MAX_ANALYSIS_ATTEMPTS):
+            await self._failing_analysis_check(db_conn, db_path, topic, [article])
+
+        row = db_conn.execute(
+            "SELECT processed, analysis_attempts FROM articles WHERE id = ?", (article.id,)
+        ).fetchone()
+        assert row["analysis_attempts"] == MAX_ANALYSIS_ATTEMPTS
+        assert row["processed"] == 1
+
+    async def test_unprocessed_articles_are_re_analyzed_on_a_later_cycle(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """A stranded row is fed back into analysis even when the feed has nothing new.
+
+        The scraper dedups against stored hashes, so a failed cycle's articles never
+        arrive again from the fetch — without an explicit re-select they were dead
+        work nobody would ever look at (TW-AUD-001).
+        """
+        topic = _make_topic(db_conn, name="Stranded")
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
+        db_conn.commit()
+
+        await self._failing_analysis_check(db_conn, db_path, topic, [article])
+
+        novelty = NoveltyResult(has_new_info=False, confidence=0.9)
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=1, feeds_failed=0),
+            ),
+            patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty) as mock_analyze,
+            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)),
+        ):
+            await check_topic(get_topic(db_conn, topic.id), _make_settings(), db_path=db_path)
+
+        mock_analyze.assert_awaited_once()
+        analyzed = mock_analyze.await_args.args[0]
+        assert [a.id for a in analyzed] == [article.id]
+        row = db_conn.execute("SELECT processed FROM articles WHERE id = ?", (article.id,)).fetchone()
+        assert row["processed"] == 1

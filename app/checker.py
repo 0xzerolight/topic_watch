@@ -22,6 +22,7 @@ from app.analysis.llm import analyze_articles
 from app.check_context import check_id_var, generate_check_id
 from app.config import Settings
 from app.crud import (
+    MAX_ANALYSIS_ATTEMPTS,
     claim_heartbeat_alert,
     claim_pending_notification,
     clear_heartbeat_alert,
@@ -33,8 +34,10 @@ from app.crud import (
     get_topic,
     get_topics_due_for_check,
     increment_notification_retry,
+    list_articles_for_topic,
     list_pending_notifications,
     mark_articles_processed,
+    record_article_analysis_failure,
     release_stale_notification_claims,
     topic_generation_matches,
     update_check_result_delivery,
@@ -43,6 +46,7 @@ from app.crud import (
 from app.database import get_db, short_conn
 from app.heartbeat import evaluate_heartbeat
 from app.models import (
+    Article,
     CheckResult,
     KnowledgeRevisionSource,
     NotificationDelivery,
@@ -146,6 +150,31 @@ def _snapshot_topic(conn: sqlite3.Connection, topic_id: int) -> TopicSnapshot | 
     )
 
 
+def _analysis_batch(
+    db_path: Path | None,
+    topic_id: int,
+    new_articles: list[Article],
+    max_articles: int,
+) -> list[Article]:
+    """This cycle's fetch plus whatever earlier cycles left unfinished.
+
+    An article is stored before it is analyzed, and the scraper deduplicates
+    against stored hashes — so once a cycle stores an article and then fails to
+    finish with it (LLM outage, failed knowledge merge), no feed will ever offer
+    it again. Re-selecting the unprocessed rows here is what makes that work
+    resumable instead of silently lost (TW-AUD-001).
+
+    Stranded rows come first: they are bounded by the per-article attempt cap and
+    drain within a few cycles, while a busy feed that fills ``max_articles`` every
+    cycle would otherwise starve them indefinitely.
+    """
+    fresh_ids = {a.id for a in new_articles if a.id is not None}
+    with get_db(db_path) as conn:
+        stored = list_articles_for_topic(conn, topic_id, unprocessed_only=True, limit=max_articles)
+    stranded = [a for a in stored if a.id not in fresh_ids]
+    return (stranded + new_articles)[:max_articles]
+
+
 def _commit_check_transition(
     conn: sqlite3.Connection,
     snapshot: TopicSnapshot,
@@ -191,6 +220,14 @@ def _commit_check_transition(
             )
 
     mark_articles_processed(conn, outcome.article_ids)
+    abandoned = record_article_analysis_failure(conn, outcome.failed_article_ids)
+    if abandoned:
+        logger.warning(
+            "Topic id=%d: abandoning %d article(s) after %d failed analysis attempt(s)",
+            topic_id,
+            abandoned,
+            MAX_ANALYSIS_ATTEMPTS,
+        )
     outcome.result.notify_disposition = outcome.notify_disposition
     created = create_check_result(conn, outcome.result)
     conn.commit()
@@ -350,12 +387,22 @@ async def _check_topic_inner(
             skipped = fetch_result.feeds_skipped
             detail = f"{skipped} feed(s) in backoff" if skipped else "no source configured or enabled"
             result.stage_error = f"sources_unavailable: no source attempted ({detail})"
+
+    # --- P1c: the analysis batch is this cycle's fetch PLUS any article an earlier
+    # cycle stored but never finished with. The scraper dedups against stored
+    # hashes, so those rows can never arrive from a feed again: without this
+    # re-select a single failed analysis or knowledge update stranded them forever
+    # (TW-AUD-001). Stranded work goes first — it is bounded by the attempt cap and
+    # drains, whereas a busy feed filling the cap every cycle would starve it.
+    articles = _analysis_batch(db_path, topic_id, new_articles, settings.max_articles_per_check)
+
+    if not articles:
         logger.info("Topic '%s': no new articles found", topic.name)
         return await _finish_check(db_path, topic, result, settings)
 
     # --- P2: analyze against the knowledge snapshotted at P0, with no connection
     # open (returns a safe default on LLM error — analyze_articles never raises).
-    novelty = await analyze_articles(new_articles, snapshot.knowledge_summary, topic, settings)
+    novelty = await analyze_articles(articles, snapshot.knowledge_summary, topic, settings)
     result.has_new_info = novelty.has_new_info
     result.llm_response = novelty.model_dump_json()
     result.prompt_tokens += novelty.prompt_tokens
@@ -450,10 +497,16 @@ async def _check_topic_inner(
     # re-analyze them every cycle after retention deletion + feed reappearance,
     # wasting LLM quota.
     #
-    # Exception (OVH-009): when the knowledge update failed, the recorded
-    # knowledge state is now stale. Leave these articles unprocessed so the next
-    # cycle re-fetches and re-attempts the update instead of silently diverging.
-    article_ids = [] if knowledge_update_failed else [a.id for a in new_articles if a.id is not None]
+    # Two exceptions, both meaning "this check did not finish with these
+    # articles": the analysis itself failed (nothing was evaluated at all), or the
+    # knowledge update did not land, leaving the recorded state stale (OVH-009).
+    # Either way they stay unprocessed and carry an attempt, so the next cycle
+    # re-analyzes them and a permanently failing article is eventually abandoned
+    # instead of retried forever (TW-AUD-001).
+    batch_ids = [a.id for a in articles if a.id is not None]
+    unfinished = bool(novelty.error) or knowledge_update_failed
+    article_ids = [] if unfinished else batch_ids
+    failed_article_ids = batch_ids if unfinished else []
 
     # --- C3: THE durable transition. Knowledge + revision + article disposition
     # + CheckResult in one commit, fenced by the P0 generation and knowledge
@@ -466,6 +519,7 @@ async def _check_topic_inner(
         knowledge_source=KnowledgeRevisionSource.UPDATE,
         knowledge_change_note=novelty.summary,
         article_ids=article_ids,
+        failed_article_ids=failed_article_ids,
         notify_disposition=disposition,
     )
     try:
@@ -537,7 +591,7 @@ async def _check_topic_inner(
     logger.info(
         "Topic '%s': %d articles, new_info=%s, notified=%s",
         topic.name,
-        len(new_articles),
+        len(articles),
         novelty.has_new_info,
         result.notification_sent,
     )

@@ -333,6 +333,11 @@ class Article(SQLiteModel):
     published_at: datetime | None = None
     fetched_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     processed: bool = False
+    # How many checks have tried and failed to analyze this article. ``processed``
+    # says the article is done with; this says how much of that was wasted effort,
+    # and caps the retries so one undecodable row cannot ride along in every future
+    # prompt (see ``crud.record_article_analysis_failure``).
+    analysis_attempts: int = 0
 
 
 class KnowledgeState(SQLiteModel):
