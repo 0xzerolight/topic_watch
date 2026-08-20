@@ -85,6 +85,25 @@ class TestMapExaResult:
         assert entry is not None
         assert entry.content is None
 
+    def test_whitespace_only_text_yields_none_content(self) -> None:
+        """AUG-308: blank text is truthy, so it would short-circuit the publisher fetch."""
+        entry = _map_exa_result({"url": "https://x.com/a", "title": "T", "text": "   \n\t "})
+        assert entry is not None
+        assert entry.content is None
+
+    def test_non_string_text_keeps_the_row(self) -> None:
+        """AUG-308: a structured ``text`` value must not discard a usable URL/title."""
+        entry = _map_exa_result({"url": "https://x.com/a", "title": "T", "text": {"value": "x"}})
+        assert entry is not None
+        assert entry.url == "https://x.com/a"
+        assert entry.content is None
+
+    def test_text_keeps_its_own_whitespace(self) -> None:
+        """Only the outer padding is trimmed; the body itself is untouched."""
+        entry = _map_exa_result({"url": "https://x.com/a", "title": "T", "text": "  one\n\ntwo  "})
+        assert entry is not None
+        assert entry.content == "one\n\ntwo"
+
 
 class TestFetchExaEntries:
     async def test_request_contract(self) -> None:

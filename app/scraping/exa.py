@@ -59,7 +59,12 @@ def _map_exa_result(raw: dict[str, Any]) -> FeedEntry | None:
     if published is not None and published.tzinfo is None:
         published = published.replace(tzinfo=UTC)
 
-    text = raw.get("text") or ""
+    # AUG-308: prefetched text counts only when it is a string with something in
+    # it. Whitespace-only text is truthy and would short-circuit the publisher
+    # fetch into storing a blank body, and a non-string value would fail
+    # FeedEntry validation and discard an otherwise usable url/title row.
+    raw_text = raw.get("text")
+    text = raw_text.strip() if isinstance(raw_text, str) else ""
     # summary stays "" (that field means "RSS summary"); Exa's full text rides on
     # ``content`` as the single prefetched channel that short-circuits extraction.
     return FeedEntry(
