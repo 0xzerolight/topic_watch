@@ -315,6 +315,14 @@ def _scenario_from_live(topic: Topic, summary: str, articles: list[Article], kin
     )
 
 
+# Kinds a live fetch cannot build a faithful scenario for. knowledge_update
+# needs a real NoveltyResult (novelty_summary + key_facts) to update FROM;
+# nothing in a live fetch produces one, so run_live used to fabricate
+# has_new_info=True with a blank summary — an input production never sends,
+# evaluated at the cost of a billed call (AUG-047).
+_LIVE_UNSUPPORTED_KINDS = frozenset({"knowledge_update"})
+
+
 async def run_live(
     topic_name: str,
     settings: Settings,
@@ -331,7 +339,19 @@ async def run_live(
     fetch bookkeeping (articles, feed_health, dedup) happens in a throwaway
     scratch DB in a tempdir. ``inner`` is the recorder's inner client (None ->
     real; tests inject a mock).
+
+    ``kind="knowledge_update"`` is rejected outright (see
+    ``_LIVE_UNSUPPORTED_KINDS``): run ``live --kind novelty`` (optionally
+    ``--freeze``) first, then hand-author a ``scenario`` YAML with the real
+    ``novelty_summary``/``key_facts`` for the update stage.
     """
+    if kind in _LIVE_UNSUPPORTED_KINDS:
+        raise LiveError(
+            f"live --kind {kind} is not supported: a live fetch has no real novelty result to update "
+            "from, so it would fabricate one and evaluate input production never sends. Run `live "
+            "--kind novelty` first, then hand-author a `scenario` YAML with the real "
+            "novelty_summary/key_facts."
+        )
     prod = prod_db_path if prod_db_path is not None else settings.db_path
     ro = _open_readonly(prod)
     try:

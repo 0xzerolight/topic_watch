@@ -695,6 +695,43 @@ def test_open_readonly_raises_live_error_on_missing_db(tmp_path) -> None:
         _open_readonly(tmp_path / "does-not-exist.db")
 
 
+async def test_run_live_rejects_knowledge_update_kind(tmp_path, monkeypatch) -> None:
+    """AUG-047: a live fetch has no real NoveltyResult to update from — the
+    live scenario builder never populates novelty_summary/key_facts, so
+    `live --kind knowledge_update` used to fabricate has_new_info=True with a
+    blank summary and evaluate input production never sends, while consuming
+    a billed call. It must be rejected before any prod read or LLM call, even
+    though a matching topic genuinely exists in prod."""
+    import evals.runner as runner
+    from app.crud import create_topic
+    from app.database import get_connection, init_db
+    from app.models import Topic, TopicStatus
+    from evals.runner import LiveError
+
+    prod = tmp_path / "prod.db"
+    init_db(prod)
+    conn = get_connection(prod)
+    create_topic(
+        conn,
+        Topic(name="Acme", description="track acme", feed_urls=["http://feed"], status=TopicStatus.READY),
+    )
+    conn.commit()
+    conn.close()
+
+    async def fail_fetch(*_a: object, **_kw: object) -> object:
+        raise AssertionError("fetch attempted despite unsupported kind")
+
+    monkeypatch.setattr(runner, "fetch_new_articles_for_topic", fail_fetch)
+
+    inner = MagicMock()
+    inner.chat.completions.create_with_completion = AsyncMock(side_effect=AssertionError("billed call attempted"))
+
+    with pytest.raises(LiveError):
+        await runner.run_live("Acme", _settings(), kind="knowledge_update", inner=inner, prod_db_path=prod)
+
+    inner.chat.completions.create_with_completion.assert_not_awaited()
+
+
 async def test_run_live_uses_scratch_topic_and_reads_prod_readonly(tmp_path, monkeypatch) -> None:
     import evals.runner as runner
     from app.crud import create_topic
