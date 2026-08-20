@@ -3,7 +3,7 @@
 The real seam (see ``tests/test_analysis.py``) is ``app.analysis.llm._get_client``,
 which returns an instructor-patched async client. Every public function in
 ``app.analysis.llm`` calls ``client.chat.completions.create(...)`` with a
-``response_model`` of either ``NoveltyResult`` or ``KnowledgeStateUpdate``.
+``response_model`` of either ``NoveltyResponse`` or ``KnowledgeStateUpdate``.
 
 ``stub_llm_boundary`` patches ``_get_client`` to return a mock whose
 ``create_with_completion`` (and legacy ``create``) dispatches on that
@@ -19,7 +19,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.analysis.llm import CompressedKnowledge, KnowledgeStateUpdate, NoveltyResult
+from app.analysis.llm import CompressedKnowledge, KnowledgeStateUpdate, NoveltyResponse, NoveltyResult
 
 
 class _StubUsage:
@@ -79,6 +79,15 @@ def make_novelty_result(
     )
 
 
+def _as_live_response(result: NoveltyResult) -> NoveltyResponse:
+    """Re-shape a canned result as the LIVE provider response the analyzer decodes.
+
+    ``analyze_articles`` asks for ``NoveltyResponse`` and converts it, so the stub
+    hands back that shape and the real conversion runs.
+    """
+    return NoveltyResponse(**result.model_dump(include=set(NoveltyResponse.model_fields)))
+
+
 @contextmanager
 def stub_llm_boundary(
     *,
@@ -92,7 +101,7 @@ def stub_llm_boundary(
     The returned mock client's ``chat.completions.create`` inspects the
     ``response_model`` kwarg and returns:
 
-    * ``novelty`` for ``response_model is NoveltyResult``
+    * ``novelty`` for ``response_model is NoveltyResponse`` (the live analyzer shape)
     * ``knowledge_init`` (falling back to ``knowledge_update``) for the FIRST
       ``KnowledgeStateUpdate`` call, and ``knowledge_update`` thereafter — so a
       single ``with`` block can serve both ``initialize_new_topic`` and a
@@ -115,8 +124,8 @@ def stub_llm_boundary(
 
     def _dispatch(kwargs: dict) -> object:
         response_model = kwargs.get("response_model")
-        if response_model is NoveltyResult:
-            return novelty_result
+        if response_model is NoveltyResponse:
+            return _as_live_response(novelty_result)
         if response_model is CompressedKnowledge:
             return compressed_result
         if response_model is KnowledgeStateUpdate:

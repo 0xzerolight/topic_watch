@@ -16,15 +16,26 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from app.analysis import llm as llm_mod
-from app.analysis.llm import CompressedKnowledge, KnowledgeStateUpdate, NoveltyResult
+from app.analysis.llm import CompressedKnowledge, KnowledgeStateUpdate, NoveltyResponse
 from app.config import LLMSettings, Settings
 from tests.helpers.stub_llm import _StubCompletion, _StubUsage
 
 
-def _novelty(**kw: object) -> NoveltyResult:
-    base: dict[str, object] = {"has_new_info": True, "summary": "s", "confidence": 0.9}
+def _novelty(**kw: object) -> NoveltyResponse:
+    """A canned LIVE novelty response — what a provider parses into.
+
+    ``relevance``/``importance`` are part of the live contract (no defaults), so
+    the base payload carries both.
+    """
+    base: dict[str, object] = {
+        "has_new_info": True,
+        "summary": "s",
+        "confidence": 0.9,
+        "relevance": 0.8,
+        "importance": 3,
+    }
     base.update(kw)
-    return NoveltyResult(**base)  # type: ignore[arg-type]
+    return NoveltyResponse(**base)  # type: ignore[arg-type]
 
 
 def _settings() -> Settings:
@@ -34,7 +45,7 @@ def _settings() -> Settings:
 
 def _mock_inner(
     *,
-    novelty: NoveltyResult | None = None,
+    novelty: NoveltyResponse | None = None,
     knowledge: KnowledgeStateUpdate | None = None,
     compressed: CompressedKnowledge | None = None,
 ) -> MagicMock:
@@ -42,7 +53,7 @@ def _mock_inner(
 
     async def _cwc(**kwargs: object) -> tuple[object, object]:
         rm = kwargs.get("response_model")
-        if rm is NoveltyResult:
+        if rm is NoveltyResponse:
             parsed: object = novelty
         elif rm is CompressedKnowledge:
             parsed = compressed
@@ -70,7 +81,7 @@ async def test_recording_client_captures_messages_model_response_model_and_usage
         client = llm_mod._get_client(MagicMock())  # patched to return the recording proxy
         result, comp = await client.chat.completions.create_with_completion(
             model="some/model",
-            response_model=NoveltyResult,
+            response_model=NoveltyResponse,
             messages=[{"role": "user", "content": "hi"}],
             temperature=0.2,
             api_key="SUPER_SECRET_KEY",
@@ -79,7 +90,7 @@ async def test_recording_client_captures_messages_model_response_model_and_usage
     assert result is parsed and comp is completion  # passthrough, unchanged
     assert len(records) == 1
     rec = records[0]
-    assert rec.response_model is NoveltyResult
+    assert rec.response_model is NoveltyResponse
     assert rec.messages == [{"role": "user", "content": "hi"}]
     assert rec.model == "some/model"
     assert rec.temperature == 0.2
@@ -104,7 +115,7 @@ async def test_recorded_parsed_is_snapshot_immune_to_later_mutation() -> None:
     with recording_client(inner=inner) as records:
         client = llm_mod._get_client(MagicMock())
         result, _ = await client.chat.completions.create_with_completion(
-            model="m", response_model=NoveltyResult, messages=[], temperature=0.2
+            model="m", response_model=NoveltyResponse, messages=[], temperature=0.2
         )
         # Simulate analyze_articles' post-call mutation of the same object.
         result.key_facts = []
@@ -159,10 +170,12 @@ async def test_recording_client_calls_land_on_the_mode_specific_inner() -> None:
 
     with recording_client(inner={instructor.Mode.TOOLS: tools_inner, instructor.Mode.JSON: json_inner}) as records:
         tools_client = llm_mod._get_client(MagicMock(), instructor.Mode.TOOLS)
-        await tools_client.chat.completions.create_with_completion(model="m", response_model=NoveltyResult, messages=[])
+        await tools_client.chat.completions.create_with_completion(
+            model="m", response_model=NoveltyResponse, messages=[]
+        )
         json_client = llm_mod._get_client(MagicMock(), instructor.Mode.JSON)
         result, _ = await json_client.chat.completions.create_with_completion(
-            model="m", response_model=NoveltyResult, messages=[]
+            model="m", response_model=NoveltyResponse, messages=[]
         )
 
     assert tools_inner.chat.completions.create_with_completion.await_count == 1
@@ -186,7 +199,7 @@ async def test_recording_client_records_a_rejected_attempt_before_reraising() ->
         with pytest.raises(RuntimeError, match="rejected"):
             await client.chat.completions.create_with_completion(
                 model="m",
-                response_model=NoveltyResult,
+                response_model=NoveltyResponse,
                 messages=[{"role": "user", "content": "hi"}],
                 api_key="SUPER_SECRET_KEY",
             )
