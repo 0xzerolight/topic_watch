@@ -16,6 +16,7 @@
 $ErrorActionPreference = 'Stop'
 
 $Repo = "0xzerolight/topic_watch"
+$ImageRepo = "ghcr.io/$Repo"
 # Pin to a commit SHA or release tag for a verifiable install (OVH-146).
 # Defaults to "main" (mutable) — see the supply-chain note above.
 $Branch = if ($env:TOPIC_WATCH_REF) { $env:TOPIC_WATCH_REF } else { "main" }
@@ -171,7 +172,7 @@ try {
     Write-Info "Pulling Docker image..."
     & docker compose pull
     if ($LASTEXITCODE -ne 0) {
-        Write-Err "Could not pull the Docker image (ghcr.io/$Repo)."
+        Write-Err "Could not pull the Docker image ($ImageRepo)."
         Write-Host ""
         Write-Host "  Most likely the image is not publicly accessible, or ghcr.io is unreachable."
         Write-Host "  - Check your network and that https://ghcr.io is reachable."
@@ -179,6 +180,18 @@ try {
         Write-Host "  - Pin a known release instead of latest: set TOPIC_WATCH_REF=<tag> and re-run."
         throw "docker compose pull failed"
     }
+
+    # Pin the exact digest just pulled into .env (TW-AUD-032): docker-compose.yml
+    # reads TOPIC_WATCH_IMAGE for its image reference, so a later restart
+    # (reboot, `docker compose up`) reruns this specific, already-verified
+    # image instead of silently re-resolving the movable "latest" tag.
+    # Skipped, not fatal, if the digest can't be resolved.
+    try {
+        $imageDigest = (& docker inspect --format '{{index .RepoDigests 0}}' "${ImageRepo}:latest" 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $imageDigest) {
+            Set-EnvVar "TOPIC_WATCH_IMAGE" $imageDigest $EnvFile
+        }
+    } catch {}
 
     Write-Info "Starting Topic Watch..."
     & docker compose up -d

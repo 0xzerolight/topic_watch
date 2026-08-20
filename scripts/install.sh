@@ -8,13 +8,18 @@
 # branch with no commit pin, tag, signature, or checksum, so a repo/branch
 # compromise or a MITM proxy means arbitrary code runs as you. To reduce trust:
 #   1. Review this script before piping it to a shell, or download + run it.
-#   2. Pin a specific commit or release tag instead of "main":
-#        TOPIC_WATCH_REF=v1.1.2 curl -fsSL \
-#          https://raw.githubusercontent.com/0xzerolight/topic_watch/v1.1.2/scripts/install.sh | bash
+#   2. Pin a specific commit or release tag instead of "main". TOPIC_WATCH_REF
+#      must reach the `bash` process, not the `curl` process ahead of it in
+#      the pipe — a "VAR=val curl ... | bash" prefix does not propagate
+#      across the pipe, so set it on bash's side instead:
+#        curl -fsSL \
+#          https://raw.githubusercontent.com/0xzerolight/topic_watch/v1.1.2/scripts/install.sh \
+#          | TOPIC_WATCH_REF=v1.1.2 bash
 #      TOPIC_WATCH_REF also pins the docker-compose file this script downloads.
 set -euo pipefail
 
 REPO="0xzerolight/topic_watch"
+IMAGE_REPO="ghcr.io/${REPO}"
 # Pin to a commit SHA or release tag for a verifiable install (OVH-146).
 # Defaults to "main" (mutable) — see the supply-chain note above.
 BRANCH="${TOPIC_WATCH_REF:-main}"
@@ -248,13 +253,24 @@ info "Pulling Docker image..."
 # not being publicly pullable. set -e would abort anyway, but with only Docker's
 # raw "denied"/network error and no pointer to the fix.
 if ! docker compose pull; then
-    error "Could not pull the Docker image (ghcr.io/${REPO})."
+    error "Could not pull the Docker image (${IMAGE_REPO})."
     echo ""
     echo "  Most likely the image is not publicly accessible, or ghcr.io is unreachable."
     echo "  - Check your network and that https://ghcr.io is reachable."
     echo "  - Maintainers: confirm the GHCR package visibility is set to Public."
     echo "  - Pin a known release instead of latest: TOPIC_WATCH_REF=<tag> re-run this installer."
     exit 1
+fi
+
+# Pin the exact digest just pulled into .env (TW-AUD-032): docker-compose.yml
+# reads TOPIC_WATCH_IMAGE for its image reference, so once this is set, a
+# later restart (reboot, systemd, `docker compose up`) reruns this specific,
+# already-verified image instead of silently re-resolving the movable
+# "latest" tag to whatever the registry has by then. Skipped, not fatal, if
+# the digest can't be resolved — `up -d` then falls back to `:latest`.
+IMAGE_DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "${IMAGE_REPO}:latest" 2>/dev/null || true)"
+if [ -n "$IMAGE_DIGEST" ]; then
+    upsert_env "TOPIC_WATCH_IMAGE" "$IMAGE_DIGEST" "${ENV_FILE}"
 fi
 
 info "Starting Topic Watch..."

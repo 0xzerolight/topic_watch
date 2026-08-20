@@ -1,6 +1,11 @@
 services:
   topic-watch:
-    image: ghcr.io/0xzerolight/topic_watch:latest
+    # TOPIC_WATCH_IMAGE is written to .env by install.sh/install.ps1/update.sh
+    # after a successful pull, pinned to the exact digest just verified
+    # healthy — so a later restart (reboot, systemd, `docker compose up`)
+    # reruns that known-good image instead of silently re-resolving the
+    # movable "latest" tag to whatever is newest on the registry.
+    image: ${TOPIC_WATCH_IMAGE:-ghcr.io/0xzerolight/topic_watch:latest}
     container_name: topic-watch
     ports:
       # Loopback by default: Topic Watch has no authentication, and Docker's

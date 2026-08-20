@@ -163,3 +163,23 @@ def test_installers_fetch_the_ollama_override_example() -> None:
     install_ps1 = (_ROOT / "scripts" / "install.ps1").read_text()
     assert "docker-compose.override.example.yml" in install_sh
     assert "docker-compose.override.example.yml" in install_ps1
+
+
+def test_image_is_pinned_and_recorded_across_install_and_update() -> None:
+    """TW-AUD-032: the production image reference must be parameterized so a
+    verified-healthy digest can be pinned into .env at install/update time,
+    and restarts (reboot, systemd, a later `docker compose up`) then reuse
+    that recorded digest instead of silently re-resolving movable "latest"."""
+    compose_prod = (_ROOT / "docker-compose.prod.yml").read_text()
+    assert "${TOPIC_WATCH_IMAGE:-ghcr.io/0xzerolight/topic_watch:latest}" in compose_prod
+
+    install_sh = (_ROOT / "scripts" / "install.sh").read_text()
+    assert "docker inspect --format '{{index .RepoDigests 0}}'" in install_sh
+    assert 'upsert_env "TOPIC_WATCH_IMAGE"' in install_sh
+
+    update_sh = (_ROOT / "scripts" / "update.sh").read_text()
+    assert "docker inspect --format '{{index .RepoDigests 0}}'" in update_sh
+    assert 'upsert_env "TOPIC_WATCH_IMAGE" "$NEW_DIGEST"' in update_sh
+    # Rollback must restore the previously recorded digest, not just retry
+    # the now-current (possibly broken) image reference.
+    assert 'upsert_env "TOPIC_WATCH_IMAGE" "$PREV_IMAGE"' in update_sh
