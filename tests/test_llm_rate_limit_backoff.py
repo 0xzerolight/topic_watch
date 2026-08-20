@@ -273,7 +273,7 @@ class TestAnalyzeArticlesRateLimit:
     async def test_retries_on_rate_limit_and_returns_result(self) -> None:
         """analyze_articles retries on RateLimitError and returns result on success."""
         rate_error = _make_rate_limit_error()
-        expected = NoveltyResult(has_new_info=True, confidence=0.9)
+        expected = NoveltyResult(has_new_info=True, summary="Fresh development.", confidence=0.9)
         mock_client, mock_create = _mock_instructor_client(expected)
         mock_create.side_effect = [rate_error, (expected, _FakeCompletion())]
         settings = _make_settings()
@@ -588,7 +588,9 @@ class TestRealInstructorStackBackoff:
         most once, and the mode hop — a genuinely different request — is what
         recovers.
         """
-        expected = NoveltyResult(has_new_info=True, confidence=0.9, relevance=0.8, importance=4)
+        expected = NoveltyResult(
+            has_new_info=True, summary="Fresh development.", confidence=0.9, relevance=0.8, importance=4
+        )
 
         def handler(kwargs: dict) -> ModelResponse:
             if "tool_choice" in kwargs:
@@ -790,7 +792,7 @@ class TestStructuredOutputModeFallback:
 
     async def test_tools_400_falls_back_to_json(self) -> None:
         """Test 1: TOOLS tool_choice 400 -> retry in JSON mode -> success."""
-        expected = NoveltyResult(has_new_info=True, confidence=0.9)
+        expected = NoveltyResult(has_new_info=True, summary="Fresh development.", confidence=0.9)
 
         def handler(kwargs: dict) -> ModelResponse:
             if "tool_choice" in kwargs:
@@ -809,7 +811,7 @@ class TestStructuredOutputModeFallback:
 
     async def test_json_400_falls_back_to_md_json(self) -> None:
         """Test 2: TOOLS + JSON both 400 -> MD_JSON succeeds; fresh-build guards."""
-        expected = NoveltyResult(has_new_info=True, confidence=0.8)
+        expected = NoveltyResult(has_new_info=True, summary="Fresh development.", confidence=0.8)
 
         def handler(kwargs: dict) -> ModelResponse:
             if "tool_choice" in kwargs:
@@ -878,7 +880,9 @@ class TestStructuredOutputModeFallback:
         The rate-limit retry re-enters ``_create_structured``; before AUG-032 it
         restarted from TOOLS and paid the same rejection again.
         """
-        expected = NoveltyResult(has_new_info=True, confidence=0.7, relevance=0.8, importance=4)
+        expected = NoveltyResult(
+            has_new_info=True, summary="Fresh development.", confidence=0.7, relevance=0.8, importance=4
+        )
         state = {"json_calls": 0}
 
         def handler(kwargs: dict) -> ModelResponse:
@@ -913,7 +917,9 @@ class TestStructuredOutputModeFallback:
     async def test_working_mode_is_reused_by_the_next_call(self) -> None:
         """AUG-032: a fallback-only provider pays the rejection once per TTL, not
         once per analysis / initialization / compression / update."""
-        expected = NoveltyResult(has_new_info=True, confidence=0.9, relevance=0.8, importance=4)
+        expected = NoveltyResult(
+            has_new_info=True, summary="Fresh development.", confidence=0.9, relevance=0.8, importance=4
+        )
 
         def handler(kwargs: dict) -> ModelResponse:
             if "tool_choice" in kwargs:
@@ -934,7 +940,9 @@ class TestStructuredOutputModeFallback:
     async def test_mode_hint_expires_and_reprobes_the_preferred_mode(self) -> None:
         """The hint is a TTL hint: a provider that gains TOOLS support is picked
         up on the next probe, without a restart."""
-        expected = NoveltyResult(has_new_info=True, confidence=0.9, relevance=0.8, importance=4)
+        expected = NoveltyResult(
+            has_new_info=True, summary="Fresh development.", confidence=0.9, relevance=0.8, importance=4
+        )
         state = {"reject_tools": True}
 
         def handler(kwargs: dict) -> ModelResponse:

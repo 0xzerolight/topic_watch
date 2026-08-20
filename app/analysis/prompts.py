@@ -537,8 +537,18 @@ def _format_articles(articles: list[Article], max_content_chars: int = _PROMPT_A
     return "\n\n".join(parts)
 
 
-def build_novelty_messages(articles: list[Article], knowledge_summary: str, topic: Topic) -> list[dict]:
-    """Build chat messages for novelty detection."""
+def build_novelty_messages(
+    articles: list[Article],
+    knowledge_summary: str,
+    topic: Topic,
+    max_article_chars: int = _PROMPT_ARTICLE_MAX_CHARS,
+) -> list[dict]:
+    """Build chat messages for novelty detection.
+
+    ``max_article_chars`` is the per-article body cap. It is a parameter so the
+    caller can fit the whole request inside the model's context window without the
+    builder needing to know anything about tokenizers (TW-AUD-016).
+    """
     effective_summary = knowledge_summary or "No existing knowledge state."
     instruction = (topic.novelty_instruction or "").strip()
     instruction_block = _NOVELTY_INSTRUCTION_BLOCK.format(instruction=instruction) if instruction else ""
@@ -558,14 +568,23 @@ def build_novelty_messages(articles: list[Article], knowledge_summary: str, topi
                 topic_name=topic.name,
                 topic_description=topic.description,
                 knowledge_summary=effective_summary,
-                articles=_format_articles(articles),
+                articles=_format_articles(articles, max_article_chars),
             ),
         },
     ]
 
 
-def build_knowledge_init_messages(articles: list[Article], topic: Topic, max_tokens: int) -> list[dict]:
-    """Build chat messages for initial knowledge state generation."""
+def build_knowledge_init_messages(
+    articles: list[Article],
+    topic: Topic,
+    max_tokens: int,
+    max_article_chars: int = _PROMPT_ARTICLE_MAX_CHARS,
+) -> list[dict]:
+    """Build chat messages for initial knowledge state generation.
+
+    ``max_article_chars`` is the per-article body cap; see
+    ``build_novelty_messages`` (TW-AUD-016).
+    """
     return [
         {
             "role": "system",
@@ -581,7 +600,7 @@ def build_knowledge_init_messages(articles: list[Article], topic: Topic, max_tok
             "content": _KNOWLEDGE_INIT_USER.format(
                 topic_name=topic.name,
                 topic_description=topic.description,
-                articles=_format_articles(articles),
+                articles=_format_articles(articles, max_article_chars),
             ),
         },
     ]

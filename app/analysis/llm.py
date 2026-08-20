@@ -25,6 +25,8 @@ from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt
 
 from app.analysis.citations import strip_index_citations, strip_reliability_notes
 from app.analysis.prompts import (
+    _PROMPT_ARTICLE_MAX_CHARS,
+    _STUB_CONTENT_MIN_CHARS,
     build_knowledge_compress_messages,
     build_knowledge_init_messages,
     build_knowledge_update_messages,
@@ -538,6 +540,116 @@ def _backoff_delay(attempt: int, base_delay: float, backoff_multiplier: float) -
     return delay + random.uniform(0, delay * _RETRY_JITTER_FRACTION)  # noqa: S311
 
 
+# --- Aggregate input budget (TW-AUD-016) ---
+#
+# Article bodies are capped per item and the knowledge state has its own token
+# budget, but nothing bounded the SUM: knowledge + N articles + schema overhead +
+# requested output all land in one request. With supported settings that request
+# can exceed the model's context window, and the failure is not a retryable one —
+# every check safe-fails and every knowledge operation raises, permanently, until
+# a human changes the configuration. So the budget is enforced where the request is
+# actually assembled, on real tokenizer counts, and the prompt builders stay pure.
+
+# Headroom for what we do not tokenize ourselves: the JSON schema / tool block
+# instructor injects into the request, plus per-message envelope overhead and
+# tokenizer divergence on the fallback path.
+_SCHEMA_TOKEN_RESERVE = 1024
+# Per-message envelope tokens (role, delimiters) in the chat format.
+_MESSAGE_OVERHEAD_TOKENS = 4
+# Article-body caps tried in order when the assembled request is over budget.
+_ARTICLE_CHAR_LADDER = (_PROMPT_ARTICLE_MAX_CHARS, 750, 375, _STUB_CONTENT_MIN_CHARS)
+
+
+def _count_messages(messages: list[dict[str, Any]], model: str) -> int:
+    """Token count of an assembled chat request."""
+    return sum(count_tokens(str(m.get("content", "")), model) + _MESSAGE_OVERHEAD_TOKENS for m in messages)
+
+
+def _input_token_budget(settings: Settings) -> int | None:
+    """Tokens available for the PROMPT, or None when the context size is unknown.
+
+    The model's context window minus the output we are about to request minus the
+    schema reserve. Returns None for models litellm has no entry for (gateway
+    strings especially), where guessing a window would be worse than not bounding
+    one: the request goes out as before.
+    """
+    try:
+        info = litellm.get_model_info(settings.llm.model)
+    except Exception:
+        return None
+    max_input = (info or {}).get("max_input_tokens") or (info or {}).get("max_tokens")
+    if not isinstance(max_input, int) or max_input <= 0:
+        return None
+    budget = max_input - _bounded_max_tokens(settings) - _SCHEMA_TOKEN_RESERVE
+    return budget if budget > 0 else None
+
+
+def _fit_article_prompt(
+    build: Callable[[list[Article], int, str], list[dict[str, Any]]],
+    articles: list[Article],
+    knowledge_summary: str,
+    settings: Settings,
+    topic_name: str,
+) -> list[dict[str, Any]]:
+    """Assemble an article-bearing request that fits the model's context window.
+
+    Degrades in the order that costs the least information: shrink article bodies,
+    then drop trailing (oldest-scored) articles, then trim the knowledge state that
+    is only being READ for comparison. Each step is logged, because a silently
+    smaller prompt is a silently worse analysis.
+    """
+    budget = _input_token_budget(settings)
+    messages = build(articles, _PROMPT_ARTICLE_MAX_CHARS, knowledge_summary)
+    if budget is None or _count_messages(messages, settings.llm.model) <= budget:
+        return messages
+
+    for cap in _ARTICLE_CHAR_LADDER[1:]:
+        messages = build(articles, cap, knowledge_summary)
+        if _count_messages(messages, settings.llm.model) <= budget:
+            logger.warning(
+                "Prompt for topic '%s' exceeded the model's input budget; article bodies capped at %d chars",
+                topic_name,
+                cap,
+            )
+            return messages
+
+    floor = _ARTICLE_CHAR_LADDER[-1]
+    kept = list(articles)
+    while len(kept) > 1:
+        kept = kept[: len(kept) // 2]
+        messages = build(kept, floor, knowledge_summary)
+        if _count_messages(messages, settings.llm.model) <= budget:
+            logger.warning(
+                "Prompt for topic '%s' still over the input budget; analyzing %d of %d articles this cycle",
+                topic_name,
+                len(kept),
+                len(articles),
+            )
+            return messages
+
+    if knowledge_summary:
+        # Last lever, and only available where the summary is an INPUT being
+        # compared against (novelty). It is not rewritten or persisted from here,
+        # so trimming it degrades this one comparison rather than the baseline.
+        trimmed = knowledge_summary
+        while trimmed and _count_messages(messages, settings.llm.model) > budget:
+            trimmed = trimmed[: len(trimmed) // 2]
+            messages = build(kept, floor, trimmed)
+        logger.warning(
+            "Prompt for topic '%s' still over the input budget; knowledge state trimmed to %d of %d chars",
+            topic_name,
+            len(trimmed),
+            len(knowledge_summary),
+        )
+        return messages
+
+    logger.warning(
+        "Prompt for topic '%s' exceeds the model's input budget and cannot be trimmed further; sending anyway",
+        topic_name,
+    )
+    return messages
+
+
 async def _call_with_transport_retry(
     call_func: Any,
     max_retries: int = 3,
@@ -767,7 +879,13 @@ async def analyze_articles(
             lambda: _create_structured(
                 settings,
                 response_model=NoveltyResult,
-                build_messages=lambda: build_novelty_messages(articles, knowledge_summary, topic),
+                build_messages=lambda: _fit_article_prompt(
+                    lambda arts, chars, summary: build_novelty_messages(arts, summary, topic, chars),
+                    articles,
+                    knowledge_summary,
+                    settings,
+                    topic.name,
+                ),
                 timeout=settings.llm_analysis_timeout,
                 # Decode under the LIVE contract: a positive result that omits its
                 # own relevance/importance is rejected and re-prompted, instead of
@@ -847,7 +965,15 @@ async def generate_initial_knowledge(
         lambda: _create_structured(
             settings,
             response_model=KnowledgeStateUpdate,
-            build_messages=lambda: build_knowledge_init_messages(articles, topic, settings.knowledge_state_max_tokens),
+            build_messages=lambda: _fit_article_prompt(
+                lambda arts, chars, _summary: build_knowledge_init_messages(
+                    arts, topic, settings.knowledge_state_max_tokens, chars
+                ),
+                articles,
+                "",
+                settings,
+                topic.name,
+            ),
             timeout=settings.llm_knowledge_timeout,
         ),
         max_retries=settings.llm_max_retries,
