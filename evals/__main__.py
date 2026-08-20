@@ -46,9 +46,20 @@ def _messages_text(messages: list[dict[str, Any]]) -> str:
 def diff_runs(old: RunArtifact, new: RunArtifact) -> list[str]:
     """Field-by-field diff of two runs; messages compared nonce-normalized.
 
+    Covers every semantically relevant artifact field, not just the
+    post-filtered ``final`` result: raw parsed output, response model,
+    request model/temperature, token usage, and expectation verdicts. Two
+    runs can produce byte-identical ``final`` output while their raw output
+    turned unsafe, their model/schema changed, cost spiked, or an expectation
+    flipped — this must not report equivalence in that case (AUG-048).
+
     Returns one line per difference; an empty list means equivalent.
     """
     lines: list[str] = []
+    if old.model != new.model:
+        lines.append(f"model: {old.model!r} -> {new.model!r}")
+    if old.temperature != new.temperature:
+        lines.append(f"temperature: {old.temperature!r} -> {new.temperature!r}")
     of, nf = old.final or {}, new.final or {}
     for key in sorted(set(of) | set(nf)):
         if of.get(key) != nf.get(key):
@@ -56,11 +67,32 @@ def diff_runs(old: RunArtifact, new: RunArtifact) -> list[str]:
     if old.final_error != new.final_error:
         lines.append(f"final_error: {old.final_error!r} -> {new.final_error!r}")
     for i in range(max(len(old.calls), len(new.calls))):
-        o = normalize_nonce(_messages_text(old.calls[i].messages)) if i < len(old.calls) else ""
-        n = normalize_nonce(_messages_text(new.calls[i].messages)) if i < len(new.calls) else ""
+        oc = old.calls[i] if i < len(old.calls) else None
+        nc = new.calls[i] if i < len(new.calls) else None
+        if oc is None or nc is None:
+            lines.append(
+                f"calls[{i}]: {'missing' if oc is None else 'present'} -> {'missing' if nc is None else 'present'}"
+            )
+            continue
+        if oc.response_model != nc.response_model:
+            lines.append(f"calls[{i}].response_model: {oc.response_model!r} -> {nc.response_model!r}")
+        if oc.raw_parsed != nc.raw_parsed:
+            lines.append(f"calls[{i}].raw_parsed: {oc.raw_parsed!r} -> {nc.raw_parsed!r}")
+        if (oc.prompt_tokens, oc.completion_tokens) != (nc.prompt_tokens, nc.completion_tokens):
+            lines.append(
+                f"calls[{i}].tokens: prompt {oc.prompt_tokens}->{nc.prompt_tokens}, "
+                f"completion {oc.completion_tokens}->{nc.completion_tokens}"
+            )
+        o = normalize_nonce(_messages_text(oc.messages))
+        n = normalize_nonce(_messages_text(nc.messages))
         if o != n:
             lines.append(f"messages[{i}] differ (nonce-normalized):")
             lines.extend(unified_diff(o.splitlines(), n.splitlines(), lineterm="", n=1))
+    oe = {c.check: c.ok for c in old.expect_results}
+    ne = {c.check: c.ok for c in new.expect_results}
+    for key in sorted(set(oe) | set(ne)):
+        if oe.get(key) != ne.get(key):
+            lines.append(f"expect.{key}: {oe.get(key)!r} -> {ne.get(key)!r}")
     return lines
 
 

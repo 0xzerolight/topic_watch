@@ -588,6 +588,77 @@ def test_diff_runs_ignores_nonce_and_reports_final_change() -> None:
     assert any("has_new_info" in line for line in diff)
 
 
+def test_diff_runs_detects_material_changes_behind_an_unchanged_final() -> None:
+    """diff_runs must not report equivalence when raw output, model, token usage,
+    or expectation verdicts diverge even though `final` is byte-identical — the
+    exact silent-regression case AUG-048 describes (e.g. a schema/model/cost
+    change hidden behind an unchanged post-filtered result)."""
+    from evals.__main__ import diff_runs
+    from evals.scenario import CapturedCall, ExpectCheck, RunArtifact, Scenario, ScenarioTopic
+
+    def _art(**overrides: object) -> RunArtifact:
+        base: dict[str, object] = dict(
+            name="s",
+            kind="novelty",
+            model="openai/gpt-4o-mini",
+            temperature=0.2,
+            final={"has_new_info": True, "confidence": 0.9},
+            calls=[
+                CapturedCall(
+                    response_model="NoveltyResult",
+                    messages=[{"role": "user", "content": "hi"}],
+                    raw_parsed={"has_new_info": True, "source_urls": ["http://safe"]},
+                    prompt_tokens=10,
+                    completion_tokens=5,
+                )
+            ],
+            expect_results=[ExpectCheck(check="has_new_info", ok=True, detail="")],
+            scenario=Scenario(topic=ScenarioTopic(name="T", description="d")),
+        )
+        base.update(overrides)
+        return RunArtifact(**base)  # type: ignore[arg-type]
+
+    old = _art()
+
+    # Raw parsed output became unsafe (a smuggled source_url) though final is unchanged.
+    unsafe_raw = _art(
+        calls=[
+            CapturedCall(
+                response_model="NoveltyResult",
+                messages=[{"role": "user", "content": "hi"}],
+                raw_parsed={"has_new_info": True, "source_urls": ["http://safe", "http://evil"]},
+                prompt_tokens=10,
+                completion_tokens=5,
+            )
+        ]
+    )
+    assert diff_runs(old, unsafe_raw) != []
+
+    # Model changed.
+    assert diff_runs(old, _art(model="openai/gpt-4o")) != []
+
+    # Token usage spiked.
+    diff = diff_runs(
+        old,
+        _art(
+            calls=[
+                CapturedCall(
+                    response_model="NoveltyResult",
+                    messages=[{"role": "user", "content": "hi"}],
+                    raw_parsed={"has_new_info": True, "source_urls": ["http://safe"]},
+                    prompt_tokens=9000,
+                    completion_tokens=5,
+                )
+            ]
+        ),
+    )
+    assert diff != []
+
+    # Expectation verdict flipped even though `final` and raw output match.
+    diff = diff_runs(old, _art(expect_results=[ExpectCheck(check="has_new_info", ok=False, detail="")]))
+    assert diff != []
+
+
 def test_render_artifact_surfaces_error_and_kind() -> None:
     from evals.__main__ import render_artifact
     from evals.scenario import CapturedCall, RunArtifact, Scenario, ScenarioTopic
