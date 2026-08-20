@@ -20,11 +20,13 @@ module. This module imports no source, which is what keeps that possible.
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+import time
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, TypeVar
 from urllib.parse import urlparse
 
 from pydantic import BaseModel
@@ -39,12 +41,86 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+T = TypeVar("T")
+
 FeedHealthCallback = Callable[
     [str, bool, str | None, str | None, str | None], None
 ]  # (feed_url, success, error_msg, etag, last_modified)
 
 FeedStateLoader = Callable[[str], "FeedHealth | None"]
 """Returns the stored health row for a feed URL, or None when untracked."""
+
+
+SOURCE_ATTEMPT_BUDGET_SECONDS = 300.0
+"""Total wall-clock a single topic's source work may occupy (TW-AUD-018).
+
+Per-request timeouts bound one transport wait each, and nothing bounded their
+sum: retries, redirect hops, DNS checks, Google resolution and content
+extraction each drew a fresh budget, so a source that is merely slow rather than
+broken could hold a topic slot indefinitely and starve the next scheduler tick.
+Five minutes is far above a healthy check (seconds) and far below an interval,
+so it only ever truncates work that was already failing.
+"""
+
+DEADLINE_ERROR = "Source deadline exceeded"
+"""Health-row text for the typed timeout outcome, so an expired budget is
+distinguishable from an ordinary per-request timeout on the Feed Health page."""
+
+
+class SourceDeadlineExceeded(Exception):
+    """One logical source attempt ran out of its total budget."""
+
+
+@dataclass(frozen=True)
+class Deadline:
+    """An absolute monotonic deadline shared by every stage of one attempt.
+
+    Monotonic by construction: ``at`` is a ``time.monotonic()`` reference, never
+    a wall-clock timestamp, so a clock adjustment mid-check cannot extend or
+    collapse the budget (wave-A clock policy).
+
+    Passing the same instance down through fetch, retry, resolution and
+    extraction is what makes the budget one budget rather than one per stage.
+    """
+
+    at: float
+
+    @classmethod
+    def after(cls, budget: float = SOURCE_ATTEMPT_BUDGET_SECONDS) -> Deadline:
+        """A deadline ``budget`` seconds from now."""
+        return cls(at=time.monotonic() + budget)
+
+    def remaining(self) -> float:
+        """Seconds left, clamped at zero."""
+        return max(0.0, self.at - time.monotonic())
+
+    def expired(self) -> bool:
+        return self.remaining() <= 0.0
+
+    def slice(self, timeout: float) -> float:
+        """The per-request timeout, shortened to what is left of the budget."""
+        return min(timeout, self.remaining())
+
+    def check(self, stage: str) -> None:
+        """Raise :class:`SourceDeadlineExceeded` when nothing is left to spend."""
+        if self.expired():
+            raise SourceDeadlineExceeded(f"{DEADLINE_ERROR} before {stage}")
+
+
+async def bounded(deadline: Deadline, stage: str, coro: Coroutine[Any, Any, T]) -> T:
+    """Await ``coro`` under what is left of ``deadline``.
+
+    Raises :class:`SourceDeadlineExceeded` instead of letting a stage run past
+    the budget, and never starts one that has nothing left to spend.
+    """
+    if deadline.expired():
+        coro.close()
+        raise SourceDeadlineExceeded(f"{DEADLINE_ERROR} before {stage}")
+    try:
+        async with asyncio.timeout(deadline.remaining()):
+            return await coro
+    except TimeoutError as exc:
+        raise SourceDeadlineExceeded(f"{DEADLINE_ERROR} during {stage}") from exc
 
 
 def url_hostname(url: str) -> str:
@@ -164,6 +240,7 @@ class SourceRequest:
     """
 
     timeout: float
+    deadline: Deadline = field(default_factory=Deadline.after)
     max_attempts: int = 2
     max_results: int = 10
     health_callback: FeedHealthCallback | None = None
@@ -195,6 +272,7 @@ async def fetch_feeds_for_topic(
     backoff_cap_hours: int = BACKOFF_CAP_HOURS,
     exa_settings: ExaSettings | None = None,
     max_results: int = 10,
+    deadline: Deadline | None = None,
 ) -> FeedResponse:
     """Fetch all entries for a topic from whichever source its feed mode names.
 
@@ -207,9 +285,14 @@ async def fetch_feeds_for_topic(
     ``feed_state_loader`` supplies the stored ``FeedHealth`` per URL — used to
     send conditional-GET validators (both RSS modes) and to skip backed-off feeds
     (MANUAL only; AUTO provider backoff is owned by ``ProviderRouter``).
+
+    ``deadline`` bounds the whole attempt. Callers that own a larger unit of work
+    (a topic check) pass theirs so the budget spans it; otherwise a fresh one is
+    started here, because an unbounded source attempt is never wanted.
     """
     request = SourceRequest(
         timeout=timeout,
+        deadline=deadline if deadline is not None else Deadline.after(),
         max_attempts=max_attempts,
         max_results=max_results,
         health_callback=health_callback,

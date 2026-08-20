@@ -21,11 +21,14 @@ import httpx
 from app.log_redaction import redact_url
 from app.models import FeedMode
 from app.scraping.source import (
+    Deadline,
     FeedEntry,
     FeedHealthCallback,
     FeedResponse,
+    SourceDeadlineExceeded,
     SourceIdentity,
     SourceRequest,
+    bounded,
     register_source,
 )
 from app.url_validation import is_private_url
@@ -96,6 +99,7 @@ async def fetch_exa_entries(
     timeout: float,
     client: httpx.AsyncClient | None = None,
     health_callback: FeedHealthCallback | None = None,
+    deadline: Deadline | None = None,
 ) -> FeedResponse:
     """Query the Exa ``/search`` API for ``topic`` and return a ``FeedResponse``.
 
@@ -107,7 +111,11 @@ async def fetch_exa_entries(
     failure) but NOT on the disabled/no-key early return, where nothing is
     attempted (mirrors ``all_sources_failed`` semantics). Exa has no
     conditional-GET validators, so etag/last_modified are always ``None``.
+
+    ``deadline`` bounds the search request against the topic's whole source
+    budget (TW-AUD-018); running out is recorded like any other failed fetch.
     """
+    budget = deadline if deadline is not None else Deadline.after()
     if not exa_settings.enabled or not exa_settings.api_key:
         # Nothing attempted (no HTTP). feeds_total=0 keeps _log_feed_coverage from
         # reporting an "all sources failed" line for a self-inflicted disabled state.
@@ -149,9 +157,14 @@ async def fetch_exa_entries(
         client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
     assert client is not None
     try:
-        response = await client.post(endpoint, json=body, headers=headers)
+        response = await bounded(budget, "the Exa search", client.post(endpoint, json=body, headers=headers))
         response.raise_for_status()
         data = response.json()
+    except SourceDeadlineExceeded as exc:
+        logger.warning("Exa request out of budget for topic '%s': %s", topic.name, exc)
+        if health_callback:
+            health_callback(endpoint, False, str(exc), None, None)
+        return FeedResponse.from_source(EXA_SOURCE, feeds_total=1, feeds_failed=1)
     except httpx.TimeoutException:
         logger.warning("Exa request timed out for topic '%s'", topic.name)
         if health_callback:
@@ -205,6 +218,7 @@ async def fetch_exa_source(topic: Topic, request: SourceRequest) -> FeedResponse
         max_results=request.max_results,
         timeout=request.timeout,
         health_callback=request.health_callback,
+        deadline=request.deadline,
     )
 
 

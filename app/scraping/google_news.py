@@ -17,7 +17,7 @@ from urllib.parse import quote, urlparse
 
 import httpx
 
-from app.scraping.source import host_matches, url_hostname
+from app.scraping.source import Deadline, SourceDeadlineExceeded, bounded, host_matches, url_hostname
 from app.url_validation import safe_get, safe_send
 
 logger = logging.getLogger(__name__)
@@ -233,6 +233,7 @@ async def resolve_google_news_urls(
     urls: list[str],
     timeout: float = _RESOLVE_TIMEOUT,
     request_delay: float = _REQUEST_DELAY,
+    deadline: Deadline | None = None,
 ) -> dict[str, str]:
     """Batch-resolve Google News redirect URLs to actual article URLs.
 
@@ -250,6 +251,10 @@ async def resolve_google_news_urls(
         urls: List of URLs (may include non-Google News URLs, which are skipped).
         timeout: HTTP timeout for resolution requests.
         request_delay: Upper bound (seconds) on the jittered per-request throttle.
+        deadline: The topic's source budget. Resolution is a best-effort
+            enrichment — unresolved entries keep their redirect URL — so an
+            expired budget short-circuits the remaining URLs exactly like a 429
+            does, rather than failing the batch (TW-AUD-018).
 
     Returns:
         Dict mapping original Google News URLs to resolved URLs.
@@ -259,9 +264,11 @@ async def resolve_google_news_urls(
     if not google_urls:
         return {}
 
+    budget = deadline if deadline is not None else Deadline.after()
     resolved: dict[str, str] = {}
     failures = 0
     decoder_breaks = 0
+    out_of_budget = False
     semaphore = asyncio.Semaphore(_RESOLVE_CONCURRENCY)
     # Shared 429 abort flag: once Google rate-limits, every not-yet-started task
     # short-circuits rather than piling on more throttled requests.
@@ -281,20 +288,25 @@ async def resolve_google_news_urls(
             True only when a 200 batchexecute body failed to parse structurally
             (OVH-134).
             """
+            nonlocal out_of_budget
             async with semaphore:
-                if aborted.is_set():
+                if aborted.is_set() or budget.expired():
                     return url, None, False
                 # Jittered throttle: 0..request_delay before each request keeps the
-                # average rate near the old fixed delay without the strict stall.
+                # average rate near the old fixed delay without the strict stall,
+                # and never outlasts the budget it is spending.
                 if request_delay > 0:
-                    await asyncio.sleep(secrets.SystemRandom().uniform(0, request_delay))
+                    await asyncio.sleep(budget.slice(secrets.SystemRandom().uniform(0, request_delay)))
                 try:
-                    result = await _resolve_or_raise(url, client)
+                    result = await bounded(budget, "Google News resolution", _resolve_or_raise(url, client))
                 except _RateLimitedError:
                     aborted.set()
                     return url, None, False
                 except _DecoderBrokeError:
                     return url, None, True
+                except SourceDeadlineExceeded:
+                    out_of_budget = True
+                    return url, None, False
             return url, (None if result == url else result), False
 
         outcomes = await asyncio.gather(*(_resolve_one(u) for u in google_urls))
@@ -310,6 +322,9 @@ async def resolve_google_news_urls(
 
     if aborted.is_set():
         logger.warning("Google News rate-limited (429); aborted remaining resolutions")
+
+    if out_of_budget:
+        logger.warning("Google News resolution ran out of budget; %d URL(s) keep their redirect", failures)
 
     # A structural decoder break (Google changed the batchexecute response shape)
     # is a different failure mode than an unresolvable URL: it tends to affect

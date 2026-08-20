@@ -29,6 +29,8 @@ from app.scraping.exa import fetch_exa_source as fetch_exa_source
 from app.scraping.google_news import is_google_news_url, resolve_google_news_urls
 from app.scraping.rss import FeedEntry, compute_article_hash, fetch_feeds_for_topic
 from app.scraping.rss import FeedResponse as FeedResponse
+from app.scraping.source import Deadline as Deadline
+from app.scraping.source import bounded
 
 if TYPE_CHECKING:
     from app.config import ExaSettings
@@ -284,6 +286,7 @@ async def _resolve_redirect_urls(
     fetch_batch: list[tuple[FeedEntry, str]],
     response: FeedResponse,
     feed_fetch_timeout: float,
+    deadline: Deadline,
 ) -> None:
     """Resolve provider redirect URLs in-place for entries needing content fetch.
 
@@ -299,7 +302,7 @@ async def _resolve_redirect_urls(
     to_resolve = [e.url for e, _ in fetch_batch if is_google_news_url(e.url)]
     if not to_resolve:
         return
-    resolved = await resolve_google_news_urls(to_resolve, timeout=feed_fetch_timeout)
+    resolved = await resolve_google_news_urls(to_resolve, timeout=feed_fetch_timeout, deadline=deadline)
     for entry, _ in fetch_batch:
         if entry.url in resolved:
             entry.url = resolved[entry.url]
@@ -309,6 +312,7 @@ async def _extract_contents(
     fetch_batch: list[tuple[FeedEntry, str]],
     article_fetch_timeout: float,
     concurrency: int,
+    deadline: Deadline,
 ) -> list[str | BaseException]:
     """Extract article content concurrently for the fetch batch.
 
@@ -326,14 +330,27 @@ async def _extract_contents(
 
         async def _extract(entry: FeedEntry) -> str:
             async with semaphore:
+                if deadline.expired():
+                    # Out of budget (TW-AUD-018): keep whatever the source already
+                    # gave us instead of starting another fetch. Routing it through
+                    # the prefetched short-circuit applies the same length cap the
+                    # network path would have, with no request.
+                    already_have = entry.content or entry.summary
+                    if not already_have:
+                        return ""
+                    return await extract_article_content(entry.url, prefetched=already_have)
                 # entry.content (Exa prefetched text) short-circuits the fetch; RSS and
                 # empty-text entries carry content=None and fall through to the network path.
-                return await extract_article_content(
-                    entry.url,
-                    fallback_summary=entry.summary,
-                    client=fetch_client,
-                    timeout=article_fetch_timeout,
-                    prefetched=entry.content,
+                return await bounded(
+                    deadline,
+                    "article extraction",
+                    extract_article_content(
+                        entry.url,
+                        fallback_summary=entry.summary,
+                        client=fetch_client,
+                        timeout=article_fetch_timeout,
+                        prefetched=entry.content,
+                    ),
                 )
 
         content_tasks = [_extract(entry) for entry, _ in fetch_batch]
@@ -400,6 +417,7 @@ async def fetch_new_articles_for_topic(
     feed_backoff_base_minutes: int = 15,
     feed_backoff_cap_hours: int = 24,
     exa_settings: "ExaSettings | None" = None,
+    deadline: Deadline | None = None,
 ) -> FetchResult:
     """Fetch feeds, dedup against DB, extract content, and store new articles.
 
@@ -418,12 +436,18 @@ async def fetch_new_articles_for_topic(
         feed_max_retries: Maximum retry attempts for feed fetching.
         concurrency: Maximum number of concurrent article content fetches.
         exa_settings: Exa configuration, required for EXA-mode topics (ignored otherwise).
+        deadline: One monotonic budget for this whole logical attempt (TW-AUD-018).
+            Feed retries, redirect resolution and content extraction each used to
+            draw their own, so their sum was unbounded and a merely-slow source
+            could hold the topic slot past the next scheduler tick. Callers that
+            own a larger unit of work pass theirs; otherwise one starts here.
 
     Returns:
         FetchResult with stored articles and total feed entry count.
     """
     if topic.id is None:
         raise ValueError("Topic must have an ID")
+    budget = deadline if deadline is not None else Deadline.after()
 
     # --- P1: fetch all feed entries with NO connection open. Per-feed health
     # verdicts accumulate in memory; they are applied below in one short phase.
@@ -439,6 +463,7 @@ async def fetch_new_articles_for_topic(
             backoff_cap_hours=feed_backoff_cap_hours,
             exa_settings=exa_settings,
             max_results=max_articles,
+            deadline=budget,
         )
     except BaseException:
         # A partial fetch still observed real per-feed failures. Persist what was
@@ -476,8 +501,8 @@ async def fetch_new_articles_for_topic(
     reuse_batch, fetch_batch = _select_candidates(new_entries, reuse_entries, max_articles)
 
     # --- P1b: redirect resolution and content extraction, still connection-free.
-    await _resolve_redirect_urls(fetch_batch, response, feed_fetch_timeout)
-    contents = await _extract_contents(fetch_batch, article_fetch_timeout, concurrency)
+    await _resolve_redirect_urls(fetch_batch, response, feed_fetch_timeout, budget)
+    contents = await _extract_contents(fetch_batch, article_fetch_timeout, concurrency, budget)
 
     # --- C2: one short connection normalizes both batches and inserts.
     with get_db(db_path) as conn:

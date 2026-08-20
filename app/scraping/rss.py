@@ -25,10 +25,19 @@ from app.log_redaction import redact_url
 from app.models import FeedMode, Topic
 from app.scraping.google_news import GOOGLE_NEWS_HOST
 from app.scraping.providers import provider_identity
+from app.scraping.source import (
+    DEADLINE_ERROR,
+    Deadline,
+    SourceDeadlineExceeded,
+    SourceRequest,
+    bounded,
+    host_matches,
+    register_source,
+    url_hostname,
+)
 from app.scraping.source import FeedEntry as FeedEntry
 from app.scraping.source import FeedHealthCallback as FeedHealthCallback
 from app.scraping.source import FeedResponse as FeedResponse
-from app.scraping.source import SourceRequest, host_matches, register_source, url_hostname
 from app.scraping.source import fetch_feeds_for_topic as fetch_feeds_for_topic
 from app.url_validation import is_private_url, safe_get
 
@@ -36,6 +45,8 @@ if TYPE_CHECKING:
     from app.models import FeedHealth
 
 logger = logging.getLogger(__name__)
+
+_RETRY_BACKOFF_SECONDS = 2.0
 
 BING_HOST = "bing.com"
 """Bing News RSS and its apiclick redirects are served from this domain."""
@@ -294,6 +305,25 @@ def _parse_entry(raw_entry: dict, source_feed: str) -> FeedEntry | None:
     )
 
 
+def _record_out_of_budget(feed_url: str, health_callback: FeedHealthCallback | None, reason: str) -> None:
+    """Record the typed timeout outcome for a feed that ran out of budget."""
+    logger.warning("Feed fetch out of budget: %s — %s", feed_url, reason)
+    if health_callback:
+        health_callback(feed_url, False, reason, None, None)
+
+
+async def _retry_pause(budget: Deadline) -> bool:
+    """Wait out the retry backoff; False when the budget cannot fund another try.
+
+    The pause itself is charged against the deadline, so a feed that has burned
+    its budget stops retrying instead of sleeping into the next scheduler tick.
+    """
+    if budget.expired():
+        return False
+    await asyncio.sleep(budget.slice(_RETRY_BACKOFF_SECONDS))
+    return not budget.expired()
+
+
 async def fetch_feed(
     feed_url: str,
     client: httpx.AsyncClient | None = None,
@@ -302,6 +332,7 @@ async def fetch_feed(
     health_callback: FeedHealthCallback | None = None,
     etag: str | None = None,
     last_modified: str | None = None,
+    deadline: Deadline | None = None,
 ) -> list[FeedEntry]:
     """Fetch and parse a single RSS/Atom feed. Returns [] on any error."""
     entries, _ = await fetch_feed_with_status(
@@ -312,6 +343,7 @@ async def fetch_feed(
         health_callback=health_callback,
         etag=etag,
         last_modified=last_modified,
+        deadline=deadline,
     )
     return entries
 
@@ -324,6 +356,7 @@ async def fetch_feed_with_status(
     health_callback: FeedHealthCallback | None = None,
     etag: str | None = None,
     last_modified: str | None = None,
+    deadline: Deadline | None = None,
 ) -> tuple[list[FeedEntry], bool]:
     """Fetch and parse a single feed, also reporting whether the fetch succeeded.
 
@@ -336,7 +369,18 @@ async def fetch_feed_with_status(
     ``etag`` / ``last_modified`` are the feed's stored conditional-GET validators;
     when present they are sent as ``If-None-Match`` / ``If-Modified-Since`` and a
     304 returns ``([], True)`` (the empty-but-OK bucket) without re-parsing.
+
+    ``deadline`` bounds this feed's whole share of the attempt — the DNS check,
+    every retry and the sleeps between them — rather than each transport wait
+    separately (TW-AUD-018). Running out is a typed outcome: the feed is recorded
+    as failed with ``DEADLINE_ERROR`` and no further attempt is made.
     """
+    budget = deadline if deadline is not None else Deadline.after()
+    if budget.expired():
+        _record_out_of_budget(feed_url, health_callback, f"{DEADLINE_ERROR} before the feed fetch")
+        return [], False
+    # The SSRF check resolves DNS, which is why it runs once per feed rather than
+    # once per attempt; it carries its own hard resolve cap (OVH-148).
     if await asyncio.to_thread(is_private_url, feed_url):
         logger.warning("Blocked fetch to private URL: %s", redact_url(feed_url))
         return [], False
@@ -356,7 +400,9 @@ async def fetch_feed_with_status(
     try:
         for attempt in range(max_attempts):
             try:
-                response = await safe_get(client, feed_url, headers=cond_headers or None)
+                response = await bounded(
+                    budget, "the feed request", safe_get(client, feed_url, headers=cond_headers or None)
+                )
                 # 304 Not Modified: validators still valid. Treat as an empty-but-
                 # successful fetch — the existing "([], True)" bucket that
                 # _fetch_auto/_fetch_manual already handle. Pass (None, None) so the
@@ -402,35 +448,35 @@ async def fetch_feed_with_status(
                         response.headers.get("last-modified"),
                     )
                 return entries, True
+            except SourceDeadlineExceeded as exc:
+                _record_out_of_budget(feed_url, health_callback, str(exc))
+                return [], False
             except httpx.TimeoutException as exc:
-                if attempt < max_attempts - 1:
+                if attempt < max_attempts - 1 and await _retry_pause(budget):
                     logger.debug("Timeout fetching feed (attempt %d): %s", attempt + 1, feed_url)
-                    await asyncio.sleep(2)
                     continue
                 logger.warning("Timeout fetching feed after %d attempts: %s", max_attempts, feed_url)
                 if health_callback:
                     health_callback(feed_url, False, f"Timeout after {max_attempts} attempts: {exc}", None, None)
                 return [], False
             except httpx.HTTPStatusError as exc:
-                if exc.response.status_code >= 500 and attempt < max_attempts - 1:
+                if exc.response.status_code >= 500 and attempt < max_attempts - 1 and await _retry_pause(budget):
                     logger.debug(
                         "HTTP %d fetching feed (attempt %d): %s", exc.response.status_code, attempt + 1, feed_url
                     )
-                    await asyncio.sleep(2)
                     continue
                 logger.warning("HTTP %d fetching feed: %s", exc.response.status_code, feed_url)
                 if health_callback:
                     health_callback(feed_url, False, f"HTTP {exc.response.status_code}", None, None)
                 return [], False
             except httpx.NetworkError as exc:
-                if attempt < max_attempts - 1:
+                if attempt < max_attempts - 1 and await _retry_pause(budget):
                     logger.debug(
                         "Network error fetching feed (attempt %d): %s — %s",
                         attempt + 1,
                         feed_url,
                         type(exc).__name__,
                     )
-                    await asyncio.sleep(2)
                     continue
                 logger.warning(
                     "Network error fetching feed after %d attempts: %s — %s",
@@ -458,6 +504,7 @@ async def _fetch_auto(topic: Topic, request: SourceRequest) -> FeedResponse:
     max_attempts = request.max_attempts
     health_callback = request.health_callback
     feed_state_loader = request.feed_state_loader
+    deadline = request.deadline
     router = request.router
     if router is None:
         from app.scraping.routing import router as default_router
@@ -484,6 +531,7 @@ async def _fetch_auto(topic: Topic, request: SourceRequest) -> FeedResponse:
             health_callback=health_callback,
             etag=p_etag,
             last_modified=p_last_modified,
+            deadline=deadline,
         )
 
         if entries:
@@ -513,6 +561,17 @@ async def _fetch_auto(topic: Topic, request: SourceRequest) -> FeedResponse:
                 needs_url_resolution=False,
             )
 
+        if deadline.expired():
+            # The cascade is a second full fetch; starting one with no budget left
+            # only pushes the topic further past its slot.
+            logger.warning("Provider %s %s; no budget left to cascade to %s", provider.name, reason, next_provider.name)
+            return FeedResponse.from_source(
+                provider_identity(provider),
+                feeds_total=1,
+                feeds_failed=1 if not fetch_ok else 0,
+                needs_url_resolution=False,
+            )
+
         logger.info("Provider %s %s, cascading to %s", provider.name, reason, next_provider.name)
         feed_url = next_provider.build_feed_url(topic)
         next_epoch = router.health_epoch(next_provider.name)
@@ -525,6 +584,7 @@ async def _fetch_auto(topic: Topic, request: SourceRequest) -> FeedResponse:
             health_callback=health_callback,
             etag=f_etag,
             last_modified=f_last_modified,
+            deadline=deadline,
         )
         first_failed = 1 if not fetch_ok else 0
 
@@ -564,6 +624,7 @@ async def _fetch_manual(topic: Topic, request: SourceRequest) -> FeedResponse:
     feed_state_loader = request.feed_state_loader
     backoff_base_minutes = request.backoff_base_minutes
     backoff_cap_hours = request.backoff_cap_hours
+    deadline = request.deadline
     if not topic.feed_urls:
         return FeedResponse()
 
@@ -603,6 +664,7 @@ async def _fetch_manual(topic: Topic, request: SourceRequest) -> FeedResponse:
                 health_callback=health_callback,
                 etag=etag,
                 last_modified=last_modified,
+                deadline=deadline,
             )
             for (url, etag, last_modified) in attempted
         ]

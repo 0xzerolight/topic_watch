@@ -1,5 +1,6 @@
 """Tests for the scraping pipeline: RSS fetching, content extraction, orchestration."""
 
+import asyncio
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,6 +27,7 @@ from app.scraping.rss import (
     fetch_feed,
     fetch_feeds_for_topic,
 )
+from app.scraping.source import Deadline
 
 # --- Sample RSS/Atom XML for mocking ---
 
@@ -804,6 +806,163 @@ class TestBingStubRegression:
         assert _content_quality_tag(content) == ""
 
 
+class TestSourceDeadline:
+    """TW-AUD-018: one monotonic budget bounds a whole logical source attempt."""
+
+    def test_remaining_is_clamped_and_monotonic(self) -> None:
+        from app.scraping.source import Deadline
+
+        live = Deadline.after(30.0)
+        assert 0.0 < live.remaining() <= 30.0
+        assert live.expired() is False
+        assert live.slice(60.0) <= 30.0  # a per-request timeout never outlives the budget
+        assert live.slice(0.5) == 0.5
+
+        spent = Deadline.after(-1.0)
+        assert spent.remaining() == 0.0
+        assert spent.expired() is True
+        assert spent.slice(10.0) == 0.0
+
+    def test_check_raises_the_typed_outcome(self) -> None:
+        from app.scraping.source import Deadline, SourceDeadlineExceeded
+
+        Deadline.after(30.0).check("the feed request")  # does not raise
+        with pytest.raises(SourceDeadlineExceeded, match="deadline"):
+            Deadline.after(-1.0).check("the feed request")
+
+    async def test_spent_budget_makes_no_request_and_records_the_outcome(self) -> None:
+        """A feed whose budget is gone is a typed failure, not a silent empty fetch."""
+        from unittest.mock import MagicMock
+
+        from app.scraping.rss import fetch_feed_with_status
+        from app.scraping.source import DEADLINE_ERROR, Deadline
+
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(str(request.url))
+            return httpx.Response(200, text=_SAMPLE_RSS)
+
+        callback = MagicMock()
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            entries, fetch_ok = await fetch_feed_with_status(
+                "https://example.com/feed.xml",
+                client,
+                health_callback=callback,
+                deadline=Deadline.after(-1.0),
+            )
+
+        assert (entries, fetch_ok) == ([], False)
+        assert calls == []
+        args = callback.call_args[0]
+        assert args[1] is False
+        assert DEADLINE_ERROR in args[2]
+
+    async def test_a_hanging_feed_is_cut_off_and_not_retried(self) -> None:
+        """The budget, not the per-request timeout, ends a source that never answers."""
+        from unittest.mock import MagicMock
+
+        from app.scraping.rss import fetch_feed_with_status
+        from app.scraping.source import DEADLINE_ERROR, Deadline
+
+        calls: list[str] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(str(request.url))
+            await asyncio.Event().wait()  # never answers
+            raise AssertionError("unreachable")
+
+        callback = MagicMock()
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            entries, fetch_ok = await fetch_feed_with_status(
+                "https://example.com/feed.xml",
+                client,
+                timeout=600.0,
+                max_attempts=3,
+                health_callback=callback,
+                deadline=Deadline.after(0.05),
+            )
+
+        assert (entries, fetch_ok) == ([], False)
+        assert len(calls) == 1  # no retry once the budget is gone
+        assert DEADLINE_ERROR in callback.call_args[0][2]
+
+    async def test_manual_feeds_share_one_budget(self) -> None:
+        """Every feed of a topic draws on the same deadline instance."""
+        seen: list[object] = []
+
+        async def fake_fetch(url, client, *, deadline=None, **kwargs):
+            seen.append(deadline)
+            return ([], True)
+
+        topic = Topic(
+            name="T",
+            description="d",
+            feed_mode=FeedMode.MANUAL,
+            feed_urls=["https://a.example/feed", "https://b.example/feed"],
+        )
+        budget = Deadline.after(30.0)
+        with patch("app.scraping.rss.fetch_feed_with_status", side_effect=fake_fetch):
+            await fetch_feeds_for_topic(topic, deadline=budget)
+
+        assert seen == [budget, budget]
+
+    async def test_extraction_keeps_the_summary_instead_of_fetching(self) -> None:
+        """With the budget gone, extraction stops hitting the network (TW-AUD-018)."""
+        from app.scraping import _extract_contents
+
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(str(request.url))
+            return httpx.Response(200, text=_SAMPLE_HTML)
+
+        transport = httpx.MockTransport(handler)
+        entry = FeedEntry(
+            title="RSS", url="https://example.com/x", summary="the summary", source_feed="rss", content=None
+        )
+        original_init = httpx.AsyncClient.__init__
+
+        def patched_init(self_client, **kwargs):
+            kwargs["transport"] = transport
+            original_init(self_client, **kwargs)
+
+        with patch.object(httpx.AsyncClient, "__init__", patched_init):
+            contents = await _extract_contents(
+                [(entry, "h")], article_fetch_timeout=5.0, concurrency=2, deadline=Deadline.after(-1.0)
+            )
+
+        assert contents == ["the summary"]
+        assert calls == []
+
+    async def test_redirect_resolution_stops_when_the_budget_is_gone(self) -> None:
+        """Unresolved entries keep their redirect URL rather than spending more time."""
+        from app.scraping.google_news import resolve_google_news_urls
+
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(str(request.url))
+            return httpx.Response(200, text="")
+
+        transport = httpx.MockTransport(handler)
+        original_init = httpx.AsyncClient.__init__
+
+        def patched_init(self_client, **kwargs):
+            kwargs["transport"] = transport
+            original_init(self_client, **kwargs)
+
+        with patch.object(httpx.AsyncClient, "__init__", patched_init):
+            resolved = await resolve_google_news_urls(
+                ["https://news.google.com/rss/articles/ABC123"],
+                request_delay=0.0,
+                deadline=Deadline.after(-1.0),
+            )
+
+        assert resolved == {}
+        assert calls == []
+
+
 class TestSourceHostClassification:
     """TW-AUD-031: source labels come from the parsed hostname, not URL substrings.
 
@@ -1469,7 +1628,9 @@ class TestExtractContentsPrefetched:
             original_init(self_client, **kwargs)
 
         with patch.object(httpx.AsyncClient, "__init__", patched_init):
-            contents = await _extract_contents(batch, article_fetch_timeout=5.0, concurrency=2)
+            contents = await _extract_contents(
+                batch, article_fetch_timeout=5.0, concurrency=2, deadline=Deadline.after()
+            )
 
         assert contents[0] == "Prefetched A body"  # short-circuited
         assert calls == ["https://example.com/b"]  # only the content-less entry fetched
@@ -1701,6 +1862,7 @@ class TestFetchNewArticlesForTopic:
             backoff_cap_hours=24,
             exa_settings=None,
             max_results=10,
+            deadline=None,
         ):
             # Simulate a successful feed fetch that triggers a health write.
             if health_callback:
@@ -2252,7 +2414,7 @@ class TestResolveRedirectUrls:
         response = FeedResponse(provider_name="bing_news", needs_url_resolution=False)
 
         with patch("app.scraping.resolve_google_news_urls", new_callable=AsyncMock) as mock_resolve:
-            await _resolve_redirect_urls(fetch_batch, response, feed_fetch_timeout=5.0)
+            await _resolve_redirect_urls(fetch_batch, response, 5.0, Deadline.after())
         mock_resolve.assert_not_called()
         # URL left untouched.
         assert fetch_batch[0][0].url == gnews
@@ -2270,7 +2432,7 @@ class TestResolveRedirectUrls:
             new_callable=AsyncMock,
             return_value={gnews: "https://real.example/article"},
         ) as mock_resolve:
-            await _resolve_redirect_urls(fetch_batch, response, feed_fetch_timeout=5.0)
+            await _resolve_redirect_urls(fetch_batch, response, 5.0, Deadline.after())
 
         # Only the Google article URL was offered for resolution (not the plain one).
         mock_resolve.assert_awaited_once()
@@ -2287,7 +2449,7 @@ class TestResolveRedirectUrls:
         response = FeedResponse(provider_name="google_news", needs_url_resolution=True)
 
         with patch("app.scraping.resolve_google_news_urls", new_callable=AsyncMock) as mock_resolve:
-            await _resolve_redirect_urls(fetch_batch, response, feed_fetch_timeout=5.0)
+            await _resolve_redirect_urls(fetch_batch, response, 5.0, Deadline.after())
         mock_resolve.assert_not_called()
 
 
@@ -2418,7 +2580,7 @@ class TestManualBackoffAndValidators:
         attempted: list[str] = []
 
         async def fake_fetch(
-            url, client, *, timeout, max_attempts, health_callback=None, etag=None, last_modified=None
+            url, client, *, timeout, max_attempts, health_callback=None, etag=None, last_modified=None, deadline=None
         ):
             attempted.append(url)
             return ([FeedEntry(title="A", url="https://live.example/a", source_feed=url)], True)
@@ -2455,7 +2617,7 @@ class TestManualBackoffAndValidators:
         seen: list[tuple[str | None, str | None]] = []
 
         async def fake_fetch(
-            url, client, *, timeout, max_attempts, health_callback=None, etag=None, last_modified=None
+            url, client, *, timeout, max_attempts, health_callback=None, etag=None, last_modified=None, deadline=None
         ):
             seen.append((etag, last_modified))
             return ([FeedEntry(title="A", url="https://x/a", source_feed=url)], True)
@@ -2477,7 +2639,7 @@ class TestManualBackoffAndValidators:
         calls: list[tuple[str, str | None]] = []  # (url, etag)
 
         async def fake_fetch(
-            url, client, *, timeout, max_attempts, health_callback=None, etag=None, last_modified=None
+            url, client, *, timeout, max_attempts, health_callback=None, etag=None, last_modified=None, deadline=None
         ):
             calls.append((url, etag))
             if len(calls) == 1:  # primary: fetch failed, no entries -> cascade

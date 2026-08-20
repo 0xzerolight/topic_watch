@@ -210,6 +210,35 @@ class TestFetchExaEntries:
         assert resp.feeds_total == 0 and resp.feeds_failed == 0
         assert calls == []
 
+    async def test_spent_deadline_makes_no_request(self) -> None:
+        """TW-AUD-018: Exa draws on the topic's source budget like any other fetch."""
+        from unittest.mock import MagicMock
+
+        from app.scraping.source import DEADLINE_ERROR, Deadline
+
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(str(request.url))
+            return httpx.Response(200, json={"results": []})
+
+        callback = MagicMock()
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            resp = await fetch_exa_entries(
+                _EXA_TOPIC,
+                _ENABLED,
+                max_results=5,
+                timeout=5.0,
+                client=client,
+                health_callback=callback,
+                deadline=Deadline.after(-1.0),
+            )
+
+        assert resp.feeds_total == 1 and resp.feeds_failed == 1
+        assert resp.entries == []
+        assert calls == []
+        assert DEADLINE_ERROR in callback.call_args[0][2]
+
     async def test_http_4xx_fails_safe(self) -> None:
         transport = httpx.MockTransport(lambda r: httpx.Response(401, json={"error": "bad key"}))
         async with httpx.AsyncClient(transport=transport) as client:
