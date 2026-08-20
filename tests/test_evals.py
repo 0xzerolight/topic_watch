@@ -115,9 +115,12 @@ async def test_recorded_parsed_is_snapshot_immune_to_later_mutation() -> None:
 
 
 def test_recording_client_builds_real_inner_when_none_injected(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Omitting the mock inner builds the real client — proving the no-live-call
-    guarantee is load-bearing. With from_litellm patched to raise, the default
-    path raises; the injected path does not.
+    """Omitting the mock inner builds a real per-mode client the first time
+    ``_get_client`` is actually invoked — proving the no-live-call guarantee is
+    load-bearing. With from_litellm patched to raise, the default path raises;
+    the injected path does not. (Client construction is now lazy per mode, to
+    match production's own per-mode client cache, so this must call
+    ``_get_client`` rather than exercise nothing inside the context.)
     """
     import evals.recorder as recorder
 
@@ -127,11 +130,73 @@ def test_recording_client_builds_real_inner_when_none_injected(monkeypatch: pyte
     monkeypatch.setattr(recorder.instructor, "from_litellm", _boom)
 
     with pytest.raises(AssertionError, match="real client build attempted"), recorder.recording_client():
-        pass
+        llm_mod._get_client(MagicMock())
 
     # Injecting an inner avoids the real build entirely.
     with recorder.recording_client(inner=MagicMock()):
-        pass
+        llm_mod._get_client(MagicMock())
+
+
+async def test_recording_client_calls_land_on_the_mode_specific_inner() -> None:
+    """AUG-294: production bakes the structured-output mode into a DISTINCT
+    client at build time (TOOLS/JSON/MD_JSON), because that mode decides how
+    the request is shaped. A recorder that returns one constant proxy for
+    every ``_get_client(settings, mode)`` call would route every fallback
+    attempt through the same client, silently skipping the mode switch a real
+    retry makes. Injecting a ``{mode: mock}`` dict must dispatch each mode to
+    its own mock, and each captured record must carry the mode it used.
+    """
+    import instructor
+
+    from evals.recorder import recording_client
+
+    tools_inner = MagicMock()
+    tools_inner.chat.completions.create_with_completion = AsyncMock(return_value=(_novelty(), _StubCompletion()))
+    json_inner = MagicMock()
+    json_inner.chat.completions.create_with_completion = AsyncMock(
+        return_value=(_novelty(summary="from json mode"), _StubCompletion())
+    )
+
+    with recording_client(inner={instructor.Mode.TOOLS: tools_inner, instructor.Mode.JSON: json_inner}) as records:
+        tools_client = llm_mod._get_client(MagicMock(), instructor.Mode.TOOLS)
+        await tools_client.chat.completions.create_with_completion(model="m", response_model=NoveltyResult, messages=[])
+        json_client = llm_mod._get_client(MagicMock(), instructor.Mode.JSON)
+        result, _ = await json_client.chat.completions.create_with_completion(
+            model="m", response_model=NoveltyResult, messages=[]
+        )
+
+    assert tools_inner.chat.completions.create_with_completion.await_count == 1
+    assert json_inner.chat.completions.create_with_completion.await_count == 1
+    assert result.summary == "from json mode"
+    assert [r.mode for r in records] == [instructor.Mode.TOOLS, instructor.Mode.JSON]
+
+
+async def test_recording_client_records_a_rejected_attempt_before_reraising() -> None:
+    """A structured-output attempt that a provider rejects (e.g. a forced
+    tool_choice a mode-fallback retries past) must not vanish — the recorder
+    only appended after success, hiding every attempt but the last (AUG-294).
+    """
+    from evals.recorder import recording_client
+
+    inner = MagicMock()
+    inner.chat.completions.create_with_completion = AsyncMock(side_effect=RuntimeError("rejected: SUPER_SECRET_KEY"))
+
+    with recording_client(inner=inner) as records:
+        client = llm_mod._get_client(MagicMock())
+        with pytest.raises(RuntimeError, match="rejected"):
+            await client.chat.completions.create_with_completion(
+                model="m",
+                response_model=NoveltyResult,
+                messages=[{"role": "user", "content": "hi"}],
+                api_key="SUPER_SECRET_KEY",
+            )
+
+    assert len(records) == 1
+    rec = records[0]
+    assert rec.parsed is None
+    assert rec.error is not None
+    assert "RuntimeError" in rec.error
+    assert "SUPER_SECRET_KEY" not in rec.error  # the leaked key in the message is sanitized
 
 
 # --- scenario + RunArtifact ---
@@ -212,6 +277,93 @@ def test_load_scenario_parses_handauthored_yaml(tmp_path) -> None:
     assert sc.articles[0].published.year == 2025
 
 
+def test_load_scenario_rejects_a_typo_d_top_level_key(tmp_path) -> None:
+    """AUG-050: a misspelled top-level key (e.g. `expects:` instead of
+    `expect:`) used to be silently discarded — the scenario would still run
+    against the real LLM, just without the check its author intended, and
+    the artifact would look like a valid run."""
+    import pydantic
+
+    from evals.scenario import load_scenario
+
+    p = tmp_path / "typo.yml"
+    p.write_text(
+        textwrap.dedent(
+            """
+            kind: novelty
+            topic:
+              name: "Acme"
+              description: "track acme funding"
+            articles:
+              - title: "dup"
+                url: "http://a"
+                content: "c"
+                source_feed: "http://feed"
+            expects:
+              has_new_info: false
+            """
+        )
+    )
+    with pytest.raises(pydantic.ValidationError):
+        load_scenario(p)
+
+
+def test_load_scenario_rejects_a_typo_d_topic_key(tmp_path) -> None:
+    """A typo'd extra key alongside otherwise-valid, complete fields — not a
+    missing-required-field error, which would mask whether extras are
+    actually forbidden."""
+    import pydantic
+
+    from evals.scenario import load_scenario
+
+    p = tmp_path / "typo_topic.yml"
+    p.write_text(
+        textwrap.dedent(
+            """
+            kind: novelty
+            topic:
+              name: "Acme"
+              description: "track acme funding"
+              descripton: "typo duplicate"
+            articles:
+              - title: "dup"
+                url: "http://a"
+                content: "c"
+                source_feed: "http://feed"
+            """
+        )
+    )
+    with pytest.raises(pydantic.ValidationError):
+        load_scenario(p)
+
+
+def test_load_scenario_rejects_a_typo_d_expectation_key(tmp_path) -> None:
+    import pydantic
+
+    from evals.scenario import load_scenario
+
+    p = tmp_path / "typo_expect.yml"
+    p.write_text(
+        textwrap.dedent(
+            """
+            kind: novelty
+            topic:
+              name: "Acme"
+              description: "track acme funding"
+            articles:
+              - title: "dup"
+                url: "http://a"
+                content: "c"
+                source_feed: "http://feed"
+            expect:
+              has_new_infoo: false
+            """
+        )
+    )
+    with pytest.raises(pydantic.ValidationError):
+        load_scenario(p)
+
+
 def test_run_artifact_save_load_round_trip(tmp_path) -> None:
     from evals.scenario import (
         CapturedCall,
@@ -252,6 +404,109 @@ def test_run_artifact_save_load_round_trip(tmp_path) -> None:
     assert loaded.calls[0].raw_parsed == {"has_new_info": True, "key_facts": ["x"]}
     assert loaded.final == {"has_new_info": True, "key_facts": []}
     assert loaded.scenario.topic.name == "T"
+
+
+def test_run_artifact_carries_schema_version_and_run_id() -> None:
+    """AUG-295: artifacts had no schema version or stable identity, so replay
+    lineage could not be established and an old file silently loaded under
+    current field defaults."""
+    from evals.scenario import RunArtifact, Scenario, ScenarioTopic
+
+    art = RunArtifact(name="s", kind="novelty", scenario=Scenario(topic=ScenarioTopic(name="T", description="d")))
+
+    assert art.schema_version >= 1
+    assert isinstance(art.run_id, str) and art.run_id
+    art2 = RunArtifact(name="s", kind="novelty", scenario=Scenario(topic=ScenarioTopic(name="T", description="d")))
+    assert art.run_id != art2.run_id  # each run gets its own identity
+
+
+def test_load_run_rejects_a_newer_unsupported_schema_version(tmp_path) -> None:
+    import json
+
+    from evals.scenario import RunArtifact, Scenario, ScenarioTopic, load_run
+
+    art = RunArtifact(name="s", kind="novelty", scenario=Scenario(topic=ScenarioTopic(name="T", description="d")))
+    data = art.model_dump(mode="json")
+    data["schema_version"] = 999999
+    path = tmp_path / "future.json"
+    path.write_text(json.dumps(data))
+
+    with pytest.raises(ValueError, match="schema_version"):
+        load_run(path)
+
+
+def _minimal_artifact(name: str = "s"):
+    from evals.scenario import RunArtifact, Scenario, ScenarioTopic
+
+    return RunArtifact(
+        name=name,
+        kind="novelty",
+        scenario=Scenario(topic=ScenarioTopic(name="T", description="d")),
+    )
+
+
+def test_save_run_uses_restrictive_permissions(tmp_path) -> None:
+    """AUG-297: artifacts embed raw article bodies, prompts, and topic
+    instructions; an ambient umask must not make them world/group readable
+    on a shared self-hosting machine."""
+    import stat
+
+    from evals.scenario import save_run
+
+    runs = tmp_path / "runs"
+    path = save_run(_minimal_artifact(), runs)
+
+    dir_mode = stat.S_IMODE(runs.stat().st_mode)
+    file_mode = stat.S_IMODE(path.stat().st_mode)
+    assert dir_mode == 0o700
+    assert file_mode == 0o600
+
+
+def test_dump_scenario_uses_restrictive_permissions(tmp_path) -> None:
+    """The same private writer applies to frozen scenarios (--freeze), which
+    also carry article bodies and topic instructions (AUG-297)."""
+    import stat
+
+    from evals.scenario import Scenario, ScenarioTopic, dump_scenario
+
+    p = tmp_path / "frozen.yml"
+    dump_scenario(Scenario(topic=ScenarioTopic(name="T", description="d")), p)
+
+    assert stat.S_IMODE(p.stat().st_mode) == 0o600
+
+
+def test_save_run_rejects_path_traversal_via_scenario_name(tmp_path) -> None:
+    """AUG-298: Scenario.name is attacker/author-controlled (a hand-authored
+    YAML `name:` field), and must never let a run escape runs_dir."""
+    from evals.scenario import save_run
+
+    runs = tmp_path / "runs"
+    path = save_run(_minimal_artifact(name="../../etc/passwd"), runs)
+
+    assert path.resolve().parent == runs.resolve()
+    assert ".." not in path.name
+
+
+def test_save_run_slugifies_absolute_scenario_name(tmp_path) -> None:
+    from evals.scenario import save_run
+
+    runs = tmp_path / "runs"
+    path = save_run(_minimal_artifact(name="/etc/passwd"), runs)
+
+    assert path.resolve().parent == runs.resolve()
+
+
+def test_save_run_prunes_old_artifacts_beyond_cap(tmp_path, monkeypatch) -> None:
+    """AUG-298: unbounded artifact storage — cap saved runs so an unattended
+    habit of eval invocations does not grow runs_dir without bound."""
+    import evals.scenario as scenario_mod
+
+    monkeypatch.setattr(scenario_mod, "_MAX_SAVED_RUNS", 3)
+    runs = tmp_path / "runs"
+    for i in range(5):
+        scenario_mod.save_run(_minimal_artifact(name=f"s{i}"), runs)
+
+    assert len(list(runs.glob("*.json"))) == 3
 
 
 # --- runner: run_scenario ---
@@ -325,6 +580,50 @@ async def test_run_scenario_novelty_evaluates_min_importance() -> None:
 
     oks = {c.check: c.ok for c in art.expect_results}
     assert oks["min_importance"] is False  # 2 < 4
+
+
+async def test_run_scenario_novelty_evaluates_max_importance() -> None:
+    """AUG-049: max_importance catches over-scoring noise (a model treating a
+    minor update as major) — min_importance alone can't express that check."""
+    from evals.runner import run_scenario
+    from evals.scenario import Expectation, Scenario, ScenarioArticle, ScenarioTopic
+
+    inner = _mock_inner(novelty=_novelty(importance=5))
+    sc = Scenario(
+        kind="novelty",
+        topic=ScenarioTopic(name="T", description="d"),
+        articles=[ScenarioArticle(title="a", url="http://x", content="c", source_feed="http://f")],
+        expect=Expectation(max_importance=2),
+        name="s",
+    )
+    art = await run_scenario(sc, _settings(), inner=inner)
+
+    oks = {c.check: c.ok for c in art.expect_results}
+    assert oks["max_importance"] is False  # 5 > 2
+
+
+def test_shipped_scenario_corpus_covers_every_dispatch_kind() -> None:
+    """AUG-049: the manual real-model corpus (evals/scenarios/) shipped with
+    only a negative-novelty and a knowledge_init case, leaving half the
+    dispatch kinds (and positive novelty / custom-instruction / importance
+    behavior) with no real-model regression coverage at all. These files are
+    dev-only and never exercised by CI (billed, real LLM), so this parse-and-
+    cover check is the only guard against the corpus rotting out of sync with
+    the scenario schema or silently losing kind coverage.
+    """
+    from pathlib import Path
+
+    from evals.runner import KIND_DISPATCH
+    from evals.scenario import load_scenario
+
+    scenarios_dir = Path(__file__).resolve().parent.parent / "evals" / "scenarios"
+    files = sorted(scenarios_dir.glob("*.yml"))
+    assert files, "no shipped scenario files found"
+
+    kinds_covered = {load_scenario(f).kind for f in files}
+    assert kinds_covered == set(KIND_DISPATCH), (
+        f"corpus is missing dispatch kinds: {set(KIND_DISPATCH) - kinds_covered}"
+    )
 
 
 async def test_scenario_novelty_instruction_reaches_the_prompt() -> None:
@@ -411,6 +710,121 @@ async def test_run_scenario_surfaces_swallowed_llm_error() -> None:
     assert "boom" in art.final_error
 
 
+async def test_run_scenario_error_skips_expectation_match() -> None:
+    """AUG-296: a swallowed LLM failure must not be reportable as MATCH.
+
+    The safe default is has_new_info=False, which numerically satisfies an
+    `expect: {has_new_info: false}` — but that "match" would be a lie: the
+    model never actually judged anything. An errored run must collapse to a
+    single failing execution check instead of the normal per-field checks.
+    """
+    from evals.runner import run_scenario
+    from evals.scenario import Expectation, Scenario, ScenarioArticle, ScenarioTopic
+
+    inner = MagicMock()
+    inner.chat.completions.create_with_completion = AsyncMock(side_effect=RuntimeError("provider down"))
+    sc = Scenario(
+        kind="novelty",
+        topic=ScenarioTopic(name="T", description="d"),
+        articles=[ScenarioArticle(title="a", url="http://x", content="c", source_feed="http://f")],
+        expect=Expectation(has_new_info=False),
+        name="s",
+    )
+    art = await run_scenario(sc, _settings(), inner=inner)
+
+    assert art.final_error is not None
+    assert len(art.expect_results) == 1
+    check = art.expect_results[0]
+    assert check.ok is False
+    assert check.check != "has_new_info"  # not evaluated as a normal field match
+
+
+async def test_run_scenario_raising_kind_returns_evidence_instead_of_raising() -> None:
+    """knowledge_init/update/compress raise on failure (production invariant), but
+    the harness must still finalize an artifact as evidence (AUG-296) rather than
+    losing the run entirely to an uncaught traceback."""
+    from evals.runner import run_scenario
+    from evals.scenario import Scenario, ScenarioArticle, ScenarioTopic
+
+    inner = MagicMock()
+    inner.chat.completions.create_with_completion = AsyncMock(side_effect=RuntimeError("provider down"))
+    sc = Scenario(
+        kind="knowledge_init",
+        topic=ScenarioTopic(name="T", description="d"),
+        articles=[ScenarioArticle(title="a", url="http://x", content="c", source_feed="http://f")],
+        name="s",
+    )
+    art = await run_scenario(sc, _settings(), inner=inner)  # must not raise
+
+    assert art.final is None
+    assert art.final_error is not None
+    assert "provider down" in art.final_error
+
+
+# --- __main__: exit codes (AUG-296) ---
+
+
+def test_exit_code_zero_for_clean_match() -> None:
+    from evals.__main__ import _exit_code
+    from evals.scenario import ExpectCheck, RunArtifact, Scenario, ScenarioTopic
+
+    art = RunArtifact(
+        name="s",
+        kind="novelty",
+        final={"has_new_info": False},
+        expect_results=[ExpectCheck(check="has_new_info", ok=True, detail="")],
+        scenario=Scenario(topic=ScenarioTopic(name="T", description="d")),
+    )
+    assert _exit_code(art, strict=False) == 0
+    assert _exit_code(art, strict=True) == 0
+
+
+def test_exit_code_nonzero_for_final_error_even_without_strict() -> None:
+    from evals.__main__ import _exit_code
+    from evals.scenario import ExpectCheck, RunArtifact, Scenario, ScenarioTopic
+
+    art = RunArtifact(
+        name="s",
+        kind="novelty",
+        final={"has_new_info": False},
+        final_error="RuntimeError: boom",
+        expect_results=[ExpectCheck(check="execution", ok=False, detail="")],
+        scenario=Scenario(topic=ScenarioTopic(name="T", description="d")),
+    )
+    assert _exit_code(art, strict=False) == 1
+    assert _exit_code(art, strict=True) == 1
+
+
+def test_exit_code_mismatch_nonzero_only_when_strict() -> None:
+    from evals.__main__ import _exit_code
+    from evals.scenario import ExpectCheck, RunArtifact, Scenario, ScenarioTopic
+
+    art = RunArtifact(
+        name="s",
+        kind="novelty",
+        final={"has_new_info": True},
+        expect_results=[ExpectCheck(check="has_new_info", ok=False, detail="")],
+        scenario=Scenario(topic=ScenarioTopic(name="T", description="d")),
+    )
+    assert _exit_code(art, strict=False) == 0
+    assert _exit_code(art, strict=True) == 1
+
+
+def test_exit_code_replay_diff_nonzero_only_when_strict() -> None:
+    from evals.__main__ import _exit_code
+    from evals.scenario import RunArtifact, Scenario, ScenarioTopic
+
+    art = RunArtifact(
+        name="s",
+        kind="novelty",
+        final={"has_new_info": True},
+        scenario=Scenario(topic=ScenarioTopic(name="T", description="d")),
+    )
+    assert _exit_code(art, strict=False, diff=["final.has_new_info: False -> True"]) == 0
+    assert _exit_code(art, strict=True, diff=["final.has_new_info: False -> True"]) == 1
+    assert _exit_code(art, strict=True, diff=[]) == 0
+
+
 # --- runner: run_live (prod read-only + scratch isolation) ---
 
 
@@ -439,6 +853,43 @@ def test_open_readonly_raises_live_error_on_missing_db(tmp_path) -> None:
 
     with pytest.raises(LiveError):
         _open_readonly(tmp_path / "does-not-exist.db")
+
+
+async def test_run_live_rejects_knowledge_update_kind(tmp_path, monkeypatch) -> None:
+    """AUG-047: a live fetch has no real NoveltyResult to update from — the
+    live scenario builder never populates novelty_summary/key_facts, so
+    `live --kind knowledge_update` used to fabricate has_new_info=True with a
+    blank summary and evaluate input production never sends, while consuming
+    a billed call. It must be rejected before any prod read or LLM call, even
+    though a matching topic genuinely exists in prod."""
+    import evals.runner as runner
+    from app.crud import create_topic
+    from app.database import get_connection, init_db
+    from app.models import Topic, TopicStatus
+    from evals.runner import LiveError
+
+    prod = tmp_path / "prod.db"
+    init_db(prod)
+    conn = get_connection(prod)
+    create_topic(
+        conn,
+        Topic(name="Acme", description="track acme", feed_urls=["http://feed"], status=TopicStatus.READY),
+    )
+    conn.commit()
+    conn.close()
+
+    async def fail_fetch(*_a: object, **_kw: object) -> object:
+        raise AssertionError("fetch attempted despite unsupported kind")
+
+    monkeypatch.setattr(runner, "fetch_new_articles_for_topic", fail_fetch)
+
+    inner = MagicMock()
+    inner.chat.completions.create_with_completion = AsyncMock(side_effect=AssertionError("billed call attempted"))
+
+    with pytest.raises(LiveError):
+        await runner.run_live("Acme", _settings(), kind="knowledge_update", inner=inner, prod_db_path=prod)
+
+    inner.chat.completions.create_with_completion.assert_not_awaited()
 
 
 async def test_run_live_uses_scratch_topic_and_reads_prod_readonly(tmp_path, monkeypatch) -> None:
@@ -487,6 +938,40 @@ async def test_run_live_uses_scratch_topic_and_reads_prod_readonly(tmp_path, mon
     assert captured["topic_id"] != prod_target_id
     assert len(art.calls) == 1
     assert art.scenario.articles[0].title == "fetched"
+
+
+async def test_run_live_passes_exa_settings_to_fetch(tmp_path, monkeypatch) -> None:
+    """AUG-046: production passes settings.exa into fetch_new_articles_for_topic
+    (app/checker.py); run_live omitted it, so the Exa branch always received
+    None and an Exa-mode live/frozen eval used an empty article corpus."""
+    import evals.runner as runner
+    from app.crud import create_topic
+    from app.database import get_connection, init_db
+    from app.models import Topic, TopicStatus
+    from app.scraping import FetchResult
+
+    prod = tmp_path / "prod.db"
+    init_db(prod)
+    conn = get_connection(prod)
+    create_topic(
+        conn,
+        Topic(name="Acme", description="track acme", feed_urls=["http://feed"], status=TopicStatus.READY),
+    )
+    conn.commit()
+    conn.close()
+
+    captured_kwargs: dict[str, object] = {}
+
+    async def fake_fetch(topic: Topic, **kwargs: object) -> FetchResult:
+        captured_kwargs.update(kwargs)
+        return FetchResult(articles=[], total_feed_entries=0)
+
+    monkeypatch.setattr(runner, "fetch_new_articles_for_topic", fake_fetch)
+
+    settings = _settings()
+    await runner.run_live("Acme", settings, kind="novelty", inner=_mock_inner(novelty=_novelty()), prod_db_path=prod)
+
+    assert captured_kwargs.get("exa_settings") is settings.exa
 
 
 async def test_run_live_freeze_writes_replayable_scenario(tmp_path, monkeypatch) -> None:
@@ -588,6 +1073,77 @@ def test_diff_runs_ignores_nonce_and_reports_final_change() -> None:
     assert any("has_new_info" in line for line in diff)
 
 
+def test_diff_runs_detects_material_changes_behind_an_unchanged_final() -> None:
+    """diff_runs must not report equivalence when raw output, model, token usage,
+    or expectation verdicts diverge even though `final` is byte-identical — the
+    exact silent-regression case AUG-048 describes (e.g. a schema/model/cost
+    change hidden behind an unchanged post-filtered result)."""
+    from evals.__main__ import diff_runs
+    from evals.scenario import CapturedCall, ExpectCheck, RunArtifact, Scenario, ScenarioTopic
+
+    def _art(**overrides: object) -> RunArtifact:
+        base: dict[str, object] = dict(
+            name="s",
+            kind="novelty",
+            model="openai/gpt-4o-mini",
+            temperature=0.2,
+            final={"has_new_info": True, "confidence": 0.9},
+            calls=[
+                CapturedCall(
+                    response_model="NoveltyResult",
+                    messages=[{"role": "user", "content": "hi"}],
+                    raw_parsed={"has_new_info": True, "source_urls": ["http://safe"]},
+                    prompt_tokens=10,
+                    completion_tokens=5,
+                )
+            ],
+            expect_results=[ExpectCheck(check="has_new_info", ok=True, detail="")],
+            scenario=Scenario(topic=ScenarioTopic(name="T", description="d")),
+        )
+        base.update(overrides)
+        return RunArtifact(**base)  # type: ignore[arg-type]
+
+    old = _art()
+
+    # Raw parsed output became unsafe (a smuggled source_url) though final is unchanged.
+    unsafe_raw = _art(
+        calls=[
+            CapturedCall(
+                response_model="NoveltyResult",
+                messages=[{"role": "user", "content": "hi"}],
+                raw_parsed={"has_new_info": True, "source_urls": ["http://safe", "http://evil"]},
+                prompt_tokens=10,
+                completion_tokens=5,
+            )
+        ]
+    )
+    assert diff_runs(old, unsafe_raw) != []
+
+    # Model changed.
+    assert diff_runs(old, _art(model="openai/gpt-4o")) != []
+
+    # Token usage spiked.
+    diff = diff_runs(
+        old,
+        _art(
+            calls=[
+                CapturedCall(
+                    response_model="NoveltyResult",
+                    messages=[{"role": "user", "content": "hi"}],
+                    raw_parsed={"has_new_info": True, "source_urls": ["http://safe"]},
+                    prompt_tokens=9000,
+                    completion_tokens=5,
+                )
+            ]
+        ),
+    )
+    assert diff != []
+
+    # Expectation verdict flipped even though `final` and raw output match.
+    diff = diff_runs(old, _art(expect_results=[ExpectCheck(check="has_new_info", ok=False, detail="")]))
+    assert diff != []
+
+
 def test_render_artifact_surfaces_error_and_kind() -> None:
     from evals.__main__ import render_artifact
     from evals.scenario import CapturedCall, RunArtifact, Scenario, ScenarioTopic
@@ -627,3 +1183,45 @@ async def test_replay_reruns_scenario_and_diffs(tmp_path) -> None:
     assert new.final is not None
     assert new.final["has_new_info"] is False
     assert any("has_new_info" in line for line in diff)
+
+
+async def test_replay_sets_replay_parent_to_the_old_run_id(tmp_path) -> None:
+    """AUG-295: a replay artifact must record which run it replayed, so a
+    chain of replays can be traced back to the original scenario run."""
+    from evals.__main__ import replay
+    from evals.runner import run_scenario
+    from evals.scenario import Scenario, ScenarioArticle, ScenarioTopic, save_run
+
+    sc = Scenario(
+        kind="novelty",
+        topic=ScenarioTopic(name="T", description="d"),
+        articles=[ScenarioArticle(title="a", url="http://x", content="c", source_feed="http://f")],
+        name="s",
+    )
+    old = await run_scenario(sc, _settings(), inner=_mock_inner(novelty=_novelty()))
+    run_path = save_run(old, tmp_path / "runs")
+
+    new, _diff = await replay(run_path, _settings(), inner=_mock_inner(novelty=_novelty()))
+
+    assert new.replay_parent == old.run_id
+    assert new.run_id != old.run_id  # the replay is its own run, not the same identity
+
+
+async def test_build_artifact_records_code_version() -> None:
+    """AUG-295: an artifact should record the code revision it was captured
+    under, so a replay drift can be attributed to a code change vs a live
+    model/provider change."""
+    from evals.runner import run_scenario
+    from evals.scenario import Scenario, ScenarioArticle, ScenarioTopic
+
+    sc = Scenario(
+        kind="novelty",
+        topic=ScenarioTopic(name="T", description="d"),
+        articles=[ScenarioArticle(title="a", url="http://x", content="c", source_feed="http://f")],
+        name="s",
+    )
+    art = await run_scenario(sc, _settings(), inner=_mock_inner(novelty=_novelty()))
+
+    from app import __version__ as app_version
+
+    assert art.code_version == app_version

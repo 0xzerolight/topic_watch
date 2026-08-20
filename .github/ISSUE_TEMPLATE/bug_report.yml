@@ -63,6 +63,16 @@ body:
     validations:
       required: true
 
+  - type: markdown
+    attributes:
+      value: |
+        **This issue is public.** Before pasting diagnostics or logs below, remove
+        or redact: feed/article URLs and their contents, notification webhook URLs,
+        your API key, local file paths, and anything else about the topics you
+        monitor that you don't want publicly visible. Found something that looks
+        like a real credential leak rather than a bug? Don't post it here — see
+        [SECURITY.md](../../SECURITY.md) instead.
+
   - type: textarea
     id: diagnostics
     attributes:
@@ -70,9 +80,10 @@ body:
       description: |
         Paste the output of `python -m app.cli doctor`
         (Docker: `docker compose exec topic-watch python -m app.cli doctor`).
-        It is secret-safe — the API key shows as set/not set and notification URLs
-        as scheme + count only. If you can't run it, note your OS, Python version,
-        and how you installed Topic Watch.
+        It redacts the API key (set/not set) and notification URLs (scheme + count
+        only), but feed hosts and short path segments are still shown — check the
+        output against the warning above before posting. If you can't run it, note
+        your OS, Python version, and how you installed Topic Watch.
       render: shell
     validations:
       required: false
@@ -81,7 +92,10 @@ body:
     id: logs
     attributes:
       label: Relevant log output
-      description: Paste any relevant log lines here. Use `docker compose logs` or check your terminal output.
+      description: |
+        Paste any relevant log lines here. Use `docker compose logs` or check your
+        terminal output. Logs are not redacted — check them against the warning
+        above first.
       render: shell
     validations:
       required: false

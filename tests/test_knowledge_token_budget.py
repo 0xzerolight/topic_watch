@@ -1,12 +1,23 @@
-"""Tests for the token-budget handling (LLM compression + truncation fallback) in knowledge.py."""
+"""Tests for the token-budget handling: knowledge.py's compression/truncation
+fallback, and the aggregate input budget the LLM gateway enforces per request."""
 
 import math
 import re
 import sqlite3
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import app.analysis.llm as llm_module
 from app.analysis.knowledge import _truncate_to_budget, compress_knowledge
-from app.analysis.llm import CompressedKnowledge, KnowledgeStateUpdate, NoveltyResult
+from app.analysis.llm import (
+    CompressedKnowledge,
+    KnowledgeStateUpdate,
+    NoveltyResult,
+    _fit_article_prompt,
+    _input_token_budget,
+    analyze_articles,
+    generate_initial_knowledge,
+)
+from app.analysis.prompts import build_knowledge_init_messages, build_novelty_messages
 from app.config import LLMSettings, Settings
 from app.crud import create_knowledge_state, create_topic, get_knowledge_state
 from app.models import Article, KnowledgeState, Topic
@@ -797,3 +808,161 @@ class TestCompressionTriggerBoundary:
 
         compress_mock.assert_awaited_once()
         assert state.summary_text == "Tight."
+
+
+# ============================================================
+# TestAggregateInputBudget (TW-AUD-016)
+# ============================================================
+
+
+def _novelty_build(articles, chars, summary, topic):
+    return build_novelty_messages(articles, summary, topic, chars)
+
+
+# gpt-4 has an 8k context window, so a realistic batch genuinely overruns it and
+# the degradation ladder actually runs (a 128k model would hide it).
+_SMALL_CONTEXT = LLMSettings(model="openai/gpt-4", api_key="test-key")
+
+
+def _long_article(index: int, body_chars: int = 20_000) -> Article:
+    return _make_article(
+        id=index,
+        title=f"Article {index}",
+        url=f"https://example.com/{index}",
+        raw_content=" ".join(f"word{index}x{i}" for i in range(body_chars // 8)),
+    )
+
+
+class TestAggregateInputBudget:
+    """Per-item caps bounded each article; nothing bounded the SUM of knowledge +
+    N articles + schema overhead + requested output against the model's context.
+
+    A request over that window is not a retryable failure: every check safe-fails
+    and every knowledge operation raises, permanently, until the configuration
+    changes.
+    """
+
+    def test_budget_reserves_output_and_schema(self) -> None:
+        settings = _make_settings()
+        budget = _input_token_budget(settings)
+        info = __import__("litellm").get_model_info(settings.llm.model)
+        assert budget is not None
+        assert budget < info["max_input_tokens"]
+        assert budget <= info["max_input_tokens"] - llm_module._bounded_max_tokens(settings)
+
+    def test_unknown_model_has_no_budget(self) -> None:
+        """A gateway model string litellm cannot size must not be guessed at."""
+        settings = _make_settings(llm=LLMSettings(model="openai/some-private-gateway-model", api_key="k"))
+        assert _input_token_budget(settings) is None
+
+    def test_oversized_batch_is_trimmed_to_fit(self) -> None:
+        topic = _make_topic()
+        settings = _make_settings(llm=_SMALL_CONTEXT)
+        articles = [_long_article(i) for i in range(40)]
+
+        messages = _fit_article_prompt(
+            lambda arts, chars, summary: _novelty_build(arts, chars, summary, topic),
+            articles,
+            "Known facts.",
+            settings,
+            topic.name,
+        )
+
+        budget = _input_token_budget(settings)
+        assert budget is not None
+        assert llm_module._count_messages(messages, settings.llm.model) <= budget
+
+    def test_small_batch_is_untouched(self) -> None:
+        topic = _make_topic()
+        settings = _make_settings()
+        articles = [_make_article(id=1, raw_content="x" * 900)]
+
+        fitted = _fit_article_prompt(
+            lambda arts, chars, summary: _novelty_build(arts, chars, summary, topic),
+            articles,
+            "Known facts.",
+            settings,
+            topic.name,
+        )
+
+        # Full body, no ellipsis: nothing was degraded (the fence nonce is fresh
+        # per call, so the messages are compared by their variable part).
+        assert "x" * 900 in fitted[1]["content"]
+        assert "..." not in fitted[1]["content"]
+
+    def test_articles_are_shrunk_before_any_are_dropped(self) -> None:
+        topic = _make_topic()
+        settings = _make_settings(llm=_SMALL_CONTEXT)
+        articles = [_long_article(i, body_chars=3_000) for i in range(6)]
+
+        messages = _fit_article_prompt(
+            lambda arts, chars, summary: _novelty_build(arts, chars, summary, topic),
+            articles,
+            "",
+            settings,
+            topic.name,
+        )
+
+        user = messages[1]["content"]
+        # Every article still present, just with shorter bodies.
+        for i in range(6):
+            assert f"https://example.com/{i}" in user
+
+    def test_oversized_knowledge_state_is_trimmed_last(self) -> None:
+        topic = _make_topic()
+        settings = _make_settings(llm=_SMALL_CONTEXT)
+        articles = [_make_article(id=1, raw_content="body")]
+        huge_summary = " ".join(f"fact{i}" for i in range(200_000))
+
+        messages = _fit_article_prompt(
+            lambda arts, chars, summary: _novelty_build(arts, chars, summary, topic),
+            articles,
+            huge_summary,
+            settings,
+            topic.name,
+        )
+
+        budget = _input_token_budget(settings)
+        assert budget is not None
+        assert llm_module._count_messages(messages, settings.llm.model) <= budget
+
+    async def test_analyze_articles_sends_a_fitting_request(self) -> None:
+        """The gateway, not the caller, is where the whole request is bounded."""
+        captured: dict = {}
+
+        async def _cwc(*_args, **kwargs):
+            captured.update(kwargs)
+            return NoveltyResult(has_new_info=False, confidence=0.5), MagicMock(usage=None)
+
+        client = MagicMock()
+        client.chat.completions.create_with_completion = AsyncMock(side_effect=_cwc)
+        settings = _make_settings(llm=_SMALL_CONTEXT)
+
+        with patch("app.analysis.llm._get_client", return_value=client):
+            await analyze_articles([_long_article(i) for i in range(40)], "Known.", _make_topic(), settings)
+
+        budget = _input_token_budget(settings)
+        assert budget is not None
+        assert llm_module._count_messages(captured["messages"], settings.llm.model) <= budget
+
+    async def test_initial_knowledge_sends_a_fitting_request(self) -> None:
+        captured: dict = {}
+
+        async def _cwc(*_args, **kwargs):
+            captured.update(kwargs)
+            return (
+                KnowledgeStateUpdate(sufficient_data=True, confidence=0.9, updated_summary="Summary."),
+                MagicMock(usage=None),
+            )
+
+        client = MagicMock()
+        client.chat.completions.create_with_completion = AsyncMock(side_effect=_cwc)
+        settings = _make_settings(llm=_SMALL_CONTEXT)
+
+        with patch("app.analysis.llm._get_client", return_value=client):
+            await generate_initial_knowledge([_long_article(i) for i in range(40)], _make_topic(), settings)
+
+        budget = _input_token_budget(settings)
+        assert budget is not None
+        assert llm_module._count_messages(captured["messages"], settings.llm.model) <= budget
+        assert build_knowledge_init_messages  # imported builder is the one under test

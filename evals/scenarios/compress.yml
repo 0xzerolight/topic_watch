@@ -1,0 +1,20 @@
+# Controlled compression scenario: condense an over-budget knowledge summary
+# while preserving its facts. No articles — compress works from
+# knowledge_summary alone.
+# Expectation: the compressed summary still contains the load-bearing fact
+# (the current valuation), not just the earliest one.
+kind: compress
+topic:
+  name: "Acme funding"
+  description: "Track Acme Corp funding rounds, investors, and amounts."
+knowledge_summary: |
+  Acme Corp raised a $5M Series A led by Foo Ventures, announced in January
+  2025, to expand the engineering team and build out its initial product.
+  In June 2025, Acme Corp closed a $50M Series B led by Bar Capital, with
+  Foo Ventures returning as a participant, valuing the company at $300
+  million; the round funds international expansion into Europe and Asia.
+  In September 2025, Acme Corp opened a five-person satellite office in
+  Austin, Texas, to support existing customers in the region, with no
+  near-term plan to expand the office further.
+expect:
+  summary_contains: "$300 million"

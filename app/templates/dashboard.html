@@ -207,10 +207,12 @@ document.body.addEventListener("htmx:afterSwap", function(event) {
         var topicName = target.getAttribute("data-topic-name");
         if (justChecked === "true" && newInfo === "true" && topicName) {
             var link = target.querySelector("a");
+            // AUG-219: tag scoped to this topic's row id, so a fresh alert for one
+            // topic never replaces an unread alert for another.
             TopicWatchNotifications.show(
                 "New Info: " + topicName,
                 "Topic Watch found new information for \"" + topicName + "\".",
-                { url: link ? link.href : "/" }
+                { url: link ? link.href : "/", tag: detailTarget.id }
             );
         }
     }
@@ -226,8 +228,9 @@ document.body.addEventListener("htmx:afterSwap", function(event) {
         <form method="post" action="/import/opml" enctype="multipart/form-data">
             <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
             <p>Upload an OPML file from your RSS reader (FreshRSS, Miniflux, Tiny Tiny RSS, etc.).</p>
-            <input type="file" name="opml_file" accept=".opml,.xml" required>
-            <small>Max 500 feeds per import. Duplicate feeds will be skipped.</small>
+            <label for="opml_file" class="sr-only">OPML File</label>
+            <input type="file" id="opml_file" name="opml_file" accept=".opml,.xml" required aria-describedby="opml-file-hint">
+            <small id="opml-file-hint">Max 500 feeds per import. Duplicate feeds will be skipped.</small>
             <footer>
                 <button type="submit">Import</button>
             </footer>

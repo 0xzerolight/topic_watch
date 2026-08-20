@@ -8,6 +8,12 @@ Commands:
 * ``replay <run.json>`` — re-run a saved run's inputs against the current
   prompt/code and diff the result (nonce-normalized).
 
+``--strict`` (before the subcommand) additionally exits nonzero on a soft
+expectation mismatch or non-empty replay diff. Without it, exit is nonzero
+only for a provider/harness failure (a swallowed LLM error or a caught
+knowledge-stage exception) — never for a mismatch alone, so a mismatch
+remains a diagnostic a human reads rather than a build-breaking assertion.
+
 Also holds console rendering and the replay diff — no separate report module.
 """
 
@@ -46,9 +52,20 @@ def _messages_text(messages: list[dict[str, Any]]) -> str:
 def diff_runs(old: RunArtifact, new: RunArtifact) -> list[str]:
     """Field-by-field diff of two runs; messages compared nonce-normalized.
 
+    Covers every semantically relevant artifact field, not just the
+    post-filtered ``final`` result: raw parsed output, response model,
+    request model/temperature, token usage, and expectation verdicts. Two
+    runs can produce byte-identical ``final`` output while their raw output
+    turned unsafe, their model/schema changed, cost spiked, or an expectation
+    flipped — this must not report equivalence in that case (AUG-048).
+
     Returns one line per difference; an empty list means equivalent.
     """
     lines: list[str] = []
+    if old.model != new.model:
+        lines.append(f"model: {old.model!r} -> {new.model!r}")
+    if old.temperature != new.temperature:
+        lines.append(f"temperature: {old.temperature!r} -> {new.temperature!r}")
     of, nf = old.final or {}, new.final or {}
     for key in sorted(set(of) | set(nf)):
         if of.get(key) != nf.get(key):
@@ -56,11 +73,36 @@ def diff_runs(old: RunArtifact, new: RunArtifact) -> list[str]:
     if old.final_error != new.final_error:
         lines.append(f"final_error: {old.final_error!r} -> {new.final_error!r}")
     for i in range(max(len(old.calls), len(new.calls))):
-        o = normalize_nonce(_messages_text(old.calls[i].messages)) if i < len(old.calls) else ""
-        n = normalize_nonce(_messages_text(new.calls[i].messages)) if i < len(new.calls) else ""
+        oc = old.calls[i] if i < len(old.calls) else None
+        nc = new.calls[i] if i < len(new.calls) else None
+        if oc is None or nc is None:
+            lines.append(
+                f"calls[{i}]: {'missing' if oc is None else 'present'} -> {'missing' if nc is None else 'present'}"
+            )
+            continue
+        if oc.response_model != nc.response_model:
+            lines.append(f"calls[{i}].response_model: {oc.response_model!r} -> {nc.response_model!r}")
+        if oc.mode != nc.mode:
+            lines.append(f"calls[{i}].mode: {oc.mode!r} -> {nc.mode!r}")
+        if oc.raw_parsed != nc.raw_parsed:
+            lines.append(f"calls[{i}].raw_parsed: {oc.raw_parsed!r} -> {nc.raw_parsed!r}")
+        if oc.error != nc.error:
+            lines.append(f"calls[{i}].error: {oc.error!r} -> {nc.error!r}")
+        if (oc.prompt_tokens, oc.completion_tokens) != (nc.prompt_tokens, nc.completion_tokens):
+            lines.append(
+                f"calls[{i}].tokens: prompt {oc.prompt_tokens}->{nc.prompt_tokens}, "
+                f"completion {oc.completion_tokens}->{nc.completion_tokens}"
+            )
+        o = normalize_nonce(_messages_text(oc.messages))
+        n = normalize_nonce(_messages_text(nc.messages))
         if o != n:
             lines.append(f"messages[{i}] differ (nonce-normalized):")
             lines.extend(unified_diff(o.splitlines(), n.splitlines(), lineterm="", n=1))
+    oe = {c.check: c.ok for c in old.expect_results}
+    ne = {c.check: c.ok for c in new.expect_results}
+    for key in sorted(set(oe) | set(ne)):
+        if oe.get(key) != ne.get(key):
+            lines.append(f"expect.{key}: {oe.get(key)!r} -> {ne.get(key)!r}")
     return lines
 
 
@@ -96,13 +138,38 @@ def _pretty(data: dict[str, Any]) -> str:
     return "\n".join(f"  {k}: {v!r}" for k, v in data.items())
 
 
+# --- run outcome / exit status (AUG-296) ---
+
+
+def _exit_code(art: RunArtifact, *, strict: bool, diff: list[str] | None = None) -> int:
+    """Map a run's outcome to a process exit code.
+
+    A provider/harness failure (``final_error`` set — a swallowed novelty LLM
+    error or a caught knowledge-stage exception) is always nonzero, so
+    automation can tell "the model said no" apart from "the call blew up". A
+    soft expectation mismatch or non-empty replay diff is nonzero only under
+    ``--strict``: those are diagnostic signals for a human, not proof the
+    harness itself failed to run.
+    """
+    if art.final_error is not None:
+        return 1
+    if strict and (any(not c.ok for c in art.expect_results) or bool(diff)):
+        return 1
+    return 0
+
+
 # --- replay ---
 
 
 async def replay(run_path: Path, settings: Settings, *, inner: Any = None) -> tuple[RunArtifact, list[str]]:
-    """Re-run a saved run's inputs against the current prompt/code and diff it."""
+    """Re-run a saved run's inputs against the current prompt/code and diff it.
+
+    The new artifact's ``replay_parent`` is set to the old run's ``run_id`` so
+    a chain of replays can be traced back to its origin (AUG-295).
+    """
     old = load_run(run_path)
     new = await run_scenario(old.scenario, settings, inner=inner)
+    new.replay_parent = old.run_id
     return new, diff_runs(old, new)
 
 
@@ -113,36 +180,50 @@ def _default_runs_dir(settings: Settings) -> Path:
     return Path(settings.db_path).parent / "eval" / "runs"
 
 
-async def _cmd_scenario(file: str, settings: Settings, *, dry_run: bool, runs_dir: Path) -> None:
+async def _cmd_scenario(file: str, settings: Settings, *, dry_run: bool, runs_dir: Path) -> RunArtifact | None:
     scenario = load_scenario(Path(file))
     if dry_run:
         messages = KIND_DISPATCH[scenario.kind].build(scenario, settings)
         print(_section(f"DRY RUN PROMPT [{scenario.kind}]", render_messages(messages)))
-        return
+        return None
     art = await run_scenario(scenario, settings)
     path = save_run(art, runs_dir)
     print(render_artifact(art))
     print(f"saved: {path}")
+    return art
 
 
-async def _cmd_live(topic_name: str, settings: Settings, *, kind: str, freeze: str | None, runs_dir: Path) -> None:
+async def _cmd_live(
+    topic_name: str, settings: Settings, *, kind: str, freeze: str | None, runs_dir: Path
+) -> RunArtifact:
     art = await run_live(topic_name, settings, kind=kind, freeze_path=freeze)
     path = save_run(art, runs_dir)
     print(render_artifact(art))
     if freeze:
         print(f"frozen scenario: {freeze}")
     print(f"saved: {path}")
+    return art
 
 
-async def _cmd_replay(run: str, settings: Settings, *, runs_dir: Path) -> None:
+async def _cmd_replay(run: str, settings: Settings, *, runs_dir: Path) -> tuple[RunArtifact, list[str]]:
     new, diff = await replay(Path(run), settings)
     save_run(new, runs_dir)
     print(render_artifact(new))
     print(_section("DIFF vs saved run", "\n".join(diff) if diff else "(no differences)"))
+    return new, diff
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="evals", description="On-demand real-LLM eval harness for topic_watch")
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help=(
+            "Also exit nonzero on an expectation mismatch or replay drift "
+            "(place before the subcommand, e.g. `evals --strict replay run.json`). "
+            "A provider/harness failure is always nonzero regardless of this flag."
+        ),
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     sp = sub.add_parser("scenario", help="Run a controlled scenario against the real LLM")
@@ -162,15 +243,24 @@ def main() -> None:
     settings = load_settings()
     runs_dir = _default_runs_dir(settings)
 
+    exit_code = 0
     try:
         if args.command == "scenario":
-            asyncio.run(_cmd_scenario(args.file, settings, dry_run=args.dry_run, runs_dir=runs_dir))
+            art = asyncio.run(_cmd_scenario(args.file, settings, dry_run=args.dry_run, runs_dir=runs_dir))
+            if art is not None:
+                exit_code = _exit_code(art, strict=args.strict)
         elif args.command == "live":
-            asyncio.run(_cmd_live(args.topic_name, settings, kind=args.kind, freeze=args.freeze, runs_dir=runs_dir))
+            art = asyncio.run(
+                _cmd_live(args.topic_name, settings, kind=args.kind, freeze=args.freeze, runs_dir=runs_dir)
+            )
+            exit_code = _exit_code(art, strict=args.strict)
         elif args.command == "replay":
-            asyncio.run(_cmd_replay(args.run, settings, runs_dir=runs_dir))
+            new, diff = asyncio.run(_cmd_replay(args.run, settings, runs_dir=runs_dir))
+            exit_code = _exit_code(new, strict=args.strict, diff=diff)
     except LiveError as exc:
         raise SystemExit(str(exc)) from exc
+
+    raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":

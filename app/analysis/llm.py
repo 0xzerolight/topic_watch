@@ -5,33 +5,41 @@ validation retry. All LLM calls go through this module.
 """
 
 import asyncio
+import json
 import logging
-from collections.abc import Callable
+import random
+import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any, TypeVar, cast
 
 import instructor
 import litellm
 from instructor import Mode
+from instructor.core import AsyncValidationError as InstructorAsyncValidationError
 from instructor.core import InstructorRetryException
-from pydantic import BaseModel, Field
-from tenacity import AsyncRetrying, retry_if_not_exception_type, stop_after_attempt
+from instructor.core import ResponseParsingError as InstructorResponseParsingError
+from pydantic import BaseModel, Field, ValidationInfo, model_validator
+from pydantic import ValidationError as PydanticValidationError
+from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt
 
 from app.analysis.citations import strip_index_citations, strip_reliability_notes
 from app.analysis.prompts import (
+    _PROMPT_ARTICLE_MAX_CHARS,
+    _STUB_CONTENT_MIN_CHARS,
     build_knowledge_compress_messages,
     build_knowledge_init_messages,
     build_knowledge_update_messages,
     build_novelty_messages,
+)
+from app.analysis.restatement import (
+    _has_shared_run as _has_shared_run,
 )
 
 # Back-compat re-exports: the restatement-filter algorithm moved to
 # app/analysis/restatement.py (OVH-178); keep these importable from here.
 from app.analysis.restatement import (
     _is_restatement as _is_restatement,
-)
-from app.analysis.restatement import (
-    _longest_contiguous_run as _longest_contiguous_run,
 )
 from app.analysis.restatement import (
     _normalize_for_match as _normalize_for_match,
@@ -90,8 +98,35 @@ def _extract_usage(completion: Any) -> TokenUsage:
 # --- Response models (structured output) ---
 
 
+# Validation-context flag marking a decode as LIVE provider output rather than a
+# stored blob being re-read. The two have opposite needs — see NoveltyResult —
+# and the context is the seam that lets one class serve both.
+_LIVE_OUTPUT_CONTEXT = {"live_llm_output": True}
+_SCORE_FIELDS = ("relevance", "importance")
+
+
 class NoveltyResult(BaseModel):
-    """LLM response for novelty detection.
+    """LLM response for novelty detection, decoded under one of two contracts.
+
+    STORED (default): every scoring field has a default, so an ``llm_response``
+    blob written before that field existed still re-parses — the force-notify
+    handler calls ``model_validate_json`` on exactly those blobs.
+
+    LIVE (``context=_LIVE_OUTPUT_CONTEXT``, used by ``analyze_articles``): a
+    POSITIVE result must carry its own ``relevance`` and ``importance``. Those
+    defaults are load-bearing downstream — ``relevance=0.0`` is below every usable
+    threshold and ``importance=3`` is below a threshold of 4 or 5 — so a provider
+    that simply omits the field would silently mute a genuine update with nothing
+    in the logs (AUG-159 / TW-AUD-009). Omission is told apart from a real zero via
+    ``model_fields_set``: an explicit ``relevance: 0.0`` is the model's own
+    judgement and passes.
+
+    A live violation raises ``ValidationError``, which instructor re-prompts with
+    the message (the model usually complies, so the update is DELIVERED rather
+    than suppressed); if it never complies, ``analyze_articles`` maps it through
+    the settled safe-false path with ``error`` populated, so the checker records
+    ``analysis_failed`` instead of a silent skip. The requirement is scoped to
+    ``has_new_info=true`` because nothing is gated on either score otherwise.
 
     ``prompt_tokens`` / ``completion_tokens`` are NOT filled by the LLM — they
     default to 0 and are populated from the raw completion's usage after the
@@ -112,6 +147,9 @@ class NoveltyResult(BaseModel):
     key_facts: list[str] = []
     source_urls: list[str] = []
     confidence: float = Field(ge=0.0, le=1.0)
+    # Default (not required) is deliberate: see the class docstring — stored blobs
+    # predate this field. 0.0 is the value the checker's relevance gate reads as
+    # "off-topic", which is why a LIVE omission must never reach it (AUG-159).
     relevance: float = Field(
         ge=0.0,
         le=1.0,
@@ -121,7 +159,7 @@ class NoveltyResult(BaseModel):
     # Default (not required) is deliberate: stored llm_response blobs predate this
     # field and are re-parsed via model_validate_json in the force-notify handler —
     # a required field would break the Notify re-send button for pre-existing
-    # checks. 3 is the neutral midpoint so provider omission doesn't hard-suppress.
+    # checks. 3 is the neutral midpoint so an old blob doesn't hard-suppress.
     importance: int = Field(
         ge=1,
         le=5,
@@ -140,6 +178,18 @@ class NoveltyResult(BaseModel):
         default=None,
         description="Internal error channel; the model must always leave this null.",
     )
+
+    @model_validator(mode="after")
+    def _require_scores_on_live_positive(self, info: ValidationInfo) -> "NoveltyResult":
+        if not (info.context or {}).get("live_llm_output") or not self.has_new_info:
+            return self
+        missing = [name for name in _SCORE_FIELDS if name not in self.model_fields_set]
+        if missing:
+            raise ValueError(
+                f"{' and '.join(missing)} must be set explicitly when has_new_info is true "
+                "(they decide whether the user is notified); do not omit them."
+            )
+        return self
 
 
 class KnowledgeStateUpdate(BaseModel):
@@ -199,106 +249,133 @@ def _summarize_exc(exc: BaseException, *, limit: int = 200) -> str:
     return summary[:limit]
 
 
-# Permanent client-side 4xx errors: retrying them is pointless (the same request
-# fails identically) and, worse, instructor's retry loop buries the provider's
-# real message inside an opaque ``RetryError[<Future ... raised BadRequestError>]``
-# — the exact symptom reported for a new topic's first check (issue #53). Excluding
-# them from instructor's retry set makes the call fail once with the real error
-# surfaced (readable in ``str`` and bare on ``__cause__``). Exclusion is by TYPE,
-# not HTTP status, so a bare ``APIError(status_code=400)`` stays retryable and
-# ``BadRequestError`` subclasses (``ContextWindowExceededError`` etc.) are covered
-# via ``isinstance``.
-_NON_RETRYABLE_LLM_ERRORS = (
-    litellm.BadRequestError,  # 400
-    litellm.AuthenticationError,  # 401
-    litellm.PermissionDeniedError,  # 403
-    litellm.NotFoundError,  # 404 (unknown model/route)
-    litellm.UnprocessableEntityError,  # 422
+# Parse failures instructor is *supposed* to retry: the model returned something
+# that does not fit the response schema, so re-prompting it with the validation
+# error genuinely can fix the next attempt. Everything else that can come out of
+# a call is a TRANSPORT outcome and belongs to ``_call_with_transport_retry``,
+# which is the only layer that waits between attempts (AUG-325). These are the
+# same types instructor's own retry loop classifies as re-askable.
+_RETRYABLE_PARSE_ERRORS: tuple[type[BaseException], ...] = (
+    PydanticValidationError,
+    json.JSONDecodeError,
+    InstructorAsyncValidationError,
+    InstructorResponseParsingError,
 )
+
+# HTTP statuses no retry can fix: the identical request fails identically. A 400
+# may still MODE-HOP first (see ``_fallback_mode``) — that changes the request,
+# which is why it is not simply "permanent" — but it is never re-sent unchanged.
+_PERMANENT_STATUS_CODES = frozenset({400, 401, 403, 404, 405, 413, 422})
+# Statuses worth re-sending the same request for, after a wait.
+_TRANSIENT_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 
 
 def _instructor_retries(max_retries: int) -> AsyncRetrying:
-    """Build instructor's per-call retry policy.
+    """Build instructor's per-call retry policy: validation re-prompts ONLY.
 
     Instructor's ``max_retries`` governs structured-output *validation* retries
-    (re-prompting when the LLM's response fails Pydantic validation). We keep
-    those, but exclude two families from instructor's retry set:
-
-    - ``RateLimitError`` (429): propagates *bare* to ``_call_with_rate_limit_retry``,
-      which owns the rate-limit backoff. Otherwise instructor would swallow the 429
-      inside an ``InstructorRetryException`` and immediately re-fire it
-      ``max_retries`` times with zero delay — hammering the throttled provider and
-      hiding the rate limit from operators (OVH-008).
-    - ``_NON_RETRYABLE_LLM_ERRORS`` (permanent 4xx): retrying can't help and only
-      masks the provider's real message behind an opaque ``RetryError`` — the
-      issue #53 symptom. Excluding them fails fast with the true error visible.
-
-    ``ValidationError`` is deliberately absent from both, so structured-output
-    re-prompting is preserved.
+    (re-prompting when the response fails Pydantic validation), and the classifier
+    is POSITIVE — only ``_RETRYABLE_PARSE_ERRORS`` are retried here (AUG-325).
+    A negative "retry everything except these types" list let transport failures
+    into this loop, where they were re-fired ``max_retries`` times with ZERO delay
+    and no ``Retry-After`` handling: a throttled provider got hammered (OVH-008), a
+    transient 5xx got no backoff, and a permanent error was replayed and then
+    buried inside an opaque ``RetryError[...]`` (issue #53). Every provider
+    exception now leaves instructor after one attempt, with the real error on
+    ``__cause__``, and ``_call_with_transport_retry`` decides its fate.
     """
     return AsyncRetrying(
         stop=stop_after_attempt(max_retries + 1),
-        retry=retry_if_not_exception_type((litellm.RateLimitError, *_NON_RETRYABLE_LLM_ERRORS)),
+        retry=retry_if_exception_type(_RETRYABLE_PARSE_ERRORS),
     )
 
 
+def _iter_error_chain(exc: BaseException) -> Iterator[BaseException]:
+    """Yield ``exc`` and every exception reachable from it, once each.
+
+    Instructor's v2 retry stack re-wraps a provider error as
+    ``InstructorRetryException``: it stringifies the error into ``args``, may
+    record it in ``failed_attempts``, and chains the real one onto ``__cause__``.
+    Callers therefore have to look past the wrapper to classify what happened —
+    all three places are walked here (cycle-guarded) so each classifier below is
+    a one-line filter over this iterator.
+    """
+    seen: set[int] = set()
+    queue: list[BaseException] = [exc]
+    while queue:
+        cur = queue.pop(0)
+        if cur is None or id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        yield cur
+        if isinstance(cur, InstructorRetryException):
+            queue.extend(arg for arg in cur.args if isinstance(arg, BaseException))
+            for attempt in cur.failed_attempts or []:
+                attempt_exc = getattr(attempt, "exception", None)
+                if isinstance(attempt_exc, BaseException):
+                    queue.append(attempt_exc)
+        for nxt in (cur.__cause__, cur.__context__):
+            if nxt is not None:
+                queue.append(nxt)
+
+
 def _unwrap_rate_limit(exc: BaseException) -> litellm.RateLimitError | None:
-    """Return the underlying ``RateLimitError`` if ``exc`` represents a 429.
+    """Return the underlying ``RateLimitError`` if ``exc`` represents a 429."""
+    return next((e for e in _iter_error_chain(exc) if isinstance(e, litellm.RateLimitError)), None)
 
-    Belt-and-suspenders for the rate-limit backoff: a bare ``RateLimitError`` is
-    returned as-is, and an ``InstructorRetryException`` is inspected (its args and
-    ``failed_attempts``) for an underlying ``RateLimitError`` in case a
-    provider/instructor path still wraps it despite ``_instructor_retries``.
-    Instructor's v2 retry path (1.15.x) populates neither of those — it stringifies
-    the error into ``args`` and leaves ``failed_attempts`` empty — but chains the
-    real ``RateLimitError`` onto ``__cause__``, so the final fallback walks the
-    ``__cause__``/``__context__`` chain (cycle-guarded) to find it.
+
+def _status_code(exc: BaseException) -> int | None:
+    """HTTP status carried by ``exc`` or anything in its chain, else None.
+
+    Classification is by STATUS, not by exception type: a gateway or adapter that
+    raises a generic ``litellm.APIError(status_code=400)`` instead of the specific
+    ``BadRequestError`` subclass described the same permanent failure, and used to
+    be treated as retryable purely because of its Python type (AUG-325).
     """
-    if isinstance(exc, litellm.RateLimitError):
-        return exc
-    if isinstance(exc, InstructorRetryException):
-        for arg in exc.args:
-            if isinstance(arg, litellm.RateLimitError):
-                return arg
-        for attempt in exc.failed_attempts or []:
-            attempt_exc = getattr(attempt, "exception", None)
-            if isinstance(attempt_exc, litellm.RateLimitError):
-                return attempt_exc
-    seen: set[int] = set()
-    cur: BaseException | None = exc
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
-        nxt = cur.__cause__ or cur.__context__
-        if isinstance(nxt, litellm.RateLimitError):
-            return nxt
-        cur = nxt
+    for candidate in _iter_error_chain(exc):
+        code = getattr(candidate, "status_code", None)
+        if isinstance(code, int):
+            return code
+        if isinstance(code, str) and code.isdigit():
+            return int(code)
     return None
 
 
-def _unwrap_bad_request(exc: BaseException) -> litellm.BadRequestError | None:
-    """Return the underlying ``BadRequestError`` (400) in ``exc``'s chain, else None.
+def _unwrap_bad_request(exc: BaseException) -> BaseException | None:
+    """Return the 400 in ``exc``'s chain, else None.
 
-    A bare ``BadRequestError`` is returned as-is. Otherwise the ``__cause__`` /
-    ``__context__`` chain is walked (cycle-guarded), because instructor's v2 retry
-    stack re-wraps an excluded 400 as ``InstructorRetryException`` with the real
-    error chained on ``__cause__`` (pinned by
-    test_llm_rate_limit_backoff.py:535); a bare 400 never propagates from
-    ``create_with_completion``. Returns ``None`` when no ``BadRequestError`` is in
-    the chain — e.g. a rate-limit wrapper — so 429s keep flowing untouched to
-    ``_call_with_rate_limit_retry``. Mirrors the final-fallback stanza of
-    ``_unwrap_rate_limit``.
+    A bare 400 is returned as-is; otherwise the wrapper chain is walked, because
+    instructor re-wraps an unretried 400 as ``InstructorRetryException`` with the
+    real error on ``__cause__`` — a bare 400 never propagates from
+    ``create_with_completion``. Returns ``None`` for anything that is not a 400
+    (e.g. a rate-limit wrapper), so those keep flowing untouched to their own
+    handler.
     """
-    if isinstance(exc, litellm.BadRequestError):
-        return exc
-    seen: set[int] = set()
-    cur: BaseException | None = exc
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
-        nxt = cur.__cause__ or cur.__context__
-        if isinstance(nxt, litellm.BadRequestError):
-            return nxt
-        cur = nxt
-    return None
+    return next(
+        (e for e in _iter_error_chain(exc) if isinstance(e, litellm.BadRequestError) or _has_status(e, 400)),
+        None,
+    )
+
+
+def _has_status(exc: BaseException, code: int) -> bool:
+    status = getattr(exc, "status_code", None)
+    return status == code or (isinstance(status, str) and status.isdigit() and int(status) == code)
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """True when re-sending the SAME request after a wait could plausibly work.
+
+    Transient: 429/408/5xx and network-level failures (no response at all).
+    Permanent: every other classified status, and anything unclassifiable — an
+    unknown failure is not replayed, so a bug in this module cannot turn one
+    check into a retry storm.
+    """
+    if any(isinstance(e, litellm.APIConnectionError | litellm.Timeout) for e in _iter_error_chain(exc)):
+        return True
+    status = _status_code(exc)
+    if status is None:
+        return False
+    return status in _TRANSIENT_STATUS_CODES or (status >= 500 and status not in _PERMANENT_STATUS_CODES)
 
 
 # Ordered structured-output fallback chain. TOOLS sends a forced named
@@ -325,8 +402,11 @@ def _fallback_mode(mode: instructor.Mode, exc: BaseException) -> instructor.Mode
       MD_JSON stays the terminal no matter how an unknown gateway words its
       rejection.
 
-    Anything that is not an unwrapped ``BadRequestError`` (e.g. a 429 wrapper)
-    returns ``None`` so it propagates to its own handler untouched.
+    Anything that is not an unwrapped 400 (e.g. a 429 wrapper) returns ``None`` so
+    it propagates to its own handler untouched. A 400 is recognized by STATUS as
+    well as by type, so a gateway raising a generic ``APIError(status_code=400)``
+    for a rejected structured-output mode still mode-hops instead of being
+    replayed in the same mode (AUG-325).
     """
     bad_request = _unwrap_bad_request(exc)
     if bad_request is None or isinstance(bad_request, litellm.ContextWindowExceededError):
@@ -435,42 +515,222 @@ def count_tokens(text: str, model: str) -> int:
         return len(text) // 4
 
 
-async def _call_with_rate_limit_retry(
+# Bounds on the transport backoff (AUG-160). Uncapped ``base_delay *
+# multiplier**attempt`` reached 98,415s on the tenth sleep at the supported
+# maximum ``llm_max_retries=10`` — one throttled check held the scheduler's
+# single job instance for ~41 hours, skipping every later minute tick. Both are
+# module constants, not settings: they are liveness bounds on a shared runtime,
+# not a per-deployment preference.
+#
+# The total budget is the load-bearing one — it is what makes the worst case
+# finite regardless of ``llm_max_retries`` — and 120s sits well under
+# ``interval.MIN_INTERVAL_MINUTES`` (10 minutes), so even the shortest check
+# interval cannot be overrun by backoff alone.
+_RETRY_MAX_DELAY_SECONDS = 60.0
+_RETRY_TOTAL_BUDGET_SECONDS = 120.0
+# Jitter spreads the retries of concurrently-checked topics that hit the same
+# provider limit in the same tick, so they do not re-fire in lockstep.
+_RETRY_JITTER_FRACTION = 0.25
+
+
+def _backoff_delay(attempt: int, base_delay: float, backoff_multiplier: float) -> float:
+    """Capped exponential delay with bounded upward jitter."""
+    delay = min(base_delay * (backoff_multiplier**attempt), _RETRY_MAX_DELAY_SECONDS)
+    # Not a security decision — retry spacing only (hence the S311 exemption).
+    return delay + random.uniform(0, delay * _RETRY_JITTER_FRACTION)  # noqa: S311
+
+
+# --- Aggregate input budget (TW-AUD-016) ---
+#
+# Article bodies are capped per item and the knowledge state has its own token
+# budget, but nothing bounded the SUM: knowledge + N articles + schema overhead +
+# requested output all land in one request. With supported settings that request
+# can exceed the model's context window, and the failure is not a retryable one —
+# every check safe-fails and every knowledge operation raises, permanently, until
+# a human changes the configuration. So the budget is enforced where the request is
+# actually assembled, on real tokenizer counts, and the prompt builders stay pure.
+
+# Headroom for what we do not tokenize ourselves: the JSON schema / tool block
+# instructor injects into the request, plus per-message envelope overhead and
+# tokenizer divergence on the fallback path.
+_SCHEMA_TOKEN_RESERVE = 1024
+# Per-message envelope tokens (role, delimiters) in the chat format.
+_MESSAGE_OVERHEAD_TOKENS = 4
+# Article-body caps tried in order when the assembled request is over budget.
+_ARTICLE_CHAR_LADDER = (_PROMPT_ARTICLE_MAX_CHARS, 750, 375, _STUB_CONTENT_MIN_CHARS)
+
+
+def _count_messages(messages: list[dict[str, Any]], model: str) -> int:
+    """Token count of an assembled chat request."""
+    return sum(count_tokens(str(m.get("content", "")), model) + _MESSAGE_OVERHEAD_TOKENS for m in messages)
+
+
+def _input_token_budget(settings: Settings) -> int | None:
+    """Tokens available for the PROMPT, or None when the context size is unknown.
+
+    The model's context window minus the output we are about to request minus the
+    schema reserve. Returns None for models litellm has no entry for (gateway
+    strings especially), where guessing a window would be worse than not bounding
+    one: the request goes out as before.
+    """
+    try:
+        info = litellm.get_model_info(settings.llm.model)
+    except Exception:
+        return None
+    max_input = (info or {}).get("max_input_tokens") or (info or {}).get("max_tokens")
+    if not isinstance(max_input, int) or max_input <= 0:
+        return None
+    budget = max_input - _bounded_max_tokens(settings) - _SCHEMA_TOKEN_RESERVE
+    return budget if budget > 0 else None
+
+
+def _fit_article_prompt(
+    build: Callable[[list[Article], int, str], list[dict[str, Any]]],
+    articles: list[Article],
+    knowledge_summary: str,
+    settings: Settings,
+    topic_name: str,
+) -> list[dict[str, Any]]:
+    """Assemble an article-bearing request that fits the model's context window.
+
+    Degrades in the order that costs the least information: shrink article bodies,
+    then drop trailing (oldest-scored) articles, then trim the knowledge state that
+    is only being READ for comparison. Each step is logged, because a silently
+    smaller prompt is a silently worse analysis.
+    """
+    budget = _input_token_budget(settings)
+    messages = build(articles, _PROMPT_ARTICLE_MAX_CHARS, knowledge_summary)
+    if budget is None or _count_messages(messages, settings.llm.model) <= budget:
+        return messages
+
+    for cap in _ARTICLE_CHAR_LADDER[1:]:
+        messages = build(articles, cap, knowledge_summary)
+        if _count_messages(messages, settings.llm.model) <= budget:
+            logger.warning(
+                "Prompt for topic '%s' exceeded the model's input budget; article bodies capped at %d chars",
+                topic_name,
+                cap,
+            )
+            return messages
+
+    floor = _ARTICLE_CHAR_LADDER[-1]
+    kept = list(articles)
+    while len(kept) > 1:
+        kept = kept[: len(kept) // 2]
+        messages = build(kept, floor, knowledge_summary)
+        if _count_messages(messages, settings.llm.model) <= budget:
+            logger.warning(
+                "Prompt for topic '%s' still over the input budget; analyzing %d of %d articles this cycle",
+                topic_name,
+                len(kept),
+                len(articles),
+            )
+            return messages
+
+    if knowledge_summary:
+        # Last lever, and only available where the summary is an INPUT being
+        # compared against (novelty). It is not rewritten or persisted from here,
+        # so trimming it degrades this one comparison rather than the baseline.
+        trimmed = knowledge_summary
+        while trimmed and _count_messages(messages, settings.llm.model) > budget:
+            trimmed = trimmed[: len(trimmed) // 2]
+            messages = build(kept, floor, trimmed)
+        logger.warning(
+            "Prompt for topic '%s' still over the input budget; knowledge state trimmed to %d of %d chars",
+            topic_name,
+            len(trimmed),
+            len(knowledge_summary),
+        )
+        return messages
+
+    logger.warning(
+        "Prompt for topic '%s' exceeds the model's input budget and cannot be trimmed further; sending anyway",
+        topic_name,
+    )
+    return messages
+
+
+async def _call_with_transport_retry(
     call_func: Any,
     max_retries: int = 3,
     base_delay: float = 5.0,
     backoff_multiplier: float = 3.0,
 ) -> Any:
-    """Wrap an async LLM call with exponential backoff on rate limit errors.
+    """Wrap an async LLM call with the ONE delayed retry policy for transport failures.
 
-    On a rate-limit error, waits ``base_delay * (backoff_multiplier ** attempt)``
-    seconds and retries up to ``max_retries`` times. Rate limits are detected via
-    ``_unwrap_rate_limit`` so this fires whether the call raises a bare
-    ``RateLimitError`` (the expected path now that instructor is told not to
-    retry 429s — see ``_instructor_retries``) or an ``InstructorRetryException``
-    that still wraps one. All other exceptions are re-raised immediately.
+    Retries only what re-sending the same request can fix — 429, 408, 5xx and
+    network failures (``_is_transient``) — waiting ``_backoff_delay`` between
+    attempts. Permanent failures and structured-output rejections are re-raised
+    immediately for their own handlers (``_fallback_mode``, the callers' safe-false
+    / raise split).
+
+    Two bounds hold the worst case (AUG-160): each delay is capped, and the whole
+    sequence stops at ``_RETRY_TOTAL_BUDGET_SECONDS`` measured on the event loop's
+    MONOTONIC clock, whichever comes first. ``max_retries`` is therefore an upper
+    bound on attempts, not a promise of them.
     """
+    deadline = time.monotonic() + _RETRY_TOTAL_BUDGET_SECONDS
     last_exc: BaseException | None = None
     for attempt in range(max_retries + 1):
         try:
             return await call_func()
         except Exception as exc:
-            rate_limit = _unwrap_rate_limit(exc)
-            if rate_limit is None:
+            if not _is_transient(exc):
                 raise
             last_exc = exc
             if attempt >= max_retries:
                 break
-            delay = base_delay * (backoff_multiplier**attempt)
-            logger.warning(
-                "Rate limit hit (attempt %d/%d), retrying in %.0fs",
-                attempt + 1,
-                max_retries,
-                delay,
-            )
+            delay = _backoff_delay(attempt, base_delay, backoff_multiplier)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning("Retry budget of %.0fs exhausted; giving up", _RETRY_TOTAL_BUDGET_SECONDS)
+                break
+            delay = min(delay, remaining)
+            if _unwrap_rate_limit(exc) is not None:
+                logger.warning("Rate limit hit (attempt %d/%d), retrying in %.0fs", attempt + 1, max_retries, delay)
+            else:
+                logger.warning(
+                    "Transient LLM error (attempt %d/%d), retrying in %.0fs: %s",
+                    attempt + 1,
+                    max_retries,
+                    delay,
+                    _summarize_exc(exc),
+                )
             await asyncio.sleep(delay)
     assert last_exc is not None
     raise last_exc
+
+
+# Last mode known to work, per (model, base URL, response-model name), with the
+# monotonic clock reading it expires at. A provider that permanently supports only
+# JSON or MD_JSON (DeepSeek thinking mode) otherwise eats one or two predictably
+# rejected requests before EVERY analysis, initialization, compression and update
+# (AUG-032). The TTL is what keeps the hint a hint: after it lapses the preferred
+# mode is probed again, so a provider that gains TOOLS support is picked up
+# without a restart, and a wrong entry costs one extra call at most.
+_MODE_HINT_TTL_SECONDS = 900.0
+_mode_hints: dict[tuple[str, str, str], tuple[instructor.Mode, float]] = {}
+
+
+def _mode_hint_key(settings: Settings, response_model: type[BaseModel]) -> tuple[str, str, str]:
+    """Hint identity: the three things that decide whether a mode is accepted."""
+    return (settings.llm.model, _effective_base_url(settings) or "", response_model.__name__)
+
+
+def _remember_mode(key: tuple[str, str, str], mode: instructor.Mode) -> None:
+    _mode_hints[key] = (mode, time.monotonic() + _MODE_HINT_TTL_SECONDS)
+
+
+def _starting_mode(key: tuple[str, str, str]) -> instructor.Mode:
+    """Hinted mode if the hint is still fresh, else the preferred mode (TOOLS)."""
+    hint = _mode_hints.get(key)
+    if hint is None:
+        return instructor.Mode.TOOLS
+    mode, expires_at = hint
+    if time.monotonic() >= expires_at:
+        del _mode_hints[key]
+        return instructor.Mode.TOOLS
+    return mode
 
 
 async def _create_structured(
@@ -479,26 +739,36 @@ async def _create_structured(
     response_model: type[T],
     build_messages: Callable[[], list[dict[str, Any]]],
     timeout: int,
+    validation_context: dict[str, Any] | None = None,
 ) -> tuple[T, Any]:
     """Run one structured-output call, falling back TOOLS -> JSON -> MD_JSON.
 
     On a structured-output-fixable 400 (see ``_fallback_mode``) the call is retried
     in the next mode; a mode-invariant error re-raises immediately, and MD_JSON is
     the terminal. ``build_messages`` is a factory invoked FRESH per attempt: this
-    preserves the rebuild-per-attempt invariant (also under 429 retries, since the
-    whole helper re-runs from TOOLS) and avoids instructor's in-place message
-    mutation leaking a doubled schema block across mode hops. Stateless by design —
-    no per-model memory, so a false-positive fallback costs one call and never
-    downgrades the process; it self-heals if the provider fixes its API.
+    preserves the rebuild-per-attempt invariant and avoids instructor's in-place
+    message mutation leaking a doubled schema block across mode hops.
+
+    The starting mode comes from the TTL hint above rather than always being TOOLS,
+    so a fallback-only provider pays the rejection once per TTL instead of on every
+    call — including after a mid-chain rate-limit retry, which used to restart the
+    whole chain from TOOLS. The fallback order itself is unchanged.
+
+    ``validation_context`` reaches the response model's validators as pydantic's
+    validation context, and instructor re-prompts on whatever they reject — that
+    is how the live-output contract (see ``NoveltyResult``) is enforced against
+    the provider rather than merely detected after the fact.
     """
-    mode: instructor.Mode = instructor.Mode.TOOLS
+    hint_key = _mode_hint_key(settings, response_model)
+    mode: instructor.Mode = _starting_mode(hint_key)
     while True:
         client = _get_client(settings, mode)
         try:
-            return await client.chat.completions.create_with_completion(  # type: ignore[no-any-return]
+            result = await client.chat.completions.create_with_completion(
                 model=settings.llm.model,
                 response_model=response_model,
                 messages=build_messages(),  # type: ignore[arg-type]
+                context=validation_context,
                 max_retries=_instructor_retries(settings.llm_max_retries),
                 api_key=settings.llm.api_key,
                 api_base=_effective_base_url(settings),
@@ -516,7 +786,13 @@ async def _create_structured(
                 settings.llm.model,
                 next_mode.value,
             )
+            # Remember the hop immediately: a rate-limit retry re-enters this
+            # helper, and without this it would replay the same rejected mode.
+            _remember_mode(hint_key, next_mode)
             mode = next_mode
+        else:
+            _remember_mode(hint_key, mode)
+            return cast(tuple[T, Any], result)
 
 
 # --- key_facts restatement filtering ---
@@ -525,6 +801,37 @@ async def _create_structured(
 # these aliases keep the historical ``app.analysis.llm`` import path working for
 # call sites and tests. ``analyze_articles`` calls ``_filter_restated_key_facts``.
 _filter_restated_key_facts = filter_restated_key_facts
+
+
+# --- Post-transform domain invariants (TW-AUD-015) ---
+#
+# Provider parsing verifies TYPES; the citation/reliability scrubs below then
+# rewrite the validated text. A response that was valid on the wire can therefore
+# become an empty alert payload or an empty knowledge state on the way out, so the
+# invariant is re-checked AFTER the mutation — mapped to the settled safe result
+# for novelty, and raised for knowledge, matching each path's contract.
+
+
+def _sanitize(text: str) -> str:
+    """Strip ephemeral article-index citations, then leaked reliability notes.
+
+    Order matters: index-citations first, so their parentheticals are gone before
+    the reliability pass classifies sentences.
+    """
+    return strip_reliability_notes(strip_index_citations(text)).strip()
+
+
+class EmptyAfterCleanupError(ValueError):
+    """A validated LLM string was left empty by citation/reliability cleanup."""
+
+
+def _sanitized_or_raise(text: str, field: str) -> str:
+    cleaned = _sanitize(text)
+    if not cleaned:
+        raise EmptyAfterCleanupError(
+            f"{field} contained only citation/reliability artifacts and was empty after cleanup"
+        )
+    return cleaned
 
 
 # --- source_urls subset guard (prompt-injection output validation) ---
@@ -568,12 +875,22 @@ async def analyze_articles(
     """
 
     try:
-        result, completion = await _call_with_rate_limit_retry(
+        result, completion = await _call_with_transport_retry(
             lambda: _create_structured(
                 settings,
                 response_model=NoveltyResult,
-                build_messages=lambda: build_novelty_messages(articles, knowledge_summary, topic),
+                build_messages=lambda: _fit_article_prompt(
+                    lambda arts, chars, summary: build_novelty_messages(arts, summary, topic, chars),
+                    articles,
+                    knowledge_summary,
+                    settings,
+                    topic.name,
+                ),
                 timeout=settings.llm_analysis_timeout,
+                # Decode under the LIVE contract: a positive result that omits its
+                # own relevance/importance is rejected and re-prompted, instead of
+                # inheriting stored-blob defaults that mute it (AUG-159).
+                validation_context=_LIVE_OUTPUT_CONTEXT,
             ),
             max_retries=settings.llm_max_retries,
         )
@@ -586,35 +903,51 @@ async def analyze_articles(
     # it on a clean run. Force it None here so ONLY the except-branch above ever
     # sets it; otherwise the checker mis-stamps a healthy run as analysis_failed.
     novelty.error = None
-    # ``importance`` has a default (see NoveltyResult), so a provider that ignores
-    # the field silently scores every result 3 — which makes a per-topic threshold
-    # of 4 or 5 mute the topic entirely, with nothing in the logs to explain it.
-    # Say so once per check rather than making the field required (that would break
-    # re-parsing of pre-m023 stored blobs in the force-notify handler).
-    if "importance" not in novelty.model_fields_set:
+    # ``relevance``/``importance`` carry stored-blob defaults (see NoveltyResult),
+    # and ``NoveltyResponse`` only *requires* them on a positive result. A provider
+    # that omits them on negatives is still worth one line per check: the same
+    # habit is what would mute a later positive, and the default scores are what
+    # the checker's gates read.
+    omitted = [name for name in _SCORE_FIELDS if name not in novelty.model_fields_set]
+    if omitted:
         logger.warning(
-            "LLM omitted 'importance' for topic '%s'; defaulting to %d. "
-            "An importance threshold above %d will suppress every notification with this model.",
+            "LLM omitted %s for topic '%s'; using the stored-blob default(s) (relevance=%.2f, importance=%d). "
+            "A threshold above the default will suppress notifications with this model.",
+            " and ".join(f"'{name}'" for name in omitted),
             topic.name,
-            novelty.importance,
+            novelty.relevance,
             novelty.importance,
         )
     usage = _extract_usage(completion)
     novelty.prompt_tokens = usage.prompt_tokens
     novelty.completion_tokens = usage.completion_tokens
-    novelty.key_facts = _filter_restated_key_facts(novelty.key_facts, knowledge_summary)
-    # Strip ephemeral article-index citations ("(Article [1])") then leaked
-    # [STUB]/[NO CONTENT] reliability notes from the fact fields before they reach
-    # the knowledge-update merge, notifications, and webhooks. Order matters:
-    # index-citations first, so their parentheticals are gone before the reliability
-    # pass classifies sentences. Not reasoning — its cites are subject-position prose
-    # that would mangle if stripped.
+    # Sanitize BEFORE filtering restatements (AUG-168). A fact identical to known
+    # knowledge except for its "(Article [1])" tail used to miss the overlap
+    # threshold, survive the filter, and only then become an exact restatement —
+    # so the filter has to run on the exact text that will be emitted and stored.
+    # Not reasoning — its cites are subject-position prose that would mangle if
+    # stripped.
     if novelty.summary:
-        novelty.summary = strip_reliability_notes(strip_index_citations(novelty.summary))
-    novelty.key_facts = [strip_reliability_notes(strip_index_citations(fact)) for fact in novelty.key_facts]
+        novelty.summary = _sanitize(novelty.summary)
+    sanitized_facts = [_sanitize(fact) for fact in novelty.key_facts]
+    novelty.key_facts = _filter_restated_key_facts([fact for fact in sanitized_facts if fact], knowledge_summary)
     # Drop any source_url not in the input set so an injected completion cannot
     # smuggle an attacker-chosen URL into notifications/webhooks (OVH-058).
     novelty.source_urls = _filter_source_urls(novelty.source_urls, articles)
+    # Re-check the domain invariant after those mutations (TW-AUD-015): a positive
+    # result whose summary was entirely citation/reliability artifacts would
+    # otherwise notify the user with an empty body and feed an empty lead-in to the
+    # knowledge merge. Mapped to the settled safe result, not raised.
+    if novelty.has_new_info and not novelty.summary:
+        logger.warning(
+            "Novelty summary for topic '%s' was empty after citation/reliability cleanup; failing safe",
+            topic.name,
+        )
+        return NoveltyResult(
+            has_new_info=False,
+            confidence=0.0,
+            error="novelty summary was empty after citation/reliability cleanup",
+        )
     return novelty
 
 
@@ -628,19 +961,29 @@ async def generate_initial_knowledge(
     Raises on failure — knowledge initialization is critical.
     """
 
-    raw_result, completion = await _call_with_rate_limit_retry(
+    raw_result, completion = await _call_with_transport_retry(
         lambda: _create_structured(
             settings,
             response_model=KnowledgeStateUpdate,
-            build_messages=lambda: build_knowledge_init_messages(articles, topic, settings.knowledge_state_max_tokens),
+            build_messages=lambda: _fit_article_prompt(
+                lambda arts, chars, _summary: build_knowledge_init_messages(
+                    arts, topic, settings.knowledge_state_max_tokens, chars
+                ),
+                articles,
+                "",
+                settings,
+                topic.name,
+            ),
             timeout=settings.llm_knowledge_timeout,
         ),
         max_retries=settings.llm_max_retries,
     )
     result: KnowledgeStateUpdate = raw_result
     # Strip article-index citations then leaked reliability notes before counting
-    # tokens so the freed budget is real.
-    result.updated_summary = strip_reliability_notes(strip_index_citations(result.updated_summary))
+    # tokens so the freed budget is real. The caller persists this summary even
+    # when sufficient_data is false (it explains what was missing), so an empty
+    # result is rejected either way — knowledge transitions fail loud (TW-AUD-015).
+    result.updated_summary = _sanitized_or_raise(result.updated_summary, "initial knowledge summary")
     result.token_count = count_tokens(result.updated_summary, settings.llm.model)
     usage = _extract_usage(completion)
     result.prompt_tokens = usage.prompt_tokens
@@ -661,7 +1004,7 @@ async def compress_knowledge_summary(
     completion's usage so this round-trip's cost is not lost (OVH-129).
     """
 
-    raw_result, completion = await _call_with_rate_limit_retry(
+    raw_result, completion = await _call_with_transport_retry(
         lambda: _create_structured(
             settings,
             response_model=CompressedKnowledge,
@@ -676,8 +1019,10 @@ async def compress_knowledge_summary(
     )
     result: CompressedKnowledge = raw_result
     # Strip article-index citations then leaked reliability notes before counting
-    # tokens so the freed budget is real.
-    result.compressed_summary = strip_reliability_notes(strip_index_citations(result.compressed_summary))
+    # tokens so the freed budget is real. An empty result raises (TW-AUD-015): the
+    # caller degrades to lossy truncation of the ORIGINAL summary, which is a far
+    # better outcome than persisting nothing.
+    result.compressed_summary = _sanitized_or_raise(result.compressed_summary, "compressed knowledge summary")
     result.token_count = count_tokens(result.compressed_summary, settings.llm.model)
     usage = _extract_usage(completion)
     result.prompt_tokens = usage.prompt_tokens
@@ -696,7 +1041,7 @@ async def generate_knowledge_update(
     Raises on failure — knowledge updates are critical.
     """
 
-    raw_result, completion = await _call_with_rate_limit_retry(
+    raw_result, completion = await _call_with_transport_retry(
         lambda: _create_structured(
             settings,
             response_model=KnowledgeStateUpdate,
@@ -714,8 +1059,14 @@ async def generate_knowledge_update(
     result: KnowledgeStateUpdate = raw_result
     # Strip article-index citations (the update LLM grafts them onto clean input by
     # mimicking the existing cited style) then leaked reliability notes before
-    # counting tokens so the budget is real.
-    result.updated_summary = strip_reliability_notes(strip_index_citations(result.updated_summary))
+    # counting tokens so the budget is real. When the merge is going to be
+    # persisted, an empty result raises rather than wiping the baseline
+    # (TW-AUD-015); on sufficient_data=false the caller keeps the existing state
+    # and never reads this text, so an empty explanation is harmless there.
+    if result.sufficient_data:
+        result.updated_summary = _sanitized_or_raise(result.updated_summary, "updated knowledge summary")
+    else:
+        result.updated_summary = _sanitize(result.updated_summary)
     result.token_count = count_tokens(result.updated_summary, settings.llm.model)
     usage = _extract_usage(completion)
     result.prompt_tokens = usage.prompt_tokens

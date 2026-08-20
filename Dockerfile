@@ -43,6 +43,11 @@ RUN apt-get update && \
 COPY app/ ./app/
 COPY config.example.yml ./
 
+# Ship license text for this project and for the vendored front-end assets in
+# app/static/vendor/ (Pico CSS, htmx) alongside the image that redistributes
+# them (AUG-341).
+COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/licenses/topic-watch/
+
 # Create the runtime user/group. UID/GID 1000 is the default; the entrypoint
 # remaps these to the host-provided PUID/PGID at startup so bind-mounted ./data
 # is writable regardless of the host user's UID.

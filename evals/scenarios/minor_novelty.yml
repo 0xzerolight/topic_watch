@@ -1,0 +1,25 @@
+# Controlled novelty scenario: new information that is real but minor — the
+# low-importance counterpart to positive_novelty.yml. Guards against a model
+# that treats any new detail as major (over-scoring / signal-to-noise).
+# Expectation: the model SHOULD flag new info, but with a LOW importance score.
+kind: novelty
+topic:
+  name: "Acme funding"
+  description: "Track Acme Corp funding rounds, investors, and amounts."
+  confidence_threshold: 0.7
+  novelty_instruction: "Only flag confirmed, official funding announcements — ignore rumors or unconfirmed reports."
+knowledge_summary: |
+  Acme Corp raised a $5M Series A led by Foo Ventures, announced in January 2025.
+articles:
+  - title: "Acme Corp opens a small satellite office in Austin"
+    url: "https://example.com/acme-austin-office"
+    content: >
+      Acme Corp has opened a five-person satellite office in Austin, Texas,
+      to support existing customers in the region. The company said there is
+      no near-term plan to expand the office further.
+    published: "2025-04-02T09:00:00Z"
+    source_feed: "https://example.com/rss"
+expect:
+  has_new_info: true
+  min_confidence: 0.5
+  max_importance: 2

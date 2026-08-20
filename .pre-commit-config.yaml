@@ -15,17 +15,15 @@ repos:
         args: [--fix, --exit-non-zero-on-fix]
       - id: ruff-format
 
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v2.3.1
+  # Runs the project's own pinned mypy (requirements-dev.txt via `make dev`)
+  # against the same app/ evals/ scope as `make lint` and hosted CI (AUG-064),
+  # instead of mirrors-mypy's isolated environment with its own floating
+  # dependency set.
+  - repo: local
     hooks:
       - id: mypy
-        additional_dependencies: [
-          "pydantic>=2.10",
-          "pydantic-settings>=2.7",
-          "fastapi>=0.115",
-          "httpx>=0.27",
-          "types-PyYAML>=6.0",
-        ]
-        args: [--ignore-missing-imports]
+        name: mypy (canonical dev environment)
+        entry: mypy app/ evals/ --ignore-missing-imports
+        language: system
         pass_filenames: false
-        entry: mypy app/
+        types: [python]

@@ -38,9 +38,9 @@
 
     {% set current_mode = feed_mode if feed_mode is defined else topic.feed_mode.value %}
     <section class="card">
-        <span class="card-kicker">Feed Source</span>
+        <span class="card-kicker" id="feed-source-kicker">Feed Source</span>
 
-        <fieldset>
+        <fieldset aria-labelledby="feed-source-kicker">
             <label>
                 <input type="radio" name="feed_mode" value="auto"
                        {{ 'checked' if current_mode == 'auto' }}
@@ -82,7 +82,7 @@
                     style="margin-top: 0.5em;">
                 Validate URLs
             </button>
-            <div id="feed-validation-results"></div>
+            <div id="feed-validation-results" role="status" aria-live="polite" aria-atomic="true"></div>
         </div>
     </section>
 

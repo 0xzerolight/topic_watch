@@ -24,6 +24,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from app import __version__ as _app_version
 from app.analysis.llm import (
     NoveltyResult,
     analyze_articles,
@@ -147,7 +148,18 @@ def _result_text(result: BaseModel) -> str:
     return ""
 
 
-def _evaluate_expect(expect: Expectation, result: BaseModel) -> list[ExpectCheck]:
+def _evaluate_expect(expect: Expectation, result: BaseModel | None, error: str | None) -> list[ExpectCheck]:
+    """Evaluate soft expectation checks against a run's result.
+
+    A run that produced no trustworthy result (``error`` set, e.g. a
+    swallowed novelty LLM failure or a caught knowledge-stage exception)
+    collapses to a single failing "execution" check instead of the normal
+    per-field comparisons — otherwise a safe-default value could coincidentally
+    satisfy an expectation and render as MATCH, hiding a provider/harness
+    failure behind a green result (AUG-296).
+    """
+    if error is not None or result is None:
+        return [ExpectCheck(check="execution", ok=False, detail=f"run failed, expectations not evaluated: {error}")]
     checks: list[ExpectCheck] = []
 
     def add(check: str, ok: bool, detail: str) -> None:
@@ -167,6 +179,9 @@ def _evaluate_expect(expect: Expectation, result: BaseModel) -> list[ExpectCheck
     if expect.min_importance is not None:
         imp = int(getattr(result, "importance", 0) or 0)
         add("min_importance", imp >= expect.min_importance, f"{imp} >= {expect.min_importance}")
+    if expect.max_importance is not None:
+        imp = int(getattr(result, "importance", 0) or 0)
+        add("max_importance", imp <= expect.max_importance, f"{imp} <= {expect.max_importance}")
     if expect.summary_contains is not None:
         needle = expect.summary_contains.lower()
         add("summary_contains", needle in _result_text(result).lower(), f"{expect.summary_contains!r} in summary")
@@ -184,6 +199,8 @@ def _to_captured(record: CallRecord) -> CapturedCall:
         response_model=record.response_model.__name__ if record.response_model else "unknown",
         messages=record.messages,
         raw_parsed=record.parsed.model_dump(mode="json") if isinstance(record.parsed, BaseModel) else {},
+        mode=record.mode.value if record.mode is not None else None,
+        error=record.error,
         prompt_tokens=record.usage.prompt_tokens,
         completion_tokens=record.usage.completion_tokens,
     )
@@ -192,22 +209,30 @@ def _to_captured(record: CallRecord) -> CapturedCall:
 def build_artifact(
     scenario: Scenario,
     settings: Settings,
-    result: BaseModel,
+    result: BaseModel | None,
     records: list[CallRecord],
     *,
+    error: str | None = None,
     created_at: str | None = None,
 ) -> RunArtifact:
-    """Assemble a RunArtifact from a stage result and its captured calls."""
+    """Assemble a RunArtifact from a stage result (or a caught run error) and
+    its captured calls. ``error`` takes precedence over a result's own
+    ``error`` attribute (e.g. NoveltyResult.error) — both funnel into the
+    same ``final_error`` outcome field so callers have one place to check for
+    a failed run.
+    """
+    final_error = error if error is not None else getattr(result, "error", None)
     return RunArtifact(
+        code_version=_app_version,
         name=scenario.name,
         kind=scenario.kind,
         model=settings.llm.model,
         temperature=settings.llm_temperature,
         created_at=created_at or datetime.now(UTC).isoformat(),
         calls=[_to_captured(r) for r in records],
-        final=result.model_dump(mode="json"),
-        final_error=getattr(result, "error", None),
-        expect_results=_evaluate_expect(scenario.expect, result) if scenario.expect else [],
+        final=result.model_dump(mode="json") if result is not None else None,
+        final_error=final_error,
+        expect_results=_evaluate_expect(scenario.expect, result, final_error) if scenario.expect else [],
         scenario=scenario,
     )
 
@@ -223,11 +248,24 @@ async def run_scenario(
 
     ``inner`` is the recorder's inner client — None uses the real one; offline
     tests inject a mock. No DB/HTTP for any of the four offline kinds.
+
+    novelty's ``analyze_articles`` never raises (production fail-safe
+    invariant) — its failure surfaces as ``result.error``. The other three
+    kinds DO raise on failure (production invariant: knowledge init/update are
+    critical); the harness catches that here so a harder failure still
+    finalizes an artifact as evidence instead of vanishing into an uncaught
+    traceback with nothing saved (AUG-296). Either path funnels into
+    ``final_error`` via ``build_artifact``.
     """
     adapter = KIND_DISPATCH[scenario.kind]
+    result: BaseModel | None = None
+    error: str | None = None
     with recording_client(inner=inner) as records:
-        result = await adapter.run(scenario, settings)
-    return build_artifact(scenario, settings, result, records, created_at=created_at)
+        try:
+            result = await adapter.run(scenario, settings)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+    return build_artifact(scenario, settings, result, records, error=error, created_at=created_at)
 
 
 # --- live run (real fetch, prod read-only, scratch-DB isolation) ---
@@ -282,6 +320,14 @@ def _scenario_from_live(topic: Topic, summary: str, articles: list[Article], kin
     )
 
 
+# Kinds a live fetch cannot build a faithful scenario for. knowledge_update
+# needs a real NoveltyResult (novelty_summary + key_facts) to update FROM;
+# nothing in a live fetch produces one, so run_live used to fabricate
+# has_new_info=True with a blank summary — an input production never sends,
+# evaluated at the cost of a billed call (AUG-047).
+_LIVE_UNSUPPORTED_KINDS = frozenset({"knowledge_update"})
+
+
 async def run_live(
     topic_name: str,
     settings: Settings,
@@ -298,7 +344,19 @@ async def run_live(
     fetch bookkeeping (articles, feed_health, dedup) happens in a throwaway
     scratch DB in a tempdir. ``inner`` is the recorder's inner client (None ->
     real; tests inject a mock).
+
+    ``kind="knowledge_update"`` is rejected outright (see
+    ``_LIVE_UNSUPPORTED_KINDS``): run ``live --kind novelty`` (optionally
+    ``--freeze``) first, then hand-author a ``scenario`` YAML with the real
+    ``novelty_summary``/``key_facts`` for the update stage.
     """
+    if kind in _LIVE_UNSUPPORTED_KINDS:
+        raise LiveError(
+            f"live --kind {kind} is not supported: a live fetch has no real novelty result to update "
+            "from, so it would fabricate one and evaluate input production never sends. Run `live "
+            "--kind novelty` first, then hand-author a `scenario` YAML with the real "
+            "novelty_summary/key_facts."
+        )
     prod = prod_db_path if prod_db_path is not None else settings.db_path
     ro = _open_readonly(prod)
     try:
@@ -325,6 +383,7 @@ async def run_live(
                 article_fetch_timeout=settings.article_fetch_timeout,
                 feed_max_retries=settings.feed_max_retries,
                 concurrency=settings.content_fetch_concurrency,
+                exa_settings=settings.exa,
             )
             articles = fetch_result.articles
         finally:

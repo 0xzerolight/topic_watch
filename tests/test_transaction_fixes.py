@@ -33,7 +33,7 @@ import pytest
 
 from app import database
 from app.analysis.knowledge import KnowledgeUpdatePlan
-from app.analysis.llm import NoveltyResult, TokenUsage
+from app.analysis.llm import EmptyAfterCleanupError, NoveltyResult, TokenUsage
 from app.checker import check_topic, initialize_new_topic
 from app.config import LLMSettings, NotificationSettings, Settings
 from app.crud import (
@@ -47,7 +47,7 @@ from app.crud import (
     recover_stuck_topics,
 )
 from app.database import get_connection
-from app.models import Article, KnowledgeState, NotificationDelivery, Topic, TopicStatus
+from app.models import Article, KnowledgeState, NotificationDelivery, NotifyDisposition, Topic, TopicStatus
 from app.scraping import FetchResult
 from app.scraping.rss import FeedEntry, FeedResponse
 
@@ -90,6 +90,11 @@ def _write_result() -> KnowledgeUpdatePlan:
         usage=TokenUsage(prompt_tokens=0, completion_tokens=0),
         sufficient_data=True,
     )
+
+
+def _per_url_ok():
+    """Stand-in for send_notification_per_url that reports one successful target."""
+    return AsyncMock(return_value=[NotificationDelivery(url="json://localhost", ok=True)])
 
 
 def _make_article(**overrides) -> Article:
@@ -1000,3 +1005,118 @@ class TestDurableTransitionGuards:
         assert "deleted or replaced" in (result.stage_error or "")
         assert db_conn.execute("SELECT COUNT(*) FROM check_results").fetchone()[0] == 0
         assert db_conn.execute("SELECT COUNT(*) FROM knowledge_states").fetchone()[0] == 0
+
+
+class TestKnowledgeCleanupFailuresAtTheTransition:
+    """The C3 transaction's behaviour when the knowledge phase raises.
+
+    ``generate_*`` now raise ``EmptyAfterCleanupError`` when citation/reliability
+    cleanup empties a summary. Knowledge init/update are allowed to raise (unlike
+    ``analyze_articles``), so these prove the raising phase is handled where it
+    matters: nothing is half-written, and the recorded row says what happened.
+    """
+
+    async def test_empty_after_cleanup_records_a_check_without_touching_knowledge(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        topic = _ready_topic(db_conn, name="EmptyMergeTopic")
+        create_knowledge_state(db_conn, KnowledgeState(topic_id=topic.id, summary_text="baseline"))
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
+        db_conn.commit()
+        settings = _pipeline_settings()
+
+        async def _prepare(*_args, **_kwargs):
+            raise EmptyAfterCleanupError("updated knowledge summary was empty after cleanup")
+
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[article], total_feed_entries=1),
+            ),
+            patch(
+                "app.checker.analyze_articles",
+                new_callable=AsyncMock,
+                return_value=NoveltyResult(has_new_info=True, summary="s", confidence=0.9, relevance=0.9, importance=5),
+            ),
+            patch("app.checker.prepare_knowledge_update", side_effect=_prepare),
+            patch("app.checker.send_notification_per_url", _per_url_ok()),
+            patch("app.checker.send_webhooks", new_callable=AsyncMock, return_value=0),
+        ):
+            result = await check_topic(topic, settings, db_path=db_path)
+
+        # The check IS recorded -- the failure is visible, not swallowed.
+        assert result.id is not None
+        assert result.stage_error is not None
+        assert result.stage_error.startswith("knowledge_update_failed:")
+        assert "EmptyAfterCleanupError" in result.stage_error
+        # The baseline survives, and the articles stay unprocessed so the next
+        # cycle re-attempts the merge (OVH-009).
+        stored = db_conn.execute(
+            "SELECT summary_text, version FROM knowledge_states WHERE topic_id = ?", (topic.id,)
+        ).fetchone()
+        assert stored["summary_text"] == "baseline"
+        assert stored["version"] == 0
+        assert db_conn.execute("SELECT COUNT(*) FROM articles WHERE processed = 1").fetchone()[0] == 0
+        # No revision was appended for a merge that never landed.
+        assert db_conn.execute("SELECT COUNT(*) FROM knowledge_revisions").fetchone()[0] == 0
+
+    async def test_init_empty_after_cleanup_leaves_the_topic_in_error(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """Knowledge init raising is the settled contract; the topic must not go READY."""
+        topic = _ready_topic(db_conn, name="EmptyInitTopic", status=TopicStatus.NEW)
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
+        db_conn.commit()
+        settings = _pipeline_settings()
+
+        async def _prepare(*_args, **_kwargs):
+            raise EmptyAfterCleanupError("initial knowledge summary was empty after cleanup")
+
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[article], total_feed_entries=1),
+            ),
+            patch("app.checker.prepare_initial_knowledge", side_effect=_prepare),
+        ):
+            await initialize_new_topic(topic, settings, db_path=db_path)
+
+        assert get_topic(db_conn, topic.id).status == TopicStatus.ERROR
+        assert db_conn.execute("SELECT COUNT(*) FROM knowledge_states").fetchone()[0] == 0
+        assert db_conn.execute("SELECT COUNT(*) FROM articles WHERE processed = 1").fetchone()[0] == 0
+
+    async def test_novelty_emptied_by_cleanup_is_recorded_as_analysis_failed(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """``analyze_articles`` never raises; its new empty-summary safe default
+        carries ``error``, so the disposition must be analysis_failed rather than
+        an indistinguishable clean ``no_new_info``."""
+        topic = _ready_topic(db_conn, name="EmptyNoveltyTopic")
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
+        db_conn.commit()
+        settings = _pipeline_settings()
+
+        safe_default = NoveltyResult(
+            has_new_info=False,
+            confidence=0.0,
+            error="novelty summary was empty after citation/reliability cleanup",
+        )
+
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[article], total_feed_entries=1),
+            ),
+            patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=safe_default),
+            patch("app.checker.send_notification_per_url", _per_url_ok()),
+        ):
+            result = await check_topic(topic, settings, db_path=db_path)
+
+        assert result.id is not None
+        assert result.notify_disposition == NotifyDisposition.ANALYSIS_FAILED
+        assert result.stage_error is not None and result.stage_error.startswith("analysis_failed:")
+        stored = db_conn.execute("SELECT notify_disposition FROM check_results WHERE id = ?", (result.id,)).fetchone()
+        assert stored["notify_disposition"] == "analysis_failed"

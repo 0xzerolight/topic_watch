@@ -1,0 +1,28 @@
+# Controlled novelty scenario: a genuinely new, major development — the
+# positive counterpart to dup_event.yml (which is deliberately NOT new).
+# Also exercises novelty_instruction (custom scoping) and importance scoring.
+# Expectation: the model SHOULD flag new info, with high confidence and a
+# major importance score.
+kind: novelty
+topic:
+  name: "Acme funding"
+  description: "Track Acme Corp funding rounds, investors, and amounts."
+  confidence_threshold: 0.7
+  novelty_instruction: "Only flag confirmed, official funding announcements — ignore rumors or unconfirmed reports."
+knowledge_summary: |
+  Acme Corp raised a $5M Series A led by Foo Ventures, announced in January 2025.
+articles:
+  - title: "Acme Corp closes $50M Series B led by Bar Capital"
+    url: "https://example.com/acme-series-b"
+    content: >
+      Acme Corp today confirmed it has closed a $50 million Series B funding
+      round led by Bar Capital, with participation from returning investor
+      Foo Ventures. The round values the company at $300 million and will
+      fund international expansion.
+    published: "2025-06-01T09:00:00Z"
+    source_feed: "https://example.com/rss"
+expect:
+  has_new_info: true
+  min_confidence: 0.6
+  min_importance: 4
+  summary_contains: "Series B"
