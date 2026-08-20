@@ -92,11 +92,19 @@ class Scenario(BaseModel):
 
 
 class CapturedCall(BaseModel):
-    """One recorded LLM round-trip, flattened to plain JSON-friendly data."""
+    """One recorded LLM round-trip, flattened to plain JSON-friendly data.
+
+    ``mode`` is the structured-output mode (TOOLS/JSON/MD_JSON) the attempt
+    used; ``error`` is set instead of ``raw_parsed`` being meaningful when the
+    provider rejected this specific attempt (a fallback retry may still have
+    produced a later, successful call).
+    """
 
     response_model: str
     messages: list[dict[str, Any]]
     raw_parsed: dict[str, Any]
+    mode: str | None = None
+    error: str | None = None
     prompt_tokens: int = 0
     completion_tokens: int = 0
 

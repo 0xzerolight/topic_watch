@@ -115,9 +115,12 @@ async def test_recorded_parsed_is_snapshot_immune_to_later_mutation() -> None:
 
 
 def test_recording_client_builds_real_inner_when_none_injected(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Omitting the mock inner builds the real client — proving the no-live-call
-    guarantee is load-bearing. With from_litellm patched to raise, the default
-    path raises; the injected path does not.
+    """Omitting the mock inner builds a real per-mode client the first time
+    ``_get_client`` is actually invoked — proving the no-live-call guarantee is
+    load-bearing. With from_litellm patched to raise, the default path raises;
+    the injected path does not. (Client construction is now lazy per mode, to
+    match production's own per-mode client cache, so this must call
+    ``_get_client`` rather than exercise nothing inside the context.)
     """
     import evals.recorder as recorder
 
@@ -127,11 +130,73 @@ def test_recording_client_builds_real_inner_when_none_injected(monkeypatch: pyte
     monkeypatch.setattr(recorder.instructor, "from_litellm", _boom)
 
     with pytest.raises(AssertionError, match="real client build attempted"), recorder.recording_client():
-        pass
+        llm_mod._get_client(MagicMock())
 
     # Injecting an inner avoids the real build entirely.
     with recorder.recording_client(inner=MagicMock()):
-        pass
+        llm_mod._get_client(MagicMock())
+
+
+async def test_recording_client_calls_land_on_the_mode_specific_inner() -> None:
+    """AUG-294: production bakes the structured-output mode into a DISTINCT
+    client at build time (TOOLS/JSON/MD_JSON), because that mode decides how
+    the request is shaped. A recorder that returns one constant proxy for
+    every ``_get_client(settings, mode)`` call would route every fallback
+    attempt through the same client, silently skipping the mode switch a real
+    retry makes. Injecting a ``{mode: mock}`` dict must dispatch each mode to
+    its own mock, and each captured record must carry the mode it used.
+    """
+    import instructor
+
+    from evals.recorder import recording_client
+
+    tools_inner = MagicMock()
+    tools_inner.chat.completions.create_with_completion = AsyncMock(return_value=(_novelty(), _StubCompletion()))
+    json_inner = MagicMock()
+    json_inner.chat.completions.create_with_completion = AsyncMock(
+        return_value=(_novelty(summary="from json mode"), _StubCompletion())
+    )
+
+    with recording_client(inner={instructor.Mode.TOOLS: tools_inner, instructor.Mode.JSON: json_inner}) as records:
+        tools_client = llm_mod._get_client(MagicMock(), instructor.Mode.TOOLS)
+        await tools_client.chat.completions.create_with_completion(model="m", response_model=NoveltyResult, messages=[])
+        json_client = llm_mod._get_client(MagicMock(), instructor.Mode.JSON)
+        result, _ = await json_client.chat.completions.create_with_completion(
+            model="m", response_model=NoveltyResult, messages=[]
+        )
+
+    assert tools_inner.chat.completions.create_with_completion.await_count == 1
+    assert json_inner.chat.completions.create_with_completion.await_count == 1
+    assert result.summary == "from json mode"
+    assert [r.mode for r in records] == [instructor.Mode.TOOLS, instructor.Mode.JSON]
+
+
+async def test_recording_client_records_a_rejected_attempt_before_reraising() -> None:
+    """A structured-output attempt that a provider rejects (e.g. a forced
+    tool_choice a mode-fallback retries past) must not vanish — the recorder
+    only appended after success, hiding every attempt but the last (AUG-294).
+    """
+    from evals.recorder import recording_client
+
+    inner = MagicMock()
+    inner.chat.completions.create_with_completion = AsyncMock(side_effect=RuntimeError("rejected: SUPER_SECRET_KEY"))
+
+    with recording_client(inner=inner) as records:
+        client = llm_mod._get_client(MagicMock())
+        with pytest.raises(RuntimeError, match="rejected"):
+            await client.chat.completions.create_with_completion(
+                model="m",
+                response_model=NoveltyResult,
+                messages=[{"role": "user", "content": "hi"}],
+                api_key="SUPER_SECRET_KEY",
+            )
+
+    assert len(records) == 1
+    rec = records[0]
+    assert rec.parsed is None
+    assert rec.error is not None
+    assert "RuntimeError" in rec.error
+    assert "SUPER_SECRET_KEY" not in rec.error  # the leaked key in the message is sanitized
 
 
 # --- scenario + RunArtifact ---

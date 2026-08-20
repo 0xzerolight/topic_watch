@@ -195,6 +195,8 @@ def _to_captured(record: CallRecord) -> CapturedCall:
         response_model=record.response_model.__name__ if record.response_model else "unknown",
         messages=record.messages,
         raw_parsed=record.parsed.model_dump(mode="json") if isinstance(record.parsed, BaseModel) else {},
+        mode=record.mode.value if record.mode is not None else None,
+        error=record.error,
         prompt_tokens=record.usage.prompt_tokens,
         completion_tokens=record.usage.completion_tokens,
     )

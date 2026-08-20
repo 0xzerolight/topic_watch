@@ -82,8 +82,12 @@ def diff_runs(old: RunArtifact, new: RunArtifact) -> list[str]:
             continue
         if oc.response_model != nc.response_model:
             lines.append(f"calls[{i}].response_model: {oc.response_model!r} -> {nc.response_model!r}")
+        if oc.mode != nc.mode:
+            lines.append(f"calls[{i}].mode: {oc.mode!r} -> {nc.mode!r}")
         if oc.raw_parsed != nc.raw_parsed:
             lines.append(f"calls[{i}].raw_parsed: {oc.raw_parsed!r} -> {nc.raw_parsed!r}")
+        if oc.error != nc.error:
+            lines.append(f"calls[{i}].error: {oc.error!r} -> {nc.error!r}")
         if (oc.prompt_tokens, oc.completion_tokens) != (nc.prompt_tokens, nc.completion_tokens):
             lines.append(
                 f"calls[{i}].tokens: prompt {oc.prompt_tokens}->{nc.prompt_tokens}, "
