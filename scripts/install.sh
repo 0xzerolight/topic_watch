@@ -176,6 +176,16 @@ COMPOSE_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}/docker-compose.
 info "Downloading docker-compose.yml..."
 curl -fsSL "$COMPOSE_URL" -o "$INSTALL_DIR/docker-compose.yml"
 
+# Also fetch the Ollama/local-LLM override example so the README's documented
+# `cp docker-compose.override.example.yml docker-compose.override.yml` step
+# works from a script install too, not only a source checkout. Optional (only
+# needed for local LLM providers), so a failure here warns instead of aborting
+# the install.
+OVERRIDE_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}/docker-compose.override.example.yml"
+if ! curl -fsSL "$OVERRIDE_URL" -o "$INSTALL_DIR/docker-compose.override.example.yml"; then
+    warn "Could not download docker-compose.override.example.yml (only needed for Ollama/local LLM setups)."
+fi
+
 # --- Write PUID/PGID so bind-mounted ./data is writable by this host user ---
 # Docker bind mounts keep host ownership. If this user's UID/GID is not the
 # image default (1000), the container must chown ./data to match. The compose

@@ -152,3 +152,14 @@ def test_update_sh_reads_port_from_persisted_env_not_process_env_only() -> None:
     update_sh = (_ROOT / "scripts" / "update.sh").read_text()
     assert "read_env TOPIC_WATCH_PORT" in update_sh
     assert 'PORT="${TOPIC_WATCH_PORT:-$(read_env TOPIC_WATCH_PORT "$ENV_FILE")}"' in update_sh
+
+
+def test_installers_fetch_the_ollama_override_example() -> None:
+    """AUG-073 remnant: the README's documented
+    ``cp docker-compose.override.example.yml docker-compose.override.yml``
+    step needs the example file present outside a source checkout too, so
+    the scripted installers must fetch it (best-effort; it's optional)."""
+    install_sh = (_ROOT / "scripts" / "install.sh").read_text()
+    install_ps1 = (_ROOT / "scripts" / "install.ps1").read_text()
+    assert "docker-compose.override.example.yml" in install_sh
+    assert "docker-compose.override.example.yml" in install_ps1

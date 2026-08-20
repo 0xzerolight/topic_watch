@@ -133,6 +133,18 @@ $ComposeDest = Join-Path $InstallDir "docker-compose.yml"
 Write-Info "Downloading docker-compose.yml..."
 Invoke-WebRequest -Uri $ComposeUrl -OutFile $ComposeDest -UseBasicParsing
 
+# Also fetch the Ollama/local-LLM override example so the README's documented
+# override-file step works from a script install too, not only a source
+# checkout. Optional (only needed for local LLM providers), so a failure here
+# warns instead of aborting the install.
+try {
+    $OverrideUrl = "https://raw.githubusercontent.com/$Repo/$Branch/docker-compose.override.example.yml"
+    $OverrideDest = Join-Path $InstallDir "docker-compose.override.example.yml"
+    Invoke-WebRequest -Uri $OverrideUrl -OutFile $OverrideDest -UseBasicParsing
+} catch {
+    Write-Warn "Could not download docker-compose.override.example.yml (only needed for Ollama/local LLM setups)."
+}
+
 # --- Persist the answers to .env ---
 # The compose file reads these. Writing them here is what makes the answers above
 # survive a later `docker compose up -d` and any future re-run of this installer:
