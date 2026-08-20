@@ -261,6 +261,78 @@ class TestDashboard:
         assert 'id="opml-file-hint"' in response.text
 
 
+class TestOpmlImportErrorRedirect:
+    """AUG-206: a rejected feed URL must not travel in the redirect Location."""
+
+    _OPML_WITH_SECRET_FEED = (
+        '<?xml version="1.0"?><opml version="2.0"><body>'
+        '<outline text="Leaky" type="rss" xmlUrl="https://user:s3cr3t@feeds.example.com/x?token=abc123"/>'
+        "</body></opml>"
+    )
+
+    async def test_a_valid_upload_is_actually_read(self, client: httpx.AsyncClient) -> None:
+        """The uploaded file reaches parse_opml instead of being read as absent.
+
+        request.form() yields starlette.datastructures.UploadFile; the route used
+        to isinstance-check against fastapi.UploadFile, a subclass, so every real
+        upload fell through to "No file selected".
+        """
+        from urllib.parse import unquote
+
+        from app.opml import OPMLResult
+
+        parsed = OPMLResult()
+        parsed.topics.append({"name": "Imported", "feed_urls": ["https://feeds.example.com/ok"], "tags": []})
+
+        with patch("app.opml.parse_opml", return_value=parsed) as mock_parse:
+            response = await client.post(
+                "/import/opml",
+                files={"opml_file": ("feeds.opml", self._OPML_WITH_SECRET_FEED, "text/xml")},
+                follow_redirects=False,
+            )
+
+        assert mock_parse.call_count == 1
+        assert "Imported 1 topic(s)" in unquote(response.headers["location"])
+
+    async def test_rejected_url_never_reaches_the_location_header(self, client: httpx.AsyncClient) -> None:
+        from app.opml import OPMLResult
+
+        rejected = OPMLResult()
+        rejected.skipped_invalid = 1
+        rejected.warnings.append("Invalid feed URL: https://user:s3cr3t@feeds.example.com/x?token=abc123 (blocked)")
+
+        with patch("app.opml.parse_opml", return_value=rejected):
+            response = await client.post(
+                "/import/opml",
+                files={"opml_file": ("feeds.opml", self._OPML_WITH_SECRET_FEED, "text/xml")},
+                follow_redirects=False,
+            )
+
+        assert response.status_code == 303
+        location = response.headers["location"]
+        assert "s3cr3t" not in location
+        assert "token=abc123" not in location
+        assert "feeds.example.com" not in location
+
+    async def test_redirect_still_says_how_many_were_rejected(self, client: httpx.AsyncClient) -> None:
+        from urllib.parse import unquote
+
+        from app.opml import OPMLResult
+
+        rejected = OPMLResult()
+        rejected.skipped_invalid = 2
+        rejected.warnings.append("Invalid feed URL: https://feeds.example.com/x (blocked)")
+
+        with patch("app.opml.parse_opml", return_value=rejected):
+            response = await client.post(
+                "/import/opml",
+                files={"opml_file": ("feeds.opml", self._OPML_WITH_SECRET_FEED, "text/xml")},
+                follow_redirects=False,
+            )
+
+        assert "2 feed URL(s) rejected" in unquote(response.headers["location"])
+
+
 class TestDashboardStatsFreshness:
     """The Active/Total stat cards must reflect mutations on the very next load.
 
