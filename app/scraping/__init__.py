@@ -15,10 +15,10 @@ from typing import TYPE_CHECKING
 import httpx
 
 from app.crud import (
-    article_hash_exists,
     create_article,
     find_article_by_hash,
     get_feed_health,
+    list_article_dedup_keys,
     upsert_feed_health_failure,
     upsert_feed_health_success,
 )
@@ -35,7 +35,10 @@ from app.scraping.source import (
     as_utc,
     bounded,
     collapse_duplicate_entries,
+    compute_article_hash,
     normalize_published,
+    revision_marker,
+    story_identity,
 )
 
 if TYPE_CHECKING:
@@ -240,10 +243,44 @@ def _prepare_entries(entries: list[FeedEntry]) -> list[FeedEntry]:
     return collapse_duplicate_entries(entries)
 
 
+@dataclass(frozen=True)
+class _StoredArticles:
+    """What a topic already holds, as the two keys dedup compares an entry against.
+
+    Read once per check rather than queried per entry, because the story key is
+    derived from a stored row's URL and title and so cannot be looked up directly
+    without an index this schema does not have.
+    """
+
+    identities: frozenset[str]
+    stories: frozenset[str]
+
+    @classmethod
+    def load(cls, conn: sqlite3.Connection, topic_id: int) -> "_StoredArticles":
+        rows = list_article_dedup_keys(conn, topic_id)
+        return cls(
+            identities=frozenset(content_hash for content_hash, _, _ in rows),
+            stories=frozenset(compute_article_hash(url, title) for _, url, title in rows),
+        )
+
+    def holds(self, entry: FeedEntry) -> bool:
+        """True when this entry is an article the topic has already stored.
+
+        Either the exact representation is stored, or the story is stored and the
+        entry offers no evidence of a revision. The second rule is what makes a
+        provider's redirect wrapper, a tracking variant and another provider's copy
+        of one story a single article (AUG-180); the revision exception is what
+        lets a correction through (AUG-320).
+        """
+        if article_identity(entry) in self.identities:
+            return True
+        return not revision_marker(entry) and story_identity(entry) in self.stories
+
+
 def _split_dedup_candidates(
     entries: list[FeedEntry],
+    stored: _StoredArticles,
     conn: sqlite3.Connection,
-    topic_id: int,
 ) -> tuple[list[tuple[FeedEntry, str]], list[tuple[FeedEntry, str, str, str | None]]]:
     """Filter feed entries to those not already stored; split reuse vs. fetch-needed.
 
@@ -258,7 +295,7 @@ def _split_dedup_candidates(
     reuse_entries: list[tuple[FeedEntry, str, str, str | None]] = []
     for entry in entries:
         content_hash = article_identity(entry)
-        if article_hash_exists(conn, topic_id, content_hash):
+        if stored.holds(entry):
             continue
         existing = find_article_by_hash(conn, content_hash)
         if existing and existing.raw_content:
@@ -340,34 +377,31 @@ async def _resolve_redirect_urls(
     return changed
 
 
-def _rededuplicate_resolved(
+def _drop_resolved_duplicates(
     fetch_batch: list[tuple[FeedEntry, str]],
-    reuse_batch: list[tuple[FeedEntry, str, str | None, str | None]],
-    conn: sqlite3.Connection,
-    topic_id: int,
+    stored: _StoredArticles,
 ) -> list[tuple[FeedEntry, str]]:
-    """Re-key resolved entries to their publisher URL and drop what collapses (AUG-180).
+    """Re-apply dedup to entries whose real URL only appeared during resolution.
 
-    Identity is computed from what the feed handed over, which for Google News is
-    an opaque wrapper that only becomes the publisher URL here. Bing hands the
-    publisher URL over directly, and a wrapper is not even stable between checks,
-    so the same story kept arriving under an identity nothing had ever stored:
-    fetched again, analyzed again, stored again. Re-keying it once the real URL is
-    known makes it the same article whichever provider answered.
+    A Google News entry names an opaque wrapper until it is resolved, so the
+    story it belongs to is unknown while the first dedup pass runs. Once the
+    publisher URL is known, an entry the topic already holds — under a previous
+    wrapper, or from the other provider, which hands that URL over directly — is
+    dropped before its content is fetched (AUG-180). Entries that collapse onto
+    each other inside the batch are dropped the same way.
 
-    Only entries whose URL actually moved are re-checked, and only against this
-    topic's stored rows and the batch itself — cross-topic content reuse already
-    ran on the pre-resolution identity.
+    The stored key stays the one computed from what the feed handed over, so a
+    later check recognises an unchanged entry without spending a resolution on it.
     """
-    seen = {content_hash for _, content_hash, _, _ in reuse_batch}
     kept: list[tuple[FeedEntry, str]] = []
+    seen_stories: set[str] = set()
     for entry, content_hash in fetch_batch:
-        identity = article_identity(entry)
-        if identity != content_hash and (identity in seen or article_hash_exists(conn, topic_id, identity)):
-            logger.info("Resolved URL matches an article already stored for this topic: %s", entry.url)
+        story = story_identity(entry)
+        if stored.holds(entry) or story in seen_stories:
+            logger.info("Resolved URL belongs to a story this topic already has: %s", entry.url)
             continue
-        seen.add(identity)
-        kept.append((entry, identity))
+        seen_stories.add(story)
+        kept.append((entry, content_hash))
     return kept
 
 
@@ -555,7 +589,8 @@ async def fetch_new_articles_for_topic(
         conn.commit()
         if not entries:
             return empty_result
-        new_entries, reuse_entries = _split_dedup_candidates(entries, conn, topic.id)
+        already_held = _StoredArticles.load(conn, topic.id)
+        new_entries, reuse_entries = _split_dedup_candidates(entries, already_held, conn)
 
     if not new_entries and not reuse_entries:
         return empty_result
@@ -565,10 +600,10 @@ async def fetch_new_articles_for_topic(
 
     # --- P1b: redirect resolution and content extraction, still connection-free.
     if await _resolve_redirect_urls(fetch_batch, response, feed_fetch_timeout, budget):
-        # Resolution changed what these articles are, so identity is re-decided
-        # before anything is fetched for them (AUG-180).
-        with get_db(db_path) as conn:
-            fetch_batch = _rededuplicate_resolved(fetch_batch, reuse_batch, conn, topic.id)
+        # Resolution revealed which story these entries belong to, so dedup runs
+        # once more before their content is fetched (AUG-180). No connection is
+        # needed: the topic's keys were read in the phase above.
+        fetch_batch = _drop_resolved_duplicates(fetch_batch, already_held)
     contents = await _extract_contents(fetch_batch, article_fetch_timeout, concurrency, budget)
 
     # --- C2: one short connection normalizes both batches and inserts.

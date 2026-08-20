@@ -2703,10 +2703,11 @@ class TestResolveRedirectUrls:
         mock_resolve.assert_not_called()
 
 
-class TestResolvedIdentityDedup:
-    """AUG-180: the publisher URL, not the provider's wrapper, decides identity."""
+class TestStoryDedup:
+    """AUG-180: one story is one article, whichever provider or wrapper carries it."""
 
     _WRAPPER = "https://news.google.com/rss/articles/ABC123?oc=5"
+    _OTHER_WRAPPER = "https://news.google.com/rss/articles/XYZ789?oc=5"
     _PUBLISHER = "https://publisher.example/the-story"
 
     def _topic(self, conn: sqlite3.Connection) -> Topic:
@@ -2714,53 +2715,150 @@ class TestResolvedIdentityDedup:
         conn.commit()
         return topic
 
-    async def _run(self, topic: Topic, db_path: Path, extract: AsyncMock) -> list[Article]:
-        entry = FeedEntry(title="The Story", url=self._WRAPPER, summary="s", source_feed="feed")
-        response = FeedResponse(entries=[entry], provider_name="google_news", needs_url_resolution=True)
-        with (
-            patch("app.scraping.fetch_feeds_for_topic", return_value=response),
-            patch(
-                "app.scraping.resolve_google_news_urls",
-                new_callable=AsyncMock,
-                return_value={self._WRAPPER: self._PUBLISHER},
-            ),
-            patch("app.scraping.extract_article_content", extract),
-        ):
-            return (await fetch_new_articles_for_topic(topic, db_path=db_path)).articles
-
-    async def test_story_already_stored_under_its_publisher_url_is_skipped(
-        self, db_conn: sqlite3.Connection, db_path: Path
-    ) -> None:
-        topic = self._topic(db_conn)
+    def _store_publisher_row(self, conn: sqlite3.Connection, topic: Topic, content_hash: str) -> None:
         create_article(
-            db_conn,
+            conn,
             Article(
                 topic_id=topic.id,
                 title="The Story",
                 url=self._PUBLISHER,
-                content_hash=compute_article_hash(self._PUBLISHER, "The Story"),
+                content_hash=content_hash,
                 raw_content="Body",
                 source_feed="https://www.bing.com/news/search?q=x&format=rss",
             ),
         )
-        db_conn.commit()
+        conn.commit()
 
-        extract = AsyncMock(return_value="Body")
-        stored = await self._run(topic, db_path, extract)
+    async def _run_google(
+        self,
+        topic: Topic,
+        db_path: Path,
+        extract: AsyncMock,
+        resolver: AsyncMock,
+        url: str | None = None,
+    ) -> list[Article]:
+        entry = FeedEntry(title="The Story", url=url or self._WRAPPER, summary="s", source_feed="feed")
+        response = FeedResponse(entries=[entry], provider_name="google_news", needs_url_resolution=True)
+        with (
+            patch("app.scraping.fetch_feeds_for_topic", return_value=response),
+            patch("app.scraping.resolve_google_news_urls", resolver),
+            patch("app.scraping.extract_article_content", extract),
+        ):
+            return (await fetch_new_articles_for_topic(topic, db_path=db_path)).articles
 
-        assert stored == []
-        # The duplicate is recognised before its content is fetched again.
-        extract.assert_not_called()
+    def _resolver(self, mapping: dict[str, str]) -> AsyncMock:
+        return AsyncMock(return_value=mapping)
 
-    async def test_a_new_story_is_stored_under_its_resolved_identity(
+    async def test_a_new_story_is_stored_with_its_publisher_url(
         self, db_conn: sqlite3.Connection, db_path: Path
     ) -> None:
         topic = self._topic(db_conn)
-        stored = await self._run(topic, db_path, AsyncMock(return_value="Body"))
+        stored = await self._run_google(
+            topic, db_path, AsyncMock(return_value="Body"), self._resolver({self._WRAPPER: self._PUBLISHER})
+        )
 
         assert len(stored) == 1
         assert stored[0].url == self._PUBLISHER
-        assert stored[0].content_hash == compute_article_hash(self._PUBLISHER, "The Story")
+
+    async def test_a_repeated_wrapper_is_skipped_without_resolving_it_again(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """The stored key is the one the feed hands over, so a repeat costs no request."""
+        topic = self._topic(db_conn)
+        resolver = self._resolver({self._WRAPPER: self._PUBLISHER})
+        first = await self._run_google(topic, db_path, AsyncMock(return_value="Body"), resolver)
+        assert len(first) == 1
+
+        second_resolver = self._resolver({self._WRAPPER: self._PUBLISHER})
+        extract = AsyncMock(return_value="Body")
+        second = await self._run_google(topic, db_path, extract, second_resolver)
+
+        assert second == []
+        second_resolver.assert_not_awaited()
+        extract.assert_not_called()
+
+    async def test_a_changed_wrapper_for_a_stored_story_is_dropped_after_resolution(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        topic = self._topic(db_conn)
+        self._store_publisher_row(db_conn, topic, "some-earlier-key")
+
+        extract = AsyncMock(return_value="Body")
+        stored = await self._run_google(
+            topic,
+            db_path,
+            extract,
+            self._resolver({self._OTHER_WRAPPER: self._PUBLISHER}),
+            url=self._OTHER_WRAPPER,
+        )
+
+        assert stored == []
+        # Dropped before its content is fetched a second time.
+        extract.assert_not_called()
+
+    async def test_another_providers_copy_of_a_stored_story_is_skipped(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """Bing hands over the publisher URL directly, so no resolution is involved."""
+        topic = self._topic(db_conn)
+        self._store_publisher_row(db_conn, topic, "google-sourced-key")
+
+        entry = FeedEntry(title="The Story", url=self._PUBLISHER, summary="s", source_feed="feed")
+        extract = AsyncMock(return_value="Body")
+        with (
+            patch(
+                "app.scraping.fetch_feeds_for_topic",
+                return_value=FeedResponse(entries=[entry], provider_name="bing_news"),
+            ),
+            patch("app.scraping.extract_article_content", extract),
+        ):
+            stored = (await fetch_new_articles_for_topic(topic, db_path=db_path)).articles
+
+        assert stored == []
+        extract.assert_not_called()
+
+    async def test_a_revision_of_a_stored_story_still_gets_through(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """AUG-320: the story rule must not swallow the correction it was stored for."""
+        topic = self._topic(db_conn)
+        self._store_publisher_row(db_conn, topic, "earlier-key")
+
+        entry = FeedEntry(
+            title="The Story",
+            url=self._PUBLISHER,
+            summary="s",
+            source_feed="feed",
+            published=datetime(2025, 1, 1, tzinfo=UTC),
+            updated=datetime(2025, 1, 2, tzinfo=UTC),
+        )
+        with (
+            patch(
+                "app.scraping.fetch_feeds_for_topic",
+                return_value=FeedResponse(entries=[entry], provider_name="bing_news"),
+            ),
+            patch("app.scraping.extract_article_content", AsyncMock(return_value="Corrected body")),
+        ):
+            stored = (await fetch_new_articles_for_topic(topic, db_path=db_path)).articles
+
+        assert len(stored) == 1
+        assert stored[0].raw_content == "Corrected body"
+
+    async def test_a_retitled_article_is_a_different_story(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
+        topic = self._topic(db_conn)
+        self._store_publisher_row(db_conn, topic, "earlier-key")
+
+        entry = FeedEntry(title="The Story, corrected", url=self._PUBLISHER, summary="s", source_feed="feed")
+        with (
+            patch(
+                "app.scraping.fetch_feeds_for_topic",
+                return_value=FeedResponse(entries=[entry], provider_name="bing_news"),
+            ),
+            patch("app.scraping.extract_article_content", AsyncMock(return_value="Body")),
+        ):
+            stored = (await fetch_new_articles_for_topic(topic, db_path=db_path)).articles
+
+        assert len(stored) == 1
 
 
 class TestCandidateSelection:

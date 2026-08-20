@@ -258,7 +258,7 @@ def _identity_digest(*parts: str) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def _revision_marker(entry: FeedEntry) -> str:
+def revision_marker(entry: FeedEntry) -> str:
     """What distinguishes this representation of a story from an earlier one.
 
     Empty unless the source itself said the article changed: an ``updated`` stamp
@@ -284,7 +284,7 @@ def article_identity(entry: FeedEntry) -> str:
     Every source path keys off this: what is stored in ``articles.content_hash``,
     what same-topic dedup skips on, and what cross-topic content reuse matches.
 
-    Identity is the story (canonical URL + title) AND the revision the source is
+    Identity is the story it is (``story_identity``) AND the revision the source is
     currently serving. Keying on the story alone meant a correction, retraction or
     expansion published at the same URL under the same headline was indistinguishable
     from the copy already stored, so it was skipped before anything could read it and
@@ -292,11 +292,21 @@ def article_identity(entry: FeedEntry) -> str:
     key, an unchanged article still deduplicates silently and only a changed one
     reaches novelty analysis.
     """
-    return _identity_digest(canonical_url(entry.url), entry.title.casefold(), _revision_marker(entry))
+    return _identity_digest(canonical_url(entry.url), entry.title.casefold(), revision_marker(entry))
+
+
+def story_identity(entry: FeedEntry) -> str:
+    """Which article this is, regardless of which revision of it.
+
+    The coarser half of the pair: two entries share a story when they name the
+    same canonical URL under the same headline, whatever wrapper, tracking
+    parameters or provider they arrived through.
+    """
+    return compute_article_hash(entry.url, entry.title)
 
 
 def compute_article_hash(url: str, title: str) -> str:
-    """``article_identity`` for callers holding only a URL and a title.
+    """``story_identity`` for callers holding only a URL and a title.
 
     Same serialization, no revision marker — one recipe, not a second one.
     """

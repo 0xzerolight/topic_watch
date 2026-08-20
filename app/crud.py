@@ -391,6 +391,21 @@ def article_hash_exists(conn: sqlite3.Connection, topic_id: int, content_hash: s
     return row is not None
 
 
+def list_article_dedup_keys(conn: sqlite3.Connection, topic_id: int) -> list[tuple[str, str, str]]:
+    """Return ``(content_hash, url, title)`` for every article stored for a topic.
+
+    Dedup compares an incoming entry against two keys — the exact representation
+    and the story it belongs to — so it reads the topic's keys once per check
+    instead of running a lookup per feed entry. The row count is bounded by the
+    article retention window.
+    """
+    rows = conn.execute(
+        "SELECT content_hash, url, title FROM articles WHERE topic_id = ?",
+        (topic_id,),
+    ).fetchall()
+    return [(row["content_hash"], row["url"], row["title"]) for row in rows]
+
+
 def find_article_by_hash(conn: sqlite3.Connection, content_hash: str) -> Article | None:
     """Find any article with this content hash, across all topics.
 
