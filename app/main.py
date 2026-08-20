@@ -26,6 +26,7 @@ from app.logging_config import setup_logging
 from app.scheduler import start_scheduler, stop_scheduler
 from app.web.api import router as api_router
 from app.web.csrf import CSRFMiddleware
+from app.web.host_allowlist import HostAllowlistMiddleware
 from app.web.routers import router
 from app.web.routers.templates import templates
 from app.web.setup_middleware import SetupRedirectMiddleware
@@ -84,6 +85,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Topic Watch", version=_app_version, lifespan=lifespan)
 app.add_middleware(CSRFMiddleware)
 app.add_middleware(SetupRedirectMiddleware)
+# Host check runs before routing, setup redirects and CSRF issuance, so a rebound
+# attacker domain never receives a CSRF token or a redirect (AUG-002).
+app.add_middleware(HostAllowlistMiddleware)
 # Added last so it wraps everything: the correlation id is set before any other
 # middleware/handler runs and is available to all of their log lines.
 app.add_middleware(RequestIdMiddleware)

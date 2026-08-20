@@ -46,3 +46,7 @@ services:
       # reaches the container through this line — uncommenting it there alone
       # is not enough, since .env only fills in ${...} placeholders here.
       - TOPIC_WATCH_SECURE_COOKIES=${TOPIC_WATCH_SECURE_COOKIES:-false}
+      # Extra hostnames the app answers to (comma-separated). Empty by default:
+      # localhost, *.local and any IP address are already accepted. Set it in
+      # .env when a reverse proxy forwards a hostname.
+      - TOPIC_WATCH_ALLOWED_HOSTS=${TOPIC_WATCH_ALLOWED_HOSTS:-}
