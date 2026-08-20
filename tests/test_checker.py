@@ -12,6 +12,7 @@ from app.analysis.llm import NoveltyResult, TokenUsage
 from app.checker import check_all_topics, check_topic, retry_pending_notifications
 from app.config import LLMSettings, NotificationSettings, Settings
 from app.crud import (
+    MAX_ANALYSIS_ATTEMPTS,
     create_article,
     create_knowledge_state,
     create_pending_notification,
@@ -26,6 +27,7 @@ from app.models import (
     FeedMode,
     KnowledgeState,
     NotificationDelivery,
+    NotifyDisposition,
     PendingNotification,
     Topic,
     TopicStatus,
@@ -217,14 +219,23 @@ class TestCheckTopic:
         assert result.id is not None
 
     async def test_skips_non_ready_topic(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
-        """Topics not in READY status should be skipped."""
+        """A non-READY topic is skipped, and the skip is not filed as a check.
+
+        Nothing was fetched or analyzed, so persisting a clean zero-valued row
+        claimed monitoring that never happened: it broke source-failure streaks
+        and its fresh ``checked_at`` pushed the first real check further out
+        (AUG-134).
+        """
         topic = _make_topic(db_conn, name="Researching", status=TopicStatus.RESEARCHING)
         settings = _make_settings()
 
         result = await check_topic(topic, settings, db_path=db_path)
 
         assert result.articles_found == 0
-        assert result.id is not None
+        assert result.id is None
+        assert result.stage_error is not None
+        assert result.stage_error.startswith("skipped: topic not ready")
+        assert db_conn.execute("SELECT COUNT(*) FROM check_results").fetchone()[0] == 0
 
     async def test_notification_failure_captured_and_queued(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         """Notification failure should be recorded and queued for retry.
@@ -482,7 +493,12 @@ class TestCheckTopic:
         assert result.completion_tokens == 20
 
     async def test_scrape_failure_sets_stage_error(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
-        """A scrape failure records stage_error='scrape_failed' + summary (OVH-037)."""
+        """A raising fetch records stage_error='pipeline_failed' + summary (OVH-037/AUG-133).
+
+        Per-feed failures are caught inside the fetch and counted, so an exception
+        escaping it is our own storage/dedup/extraction breaking — an internal
+        failure, not a source outage.
+        """
         topic = _make_topic(db_conn, name="ScrapeFail")
         settings = _make_settings()
 
@@ -495,9 +511,9 @@ class TestCheckTopic:
 
         assert result.id is not None
         assert result.stage_error is not None
-        assert result.stage_error.startswith("scrape_failed")
+        assert result.stage_error.startswith("pipeline_failed")
         row = db_conn.execute("SELECT stage_error FROM check_results WHERE id = ?", (result.id,)).fetchone()
-        assert row["stage_error"].startswith("scrape_failed")
+        assert row["stage_error"].startswith("pipeline_failed")
 
     async def test_analysis_failure_sets_stage_error(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         """An LLM analysis failure (safe-default) records stage_error='analysis_failed'.
@@ -1415,7 +1431,9 @@ class TestMultiRoundInitialization:
         with patch(
             "app.checker.fetch_new_articles_for_topic",
             new_callable=AsyncMock,
-            return_value=FetchResult(articles=[], total_feed_entries=0),
+            # A source did run (feeds_total=1) and had nothing new to give — the
+            # only shape that still earns the generic message (AUG-135).
+            return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=1),
         ):
             await initialize_new_topic(topic, settings, db_path=db_path)
         return get_topic(db_conn, topic.id)
@@ -1912,10 +1930,28 @@ class TestSourcesFailedSurfacing:
         assert updated.error_message.startswith("All feed source(s) failed")
 
     async def test_init_empty_result_keeps_generic_message(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
-        """A genuinely empty first init (feeds_total=0) keeps the generic message."""
+        """A healthy source that returned nothing keeps the generic message."""
         from app.checker import initialize_new_topic
 
         topic = _make_topic(db_conn, name="ExaInitEmpty", feed_mode=FeedMode.EXA, feed_urls=[], status=TopicStatus.NEW)
+        settings = _make_settings()
+        with patch(
+            "app.checker.fetch_new_articles_for_topic",
+            new_callable=AsyncMock,
+            return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=1, feeds_failed=0),
+        ):
+            await initialize_new_topic(topic, settings, db_path=db_path)
+        updated = get_topic(db_conn, topic.id)
+        assert updated.status == TopicStatus.ERROR
+        assert updated.error_message == "No articles found during initialization"
+
+    async def test_init_with_no_source_attempted_says_so(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
+        """Nothing ran, so the error must not blame an empty source (AUG-135)."""
+        from app.checker import initialize_new_topic
+
+        topic = _make_topic(
+            db_conn, name="ExaInitNoSource", feed_mode=FeedMode.EXA, feed_urls=[], status=TopicStatus.NEW
+        )
         settings = _make_settings()
         with patch(
             "app.checker.fetch_new_articles_for_topic",
@@ -1925,7 +1961,23 @@ class TestSourcesFailedSurfacing:
             await initialize_new_topic(topic, settings, db_path=db_path)
         updated = get_topic(db_conn, topic.id)
         assert updated.status == TopicStatus.ERROR
-        assert updated.error_message == "No articles found during initialization"
+        assert updated.error_message == "No source attempted during initialization (no source configured or enabled)"
+
+    async def test_init_names_backed_off_feeds(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
+        """Every feed sitting in a backoff window is a diagnosis, not an empty result."""
+        from app.checker import initialize_new_topic
+
+        topic = _make_topic(db_conn, name="ManualInitBackoff", status=TopicStatus.NEW)
+        settings = _make_settings()
+        with patch(
+            "app.checker.fetch_new_articles_for_topic",
+            new_callable=AsyncMock,
+            return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=0, feeds_failed=0, feeds_skipped=2),
+        ):
+            await initialize_new_topic(topic, settings, db_path=db_path)
+        updated = get_topic(db_conn, topic.id)
+        assert updated.status == TopicStatus.ERROR
+        assert updated.error_message == "No source attempted during initialization (2 feed(s) in backoff)"
 
 
 class TestSilenceHeartbeatPipeline:
@@ -1972,12 +2024,12 @@ class TestSilenceHeartbeatPipeline:
             await self._failing_check(db_conn, topic, send)
         assert send.await_count == 1
 
-    async def test_scrape_exception_path_also_heartbeats(self, db_conn: sqlite3.Connection) -> None:
-        """The fetch-raised branch is a source failure too."""
+    async def test_fetch_exception_path_never_alerts_on_the_sources(self, db_conn: sqlite3.Connection) -> None:
+        """A pipeline crash is recorded, but it is not evidence about the feeds (AUG-133)."""
         topic = _make_topic(db_conn)
         send = _per_url_mock(ok=True)
         settings = _make_settings(silence_heartbeat_checks=2)
-        for _ in range(2):
+        for _ in range(3):
             with (
                 patch(
                     "app.checker.fetch_new_articles_for_topic",
@@ -1987,8 +2039,33 @@ class TestSilenceHeartbeatPipeline:
                 patch("app.checker.send_notification_per_url", send),
             ):
                 result = await check_topic(get_topic(db_conn, topic.id), settings, db_path=conn_db_path(db_conn))
-        assert result.stage_error.startswith("scrape_failed")
+        assert result.stage_error.startswith("pipeline_failed")
+        assert send.await_count == 0
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is None
+
+    async def test_pipeline_crash_does_not_clear_an_announced_outage(self, db_conn: sqlite3.Connection) -> None:
+        """The latch survives a check that never reached the sources."""
+        topic = _make_topic(db_conn)
+        send = _per_url_mock(ok=True)
+        for _ in range(3):
+            await self._failing_check(db_conn, topic, send)
         assert send.await_count == 1
+
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("boom"),
+            ),
+            patch("app.checker.send_notification_per_url", send),
+        ):
+            await check_topic(
+                get_topic(db_conn, topic.id),
+                _make_settings(silence_heartbeat_checks=3),
+                db_path=conn_db_path(db_conn),
+            )
+        assert send.await_count == 1
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is not None
 
     async def test_recovery_notice_after_the_outage(self, db_conn: sqlite3.Connection) -> None:
         topic = _make_topic(db_conn)
@@ -2108,3 +2185,312 @@ class TestSilenceHeartbeatPipeline:
             await check_topic(topic, _make_settings(silence_heartbeat_checks=3), db_path=conn_db_path(db_conn))
         assert send.await_count == 1
         assert get_topic(db_conn, topic.id).heartbeat_alerted_at is not None
+
+
+class TestAnalysisFailureIsResumable:
+    """A failed analysis leaves its articles retryable, and bounded (TW-AUD-001)."""
+
+    async def _failing_analysis_check(
+        self,
+        db_conn: sqlite3.Connection,
+        db_path: Path,
+        topic: Topic,
+        articles: list[Article],
+    ):
+        failed = NoveltyResult(has_new_info=False, confidence=0.0, error="LLM analysis failed")
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=articles, total_feed_entries=len(articles)),
+            ),
+            patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=failed),
+            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)),
+        ):
+            return await check_topic(get_topic(db_conn, topic.id), _make_settings(), db_path=db_path)
+
+    async def test_failed_analysis_leaves_the_article_unprocessed(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """The articles were never evaluated, so they must stay queued for the next cycle."""
+        topic = _make_topic(db_conn, name="RetryMe")
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
+        db_conn.commit()
+
+        await self._failing_analysis_check(db_conn, db_path, topic, [article])
+
+        row = db_conn.execute(
+            "SELECT processed, analysis_attempts FROM articles WHERE id = ?", (article.id,)
+        ).fetchone()
+        assert row["processed"] == 0
+        assert row["analysis_attempts"] == 1
+
+    async def test_repeated_failures_abandon_the_article_at_the_cap(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """An article that fails MAX_ANALYSIS_ATTEMPTS times is abandoned, not retried forever."""
+        topic = _make_topic(db_conn, name="GiveUp")
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
+        db_conn.commit()
+
+        for _ in range(MAX_ANALYSIS_ATTEMPTS):
+            await self._failing_analysis_check(db_conn, db_path, topic, [article])
+
+        row = db_conn.execute(
+            "SELECT processed, analysis_attempts FROM articles WHERE id = ?", (article.id,)
+        ).fetchone()
+        assert row["analysis_attempts"] == MAX_ANALYSIS_ATTEMPTS
+        assert row["processed"] == 1
+
+    async def test_unprocessed_articles_are_re_analyzed_on_a_later_cycle(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """A stranded row is fed back into analysis even when the feed has nothing new.
+
+        The scraper dedups against stored hashes, so a failed cycle's articles never
+        arrive again from the fetch — without an explicit re-select they were dead
+        work nobody would ever look at (TW-AUD-001).
+        """
+        topic = _make_topic(db_conn, name="Stranded")
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
+        db_conn.commit()
+
+        await self._failing_analysis_check(db_conn, db_path, topic, [article])
+
+        novelty = NoveltyResult(has_new_info=False, confidence=0.9)
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=1, feeds_failed=0),
+            ),
+            patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty) as mock_analyze,
+            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)),
+        ):
+            await check_topic(get_topic(db_conn, topic.id), _make_settings(), db_path=db_path)
+
+        mock_analyze.assert_awaited_once()
+        analyzed = mock_analyze.await_args.args[0]
+        assert [a.id for a in analyzed] == [article.id]
+        row = db_conn.execute("SELECT processed FROM articles WHERE id = ?", (article.id,)).fetchone()
+        assert row["processed"] == 1
+
+
+class TestInsufficientKnowledgeIsRecorded:
+    """A soft knowledge rejection is not a clean notified success (TW-AUD-003)."""
+
+    async def _check_with_insufficient_merge(
+        self,
+        db_conn: sqlite3.Connection,
+        db_path: Path,
+        topic: Topic,
+        article: Article,
+        settings: Settings,
+        send,
+    ):
+        novelty = NoveltyResult(
+            has_new_info=True,
+            summary="Something new",
+            confidence=0.9,
+            relevance=0.9,
+            importance=3,
+        )
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[article], total_feed_entries=1),
+            ),
+            patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
+            patch(
+                "app.checker.prepare_knowledge_update",
+                new_callable=AsyncMock,
+                return_value=_make_write_result(sufficient_data=False),
+            ),
+            patch("app.checker.send_notification_per_url", send),
+            patch("app.checker.send_webhooks", new_callable=AsyncMock, return_value=0),
+        ):
+            return await check_topic(get_topic(db_conn, topic.id), settings, db_path=db_path)
+
+    async def test_notifies_but_records_the_unchanged_knowledge(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """The alert still fires; the row says the baseline never absorbed it."""
+        topic = _make_topic(db_conn, name="ThinMerge")
+        create_knowledge_state(
+            db_conn,
+            KnowledgeState(topic_id=topic.id, summary_text="Baseline.", token_count=9, version=1),
+        )
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
+        db_conn.commit()
+        send = _per_url_mock(ok=True)
+
+        result = await self._check_with_insufficient_merge(db_conn, db_path, topic, article, _make_settings(), send)
+
+        send.assert_awaited_once()
+        assert result.notification_sent is True
+        assert result.id is not None
+        assert result.stage_error is not None
+        assert result.stage_error.startswith("knowledge_insufficient")
+        assert result.notify_disposition == NotifyDisposition.PENDING_KNOWLEDGE_STALE
+        stored = db_conn.execute(
+            "SELECT stage_error, notify_disposition FROM check_results WHERE id = ?", (result.id,)
+        ).fetchone()
+        assert stored["stage_error"].startswith("knowledge_insufficient")
+        assert stored["notify_disposition"] == "pending_knowledge_stale"
+
+        # The prior knowledge is preserved, with no revision claiming otherwise.
+        state = db_conn.execute(
+            "SELECT summary_text, version FROM knowledge_states WHERE topic_id = ?", (topic.id,)
+        ).fetchone()
+        assert state["summary_text"] == "Baseline."
+        assert state["version"] == 1
+        assert db_conn.execute("SELECT COUNT(*) FROM knowledge_revisions").fetchone()[0] == 0
+
+        # The evidence stays queued for another attempt rather than being consumed.
+        row = db_conn.execute(
+            "SELECT processed, analysis_attempts FROM articles WHERE id = ?", (article.id,)
+        ).fetchone()
+        assert row["processed"] == 0
+        assert row["analysis_attempts"] == 1
+
+    async def test_importance_suppressed_check_still_records_the_rejection(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """No send to describe, so the disposition stays the suppression reason."""
+        topic = _make_topic(db_conn, name="ThinAndQuiet", importance_threshold=5)
+        create_knowledge_state(
+            db_conn,
+            KnowledgeState(topic_id=topic.id, summary_text="Baseline.", token_count=9, version=1),
+        )
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
+        db_conn.commit()
+        send = _per_url_mock(ok=True)
+
+        result = await self._check_with_insufficient_merge(db_conn, db_path, topic, article, _make_settings(), send)
+
+        send.assert_not_awaited()
+        assert result.notify_disposition == NotifyDisposition.SUPPRESSED_IMPORTANCE
+        assert result.stage_error is not None
+        assert result.stage_error.startswith("knowledge_insufficient")
+
+
+class _PartialNovelty(NoveltyResult):
+    """A novelty result that reports which of its input articles it actually read.
+
+    Mirrors the contract ``analyze_articles`` must provide once it surfaces what
+    ``_fit_article_prompt`` dropped to fit the model's context window.
+    """
+
+    analyzed_article_ids: list[int] = []
+
+
+class TestOnlyAnalyzedArticlesAreProcessed:
+    """Articles trimmed out of an over-budget prompt were never evaluated."""
+
+    async def test_dropped_articles_stay_queued_and_are_re_analyzed(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        topic = _make_topic(db_conn, name="BigBatch")
+        kept = create_article(db_conn, _make_article(id=None, topic_id=topic.id, content_hash="k1"))
+        dropped = create_article(
+            db_conn,
+            _make_article(id=None, topic_id=topic.id, content_hash="d1", url="https://example.com/article-2"),
+        )
+        db_conn.commit()
+
+        partial = _PartialNovelty(has_new_info=False, confidence=0.9, analyzed_article_ids=[kept.id])
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[kept, dropped], total_feed_entries=2),
+            ),
+            patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=partial),
+            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)),
+        ):
+            await check_topic(get_topic(db_conn, topic.id), _make_settings(), db_path=db_path)
+
+        rows = {
+            row["id"]: row
+            for row in db_conn.execute("SELECT id, processed, analysis_attempts FROM articles").fetchall()
+        }
+        assert rows[kept.id]["processed"] == 1
+        assert rows[dropped.id]["processed"] == 0
+        assert rows[dropped.id]["analysis_attempts"] == 1
+
+        # And the next cycle actually feeds it back to the model.
+        novelty = NoveltyResult(has_new_info=False, confidence=0.9)
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=1),
+            ),
+            patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty) as mock_analyze,
+            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)),
+        ):
+            await check_topic(get_topic(db_conn, topic.id), _make_settings(), db_path=db_path)
+
+        assert [a.id for a in mock_analyze.await_args.args[0]] == [dropped.id]
+
+    async def test_silent_analysis_still_processes_the_whole_batch(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """Without a reported subset the batch is assumed read, as before."""
+        topic = _make_topic(db_conn, name="NoSignal")
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
+        db_conn.commit()
+
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[article], total_feed_entries=1),
+            ),
+            patch(
+                "app.checker.analyze_articles",
+                new_callable=AsyncMock,
+                return_value=NoveltyResult(has_new_info=False, confidence=0.9),
+            ),
+            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)),
+        ):
+            await check_topic(get_topic(db_conn, topic.id), _make_settings(), db_path=db_path)
+
+        row = db_conn.execute("SELECT processed FROM articles WHERE id = ?", (article.id,)).fetchone()
+        assert row["processed"] == 1
+
+    async def test_initialization_only_processes_the_articles_it_used(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """A baseline built from a truncated corpus must not consume the rest."""
+        from app.checker import initialize_new_topic
+
+        topic = _make_topic(db_conn, name="TruncatedInit", status=TopicStatus.NEW)
+        used = create_article(db_conn, _make_article(id=None, topic_id=topic.id, content_hash="u1"))
+        unused = create_article(
+            db_conn,
+            _make_article(id=None, topic_id=topic.id, content_hash="x1", url="https://example.com/article-2"),
+        )
+        db_conn.commit()
+
+        plan = KnowledgeUpdatePlan(
+            summary_text="Baseline.",
+            token_count=3,
+            usage=TokenUsage(),
+            analyzed_article_ids=[used.id],
+        )
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[used, unused], total_feed_entries=2),
+            ),
+            patch("app.checker.prepare_initial_knowledge", new_callable=AsyncMock, return_value=plan),
+        ):
+            await initialize_new_topic(topic, _make_settings(), db_path=db_path)
+
+        assert get_topic(db_conn, topic.id).status == TopicStatus.READY
+        rows = {row["id"]: row["processed"] for row in db_conn.execute("SELECT id, processed FROM articles")}
+        assert rows[used.id] == 1
+        assert rows[unused.id] == 0

@@ -333,6 +333,11 @@ class Article(SQLiteModel):
     published_at: datetime | None = None
     fetched_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     processed: bool = False
+    # How many checks have tried and failed to analyze this article. ``processed``
+    # says the article is done with; this says how much of that was wasted effort,
+    # and caps the retries so one undecodable row cannot ride along in every future
+    # prompt (see ``crud.record_article_analysis_failure``).
+    analysis_attempts: int = 0
 
 
 class KnowledgeState(SQLiteModel):
@@ -407,10 +412,22 @@ SOURCE_FAILURE_PREFIXES: tuple[str, ...] = (
     "sources_unavailable:",
 )
 
+# The check broke inside Topic Watch — storage, deduplication, extraction — so it
+# never learned anything about the sources at all. Visible on the row, but neutral
+# to the Silence Heartbeat: counting it as an outage sends the operator hunting
+# for a dead feed or a bad API key, and counting it as health would announce a
+# recovery nobody observed (AUG-133).
+INTERNAL_FAILURE_PREFIXES: tuple[str, ...] = ("pipeline_failed:",)
+
 
 def is_source_failure(stage_error: str | None) -> bool:
     """True when a recorded stage_error means no source produced usable results."""
     return stage_error is not None and stage_error.startswith(SOURCE_FAILURE_PREFIXES)
+
+
+def is_internal_failure(stage_error: str | None) -> bool:
+    """True when a check failed inside the pipeline without observing its sources."""
+    return stage_error is not None and stage_error.startswith(INTERNAL_FAILURE_PREFIXES)
 
 
 class NotifyDisposition(StrEnum):
@@ -423,6 +440,14 @@ class NotifyDisposition(StrEnum):
 
     SENT = "sent"
     PENDING = "pending"
+    PENDING_KNOWLEDGE_STALE = "pending_knowledge_stale"
+    """Notifying, but the knowledge state behind the alert did not advance.
+
+    The merge was refused as too vague to apply (``knowledge_insufficient``) or it
+    raised (``knowledge_update_failed``) — ``stage_error`` says which. The alert is
+    still worth sending, so recording it as an ordinary send would claim the
+    baseline absorbed evidence it never saw (TW-AUD-003).
+    """
     NO_NEW_INFO = "no_new_info"
     BELOW_CONFIDENCE = "below_confidence"
     BELOW_RELEVANCE = "below_relevance"
@@ -455,9 +480,12 @@ class CheckResult(SQLiteModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     # Machine-distinguishable failure stage for an otherwise-recorded check:
-    # 'scrape_failed' / 'analysis_failed' / 'knowledge_update_failed' (+ a short
-    # exception summary). NULL on clean runs. Distinct from notification_error,
-    # which only covers delivery.
+    # 'sources_failed' / 'sources_unavailable' / 'pipeline_failed' /
+    # 'analysis_failed' / 'knowledge_insufficient' / 'knowledge_update_failed'
+    # (+ a short exception summary). NULL on clean runs. Distinct from
+    # notification_error, which only covers delivery. 'scrape_failed' is retained
+    # in SOURCE_FAILURE_PREFIXES for rows written before AUG-133 split internal
+    # failures out of it.
     stage_error: str | None = None
     # Why this check did or did not notify (see ``NotifyDisposition``). NULL on
     # rows written before migration 026.

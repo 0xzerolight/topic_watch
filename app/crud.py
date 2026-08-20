@@ -415,6 +415,45 @@ def mark_articles_processed(conn: sqlite3.Connection, article_ids: list[int]) ->
     )
 
 
+# How many analysis attempts an article gets before it is given up on. A cap, not
+# a preference: without one a permanently undecodable article is re-fetched and
+# re-sent to the model on every cycle forever, and with one set too low a
+# transient provider outage discards real news. Three cycles is long enough to
+# outlive a restart or a rate-limit window.
+MAX_ANALYSIS_ATTEMPTS = 3
+
+
+def record_article_analysis_failure(
+    conn: sqlite3.Connection,
+    article_ids: list[int],
+    max_attempts: int = MAX_ANALYSIS_ATTEMPTS,
+) -> int:
+    """Count a failed analysis attempt against articles. Does NOT commit.
+
+    Articles whose analysis failed are deliberately NOT marked processed: the
+    check never evaluated them, so leaving the flag clear is what lets the next
+    cycle re-select and re-analyze them (TW-AUD-001). The attempt counter is the
+    bound on that retry — once an article has burned ``max_attempts`` cycles it is
+    abandoned by marking it processed, so a single poisonous row cannot re-enter
+    every future check's prompt.
+
+    Returns the number of articles abandoned by this call, for the caller's log.
+    """
+    if not article_ids:
+        return 0
+    placeholders = ",".join("?" * len(article_ids))
+    conn.execute(
+        f"UPDATE articles SET analysis_attempts = analysis_attempts + 1 WHERE id IN ({placeholders})",
+        article_ids,
+    )
+    cursor = conn.execute(
+        f"UPDATE articles SET processed = 1 "  # noqa: S608 - placeholders only, values are bound
+        f"WHERE id IN ({placeholders}) AND processed = 0 AND analysis_attempts >= ?",
+        [*article_ids, max_attempts],
+    )
+    return cursor.rowcount
+
+
 # Bare-column compare so SQLite can use idx_articles_fetched_at (m014). Wrapping
 # fetched_at in datetime() would force a full table SCAN (OVH-022/050). The bound
 # is a precomputed tz-aware isoformat() string, matching how fetched_at is stored

@@ -686,3 +686,56 @@ class TestKnowledgeHistoryUI:
         topic = _seed_topic(db_conn, "Missing Rev Topic")
         response = await client.get(f"/topics/{topic.id}/knowledge-diff/999999")
         assert response.status_code == 404
+
+
+class TestInitialPlanCarriesTheAnalyzedSubset:
+    """A baseline built from a fitted prompt reports what it was built from."""
+
+    async def test_reported_ids_reach_the_plan(self, db_conn: sqlite3.Connection) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        from app.analysis.knowledge import prepare_initial_knowledge
+        from app.analysis.llm import KnowledgeStateUpdate
+        from app.models import Article
+
+        class _PartialInit(KnowledgeStateUpdate):
+            analyzed_article_ids: list[int] = []
+
+        topic = _seed_topic(db_conn, "Fitted Init")
+        articles = [
+            Article(
+                id=i,
+                topic_id=topic.id,
+                title=f"A{i}",
+                url=f"https://example.com/{i}",
+                content_hash=f"h{i}",
+                source_feed="https://example.com/feed.xml",
+            )
+            for i in (1, 2)
+        ]
+        result = _PartialInit(
+            updated_summary="Baseline.",
+            token_count=3,
+            confidence=0.9,
+            sufficient_data=True,
+            analyzed_article_ids=[1],
+        )
+
+        with patch(
+            "app.analysis.knowledge.generate_initial_knowledge",
+            new_callable=AsyncMock,
+            return_value=result,
+        ):
+            plan = await prepare_initial_knowledge(topic, articles, _revision_settings())
+
+        assert plan.analyzed_article_ids == [1]
+
+    async def test_silent_llm_leaves_the_plan_unconstrained(self, db_conn: sqlite3.Connection) -> None:
+        from app.analysis.knowledge import prepare_initial_knowledge
+        from tests.helpers import make_knowledge_update, stub_llm_boundary
+
+        topic = _seed_topic(db_conn, "Silent Init")
+        with stub_llm_boundary(knowledge_init=make_knowledge_update("Baseline.")):
+            plan = await prepare_initial_knowledge(topic, [], _revision_settings())
+
+        assert plan.analyzed_article_ids is None

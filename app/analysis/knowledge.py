@@ -56,6 +56,28 @@ class KnowledgeUpdatePlan:
     token_count: int
     usage: TokenUsage = field(default_factory=TokenUsage)
     sufficient_data: bool = True
+    analyzed_article_ids: list[int] | None = None
+    """Which of the input articles the prompt actually carried, when the LLM layer
+    reports it. An over-budget request is fitted by dropping trailing articles, so
+    a baseline can be built from part of the corpus; the caller marks only these
+    articles processed and leaves the rest for a later cycle. ``None`` means the
+    layer reported nothing, and the whole input is assumed used."""
+
+
+def reported_article_ids(result: object) -> list[int] | None:
+    """The article ids an LLM call says it actually read, when it says so.
+
+    An over-budget request is fitted by shrinking article bodies and then dropping
+    trailing articles — on a small-context model that happens on every call. A
+    caller that assumes its whole input was read then marks articles processed
+    that the model never saw, and nothing re-selects them. This reads the
+    ``analyzed_article_ids`` field where the analysis layer reports it; ``None``
+    means it reported nothing and the whole input is assumed used.
+    """
+    reported = getattr(result, "analyzed_article_ids", None)
+    if not isinstance(reported, list | tuple | set | frozenset):
+        return None
+    return [int(article_id) for article_id in reported if isinstance(article_id, int)]
 
 
 def _truncate_to_budget(text: str, max_tokens: int, model: str) -> tuple[str, int]:
@@ -242,6 +264,7 @@ async def prepare_initial_knowledge(
             usage.completion_tokens + compress_usage.completion_tokens,
         ),
         sufficient_data=result.sufficient_data,
+        analyzed_article_ids=reported_article_ids(result),
     )
 
 

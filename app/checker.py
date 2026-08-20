@@ -17,11 +17,13 @@ from app.analysis.knowledge import (
     apply_knowledge_update,
     prepare_initial_knowledge,
     prepare_knowledge_update,
+    reported_article_ids,
 )
 from app.analysis.llm import analyze_articles
 from app.check_context import check_id_var, generate_check_id
 from app.config import Settings
 from app.crud import (
+    MAX_ANALYSIS_ATTEMPTS,
     claim_heartbeat_alert,
     claim_pending_notification,
     clear_heartbeat_alert,
@@ -33,8 +35,10 @@ from app.crud import (
     get_topic,
     get_topics_due_for_check,
     increment_notification_retry,
+    list_articles_for_topic,
     list_pending_notifications,
     mark_articles_processed,
+    record_article_analysis_failure,
     release_stale_notification_claims,
     topic_generation_matches,
     update_check_result_delivery,
@@ -43,6 +47,7 @@ from app.crud import (
 from app.database import get_db, short_conn
 from app.heartbeat import evaluate_heartbeat
 from app.models import (
+    Article,
     CheckResult,
     KnowledgeRevisionSource,
     NotificationDelivery,
@@ -52,7 +57,7 @@ from app.models import (
     TopicStatus,
 )
 from app.notifications import format_notification, redact_url, send_notification, send_notification_per_url
-from app.scraping import all_sources_failed, fetch_new_articles_for_topic
+from app.scraping import FetchResult, all_sources_failed, fetch_new_articles_for_topic
 from app.web.state import _checking_state
 from app.webhooks import retry_pending_webhooks, send_webhooks
 
@@ -121,8 +126,10 @@ class CheckOutcome:
     article_ids: list[int] = field(default_factory=list)
     """Articles this check evaluated, to be marked processed."""
     failed_article_ids: list[int] = field(default_factory=list)
-    """Articles whose analysis failed. Populated by the failure-path semantics
-    task; A1 leaves it empty so the disposition rules stay in one place."""
+    """Articles this check did not finish with — the analysis failed, or the
+    knowledge merge they justified never landed. They stay unprocessed and take an
+    attempt, so the next cycle re-analyzes them and a hopeless one is eventually
+    abandoned (see ``crud.record_article_analysis_failure``)."""
     notify_disposition: str | None = None
 
 
@@ -144,6 +151,59 @@ def _snapshot_topic(conn: sqlite3.Connection, topic_id: int) -> TopicSnapshot | 
         knowledge_version=knowledge.version if knowledge else 0,
         knowledge_summary=knowledge.summary_text if knowledge else "",
     )
+
+
+def _no_source_detail(fetch_result: FetchResult) -> str:
+    """Say why no source ran: everything backed off, or nothing configured."""
+    skipped = fetch_result.feeds_skipped
+    return f"{skipped} feed(s) in backoff" if skipped else "no source configured or enabled"
+
+
+def _init_empty_error(fetch_result: FetchResult) -> str:
+    """Name the reason a first initialization fetch came back empty."""
+    if all_sources_failed(fetch_result.feeds_total, fetch_result.feeds_failed):
+        return "All feed source(s) failed during initialization (check credentials/connectivity; see logs)"
+    if fetch_result.feeds_total == 0:
+        return f"No source attempted during initialization ({_no_source_detail(fetch_result)})"
+    return "No articles found during initialization"
+
+
+def _analysis_batch(
+    db_path: Path | None,
+    topic_id: int,
+    new_articles: list[Article],
+    max_articles: int,
+) -> list[Article]:
+    """This cycle's fetch plus whatever earlier cycles left unfinished.
+
+    An article is stored before it is analyzed, and the scraper deduplicates
+    against stored hashes — so once a cycle stores an article and then fails to
+    finish with it (LLM outage, failed knowledge merge), no feed will ever offer
+    it again. Re-selecting the unprocessed rows here is what makes that work
+    resumable instead of silently lost (TW-AUD-001).
+
+    Stranded rows come first: they are bounded by the per-article attempt cap and
+    drain within a few cycles, while a busy feed that fills ``max_articles`` every
+    cycle would otherwise starve them indefinitely.
+    """
+    fresh_ids = {a.id for a in new_articles if a.id is not None}
+    with get_db(db_path) as conn:
+        stored = list_articles_for_topic(conn, topic_id, unprocessed_only=True, limit=max_articles)
+    stranded = [a for a in stored if a.id not in fresh_ids]
+    return (stranded + new_articles)[:max_articles]
+
+
+def _split_batch(batch: list[Article], analyzed_ids: list[int] | None) -> tuple[list[int], list[int]]:
+    """Split a batch into the articles the LLM read and the ones it never saw.
+
+    ``analyzed_ids is None`` means the analysis layer reported nothing, so the
+    whole batch counts as read — the behaviour before the signal existed.
+    """
+    ids = [article.id for article in batch if article.id is not None]
+    if analyzed_ids is None:
+        return ids, []
+    seen = set(analyzed_ids)
+    return [i for i in ids if i in seen], [i for i in ids if i not in seen]
 
 
 def _commit_check_transition(
@@ -191,6 +251,14 @@ def _commit_check_transition(
             )
 
     mark_articles_processed(conn, outcome.article_ids)
+    abandoned = record_article_analysis_failure(conn, outcome.failed_article_ids)
+    if abandoned:
+        logger.warning(
+            "Topic id=%d: abandoning %d article(s) after %d failed analysis attempt(s)",
+            topic_id,
+            abandoned,
+            MAX_ANALYSIS_ATTEMPTS,
+        )
     outcome.result.notify_disposition = outcome.notify_disposition
     created = create_check_result(conn, outcome.result)
     conn.commit()
@@ -307,11 +375,15 @@ async def _check_topic_inner(
             topic.name,
             topic.status,
         )
-        # No heartbeat here: a paused or errored topic is not being monitored, so
-        # it must neither alert nor claim recovery. The row it records carries no
-        # stage_error, so it also breaks any running streak — harmless, since this
-        # path is only reachable from a manual CLI/UI check.
-        return _record_result(db_path, result)
+        # Nothing is recorded: no fetch and no analysis ran, so a stored row would
+        # claim monitoring work that never happened — a clean zero-valued check
+        # breaks a source-failure streak and its fresh ``checked_at`` postpones the
+        # first real check once the topic becomes READY (AUG-134). No heartbeat
+        # either: a paused or errored topic must neither alert nor claim recovery.
+        return CheckResult(
+            topic_id=topic_id,
+            stage_error=f"skipped: topic not ready (status: {topic.status.value})",
+        )
 
     # --- P1: fetch new articles. Opens and closes its own short connections.
     try:
@@ -328,8 +400,14 @@ async def _check_topic_inner(
             exa_settings=settings.exa,
         )
     except Exception as exc:
-        logger.warning("Scraping failed for topic '%s'", topic.name, exc_info=True)
-        result.stage_error = f"scrape_failed: {_summarize_exc(exc)}"
+        # An exception escaping the fetch is an internal failure, not a source
+        # outage: per-feed and per-provider errors are caught inside and reported
+        # through ``feeds_failed``/feed health, so what reaches here is storage,
+        # deduplication or extraction breaking on our side. Labelling those
+        # ``scrape_failed`` made the heartbeat announce failing sources and sent
+        # the operator after feeds, network and API keys (AUG-133).
+        logger.warning("Fetch pipeline failed for topic '%s'", topic.name, exc_info=True)
+        result.stage_error = f"pipeline_failed: {_summarize_exc(exc)}"
         return await _finish_check(db_path, topic, result, settings)
 
     new_articles = fetch_result.articles
@@ -347,15 +425,23 @@ async def _check_topic_inner(
             # feed URLs, or every feed inside a backoff window. Not a fetch failure —
             # hence not ``sources_failed`` — but equally a check that cannot see news,
             # so it must not read as healthy silence (Silence Heartbeat).
-            skipped = fetch_result.feeds_skipped
-            detail = f"{skipped} feed(s) in backoff" if skipped else "no source configured or enabled"
-            result.stage_error = f"sources_unavailable: no source attempted ({detail})"
+            result.stage_error = f"sources_unavailable: no source attempted ({_no_source_detail(fetch_result)})"
+
+    # --- P1c: the analysis batch is this cycle's fetch PLUS any article an earlier
+    # cycle stored but never finished with. The scraper dedups against stored
+    # hashes, so those rows can never arrive from a feed again: without this
+    # re-select a single failed analysis or knowledge update stranded them forever
+    # (TW-AUD-001). Stranded work goes first — it is bounded by the attempt cap and
+    # drains, whereas a busy feed filling the cap every cycle would starve it.
+    articles = _analysis_batch(db_path, topic_id, new_articles, settings.max_articles_per_check)
+
+    if not articles:
         logger.info("Topic '%s': no new articles found", topic.name)
         return await _finish_check(db_path, topic, result, settings)
 
     # --- P2: analyze against the knowledge snapshotted at P0, with no connection
     # open (returns a safe default on LLM error — analyze_articles never raises).
-    novelty = await analyze_articles(new_articles, snapshot.knowledge_summary, topic, settings)
+    novelty = await analyze_articles(articles, snapshot.knowledge_summary, topic, settings)
     result.has_new_info = novelty.has_new_info
     result.llm_response = novelty.model_dump_json()
     result.prompt_tokens += novelty.prompt_tokens
@@ -386,7 +472,10 @@ async def _check_topic_inner(
     # --- P3: if new info clears the thresholds, generate the knowledge update.
     # Still connection-free: this is another multi-second LLM round-trip, and the
     # plan it produces is not written until the C3 transaction below.
-    knowledge_update_failed = False
+    # True when the knowledge state did NOT advance this cycle — the merge raised,
+    # or the model refused it as insufficient. Both leave the stored baseline
+    # behind the evidence, so both leave the articles unfinished.
+    knowledge_stale = False
     should_notify = False
     notification: tuple[str, str] | None = None
     knowledge_plan: KnowledgeUpdatePlan | None = None
@@ -426,9 +515,23 @@ async def _check_topic_inner(
                 plan = await prepare_knowledge_update(topic, novelty, snapshot.knowledge_summary, settings)
                 result.prompt_tokens += plan.usage.prompt_tokens
                 result.completion_tokens += plan.usage.completion_tokens
-                # An insufficient-data verdict preserves the existing state, so
-                # there is nothing to apply.
-                knowledge_plan = plan if plan.sufficient_data else None
+                if plan.sufficient_data:
+                    knowledge_plan = plan
+                else:
+                    # The merge was refused: the findings were too vague to fold
+                    # in, so the stored summary stays as it was. Recording that is
+                    # the whole point — a check that alerts on evidence its own
+                    # baseline never absorbed will keep re-detecting the same fact
+                    # as new, and used to look identical to a clean update
+                    # (TW-AUD-003).
+                    knowledge_stale = True
+                    result.stage_error = (
+                        "knowledge_insufficient: findings too vague to merge; knowledge state unchanged"
+                    )
+                    logger.warning(
+                        "Topic '%s': knowledge merge refused as insufficient; baseline unchanged",
+                        topic.name,
+                    )
             except Exception as exc:
                 logger.warning(
                     "Knowledge update failed for topic '%s'",
@@ -439,10 +542,12 @@ async def _check_topic_inner(
                 # but record the failure distinctly and do NOT mark these
                 # new-info-bearing articles processed, so the next cycle
                 # re-attempts the knowledge update (no silent drift).
-                knowledge_update_failed = True
+                knowledge_stale = True
                 result.stage_error = f"knowledge_update_failed: {_summarize_exc(exc)}"
             if should_notify:
                 notification = format_notification(topic.name, novelty)
+                if knowledge_stale:
+                    disposition = NotifyDisposition.PENDING_KNOWLEDGE_STALE
 
     # Article disposition. "processed" means "we've evaluated this article" — set
     # even for below-threshold (new-but-not-notified) and not-new articles, so
@@ -450,10 +555,19 @@ async def _check_topic_inner(
     # re-analyze them every cycle after retention deletion + feed reappearance,
     # wasting LLM quota.
     #
-    # Exception (OVH-009): when the knowledge update failed, the recorded
-    # knowledge state is now stale. Leave these articles unprocessed so the next
-    # cycle re-fetches and re-attempts the update instead of silently diverging.
-    article_ids = [] if knowledge_update_failed else [a.id for a in new_articles if a.id is not None]
+    # Two exceptions, both meaning "this check did not finish with these
+    # articles": the analysis itself failed (nothing was evaluated at all), or the
+    # knowledge update did not land, leaving the recorded state stale (OVH-009).
+    # Either way they stay unprocessed and carry an attempt, so the next cycle
+    # re-analyzes them and a permanently failing article is eventually abandoned
+    # instead of retried forever (TW-AUD-001).
+    # Articles dropped to fit the model's context window are in the same position:
+    # they were paid for and stored, but never read. Marking them processed with
+    # the rest is how they used to disappear unanalyzed.
+    analyzed_ids, dropped_ids = _split_batch(articles, reported_article_ids(novelty))
+    unfinished = bool(novelty.error) or knowledge_stale
+    article_ids = [] if unfinished else analyzed_ids
+    failed_article_ids = (analyzed_ids + dropped_ids) if unfinished else dropped_ids
 
     # --- C3: THE durable transition. Knowledge + revision + article disposition
     # + CheckResult in one commit, fenced by the P0 generation and knowledge
@@ -466,6 +580,7 @@ async def _check_topic_inner(
         knowledge_source=KnowledgeRevisionSource.UPDATE,
         knowledge_change_note=novelty.summary,
         article_ids=article_ids,
+        failed_article_ids=failed_article_ids,
         notify_disposition=disposition,
     )
     try:
@@ -537,7 +652,7 @@ async def _check_topic_inner(
     logger.info(
         "Topic '%s': %d articles, new_info=%s, notified=%s",
         topic.name,
-        len(new_articles),
+        len(articles),
         novelty.has_new_info,
         result.notification_sent,
     )
@@ -1052,14 +1167,13 @@ async def initialize_new_topic(
                     topic.init_attempts,
                 )
                 return
-            # A total source failure on the first init (e.g. a bad Exa key, or every
-            # RSS feed down) is distinct from a genuinely empty result — surface the
-            # real cause so the operator knows to check credentials/connectivity.
-            init_error = (
-                "All feed source(s) failed during initialization (check credentials/connectivity; see logs)"
-                if all_sources_failed(fetch_result.feeds_total, fetch_result.feeds_failed)
-                else "No articles found during initialization"
-            )
+            # Three different empty results, three different diagnoses — the same
+            # vocabulary a normal check uses (AUG-135). A total source failure (bad
+            # Exa key, every RSS feed down) is not the same as no source having run
+            # at all (Exa disabled or keyless, no feed URLs, every feed in a backoff
+            # window), and neither is the same as a healthy source with nothing to
+            # say. Only the last deserves the generic message.
+            init_error = _init_empty_error(fetch_result)
             _set_init_status(
                 TopicStatus.ERROR,
                 error_message=init_error,
@@ -1070,7 +1184,10 @@ async def initialize_new_topic(
         # LLM phase, still connection-free; the plan is persisted below.
         plan = await prepare_initial_knowledge(topic, articles, settings)
 
-        article_ids = [a.id for a in articles if a.id is not None]
+        # Only what the baseline was actually built from is finished with: an
+        # over-budget corpus is fitted by dropping trailing articles, and those
+        # stay unprocessed for the first check to pick up.
+        article_ids, _ = _split_batch(articles, plan.analyzed_article_ids)
         with get_db(db_path) as conn:
             _commit_init_transition(conn, snapshot, plan, article_ids, settings)
         topic.status = TopicStatus.READY
