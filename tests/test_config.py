@@ -527,3 +527,58 @@ class TestKnowledgeRevisionLimit:
         )
         save_settings_to_yaml(settings, path)
         assert yaml.safe_load(path.read_text())["knowledge_revision_limit"] == 7
+
+
+class TestStateRoot:
+    """TW-AUD-029: one helper resolves the writable state root for config AND database."""
+
+    def test_existing_data_dir_wins(self, tmp_path: Path) -> None:
+        """A repo checkout / worktree / container bind mount keeps its own data/ dir."""
+        from app.config import resolve_config_file, resolve_state_root
+
+        (tmp_path / "data").mkdir()
+        assert resolve_state_root(package_parent=tmp_path, environ={}) == tmp_path / "data"
+        assert resolve_config_file(package_parent=tmp_path, environ={}) == tmp_path / "data" / "config.yml"
+
+    def test_user_state_root_when_no_data_dir(self, tmp_path: Path) -> None:
+        """A wheel install with no data/ beside the package uses a user-level root."""
+        from app.config import resolve_config_file, resolve_state_root
+
+        environ = {"XDG_STATE_HOME": str(tmp_path / "state")}
+        root = resolve_state_root(package_parent=tmp_path, environ=environ)
+        assert root == tmp_path / "state" / "topic-watch"
+        assert resolve_config_file(package_parent=tmp_path, environ=environ) == root / "config.yml"
+
+    def test_explicit_config_path_is_authoritative(self, tmp_path: Path) -> None:
+        """TOPIC_WATCH_CONFIG_PATH outranks an existing data/ directory."""
+        from app.config import CONFIG_PATH_ENV_VAR, resolve_config_file, resolve_state_root
+
+        (tmp_path / "data").mkdir()
+        pinned = tmp_path / "elsewhere" / "tw.yml"
+        environ = {CONFIG_PATH_ENV_VAR: str(pinned)}
+        assert resolve_config_file(package_parent=tmp_path, environ=environ) == pinned
+        assert resolve_state_root(package_parent=tmp_path, environ=environ) == pinned.parent
+
+    def test_config_and_db_roots_cannot_diverge(self) -> None:
+        """The database module takes both its root and its default file from config."""
+        import app.config as config_module
+        import app.database as database_module
+
+        # DEFAULT_DB_PATH / DEFAULT_CONFIG_PATH are redirected per-test by conftest,
+        # so assert on the roots they are both derived from.
+        assert database_module.DATA_DIR == config_module.STATE_ROOT
+        assert config_module.DEFAULT_DB_PATH.parent == config_module.STATE_ROOT
+
+    def test_absolute_db_path_is_used_verbatim(self) -> None:
+        """TOPIC_WATCH_DB_PATH (the container's setting) stays authoritative."""
+        from app.config import resolve_db_path
+
+        settings = Settings(llm={"model": "openai/gpt-4o-mini", "api_key": "k"}, db_path="/srv/tw/topic_watch.db")
+        assert resolve_db_path(settings) == Path("/srv/tw/topic_watch.db")
+
+    def test_default_db_path_lands_in_the_state_root(self) -> None:
+        """The default relative db_path resolves beside the config file, wherever that is."""
+        from app.config import STATE_ROOT, resolve_db_path
+
+        settings = Settings(llm={"model": "openai/gpt-4o-mini", "api_key": "k"})
+        assert resolve_db_path(settings) == STATE_ROOT / "topic_watch.db"

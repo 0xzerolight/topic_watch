@@ -12,11 +12,15 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
+from app import config as config_module
+
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
-DEFAULT_DB_PATH = DATA_DIR / "topic_watch.db"
+# Both roots come from the ONE state-root helper in app.config, so the database
+# can never land somewhere the config file does not (TW-AUD-029).
+PROJECT_ROOT = config_module.PROJECT_ROOT
+DATA_DIR = config_module.STATE_ROOT
+DEFAULT_DB_PATH = config_module.DEFAULT_DB_PATH
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS topics (

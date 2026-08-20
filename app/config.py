@@ -8,6 +8,7 @@ for nested keys (e.g., TOPIC_WATCH_LLM__API_KEY).
 import logging
 import os
 import shutil
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Self
 
@@ -23,8 +24,63 @@ from pydantic_settings import (
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
-DEFAULT_CONFIG_PATH = DATA_DIR / "config.yml"
+
+# Env var pinning the config file explicitly. Authoritative wherever it is set —
+# it is the escape hatch for an installed wheel, a read-only package root, or a
+# packaged service that wants its own layout (TW-AUD-029).
+CONFIG_PATH_ENV_VAR = "TOPIC_WATCH_CONFIG_PATH"
+
+# Directory name used under the user-level state root.
+_APP_STATE_DIR_NAME = "topic-watch"
+
+
+def _user_state_root(environ: Mapping[str, str]) -> Path:
+    """Per-user writable state directory, by platform convention."""
+    if os.name == "nt":
+        base = environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    else:
+        base = environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(base).expanduser() / _APP_STATE_DIR_NAME
+
+
+def resolve_state_root(*, package_parent: Path, environ: Mapping[str, str]) -> Path:
+    """THE writable-state root: the directory holding config.yml and the database.
+
+    One helper so the config root and the database root can never diverge
+    (TW-AUD-029). Precedence, highest first:
+
+    1. ``TOPIC_WATCH_CONFIG_PATH`` — an explicitly pinned config file pins the root
+       to its parent directory.
+    2. An existing ``data/`` directory beside the package. This keeps every current
+       install working unchanged: a repo checkout, a git worktree with the config
+       copied in, and the container's ``/app/data`` bind mount all land here.
+    3. A user-level state directory, for an installed wheel whose package root is
+       not writable and has no ``data/`` beside it.
+
+    ``TOPIC_WATCH_DB_PATH`` (the ``db_path`` setting) stays authoritative for the
+    database on top of this — see ``resolve_db_path``.
+    """
+    pinned = environ.get(CONFIG_PATH_ENV_VAR)
+    if pinned:
+        return Path(pinned).expanduser().parent
+    legacy = package_parent / "data"
+    if legacy.is_dir():
+        return legacy
+    return _user_state_root(environ)
+
+
+def resolve_config_file(*, package_parent: Path, environ: Mapping[str, str]) -> Path:
+    """Path of the config file, resolved through the one state root."""
+    pinned = environ.get(CONFIG_PATH_ENV_VAR)
+    if pinned:
+        return Path(pinned).expanduser()
+    return resolve_state_root(package_parent=package_parent, environ=environ) / "config.yml"
+
+
+STATE_ROOT = resolve_state_root(package_parent=PROJECT_ROOT, environ=os.environ)
+DATA_DIR = STATE_ROOT
+DEFAULT_CONFIG_PATH = resolve_config_file(package_parent=PROJECT_ROOT, environ=os.environ)
+DEFAULT_DB_PATH = STATE_ROOT / "topic_watch.db"
 
 # Module-level override for testability
 _yaml_file_override: str | None = None
@@ -292,11 +348,24 @@ def _is_close(a: str, b: str) -> bool:
 
 
 def resolve_db_path(settings: Settings) -> Path:
-    """Resolve the database path from settings (relative to PROJECT_ROOT or absolute)."""
-    p = Path(settings.db_path)
+    """Resolve the database path from settings, through the one state root.
+
+    An absolute ``db_path`` (``TOPIC_WATCH_DB_PATH=/data/topic_watch.db``, the
+    container's own setting) is authoritative and used verbatim. A relative one
+    keeps resolving against the package parent while the legacy ``data/``
+    directory is the state root, so repo checkouts and every existing install are
+    byte-for-byte unchanged. Only when state lives elsewhere is the historical
+    leading ``data/`` component re-pointed at that root (TW-AUD-029).
+    """
+    p = Path(settings.db_path).expanduser()
     if p.is_absolute():
         return p
-    return PROJECT_ROOT / p
+    if STATE_ROOT == PROJECT_ROOT / "data":
+        return PROJECT_ROOT / p
+    parts = p.parts
+    if len(parts) > 1 and parts[0] == "data":
+        p = Path(*parts[1:])
+    return STATE_ROOT / p
 
 
 def load_settings(config_path: Path | None = None) -> Settings:
