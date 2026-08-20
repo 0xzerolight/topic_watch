@@ -695,6 +695,47 @@ class TestApiKeyRetention:
         assert app.state.settings.llm.api_key == "sk-new-explicit"
 
 
+class TestSecretEchoOnErrorPages:
+    """AUG-017: a submitted key never survives into an error re-render."""
+
+    async def test_422_never_echoes_the_submitted_llm_key(self, client: httpx.AsyncClient) -> None:
+        response = await client.post(
+            "/settings",
+            data=valid_form_data(llm_model="", llm_api_key="sk-typed-then-rejected"),
+            follow_redirects=False,
+        )
+        assert response.status_code == 422
+        assert "sk-typed-then-rejected" not in response.text
+
+    async def test_validation_error_re_render_never_echoes_the_key(self, client: httpx.AsyncClient) -> None:
+        """A Pydantic failure (not the explicit blank-model guard) blanks the key too."""
+        response = await client.post(
+            "/settings",
+            data=valid_form_data(llm_api_key="sk-typed-then-rejected", max_articles_per_check="-5"),
+            follow_redirects=False,
+        )
+        assert response.status_code == 422
+        assert "sk-typed-then-rejected" not in response.text
+
+    async def test_save_failure_re_render_never_echoes_the_key(self, client: httpx.AsyncClient) -> None:
+        with patch("app.web.routers.settings.save_settings_to_yaml", side_effect=OSError("disk full")):
+            response = await client.post(
+                "/settings",
+                data=valid_form_data(llm_api_key="sk-typed-then-rejected"),
+                follow_redirects=False,
+            )
+        assert response.status_code == 422
+        assert "sk-typed-then-rejected" not in response.text
+
+    async def test_settings_page_is_not_stored(self, client: httpx.AsyncClient) -> None:
+        response = await client.get("/settings")
+        assert response.headers["cache-control"] == "no-store"
+
+    async def test_settings_error_page_is_not_stored(self, client: httpx.AsyncClient) -> None:
+        response = await client.post("/settings", data=valid_form_data(llm_model=""), follow_redirects=False)
+        assert response.headers["cache-control"] == "no-store"
+
+
 class TestEnvSourcedSecretSafety:
     """OVH-003: an env-supplied API key must not be materialized into plaintext YAML."""
 
@@ -795,15 +836,15 @@ class TestExaSettingsWeb:
             )
         assert app.state.settings.exa.api_key == "existing-exa"
 
-    async def test_422_preserves_exa_fields(self, client: httpx.AsyncClient) -> None:
-        """A 422 (blank model) re-render keeps the submitted enable_exa + exa_api_key."""
+    async def test_422_never_echoes_the_submitted_exa_key(self, client: httpx.AsyncClient) -> None:
+        """AUG-017: a validation error must not write the submitted key back into the page."""
         response = await client.post(
             "/settings",
             data=valid_form_data(llm_model="", enable_exa="true", exa_api_key="typed-exa-key"),
             follow_redirects=False,
         )
         assert response.status_code == 422
-        assert "typed-exa-key" in response.text  # value re-rendered, not blanked
+        assert "typed-exa-key" not in response.text
 
     async def test_env_exa_key_not_written_when_blank(
         self, client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -39,7 +39,7 @@
         API Key
         <input type="password" id="llm_api_key" name="llm_api_key" required
                placeholder="Your LLM provider API key">
-        {% if form and form.llm_api_key %}
+        {% if form %}
         <small>For security, the API key is not echoed back — re-enter it.</small>
         {% endif %}
     </label>

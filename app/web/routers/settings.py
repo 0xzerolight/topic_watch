@@ -71,6 +71,17 @@ def _interval_preview(raw: str) -> str | None:
         return None
 
 
+def _render(request: Request, template: str, ctx: dict, status_code: int = 200) -> HTMLResponse:
+    """Render a setup/settings page with ``Cache-Control: no-store``.
+
+    These pages carry key hints and delivery targets, so they must not survive in
+    a disk cache, a back-forward restore or a saved-page capture (AUG-017).
+    """
+    response = templates.TemplateResponse(request, template, ctx, status_code=status_code)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 def _settings_template_ctx(request: Request, **extra: object) -> dict:
     """Shared template context for the settings page (provider lists + env-key state)."""
     ctx: dict = {
@@ -153,7 +164,7 @@ async def setup_view(request: Request):
     if not getattr(request.app.state, "setup_required", False):
         return RedirectResponse(url="/", status_code=303)
     _provider_ctx = {"cloud_providers": sorted(CLOUD_PROVIDERS), "local_provider_defaults": LOCAL_PROVIDER_DEFAULTS}
-    return templates.TemplateResponse(
+    return _render(
         request,
         "setup.html",
         {"setup_mode": True, **_provider_ctx},
@@ -184,9 +195,11 @@ async def complete_setup(
     # persist. base_url is honored for every provider (OVH-104 reversal); OVH-153.
     effective_base_url = normalize_base_url(llm_base_url)
 
+    # The key is deliberately absent: every use of this dict is an error re-render,
+    # and a submitted secret must not be written back into the page (AUG-017).
     form_values = {
         "llm_model": llm_model,
-        "llm_api_key": llm_api_key,
+        "llm_api_key": "",
         "llm_base_url": llm_base_url,
     }
     _provider_ctx = {"cloud_providers": sorted(CLOUD_PROVIDERS), "local_provider_defaults": LOCAL_PROVIDER_DEFAULTS}
@@ -219,14 +232,14 @@ async def complete_setup(
         # Wire the app so scheduler jobs read live settings from app.state (OVH-015/036).
         start_scheduler(new_settings, db_path=request.app.state.db_path, app=request.app)
     except LLMValidationError as exc:
-        return templates.TemplateResponse(
+        return _render(
             request,
             "setup.html",
             {"setup_mode": True, "errors": [str(exc)], "form": form_values, **_provider_ctx},
             status_code=422,
         )
     except ValidationError as exc:
-        return templates.TemplateResponse(
+        return _render(
             request,
             "setup.html",
             {"setup_mode": True, "errors": format_validation_errors(exc), "form": form_values, **_provider_ctx},
@@ -234,7 +247,7 @@ async def complete_setup(
         )
     except Exception as exc:
         logger.exception("Setup failed: %s", exc)
-        return templates.TemplateResponse(
+        return _render(
             request,
             "setup.html",
             {"setup_mode": True, "errors": [f"Setup failed: {exc}"], "form": form_values, **_provider_ctx},
@@ -249,7 +262,7 @@ async def complete_setup(
 async def settings_view(request: Request):
     """Display of current configuration as an editable form."""
     settings = load_settings(config_path=request.app.state.config_path)
-    return templates.TemplateResponse(
+    return _render(
         request,
         "settings.html",
         _settings_template_ctx(request, settings=settings),
@@ -285,15 +298,19 @@ async def update_settings(request: Request):
     exa_api_key = _get("exa_api_key")
 
     # form_values drives the 422 re-render; build it from the parsed form (single source).
+    # The two key fields are blanked: they are password inputs the user cannot read
+    # back, so echoing a submitted secret leaves it in the page source, the browser's
+    # form cache and any saved-page capture for no benefit (AUG-017). Both fields
+    # already mean "leave blank to keep the current key", so re-entry is the norm.
     form_values: dict = {
         "llm_model": llm_model,
-        "llm_api_key": llm_api_key,
+        "llm_api_key": "",
         "llm_base_url": llm_base_url,
         "notification_urls": notification_urls,
         "webhook_urls": webhook_urls,
         "secure_cookies": secure_cookies,
         "enable_exa": enable_exa,
-        "exa_api_key": exa_api_key,
+        "exa_api_key": "",
     }
     for field in _SCALAR_FORM_FIELDS:
         form_values[field] = _get(field)
@@ -321,7 +338,7 @@ async def update_settings(request: Request):
     # llm_model is required; an empty value has no Pydantic constraint to trip, so guard it
     # explicitly to keep the previous "blank model → 422" behavior (preserved across OVH-069).
     if not llm_model.strip():
-        return templates.TemplateResponse(
+        return _render(
             request,
             "settings.html",
             _settings_template_ctx(
@@ -362,7 +379,7 @@ async def update_settings(request: Request):
         )
         request.app.state.settings = new_settings
     except ValidationError as exc:
-        return templates.TemplateResponse(
+        return _render(
             request,
             "settings.html",
             _settings_template_ctx(
@@ -375,7 +392,7 @@ async def update_settings(request: Request):
         )
     except Exception as exc:
         logger.exception("Failed to save settings: %s", exc)
-        return templates.TemplateResponse(
+        return _render(
             request,
             "settings.html",
             _settings_template_ctx(

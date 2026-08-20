@@ -51,12 +51,16 @@
         <div class="field-group">
             <label for="llm_api_key">API Key <small>(leave blank to keep current key)</small></label>
             <div style="display: flex; gap: 0.5rem; align-items: center;">
+                <!-- Never carries a submitted value: a key typed into a rejected form
+                     must not be written back into the page (AUG-017). -->
                 <input type="password" id="llm_api_key" name="llm_api_key"
-                       value="{{ form.llm_api_key if form else '' }}"
                        placeholder="{{ settings.llm.api_key[:4] }}...{{ settings.llm.api_key[-4:] if settings.llm.api_key|length > 8 else '****' }}"
                        style="flex: 1; margin: 0;">
                 <button type="button" onclick="toggleApiKey()" style="white-space: nowrap; margin: 0;">Show</button>
             </div>
+            {% if form %}
+            <small class="help">For security, the API key is not echoed back — re-enter it if you were changing it.</small>
+            {% endif %}
         </div>
         {% endif %}
 
@@ -88,9 +92,12 @@
         {% else %}
         <div class="field-group" style="margin-top: 1rem;">
             <label for="exa_api_key">Exa API Key <small>(leave blank to keep current key)</small></label>
+            <!-- Never carries a submitted value (AUG-017), same as the LLM key above. -->
             <input type="password" id="exa_api_key" name="exa_api_key"
-                   value="{{ form.exa_api_key if form else '' }}"
                    placeholder="{{ settings.exa.api_key[:4] }}...{{ settings.exa.api_key[-4:] if settings.exa.api_key|length > 8 else '****' }}">
+            {% if form %}
+            <small class="help">For security, the Exa key is not echoed back — re-enter it if you were changing it.</small>
+            {% endif %}
         </div>
         {% endif %}
     </section>
