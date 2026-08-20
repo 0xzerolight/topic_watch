@@ -723,6 +723,41 @@ class TestMigrations:
         assert "confidence_threshold" in columns
         assert "relevance_threshold" in columns
 
+    def test_migration_027_canonicalizes_stored_tags(self, db_conn: sqlite3.Connection) -> None:
+        """AUG-338: rows written before the validator existed are repaired once.
+
+        The SQL tag filter matches stored JSON exactly, so a variant left behind
+        would be permanently unselectable from a chip or ``?tag=``.
+        """
+        import json
+
+        from app.migrations.m027_normalize_topic_tags import up as m027_up
+
+        topic = create_topic(db_conn, Topic(name="Legacy Tags", description="d"))
+        db_conn.execute(
+            "UPDATE topics SET tags = ? WHERE id = ?",
+            (json.dumps(["  Tech   News ", "Tech News", ""]), topic.id),
+        )
+        db_conn.commit()
+
+        m027_up(db_conn)
+        m027_up(db_conn)  # idempotent
+
+        stored = db_conn.execute("SELECT tags FROM topics WHERE id = ?", (topic.id,)).fetchone()[0]
+        assert json.loads(stored) == ["Tech News"]
+
+    def test_migration_027_leaves_non_array_tags_alone(self, db_conn: sqlite3.Connection) -> None:
+        """A hand-edited or future-version value must not be destroyed."""
+        from app.migrations.m027_normalize_topic_tags import up as m027_up
+
+        topic = create_topic(db_conn, Topic(name="Odd Tags", description="d"))
+        db_conn.execute("UPDATE topics SET tags = ? WHERE id = ?", ('{"a": 1}', topic.id))
+        db_conn.commit()
+
+        m027_up(db_conn)
+
+        assert db_conn.execute("SELECT tags FROM topics WHERE id = ?", (topic.id,)).fetchone()[0] == '{"a": 1}'
+
     def test_migration_026_adds_every_wave_a_column(self, db_conn: sqlite3.Connection) -> None:
         """m026 lands the whole wave-A schema in one pass."""
         expected = {

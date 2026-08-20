@@ -101,6 +101,7 @@ class TestToggleActive:
 
         response = await client.post(
             f"/topics/{topic.id}/toggle-active",
+            data={"active": "false"},
             follow_redirects=False,
         )
         assert response.status_code == 303
@@ -117,6 +118,7 @@ class TestToggleActive:
 
         response = await client.post(
             f"/topics/{topic.id}/toggle-active",
+            data={"active": "true"},
             follow_redirects=False,
         )
         assert response.status_code == 303
@@ -130,6 +132,7 @@ class TestToggleActive:
         """Toggling a non-existent topic returns 404."""
         response = await client.post(
             "/topics/99999/toggle-active",
+            data={"active": "false"},
             follow_redirects=False,
         )
         assert response.status_code == 404
@@ -139,16 +142,43 @@ class TestToggleActive:
         topic = _make_topic(db_conn, name="Persist Topic", is_active=True)
 
         # Disable
-        await client.post(f"/topics/{topic.id}/toggle-active", follow_redirects=False)
+        await client.post(f"/topics/{topic.id}/toggle-active", data={"active": "false"}, follow_redirects=False)
         after_disable = get_topic(db_conn, topic.id)
         assert after_disable is not None
         assert after_disable.is_active is False
 
         # Re-enable
-        await client.post(f"/topics/{topic.id}/toggle-active", follow_redirects=False)
+        await client.post(f"/topics/{topic.id}/toggle-active", data={"active": "true"}, follow_redirects=False)
         after_enable = get_topic(db_conn, topic.id)
         assert after_enable is not None
         assert after_enable.is_active is True
+
+    async def test_replayed_command_is_idempotent(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        """AUG-290: replaying the same POST must not re-enable monitoring."""
+        topic = _make_topic(db_conn, name="Replay Topic", is_active=True)
+
+        for _ in range(2):
+            response = await client.post(
+                f"/topics/{topic.id}/toggle-active",
+                data={"active": "false"},
+                follow_redirects=False,
+            )
+            assert response.status_code == 303
+
+        after = get_topic(db_conn, topic.id)
+        assert after is not None
+        assert after.is_active is False
+
+    async def test_missing_state_is_rejected(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        """AUG-290: the command carries its target state; there is no implicit flip."""
+        topic = _make_topic(db_conn, name="No State Topic", is_active=True)
+
+        response = await client.post(f"/topics/{topic.id}/toggle-active", follow_redirects=False)
+        assert response.status_code == 422
+
+        unchanged = get_topic(db_conn, topic.id)
+        assert unchanged is not None
+        assert unchanged.is_active is True
 
     async def test_toggle_htmx_request_returns_partial(
         self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
@@ -158,6 +188,7 @@ class TestToggleActive:
 
         response = await client.post(
             f"/topics/{topic.id}/toggle-active",
+            data={"active": "false"},
             headers={"HX-Request": "true"},
             follow_redirects=False,
         )
@@ -172,6 +203,7 @@ class TestToggleActive:
 
         response = await client.post(
             f"/topics/{topic.id}/toggle-active",
+            data={"active": "false"},
             headers={"HX-Request": "true"},
             follow_redirects=False,
         )
@@ -208,6 +240,7 @@ class TestToggleActive:
 
         response = await client.post(
             f"/topics/{topic.id}/toggle-active",
+            data={"active": "false"},
             headers={"HX-Request": "true"},
             follow_redirects=False,
         )
@@ -238,6 +271,7 @@ class TestToggleActive:
 
         response = await client.post(
             f"/topics/{topic.id}/toggle-active",
+            data={"active": "false"},
             headers={"HX-Request": "true"},
             follow_redirects=False,
         )

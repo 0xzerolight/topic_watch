@@ -345,6 +345,27 @@ class TestOpmlImportErrorRedirect:
         assert "token=abc123" not in location
         assert "feeds.example.com" not in location
 
+    async def test_imported_topics_inherit_the_global_cadence(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """TW-AUD-025: OPML has no interval, so the topic must not get an override."""
+        from app.crud import get_topic_by_name
+        from app.opml import OPMLResult
+
+        parsed = OPMLResult()
+        parsed.topics.append({"name": "Inheriting", "feed_urls": ["https://feeds.example.com/ok"], "tags": []})
+
+        with patch("app.opml.parse_opml", return_value=parsed):
+            await client.post(
+                "/import/opml",
+                files={"opml_file": ("feeds.opml", self._OPML_WITH_SECRET_FEED, "text/xml")},
+                follow_redirects=False,
+            )
+
+        topic = get_topic_by_name(db_conn, "Inheriting")
+        assert topic is not None
+        assert topic.check_interval_minutes is None
+
     async def test_redirect_still_says_how_many_were_rejected(self, client: httpx.AsyncClient) -> None:
         from urllib.parse import unquote
 
@@ -400,7 +421,9 @@ class TestDashboardStatsFreshness:
 
         # Plain POST (no HX-Request header) -> 303 redirect; an HX request would return
         # the _topic_row.html partial instead of the dashboard.
-        toggled = await client.post(f"/topics/{topics[0].id}/toggle-active", follow_redirects=False)
+        toggled = await client.post(
+            f"/topics/{topics[0].id}/toggle-active", data={"active": "false"}, follow_redirects=False
+        )
         assert toggled.status_code == 303
 
         after = await client.get("/")
@@ -531,6 +554,66 @@ class TestAddTopic:
 
         assert response.status_code == 303
         assert "/topics/" in response.headers["location"]
+
+    async def test_manual_mode_without_feed_urls_is_rejected(self, client: httpx.AsyncClient) -> None:
+        """AUG-097: an empty MANUAL list can never fetch, so refuse it up front."""
+        response = await client.post(
+            "/topics",
+            data={
+                "name": "No Sources",
+                "description": "Test",
+                "feed_mode": "manual",
+                "feed_urls": "   \n  \n",
+            },
+            follow_redirects=False,
+        )
+        assert response.status_code == 422
+        assert "at least one feed URL" in response.text
+
+    async def test_blank_topic_name_is_rejected(self, client: httpx.AsyncClient) -> None:
+        """AUG-150: whitespace-only names pass ``required`` and UNIQUE — not here."""
+        response = await client.post(
+            "/topics",
+            data={"name": "   ", "description": "Test", "feed_mode": "auto"},
+            follow_redirects=False,
+        )
+        assert response.status_code == 422
+        assert "Topic name is required" in response.text
+
+    async def test_topic_name_is_trimmed(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        """AUG-150: surrounding whitespace never becomes part of the identity."""
+        from app.crud import get_topic_by_name
+
+        with patch("app.web.routers.background._run_init", new_callable=AsyncMock):
+            await client.post(
+                "/topics",
+                data={"name": "  Padded  ", "description": "Test", "feed_mode": "auto"},
+                follow_redirects=False,
+            )
+
+        assert get_topic_by_name(db_conn, "Padded") is not None
+
+    async def test_tags_are_one_per_line_and_canonicalized(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-338/AUG-339: a comma is tag text, and equivalent tags collapse."""
+        from app.crud import get_topic_by_name
+
+        with patch("app.web.routers.background._run_init", new_callable=AsyncMock):
+            await client.post(
+                "/topics",
+                data={
+                    "name": "Tagged",
+                    "description": "Test",
+                    "feed_mode": "auto",
+                    "tags": "Policy, Europe\n  Tech   News \nTech News\n\n",
+                },
+                follow_redirects=False,
+            )
+
+        topic = get_topic_by_name(db_conn, "Tagged")
+        assert topic is not None
+        assert topic.tags == ["Policy, Europe", "Tech News"]
 
     async def test_create_topic_parses_feed_urls(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
         """Feed URLs textarea is parsed into a list (one URL per line)."""
@@ -903,6 +986,35 @@ class TestTopicDetail:
         assert response.text.index('id="status-announce"') < response.text.index('id="status-area"')
         assert 'target.id !== "status-area"' in response.text
         assert "data-status-terminal" in response.text
+
+    async def test_above_final_page_clamps_to_the_last_page_with_history(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """TW-AUD-023: an out-of-range page showed the false 'no history' state."""
+        topic = _make_topic(db_conn, name="Paged")
+        create_check_result(db_conn, CheckResult(topic_id=topic.id, articles_found=1))
+        db_conn.commit()
+
+        response = await client.get(f"/topics/{topic.id}?page=999")
+        assert response.status_code == 200
+        assert "No checks performed yet" not in response.text
+
+    async def test_absurd_page_does_not_overflow_the_offset_binding(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """TW-AUD-023: a huge page used to bind an OFFSET SQLite cannot take."""
+        topic = _make_topic(db_conn, name="Overflowing")
+        response = await client.get(f"/topics/{topic.id}?page={2**63}")
+        assert response.status_code == 200
+
+    async def test_nonpositive_page_clamps_to_one(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn, name="Negative Page")
+        create_check_result(db_conn, CheckResult(topic_id=topic.id, articles_found=1))
+        db_conn.commit()
+
+        response = await client.get(f"/topics/{topic.id}?page=-5")
+        assert response.status_code == 200
+        assert "No checks performed yet" not in response.text
 
     async def test_failing_sources_callout(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
         """The detail page warns when the most recent check found no usable source."""
@@ -2114,6 +2226,61 @@ class TestTopicEdit:
         assert '<div id="feed-validation-results" role="status" aria-live="polite" aria-atomic="true"></div>' in (
             response.text
         )
+
+    async def test_rename_onto_an_existing_name_is_a_validation_error(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-147: a duplicate rename used to reach the global 500 handler."""
+        _make_topic(db_conn, name="Taken")
+        topic = _make_topic(db_conn, name="Renamable")
+
+        response = await client.post(
+            f"/topics/{topic.id}/edit",
+            data={"name": "Taken", "description": "d", "feed_mode": "auto"},
+            follow_redirects=False,
+        )
+        assert response.status_code == 422
+        assert "already exists" in response.text
+
+        from app.crud import get_topic
+
+        assert get_topic(db_conn, topic.id).name == "Renamable"
+
+    async def test_saving_an_unchanged_name_is_not_a_conflict(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-147: a topic's own name must not collide with itself."""
+        topic = _make_topic(db_conn, name="Same Name")
+        response = await client.post(
+            f"/topics/{topic.id}/edit",
+            data={"name": "Same Name", "description": "changed", "feed_mode": "auto"},
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+
+    async def test_unchanged_save_keeps_a_comma_bearing_tag_whole(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-339: an OPML folder named "Policy, Europe" is one tag, not two."""
+        from app.crud import get_topic
+
+        topic = _make_topic(db_conn, name="Imported", tags=["Policy, Europe"])
+
+        form = await client.get(f"/topics/{topic.id}/edit")
+        assert "Policy, Europe" in form.text
+
+        response = await client.post(
+            f"/topics/{topic.id}/edit",
+            data={
+                "name": "Imported",
+                "description": topic.description,
+                "feed_mode": "auto",
+                "tags": "Policy, Europe",
+            },
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+        assert get_topic(db_conn, topic.id).tags == ["Policy, Europe"]
 
     async def test_edit_updates_topic(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
         """POST to edit updates the topic's fields."""

@@ -748,3 +748,50 @@ class TestStageErrorClassification:
         assert CheckResult(topic_id=1, stage_error="sources_failed: x").sources_failing
         assert not CheckResult(topic_id=1, stage_error="analysis_failed: x").sources_failing
         assert not CheckResult(topic_id=1).sources_failing
+
+
+class TestTagCanonicalization:
+    """AUG-338: one logical tag has exactly one stored and filtered identity."""
+
+    def test_whitespace_and_case_of_a_single_tag(self) -> None:
+        from app.models import normalize_tag
+
+        assert normalize_tag("  Tech   News \n") == "Tech News"
+        # Case is preserved on purpose: it is what the chip displays.
+        assert normalize_tag("Policy") == "Policy"
+
+    def test_nfd_and_nfc_forms_collapse(self) -> None:
+        from app.models import normalize_tags
+
+        assert normalize_tags(["Café", "Café"]) == ["Café"]
+
+    def test_invisible_characters_are_stripped(self) -> None:
+        from app.models import normalize_tag
+
+        assert normalize_tag("Tech​News") == "TechNews"
+        assert normalize_tag("‮Policy") == "Policy"
+
+    def test_blanks_dropped_and_order_preserved(self) -> None:
+        from app.models import normalize_tags
+
+        assert normalize_tags(["b", "  ", "a", "b", "​"]) == ["b", "a"]
+
+    def test_topic_canonicalizes_on_construction_and_load(self) -> None:
+        import json
+
+        row = {
+            "id": 1,
+            "name": "Topic",
+            "description": "desc",
+            "feed_urls": "[]",
+            "feed_mode": "auto",
+            "created_at": "2026-06-13T12:00:00+00:00",
+            "status_changed_at": None,
+            "is_active": 1,
+            "status": "ready",
+            "error_message": None,
+            "check_interval_minutes": 60,
+            "tags": json.dumps(["  Tech   News ", "Tech News", ""]),
+        }
+        assert Topic.from_row(row).tags == ["Tech News"]
+        assert Topic(name="n", description="d", tags=[" A ", "A"]).tags == ["A"]

@@ -19,7 +19,7 @@ from app.crud import (
     list_topics,
 )
 from app.database import get_db
-from app.models import KnowledgeState, Topic, TopicStatus
+from app.models import KnowledgeState, Topic, TopicStatus, normalize_tag
 from app.web.csrf import verify_csrf
 from app.web.dependencies import get_db_conn, get_settings
 from app.web.state import _checking_state
@@ -59,7 +59,12 @@ async def api_list_topics(
 
     ``active`` is a tri-state filter: ``true`` returns only active topics,
     ``false`` returns only inactive topics, and omitting it returns all topics.
+
+    ``tag`` is canonicalized the same way stored tags are, so a query differing
+    only in Unicode form or spacing still matches (AUG-338).
     """
+    if tag is not None:
+        tag = normalize_tag(tag)
     return list_topics(conn, is_active=active, tag=tag)
 
 
@@ -89,18 +94,22 @@ async def api_list_checks(
         raise HTTPException(status_code=404, detail="Topic not found")
 
     per_page = max(1, min(per_page, 100))
-    page = max(1, page)
+    total = count_check_results(conn, topic_id)
+    pages = max(1, (total + per_page - 1) // per_page)
+    # Clamp into range before deriving the offset: an out-of-range page returned an
+    # empty list indistinguishable from "no history", and a very large one produced
+    # an OFFSET too big for SQLite to bind (TW-AUD-023).
+    page = min(max(1, page), pages)
     offset = (page - 1) * per_page
 
     checks = list_check_results(conn, topic_id, limit=per_page, offset=offset)
-    total = count_check_results(conn, topic_id)
 
     return {
         "checks": checks,
         "total": total,
         "page": page,
         "per_page": per_page,
-        "pages": (total + per_page - 1) // per_page if per_page else 0,
+        "pages": pages,
     }
 
 

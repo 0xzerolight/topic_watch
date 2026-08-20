@@ -104,10 +104,9 @@
 
         {% set current_tags = tags if tags is defined else tags_string %}
         <div class="field-group">
-            <label for="tags">Tags (comma-separated)</label>
-            <input type="text" id="tags" name="tags"
-                   value="{{ current_tags or '' }}"
-                   placeholder="e.g., tech, ai, security">
+            <label for="tags">Tags (one per line)</label>
+            <textarea id="tags" name="tags" rows="3"
+                      placeholder="tech&#10;ai&#10;security">{{ current_tags or '' }}</textarea>
             <small class="help">Optional. Use tags to organize and filter topics.</small>
         </div>
     </section>

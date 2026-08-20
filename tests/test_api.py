@@ -147,6 +147,46 @@ class TestAPIChecksClamp:
         finally:
             app.dependency_overrides.pop(get_db_conn, None)
 
+    def test_above_final_page_clamps(self, db_conn: sqlite3.Connection):
+        """TW-AUD-023: an out-of-range page returns the last page, not an empty set."""
+        topic = _seed_topic(db_conn)
+        _seed_check(db_conn, topic.id)
+        db_conn.commit()
+
+        from app.web.dependencies import get_db_conn
+
+        app.dependency_overrides[get_db_conn] = lambda: db_conn
+        try:
+            with TestClient(app) as client:
+                resp = client.get(f"/api/v1/topics/{topic.id}/checks?page={2**63}")
+                assert resp.status_code == 200
+                data = resp.json()
+                assert data["page"] == 1
+                assert len(data["checks"]) == 1
+        finally:
+            app.dependency_overrides.pop(get_db_conn, None)
+
+
+class TestAPITagFilterNormalization:
+    """AUG-338: a tag query differing only in spacing/Unicode form still matches."""
+
+    def test_equivalent_tag_query_matches(self, db_conn: sqlite3.Connection):
+        _seed_topic(db_conn, "Tagged", tags=["Tech News"])
+        db_conn.commit()
+
+        from app.web.dependencies import get_db_conn
+
+        app.dependency_overrides[get_db_conn] = lambda: db_conn
+        try:
+            with TestClient(app) as client:
+                resp = client.get("/api/v1/topics", params={"tag": "  Tech   News "})
+                assert resp.status_code == 200
+                data = resp.json()
+                assert len(data) == 1
+                assert data[0]["name"] == "Tagged"
+        finally:
+            app.dependency_overrides.pop(get_db_conn, None)
+
 
 class TestAPIChecksSeenAt:
     def test_marking_seen_does_not_mutate_has_new_info(self, db_conn: sqlite3.Connection):

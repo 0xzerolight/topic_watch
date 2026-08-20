@@ -106,14 +106,17 @@ async def import_opml_handler(
     # Create topics with NEW status (collisions already filtered by parse_opml).
     created = 0
     for topic_data in result.topics:
-        default_interval = settings.check_interval_minutes
         topic = Topic(
             name=topic_data["name"],
             description=f"News monitoring for {topic_data['name']}",
             feed_urls=topic_data["feed_urls"],
             feed_mode=FeedMode.MANUAL,
             status=TopicStatus.NEW,
-            check_interval_minutes=default_interval,
+            # NULL, not the current global value. OPML carries no interval, and
+            # writing today's global number froze every imported topic on it: a
+            # later change to the global cadence left them behind, looking as
+            # though the user had chosen a custom one (TW-AUD-025).
+            check_interval_minutes=None,
             tags=topic_data.get("tags", []),
         )
         create_topic(conn, topic)

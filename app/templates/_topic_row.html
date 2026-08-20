@@ -70,8 +70,12 @@
             Check Now <span class="htmx-indicator spinner"></span>
         </button>
         {% endif %}
+        {# The desired state travels with the request, so replaying the POST after
+           an ambiguous network failure re-applies it instead of flipping it back
+           (AUG-290). #}
         <button
             hx-post="/topics/{{ topic.id }}/toggle-active"
+            hx-vals='{"active": "{{ 'false' if topic.is_active else 'true' }}"}'
             hx-target="#topic-{{ topic.id }}"
             hx-swap="outerHTML"
             class="secondary btn-sm"

@@ -30,7 +30,14 @@ from app.crud import (
     sum_check_tokens,
     update_topic,
 )
-from app.models import NOVELTY_INSTRUCTION_MAX_CHARS, FeedMode, KnowledgeRevisionSource, Topic, TopicStatus
+from app.models import (
+    NOVELTY_INSTRUCTION_MAX_CHARS,
+    FeedMode,
+    KnowledgeRevisionSource,
+    Topic,
+    TopicStatus,
+    normalize_tags,
+)
 from app.notifications import format_notification, send_notification
 from app.scraping.routing import router as provider_router
 from app.web.csrf import verify_csrf
@@ -40,6 +47,7 @@ from app.web.routers._validation import (
     parse_importance,
     parse_novelty_instruction,
     parse_threshold,
+    parse_topic_name,
     validate_topic_form,
 )
 from app.web.routers.templates import templates
@@ -86,7 +94,8 @@ async def create_topic_handler(
     from app.interval import format_interval
 
     mode, urls, parsed_interval, errors = await validate_topic_form(feed_mode, feed_urls, check_interval)
-    tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+    name = parse_topic_name(name, errors)
+    tag_list = normalize_tags(tags.splitlines())
     conf_threshold = parse_threshold(confidence_threshold, "Confidence threshold", errors)
     rel_threshold = parse_threshold(relevance_threshold, "Relevance threshold", errors)
     instruction = parse_novelty_instruction(novelty_instruction, errors)
@@ -214,7 +223,13 @@ async def topic_detail(
     conn.commit()
 
     per_page = settings.web_page_size
-    offset = (max(1, page) - 1) * per_page
+    total_checks = count_check_results(conn, topic_id)
+    total_pages = max(1, (total_checks + per_page - 1) // per_page)
+    # Count first, then clamp into range. An unbounded page rendered an empty list
+    # as the "No checks performed yet" empty state even when history existed, and a
+    # very large one produced an OFFSET too big for SQLite to bind (TW-AUD-023).
+    page = min(max(1, page), total_pages)
+    offset = (page - 1) * per_page
 
     knowledge = get_knowledge_state(conn, topic_id)
     # Fetch the full retained set, NOT web_page_size (default 20 vs a cap of up
@@ -223,11 +238,9 @@ async def topic_detail(
     # summary_text and is covered by idx_knowledge_revisions_topic.
     revisions = list_knowledge_revision_headers(conn, topic_id, limit=settings.knowledge_revision_limit)
     checks = list_check_results(conn, topic_id, limit=per_page, offset=offset)
-    total_checks = count_check_results(conn, topic_id)
     total_prompt_tokens, total_completion_tokens = sum_check_tokens(conn, topic_id)
     articles = list_articles_for_topic(conn, topic_id, limit=per_page)
     article_count = count_articles_for_topic(conn, topic_id)
-    total_pages = max(1, (total_checks + per_page - 1) // per_page)
 
     formatted = format_interval(topic.check_interval_minutes) if topic.check_interval_minutes else ""
     return templates.TemplateResponse(
@@ -487,19 +500,30 @@ async def check_topic_handler(
 
 
 @router.post("/topics/{topic_id}/toggle-active", dependencies=[Depends(verify_csrf)])
-async def toggle_active(
+async def set_topic_active(
     request: Request,
     topic_id: int,
     conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
+    active: bool = Form(...),
 ):
-    """Toggle a topic's is_active flag."""
+    """Set a topic's monitoring state to the submitted value.
+
+    The desired state travels in the request instead of being derived by negating
+    the stored row. Negation made the command a toggle, so replaying an identical
+    POST — which the built-in HTMX error toast does after an ambiguous network or
+    response failure — silently re-enabled the checks, notifications and provider
+    spend the user had just turned off. Reapplying the same command is now a no-op
+    (AUG-290). The path is unchanged so existing bookmarks and templates keep
+    working.
+    """
     topic = get_topic(conn, topic_id)
     if topic is None:
         raise HTTPException(status_code=404, detail="Topic not found")
 
-    topic.is_active = not topic.is_active
-    update_topic(conn, topic)
-    conn.commit()
+    if topic.is_active != active:
+        topic.is_active = active
+        update_topic(conn, topic)
+        conn.commit()
 
     # HTMX request from dashboard — return updated row partial. No just_checked:
     # a toggle is not a fresh check, so the marker stays absent (OVH-119/OVH-154).
@@ -574,7 +598,10 @@ async def topic_edit_form(
             "topic": topic,
             "formatted_interval": formatted,
             "default_interval": settings.check_interval,
-            "tags_string": ", ".join(topic.tags),
+            # One tag per line, matching the textarea the form now uses. Joining
+            # with commas and reparsing on comma split a single OPML folder such
+            # as "Policy, Europe" into two tags on any unchanged save (AUG-339).
+            "tags_string": "\n".join(topic.tags),
             "global_confidence_threshold": settings.min_confidence_threshold,
             "global_relevance_threshold": settings.min_relevance_threshold,
             "novelty_instruction_max": NOVELTY_INSTRUCTION_MAX_CHARS,
@@ -608,7 +635,8 @@ async def edit_topic_handler(
     from app.interval import format_interval
 
     mode, urls, parsed_interval, errors = await validate_topic_form(feed_mode, feed_urls, check_interval)
-    tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+    name = parse_topic_name(name, errors)
+    tag_list = normalize_tags(tags.splitlines())
     conf_threshold = parse_threshold(confidence_threshold, "Confidence threshold", errors)
     rel_threshold = parse_threshold(relevance_threshold, "Relevance threshold", errors)
     instruction = parse_novelty_instruction(novelty_instruction, errors)
@@ -620,7 +648,7 @@ async def edit_topic_handler(
     if mode == FeedMode.EXA and topic.feed_mode != FeedMode.EXA and not settings.exa.enabled:
         errors.append("Exa search is not enabled. Configure an Exa API key in Settings first.")
 
-    if errors:
+    def _render_errors() -> HTMLResponse:
         # Reuse the already-parsed interval (no re-parse) for the schedule preview.
         formatted = format_interval(parsed_interval) if parsed_interval else ""
         return templates.TemplateResponse(
@@ -649,6 +677,17 @@ async def edit_topic_handler(
             status_code=422,
         )
 
+    if errors:
+        return _render_errors()
+
+    # Renaming onto another topic's name hit the UNIQUE constraint and reached the
+    # global 500 handler, throwing the submitted form away. Creation already
+    # translates this into form feedback; the edit path now matches it (AUG-147).
+    clash = get_topic_by_name(conn, name)
+    if clash is not None and clash.id != topic_id:
+        errors.append("A topic with that name already exists")
+        return _render_errors()
+
     topic.name = name
     topic.description = description
     topic.feed_urls = urls
@@ -659,8 +698,15 @@ async def edit_topic_handler(
     topic.relevance_threshold = rel_threshold
     topic.novelty_instruction = instruction
     topic.importance_threshold = imp_threshold
-    update_topic(conn, topic)
-    conn.commit()
+    try:
+        update_topic(conn, topic)
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # Defense-in-depth against a name race between the check above and the
+        # UPDATE, mirroring create_topic_handler.
+        conn.rollback()
+        errors.append("A topic with that name already exists")
+        return _render_errors()
 
     return RedirectResponse(url=f"/topics/{topic_id}", status_code=303)
 

@@ -44,6 +44,8 @@
         <a href="/topics/{{ topic.id }}/edit" role="button" class="secondary" style="margin: 0;">Edit</a>
         <form method="post" action="/topics/{{ topic.id }}/toggle-active" style="margin: 0;">
             <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
+            {# Explicit target state, not a flip: a replayed POST is a no-op (AUG-290). #}
+            <input type="hidden" name="active" value="{{ 'false' if topic.is_active else 'true' }}">
             <button type="submit" class="secondary" style="margin: 0;">{% if topic.is_active %}Disable{% else %}Enable{% endif %}</button>
         </form>
     </div>
