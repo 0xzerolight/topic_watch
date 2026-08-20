@@ -86,6 +86,7 @@ class Expectation(BaseModel):
     max_confidence: float | None = None
     min_relevance: float | None = None
     min_importance: int | None = None
+    max_importance: int | None = None  # catches over-scoring: a minor update scored as major
     summary_contains: str | None = None
     sufficient_data: bool | None = None  # knowledge_init / knowledge_update
 

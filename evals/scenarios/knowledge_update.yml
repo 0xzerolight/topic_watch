@@ -1,0 +1,22 @@
+# Controlled knowledge-update scenario: fold a new finding into an existing
+# knowledge summary. `novelty_summary` / `key_facts` stand in for the
+# NoveltyResult a real novelty call would have produced (see
+# evals/runner.py:_update_novelty) — this kind never runs novelty itself.
+# Expectation: the updated summary retains the new fact and still has enough
+# to summarize.
+kind: knowledge_update
+topic:
+  name: "Acme funding"
+  description: "Track Acme Corp funding rounds, investors, and amounts."
+knowledge_summary: |
+  Acme Corp raised a $5M Series A led by Foo Ventures, announced in January 2025.
+novelty_summary: >
+  Acme Corp closed a $50M Series B led by Bar Capital, valuing the company at
+  $300 million.
+key_facts:
+  - "Series B round: $50M"
+  - "Lead investor: Bar Capital"
+  - "Valuation: $300 million"
+expect:
+  sufficient_data: true
+  summary_contains: "Series B"

@@ -179,6 +179,9 @@ def _evaluate_expect(expect: Expectation, result: BaseModel | None, error: str |
     if expect.min_importance is not None:
         imp = int(getattr(result, "importance", 0) or 0)
         add("min_importance", imp >= expect.min_importance, f"{imp} >= {expect.min_importance}")
+    if expect.max_importance is not None:
+        imp = int(getattr(result, "importance", 0) or 0)
+        add("max_importance", imp <= expect.max_importance, f"{imp} <= {expect.max_importance}")
     if expect.summary_contains is not None:
         needle = expect.summary_contains.lower()
         add("summary_contains", needle in _result_text(result).lower(), f"{expect.summary_contains!r} in summary")

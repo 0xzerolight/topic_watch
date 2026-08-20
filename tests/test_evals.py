@@ -582,6 +582,50 @@ async def test_run_scenario_novelty_evaluates_min_importance() -> None:
     assert oks["min_importance"] is False  # 2 < 4
 
 
+async def test_run_scenario_novelty_evaluates_max_importance() -> None:
+    """AUG-049: max_importance catches over-scoring noise (a model treating a
+    minor update as major) — min_importance alone can't express that check."""
+    from evals.runner import run_scenario
+    from evals.scenario import Expectation, Scenario, ScenarioArticle, ScenarioTopic
+
+    inner = _mock_inner(novelty=_novelty(importance=5))
+    sc = Scenario(
+        kind="novelty",
+        topic=ScenarioTopic(name="T", description="d"),
+        articles=[ScenarioArticle(title="a", url="http://x", content="c", source_feed="http://f")],
+        expect=Expectation(max_importance=2),
+        name="s",
+    )
+    art = await run_scenario(sc, _settings(), inner=inner)
+
+    oks = {c.check: c.ok for c in art.expect_results}
+    assert oks["max_importance"] is False  # 5 > 2
+
+
+def test_shipped_scenario_corpus_covers_every_dispatch_kind() -> None:
+    """AUG-049: the manual real-model corpus (evals/scenarios/) shipped with
+    only a negative-novelty and a knowledge_init case, leaving half the
+    dispatch kinds (and positive novelty / custom-instruction / importance
+    behavior) with no real-model regression coverage at all. These files are
+    dev-only and never exercised by CI (billed, real LLM), so this parse-and-
+    cover check is the only guard against the corpus rotting out of sync with
+    the scenario schema or silently losing kind coverage.
+    """
+    from pathlib import Path
+
+    from evals.runner import KIND_DISPATCH
+    from evals.scenario import load_scenario
+
+    scenarios_dir = Path(__file__).resolve().parent.parent / "evals" / "scenarios"
+    files = sorted(scenarios_dir.glob("*.yml"))
+    assert files, "no shipped scenario files found"
+
+    kinds_covered = {load_scenario(f).kind for f in files}
+    assert kinds_covered == set(KIND_DISPATCH), (
+        f"corpus is missing dispatch kinds: {set(KIND_DISPATCH) - kinds_covered}"
+    )
+
+
 async def test_scenario_novelty_instruction_reaches_the_prompt() -> None:
     """A scenario's novelty instruction must land in the built prompt.
 
