@@ -101,6 +101,33 @@ class TestSetupRedirect:
         response = unconfigured_app.get("/setup/anything", follow_redirects=False)
         assert response.status_code != 307
 
+    def test_unsafe_method_redirects_as_a_get(self, unconfigured_app: TestClient) -> None:
+        """AUG-210: 307 replayed the method and body into POST /setup."""
+        response = unconfigured_app.post("/topics", data={"name": "x"}, follow_redirects=False)
+        assert response.status_code == 303
+        assert response.headers["location"] == "/setup"
+
+    def test_delete_redirects_as_a_get(self, unconfigured_app: TestClient) -> None:
+        response = unconfigured_app.delete("/topics/1", follow_redirects=False)
+        assert response.status_code == 303
+        assert response.headers["location"] == "/setup"
+
+    def test_api_requests_get_json_not_a_redirect(self, unconfigured_app: TestClient) -> None:
+        """AUG-210: API clients get an actionable status, not an HTML form flow."""
+        response = unconfigured_app.get("/api/v1/topics", follow_redirects=False)
+        assert response.status_code == 503
+        assert "setup" in response.json()["detail"].lower()
+        assert response.headers["content-type"].startswith("application/json")
+
+    def test_api_mutation_gets_json_too(self, unconfigured_app: TestClient) -> None:
+        response = unconfigured_app.post("/api/v1/topics/1/check", follow_redirects=False)
+        assert response.status_code == 503
+
+    def test_api_lookalike_path_still_redirects(self, unconfigured_app: TestClient) -> None:
+        """/apix is not the /api segment."""
+        response = unconfigured_app.get("/apix", follow_redirects=False)
+        assert response.status_code == 307
+
 
 class TestSetupWizard:
     """Test the setup wizard GET and POST routes."""
