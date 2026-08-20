@@ -14,7 +14,7 @@ import instructor
 import litellm
 from instructor import Mode
 from instructor.core import InstructorRetryException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from tenacity import AsyncRetrying, retry_if_not_exception_type, stop_after_attempt
 
 from app.analysis.citations import strip_index_citations, strip_reliability_notes
@@ -91,7 +91,14 @@ def _extract_usage(completion: Any) -> TokenUsage:
 
 
 class NoveltyResult(BaseModel):
-    """LLM response for novelty detection.
+    """Stored/legacy novelty record — the PERMISSIVE half of the contract.
+
+    Every scoring field carries a default so a stored ``llm_response`` blob
+    written before that field existed still re-parses (the force-notify handler
+    calls ``model_validate_json`` on those blobs). ``NoveltyResponse`` below is
+    the strict live-output schema; ``analyze_articles`` asks the provider for
+    that one, so a defaulted score can only ever come from a genuinely old
+    stored blob, never from a live call (AUG-159 / TW-AUD-009).
 
     ``prompt_tokens`` / ``completion_tokens`` are NOT filled by the LLM — they
     default to 0 and are populated from the raw completion's usage after the
@@ -112,6 +119,9 @@ class NoveltyResult(BaseModel):
     key_facts: list[str] = []
     source_urls: list[str] = []
     confidence: float = Field(ge=0.0, le=1.0)
+    # Default (not required) is deliberate: see the class docstring — stored blobs
+    # predate this field. 0.0 is the value the checker's relevance gate reads as
+    # "off-topic", which is why a LIVE omission must never reach it (AUG-159).
     relevance: float = Field(
         ge=0.0,
         le=1.0,
@@ -121,7 +131,7 @@ class NoveltyResult(BaseModel):
     # Default (not required) is deliberate: stored llm_response blobs predate this
     # field and are re-parsed via model_validate_json in the force-notify handler —
     # a required field would break the Notify re-send button for pre-existing
-    # checks. 3 is the neutral midpoint so provider omission doesn't hard-suppress.
+    # checks. 3 is the neutral midpoint so an old blob doesn't hard-suppress.
     importance: int = Field(
         ge=1,
         le=5,
@@ -140,6 +150,47 @@ class NoveltyResult(BaseModel):
         default=None,
         description="Internal error channel; the model must always leave this null.",
     )
+
+
+_SCORE_FIELDS = ("relevance", "importance")
+
+
+class NoveltyResponse(NoveltyResult):
+    """Live structured-output schema — the STRICT half of the contract.
+
+    Same fields as ``NoveltyResult`` (so the JSON schema the provider sees is
+    unchanged), plus the one invariant a live call must satisfy: a POSITIVE
+    result has to carry its own ``relevance`` and ``importance``. Both fields
+    have permissive defaults on the parent for stored-blob compatibility, and
+    those defaults are load-bearing downstream — ``relevance=0.0`` is below every
+    usable threshold and ``importance=3`` is below a threshold of 4 or 5 — so a
+    provider that simply omits the field would silently mute a genuine update
+    with nothing in the logs (AUG-159 / TW-AUD-009).
+
+    Omission is distinguished from a real zero via ``model_fields_set``: an
+    explicit ``relevance: 0.0`` is the model's own judgement and passes. A
+    violation raises ``ValidationError``, which instructor re-prompts (the model
+    usually complies on the retry, so the update is delivered rather than
+    suppressed); if it never complies, ``analyze_articles`` maps it through the
+    settled safe-false path with ``error`` populated, so the checker records
+    ``analysis_failed`` instead of a silent skip.
+
+    The requirement is scoped to ``has_new_info=true`` on purpose: on a negative
+    result nothing is gated on either score, so demanding them there would turn
+    a harmless provider quirk into a failed check.
+    """
+
+    @model_validator(mode="after")
+    def _require_scores_on_positive(self) -> "NoveltyResponse":
+        if not self.has_new_info:
+            return self
+        missing = [name for name in _SCORE_FIELDS if name not in self.model_fields_set]
+        if missing:
+            raise ValueError(
+                f"{' and '.join(missing)} must be set explicitly when has_new_info is true "
+                "(they decide whether the user is notified); do not omit them."
+            )
+        return self
 
 
 class KnowledgeStateUpdate(BaseModel):
@@ -571,7 +622,7 @@ async def analyze_articles(
         result, completion = await _call_with_rate_limit_retry(
             lambda: _create_structured(
                 settings,
-                response_model=NoveltyResult,
+                response_model=NoveltyResponse,
                 build_messages=lambda: build_novelty_messages(articles, knowledge_summary, topic),
                 timeout=settings.llm_analysis_timeout,
             ),
@@ -586,17 +637,19 @@ async def analyze_articles(
     # it on a clean run. Force it None here so ONLY the except-branch above ever
     # sets it; otherwise the checker mis-stamps a healthy run as analysis_failed.
     novelty.error = None
-    # ``importance`` has a default (see NoveltyResult), so a provider that ignores
-    # the field silently scores every result 3 — which makes a per-topic threshold
-    # of 4 or 5 mute the topic entirely, with nothing in the logs to explain it.
-    # Say so once per check rather than making the field required (that would break
-    # re-parsing of pre-m023 stored blobs in the force-notify handler).
-    if "importance" not in novelty.model_fields_set:
+    # ``relevance``/``importance`` carry stored-blob defaults (see NoveltyResult),
+    # and ``NoveltyResponse`` only *requires* them on a positive result. A provider
+    # that omits them on negatives is still worth one line per check: the same
+    # habit is what would mute a later positive, and the default scores are what
+    # the checker's gates read.
+    omitted = [name for name in _SCORE_FIELDS if name not in novelty.model_fields_set]
+    if omitted:
         logger.warning(
-            "LLM omitted 'importance' for topic '%s'; defaulting to %d. "
-            "An importance threshold above %d will suppress every notification with this model.",
+            "LLM omitted %s for topic '%s'; using the stored-blob default(s) (relevance=%.2f, importance=%d). "
+            "A threshold above the default will suppress notifications with this model.",
+            " and ".join(f"'{name}'" for name in omitted),
             topic.name,
-            novelty.importance,
+            novelty.relevance,
             novelty.importance,
         )
     usage = _extract_usage(completion)

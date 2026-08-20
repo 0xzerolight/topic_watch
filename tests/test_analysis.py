@@ -1,12 +1,17 @@
 """Tests for the LLM analysis module: prompts, structured output, knowledge management."""
 
+import json
 import logging
 import sqlite3
+from contextlib import contextmanager
 from datetime import UTC
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import instructor
 import litellm
 import pytest
+from litellm import ModelResponse
+from litellm.types.utils import Choices, Message, Usage
 from pydantic import ValidationError
 
 from app.analysis.citations import strip_index_citations, strip_reliability_notes
@@ -15,6 +20,7 @@ from app.analysis.llm import (
     _OUTPUT_TOKEN_CAP,
     CompressedKnowledge,
     KnowledgeStateUpdate,
+    NoveltyResponse,
     NoveltyResult,
     _bounded_max_tokens,
     analyze_articles,
@@ -233,6 +239,56 @@ class TestNoveltyResult:
         path) must default to the neutral midpoint, not fail validation."""
         legacy_blob = '{"has_new_info": true, "summary": "x", "confidence": 0.9, "relevance": 0.8}'
         result = NoveltyResult.model_validate_json(legacy_blob)
+        assert result.importance == 3
+
+
+# ============================================================
+# TestNoveltyResponse (AUG-159 / TW-AUD-009: strict live schema)
+# ============================================================
+
+
+class TestNoveltyResponse:
+    """The live schema requires the two scoring fields on a POSITIVE result.
+
+    Their permissive defaults exist for stored blobs only; live, ``relevance=0.0``
+    is below every usable threshold and ``importance=3`` is below a threshold of
+    4 or 5, so an omitted field would silently mute a genuine update.
+    """
+
+    def test_positive_result_missing_relevance_is_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="relevance"):
+            NoveltyResponse.model_validate({"has_new_info": True, "summary": "x", "confidence": 0.9, "importance": 4})
+
+    def test_positive_result_missing_importance_is_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="importance"):
+            NoveltyResponse.model_validate({"has_new_info": True, "summary": "x", "confidence": 0.9, "relevance": 0.8})
+
+    def test_explicit_zero_relevance_is_accepted(self) -> None:
+        """A real 0.0 is the model's own judgement — only OMISSION is the defect."""
+        result = NoveltyResponse.model_validate(
+            {"has_new_info": True, "summary": "x", "confidence": 0.9, "relevance": 0.0, "importance": 1}
+        )
+        assert result.relevance == 0.0
+        assert result.importance == 1
+
+    def test_negative_result_may_omit_scores(self) -> None:
+        """Nothing is gated on either score when has_new_info is false."""
+        result = NoveltyResponse.model_validate({"has_new_info": False, "confidence": 0.4})
+        assert result.has_new_info is False
+        assert result.relevance == 0.0
+
+    def test_is_a_novelty_result(self) -> None:
+        """Consumers (checker, notifications, webhooks) keep the same type."""
+        result = NoveltyResponse.model_validate(
+            {"has_new_info": True, "summary": "x", "confidence": 0.9, "relevance": 0.7, "importance": 4}
+        )
+        assert isinstance(result, NoveltyResult)
+
+    def test_legacy_stored_blob_still_parses_permissively(self) -> None:
+        """The force-notify re-parse uses NoveltyResult, which stays permissive."""
+        legacy_blob = '{"has_new_info": true, "summary": "x", "confidence": 0.9}'
+        result = NoveltyResult.model_validate_json(legacy_blob)
+        assert result.relevance == 0.0
         assert result.importance == 3
 
 
@@ -859,7 +915,8 @@ class TestAnalyzeArticles:
         mock_create.assert_called_once()
         call_kwargs = mock_create.call_args.kwargs
         assert call_kwargs["model"] == "openai/gpt-4o-mini"
-        assert call_kwargs["response_model"] is NoveltyResult
+        # The strict live schema, not the permissive stored-blob one (AUG-159).
+        assert call_kwargs["response_model"] is NoveltyResponse
         assert call_kwargs["temperature"] == 0.2
         # Verify messages include the knowledge state and topic info
         messages = call_kwargs["messages"]
@@ -937,13 +994,14 @@ class TestAnalyzeArticles:
         assert result.has_new_info is True
         assert result.error is None
 
-    async def test_warns_when_provider_omits_importance(self, caplog: pytest.LogCaptureFixture) -> None:
-        """``importance`` has a default, so an omitting provider scores everything 3.
+    async def test_warns_when_provider_omits_scores(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The scoring fields have stored-blob defaults, so an omitting provider
+        scores everything relevance=0.0 / importance=3.
 
-        Silent, that turns an importance threshold of 4 or 5 into a permanent mute
+        Silent, that turns any threshold above the default into a permanent mute
         with nothing in the logs to explain it.
         """
-        omitted = NoveltyResult.model_validate({"has_new_info": True, "summary": "X", "confidence": 0.9})
+        omitted = NoveltyResult.model_validate({"has_new_info": False, "confidence": 0.9})
         mock_client, _ = _mock_instructor_client(omitted)
         settings = _make_settings()
 
@@ -951,12 +1009,12 @@ class TestAnalyzeArticles:
             result = await analyze_articles([_make_article()], "Known facts.", _make_topic(), settings)
 
         assert result.importance == 3
-        assert any("omitted 'importance'" in r.getMessage() for r in caplog.records)
+        assert any("'relevance' and 'importance'" in r.getMessage() for r in caplog.records)
 
-    async def test_no_warning_when_provider_sets_importance(self, caplog: pytest.LogCaptureFixture) -> None:
+    async def test_no_warning_when_provider_sets_scores(self, caplog: pytest.LogCaptureFixture) -> None:
         """An explicit score — including one equal to the default — is not a warning."""
         scored = NoveltyResult.model_validate(
-            {"has_new_info": True, "summary": "X", "confidence": 0.9, "importance": 3}
+            {"has_new_info": True, "summary": "X", "confidence": 0.9, "importance": 3, "relevance": 0.0}
         )
         mock_client, _ = _mock_instructor_client(scored)
         settings = _make_settings()
@@ -964,7 +1022,107 @@ class TestAnalyzeArticles:
         with patch("app.analysis.llm._get_client", return_value=mock_client), caplog.at_level(logging.WARNING):
             await analyze_articles([_make_article()], "Known facts.", _make_topic(), settings)
 
-        assert not any("omitted 'importance'" in r.getMessage() for r in caplog.records)
+        assert not any("LLM omitted" in r.getMessage() for r in caplog.records)
+
+
+# ============================================================
+# TestLiveNoveltyContract (AUG-159 / TW-AUD-009, real instructor stack)
+# ============================================================
+
+
+@contextmanager
+def _md_json_client(payloads):
+    """Patch ``_get_client`` with a REAL instructor client over a fake completion.
+
+    ``payloads`` is a list of dicts returned as raw JSON, one per provider call
+    (the last is repeated once exhausted), so the genuine instructor parse +
+    validation-retry layer runs against our response schema without any network
+    call. MD_JSON mode is used because it parses plain message content.
+    """
+    calls = {"n": 0}
+
+    async def _fake_acompletion(*_args, **_kwargs):
+        payload = payloads[min(calls["n"], len(payloads) - 1)]
+        calls["n"] += 1
+        message = Message(content=json.dumps(payload), role="assistant")
+        choice = Choices(message=message, index=0, finish_reason="stop")
+        return ModelResponse(choices=[choice], usage=Usage(prompt_tokens=11, completion_tokens=7))
+
+    client = instructor.from_litellm(_fake_acompletion, mode=instructor.Mode.MD_JSON)
+    with patch("app.analysis.llm._get_client", return_value=client):
+        yield calls
+
+
+class TestLiveNoveltyContract:
+    """A live positive that omits a scoring field is re-prompted, never defaulted."""
+
+    async def test_omitted_relevance_is_reprompted_and_recovered(self) -> None:
+        """The whole point of AUG-159: the valid update is delivered, not suppressed."""
+        settings = _make_settings(llm_max_retries=2)
+        payloads = [
+            {"has_new_info": True, "summary": "Date announced", "confidence": 0.9, "importance": 4},
+            {
+                "has_new_info": True,
+                "summary": "Date announced",
+                "confidence": 0.9,
+                "importance": 4,
+                "relevance": 0.9,
+            },
+        ]
+
+        with _md_json_client(payloads) as calls:
+            result = await analyze_articles([_make_article()], "Known.", _make_topic(), settings)
+
+        assert calls["n"] == 2  # first response re-prompted, second accepted
+        assert result.has_new_info is True
+        assert result.relevance == 0.9
+        assert result.error is None
+
+    async def test_persistent_omission_fails_safe_with_error(self) -> None:
+        """If the provider never complies, the result is the settled safe default
+        WITH ``error`` set — the checker records analysis_failed instead of a
+        silent below-threshold skip. analyze_articles still never raises."""
+        settings = _make_settings(llm_max_retries=1)
+        payloads = [{"has_new_info": True, "summary": "Date announced", "confidence": 0.9, "importance": 4}]
+
+        with _md_json_client(payloads) as calls:
+            result = await analyze_articles([_make_article()], "Known.", _make_topic(), settings)
+
+        assert calls["n"] == 2  # initial + 1 validation retry
+        assert result.has_new_info is False
+        assert result.confidence == 0.0
+        assert result.error is not None
+        assert "relevance" in result.error
+
+    async def test_explicit_zero_relevance_is_not_a_violation(self) -> None:
+        """Omission is the defect; a model that deliberately scores 0.0 is obeyed."""
+        settings = _make_settings()
+        payloads = [
+            {
+                "has_new_info": True,
+                "summary": "Tangential",
+                "confidence": 0.9,
+                "relevance": 0.0,
+                "importance": 1,
+            }
+        ]
+
+        with _md_json_client(payloads) as calls:
+            result = await analyze_articles([_make_article()], "Known.", _make_topic(), settings)
+
+        assert calls["n"] == 1
+        assert result.has_new_info is True
+        assert result.relevance == 0.0
+
+    async def test_negative_result_may_omit_scores(self) -> None:
+        settings = _make_settings()
+
+        with _md_json_client([{"has_new_info": False, "confidence": 0.4}]) as calls:
+            result = await analyze_articles([_make_article()], "Known.", _make_topic(), settings)
+
+        assert calls["n"] == 1
+        assert result.has_new_info is False
+        assert result.error is None
 
 
 # ============================================================
