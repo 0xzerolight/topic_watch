@@ -691,6 +691,37 @@ async def _create_structured(
 _filter_restated_key_facts = filter_restated_key_facts
 
 
+# --- Post-transform domain invariants (TW-AUD-015) ---
+#
+# Provider parsing verifies TYPES; the citation/reliability scrubs below then
+# rewrite the validated text. A response that was valid on the wire can therefore
+# become an empty alert payload or an empty knowledge state on the way out, so the
+# invariant is re-checked AFTER the mutation — mapped to the settled safe result
+# for novelty, and raised for knowledge, matching each path's contract.
+
+
+def _sanitize(text: str) -> str:
+    """Strip ephemeral article-index citations, then leaked reliability notes.
+
+    Order matters: index-citations first, so their parentheticals are gone before
+    the reliability pass classifies sentences.
+    """
+    return strip_reliability_notes(strip_index_citations(text)).strip()
+
+
+class EmptyAfterCleanupError(ValueError):
+    """A validated LLM string was left empty by citation/reliability cleanup."""
+
+
+def _sanitized_or_raise(text: str, field: str) -> str:
+    cleaned = _sanitize(text)
+    if not cleaned:
+        raise EmptyAfterCleanupError(
+            f"{field} contained only citation/reliability artifacts and was empty after cleanup"
+        )
+    return cleaned
+
+
 # --- source_urls subset guard (prompt-injection output validation) ---
 
 
@@ -772,19 +803,33 @@ async def analyze_articles(
     usage = _extract_usage(completion)
     novelty.prompt_tokens = usage.prompt_tokens
     novelty.completion_tokens = usage.completion_tokens
-    novelty.key_facts = _filter_restated_key_facts(novelty.key_facts, knowledge_summary)
-    # Strip ephemeral article-index citations ("(Article [1])") then leaked
-    # [STUB]/[NO CONTENT] reliability notes from the fact fields before they reach
-    # the knowledge-update merge, notifications, and webhooks. Order matters:
-    # index-citations first, so their parentheticals are gone before the reliability
-    # pass classifies sentences. Not reasoning — its cites are subject-position prose
-    # that would mangle if stripped.
+    # Sanitize BEFORE filtering restatements (AUG-168). A fact identical to known
+    # knowledge except for its "(Article [1])" tail used to miss the overlap
+    # threshold, survive the filter, and only then become an exact restatement —
+    # so the filter has to run on the exact text that will be emitted and stored.
+    # Not reasoning — its cites are subject-position prose that would mangle if
+    # stripped.
     if novelty.summary:
-        novelty.summary = strip_reliability_notes(strip_index_citations(novelty.summary))
-    novelty.key_facts = [strip_reliability_notes(strip_index_citations(fact)) for fact in novelty.key_facts]
+        novelty.summary = _sanitize(novelty.summary)
+    sanitized_facts = [_sanitize(fact) for fact in novelty.key_facts]
+    novelty.key_facts = _filter_restated_key_facts([fact for fact in sanitized_facts if fact], knowledge_summary)
     # Drop any source_url not in the input set so an injected completion cannot
     # smuggle an attacker-chosen URL into notifications/webhooks (OVH-058).
     novelty.source_urls = _filter_source_urls(novelty.source_urls, articles)
+    # Re-check the domain invariant after those mutations (TW-AUD-015): a positive
+    # result whose summary was entirely citation/reliability artifacts would
+    # otherwise notify the user with an empty body and feed an empty lead-in to the
+    # knowledge merge. Mapped to the settled safe result, not raised.
+    if novelty.has_new_info and not novelty.summary:
+        logger.warning(
+            "Novelty summary for topic '%s' was empty after citation/reliability cleanup; failing safe",
+            topic.name,
+        )
+        return NoveltyResult(
+            has_new_info=False,
+            confidence=0.0,
+            error="novelty summary was empty after citation/reliability cleanup",
+        )
     return novelty
 
 
@@ -809,8 +854,10 @@ async def generate_initial_knowledge(
     )
     result: KnowledgeStateUpdate = raw_result
     # Strip article-index citations then leaked reliability notes before counting
-    # tokens so the freed budget is real.
-    result.updated_summary = strip_reliability_notes(strip_index_citations(result.updated_summary))
+    # tokens so the freed budget is real. The caller persists this summary even
+    # when sufficient_data is false (it explains what was missing), so an empty
+    # result is rejected either way — knowledge transitions fail loud (TW-AUD-015).
+    result.updated_summary = _sanitized_or_raise(result.updated_summary, "initial knowledge summary")
     result.token_count = count_tokens(result.updated_summary, settings.llm.model)
     usage = _extract_usage(completion)
     result.prompt_tokens = usage.prompt_tokens
@@ -846,8 +893,10 @@ async def compress_knowledge_summary(
     )
     result: CompressedKnowledge = raw_result
     # Strip article-index citations then leaked reliability notes before counting
-    # tokens so the freed budget is real.
-    result.compressed_summary = strip_reliability_notes(strip_index_citations(result.compressed_summary))
+    # tokens so the freed budget is real. An empty result raises (TW-AUD-015): the
+    # caller degrades to lossy truncation of the ORIGINAL summary, which is a far
+    # better outcome than persisting nothing.
+    result.compressed_summary = _sanitized_or_raise(result.compressed_summary, "compressed knowledge summary")
     result.token_count = count_tokens(result.compressed_summary, settings.llm.model)
     usage = _extract_usage(completion)
     result.prompt_tokens = usage.prompt_tokens
@@ -884,8 +933,14 @@ async def generate_knowledge_update(
     result: KnowledgeStateUpdate = raw_result
     # Strip article-index citations (the update LLM grafts them onto clean input by
     # mimicking the existing cited style) then leaked reliability notes before
-    # counting tokens so the budget is real.
-    result.updated_summary = strip_reliability_notes(strip_index_citations(result.updated_summary))
+    # counting tokens so the budget is real. When the merge is going to be
+    # persisted, an empty result raises rather than wiping the baseline
+    # (TW-AUD-015); on sufficient_data=false the caller keeps the existing state
+    # and never reads this text, so an empty explanation is harmless there.
+    if result.sufficient_data:
+        result.updated_summary = _sanitized_or_raise(result.updated_summary, "updated knowledge summary")
+    else:
+        result.updated_summary = _sanitize(result.updated_summary)
     result.token_count = count_tokens(result.updated_summary, settings.llm.model)
     usage = _extract_usage(completion)
     result.prompt_tokens = usage.prompt_tokens

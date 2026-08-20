@@ -2555,6 +2555,147 @@ class TestKnowledgePromptsUntrustedInput:
 
 
 # ============================================================
+# TestCleanupOrderAndInvariants (AUG-168 / TW-AUD-015)
+# ============================================================
+
+
+class TestCleanupOrderAndInvariants:
+    """Sanitize first, then filter — and re-check the invariants afterwards."""
+
+    async def test_cited_restatement_is_filtered_after_cleanup(self) -> None:
+        """AUG-168: the citation tail used to push a pure restatement over the
+        overlap threshold, so it survived the filter and only then became an exact
+        repeat of known knowledge in the notification."""
+        knowledge = "Confirmed Facts: The release date is March 2026."
+        expected = NoveltyResult(
+            has_new_info=True,
+            summary="A delay was announced",
+            key_facts=["The release date is March 2026 (Article [1])"],
+            confidence=0.9,
+            relevance=0.9,
+            importance=4,
+        )
+        mock_client, _ = _mock_instructor_client(expected)
+
+        with patch("app.analysis.llm._get_client", return_value=mock_client):
+            result = await analyze_articles([_make_article()], knowledge, _make_topic(), _make_settings())
+
+        assert result.key_facts == []
+
+    async def test_fact_emptied_by_cleanup_is_dropped(self) -> None:
+        expected = NoveltyResult(
+            has_new_info=True,
+            summary="Real development",
+            key_facts=["(Article [1])", "Season 3 confirmed for 2027"],
+            confidence=0.9,
+            relevance=0.9,
+            importance=4,
+        )
+        mock_client, _ = _mock_instructor_client(expected)
+
+        with patch("app.analysis.llm._get_client", return_value=mock_client):
+            result = await analyze_articles([_make_article()], "Known.", _make_topic(), _make_settings())
+
+        assert result.key_facts == ["Season 3 confirmed for 2027"]
+
+    async def test_summary_emptied_by_cleanup_fails_safe(self) -> None:
+        """TW-AUD-015: parsing validated the type, then cleanup emptied the text.
+        A positive with no summary would notify with an empty body and feed an
+        empty lead-in to the knowledge merge."""
+        expected = NoveltyResult(
+            has_new_info=True,
+            summary="Note: Article [1] is marked [STUB] with minimal content.",
+            key_facts=["Season 3 confirmed"],
+            confidence=0.9,
+            relevance=0.9,
+            importance=4,
+        )
+        mock_client, _ = _mock_instructor_client(expected)
+
+        with patch("app.analysis.llm._get_client", return_value=mock_client):
+            result = await analyze_articles([_make_article()], "Known.", _make_topic(), _make_settings())
+
+        assert result.has_new_info is False
+        assert result.error is not None
+        assert "empty after" in result.error
+
+    async def test_negative_result_with_no_summary_is_untouched(self) -> None:
+        """has_new_info=False legitimately carries no summary — not an error."""
+        expected = NoveltyResult(has_new_info=False, summary=None, confidence=0.4)
+        mock_client, _ = _mock_instructor_client(expected)
+
+        with patch("app.analysis.llm._get_client", return_value=mock_client):
+            result = await analyze_articles([_make_article()], "Known.", _make_topic(), _make_settings())
+
+        assert result.has_new_info is False
+        assert result.error is None
+
+    async def test_initial_knowledge_emptied_by_cleanup_raises(self) -> None:
+        """Knowledge transitions fail loud: an empty baseline must not be stored."""
+        expected = KnowledgeStateUpdate(
+            sufficient_data=True,
+            confidence=0.9,
+            updated_summary="Note on Data Quality: Articles [1], [2] are marked [STUB].",
+            token_count=0,
+        )
+        mock_client, _ = _mock_instructor_client(expected)
+
+        with (
+            patch("app.analysis.llm._get_client", return_value=mock_client),
+            pytest.raises(ValueError, match="empty after cleanup"),
+        ):
+            await generate_initial_knowledge([_make_article()], _make_topic(), _make_settings())
+
+    async def test_knowledge_update_emptied_by_cleanup_raises(self) -> None:
+        expected = KnowledgeStateUpdate(
+            sufficient_data=True,
+            confidence=0.9,
+            updated_summary="(Articles [1], [2])",
+            token_count=0,
+        )
+        mock_client, _ = _mock_instructor_client(expected)
+        novelty = NoveltyResult(has_new_info=True, summary="x", confidence=0.9, relevance=0.9, importance=4)
+
+        with (
+            patch("app.analysis.llm._get_client", return_value=mock_client),
+            pytest.raises(ValueError, match="empty after cleanup"),
+        ):
+            await generate_knowledge_update("Current state.", novelty, _make_topic(), _make_settings())
+
+    async def test_insufficient_update_may_be_emptied_without_raising(self) -> None:
+        """On sufficient_data=false the caller keeps the existing state and never
+        reads this text, so an emptied explanation must not fail the check."""
+        expected = KnowledgeStateUpdate(
+            sufficient_data=False,
+            confidence=0.2,
+            updated_summary="Note: Article [1] is marked [STUB].",
+            token_count=0,
+        )
+        mock_client, _ = _mock_instructor_client(expected)
+        novelty = NoveltyResult(has_new_info=True, summary="x", confidence=0.9, relevance=0.9, importance=4)
+
+        with (
+            patch("app.analysis.llm._get_client", return_value=mock_client),
+            patch("app.analysis.llm.count_tokens", return_value=0),
+        ):
+            result = await generate_knowledge_update("Current state.", novelty, _make_topic(), _make_settings())
+
+        assert result.sufficient_data is False
+        assert result.updated_summary == ""
+
+    async def test_compression_emptied_by_cleanup_raises(self) -> None:
+        """The caller degrades to truncating the ORIGINAL summary instead."""
+        expected = CompressedKnowledge(compressed_summary="Note: Articles [1], [2] are marked [STUB].", token_count=0)
+        mock_client, _ = _mock_instructor_client(expected)
+
+        with (
+            patch("app.analysis.llm._get_client", return_value=mock_client),
+            pytest.raises(ValueError, match="empty after cleanup"),
+        ):
+            await compress_knowledge_summary("Verbose.", _make_topic(), _make_settings())
+
+
+# ============================================================
 # TestPromptOutputRules (the two shared rules are injected)
 # ============================================================
 
