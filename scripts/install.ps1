@@ -189,8 +189,13 @@ for ($i = 0; $i -lt 30; $i++) {
     Start-Sleep -Seconds 1
 }
 
+# AUG-059: a failed health check must not be reported as a successful
+# install — stop here, before Start Menu/startup shortcuts or the "running!"
+# message, so a broken install never looks like a working one.
 if (-not $healthy) {
-    Write-Warn "Health check not responding yet. Check: docker compose -f `"$ComposeDest`" logs"
+    Write-Err "Health check did not pass after starting Topic Watch."
+    Write-Host "  Diagnose with: docker compose -f `"$ComposeDest`" logs"
+    exit 1
 }
 
 # --- Desktop integration ---

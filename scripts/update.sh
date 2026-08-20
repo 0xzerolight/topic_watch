@@ -42,14 +42,17 @@ docker compose up -d
 
 # --- Wait for health ---
 info "Waiting for health check..."
+HEALTHY=0
 for i in $(seq 1 30); do
     if curl -sf "http://localhost:${TOPIC_WATCH_PORT:-8000}/health" >/dev/null 2>&1; then
+        HEALTHY=1
         break
     fi
     sleep 1
 done
 
-if curl -sf "http://localhost:${TOPIC_WATCH_PORT:-8000}/health" >/dev/null 2>&1; then
+# AUG-059: a failed post-update health check must not exit successfully.
+if [ "$HEALTHY" = "1" ]; then
     NEW=$(docker compose exec -T topic-watch python -c "from app import __version__; print(__version__)" 2>/dev/null || echo "unknown")
     info "Updated: ${CURRENT} → ${NEW}"
     info "Database backups: ${INSTALL_DIR}/data/backups/"
@@ -60,4 +63,5 @@ else
     echo "  Roll back:     docker compose down"
     echo "                 cp data/backups/<latest>.db data/topic_watch.db"
     echo "                 docker compose up -d"
+    exit 1
 fi

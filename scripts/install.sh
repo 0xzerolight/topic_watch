@@ -252,15 +252,23 @@ docker compose up -d
 
 # --- Wait for health check ---
 info "Waiting for Topic Watch to start..."
+HEALTHY=0
 for i in $(seq 1 30); do
     if curl -sf "http://localhost:${PORT}/health" >/dev/null 2>&1; then
+        HEALTHY=1
         break
     fi
     sleep 1
 done
 
-if ! curl -sf "http://localhost:${PORT}/health" >/dev/null 2>&1; then
-    warn "Health check not responding yet. Check: docker compose -f ${INSTALL_DIR}/docker-compose.yml logs"
+# AUG-059: a failed health check must not be reported as a successful
+# install — stop here, before desktop integration, autostart, or the
+# "running!" message, so a broken install never looks like a working one.
+if [ "$HEALTHY" != "1" ]; then
+    error "Health check did not pass after starting Topic Watch."
+    echo ""
+    echo "  Diagnose with: docker compose -f ${INSTALL_DIR}/docker-compose.yml logs"
+    exit 1
 fi
 
 # --- Desktop integration (Linux only) ---

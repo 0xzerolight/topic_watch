@@ -116,3 +116,29 @@ def test_compose_files_pass_through_secure_cookies() -> None:
     for compose_file in ("docker-compose.yml", "docker-compose.prod.yml"):
         text = (_ROOT / compose_file).read_text()
         assert "TOPIC_WATCH_SECURE_COOKIES" in text, f"{compose_file} does not pass through TOPIC_WATCH_SECURE_COOKIES"
+
+
+def test_install_and_update_scripts_exit_nonzero_on_failed_health_check() -> None:
+    """AUG-059: install.sh, install.ps1, and update.sh must fail loudly (and
+    stop before any success epilogue) when the post-start health check never
+    passes, instead of warning and then reporting success anyway."""
+    install_sh = (_ROOT / "scripts" / "install.sh").read_text()
+    install_ps1 = (_ROOT / "scripts" / "install.ps1").read_text()
+    update_sh = (_ROOT / "scripts" / "update.sh").read_text()
+
+    # install.sh: the unhealthy branch must exit 1 before the "running!" epilogue.
+    unhealthy_pos = install_sh.index('if [ "$HEALTHY" != "1" ]; then')
+    exit_pos = install_sh.index("exit 1", unhealthy_pos)
+    epilogue_pos = install_sh.index("Topic Watch is running!")
+    assert unhealthy_pos < exit_pos < epilogue_pos
+
+    # install.ps1: same shape.
+    unhealthy_pos = install_ps1.index("if (-not $healthy) {")
+    exit_pos = install_ps1.index("exit 1", unhealthy_pos)
+    epilogue_pos = install_ps1.index('"Topic Watch is running!"')
+    assert unhealthy_pos < exit_pos < epilogue_pos
+
+    # update.sh: the failure branch must exit 1, not fall off the end successfully.
+    failure_pos = update_sh.index('error "Health check failed after update!"')
+    exit_pos = update_sh.index("exit 1", failure_pos)
+    assert exit_pos > failure_pos
