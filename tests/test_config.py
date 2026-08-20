@@ -10,6 +10,19 @@ from pydantic import ValidationError
 from app.config import Settings, load_settings, save_settings_to_yaml
 
 
+@pytest.fixture(autouse=True)
+def _yaml_owned_llm_credentials(monkeypatch: pytest.MonkeyPatch):
+    """Make the LLM block YAML-owned unless a test says otherwise.
+
+    conftest (like CI) exports TOPIC_WATCH_LLM__MODEL / __API_KEY so the app counts
+    as configured; that makes both fields environment-owned, and an environment-owned
+    field is deliberately never written to the file (AUG-241). Tests about env
+    precedence set the variables they need themselves.
+    """
+    monkeypatch.delenv("TOPIC_WATCH_LLM__MODEL", raising=False)
+    monkeypatch.delenv("TOPIC_WATCH_LLM__API_KEY", raising=False)
+
+
 class TestConfigLoading:
     """Test loading configuration from YAML files."""
 

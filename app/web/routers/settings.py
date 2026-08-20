@@ -15,6 +15,7 @@ from app.config import (
     is_exa_key_env_sourced,
     load_settings,
     save_settings_to_yaml,
+    strip_env_owned,
 )
 from app.notifications import send_notification
 from app.web.csrf import verify_csrf
@@ -325,8 +326,6 @@ async def update_settings(request: Request):
     """
     from pydantic import ValidationError
 
-    from app.config import ExaSettings, LLMSettings, NotificationSettings
-
     form = await request.form()
 
     def _get(name: str, default: str = "") -> str:
@@ -388,13 +387,11 @@ async def update_settings(request: Request):
             status_code=422,
         )
 
-    # API key special-case: a blank field retains the current key (OVH-081). When the key
-    # is env-sourced we must not persist the env secret to plaintext YAML (OVH-003), so the
-    # field is read-only in the UI and the on-disk value is preserved on save.
-    api_key_env_sourced = is_api_key_env_sourced()
+    # API key special-case: a blank field retains the current key (OVH-081). An
+    # env-sourced key is dropped from the submitted data below, so it is neither
+    # persisted nor editable here (OVH-003/AUG-241).
     effective_api_key = llm_api_key.strip() or request.app.state.settings.llm.api_key
-    # Exa key mirrors the LLM key: blank retains current, env-sourced key is preserved (OVH-003).
-    exa_key_env_sourced = is_exa_key_env_sourced()
+    # Exa key mirrors the LLM key: blank retains the current one.
     effective_exa_key = exa_api_key.strip() or request.app.state.settings.exa.api_key
     # exa base_url is infra/proxy-only (not a form field); preserve the current value like db_path.
     exa_base_url = request.app.state.settings.exa.base_url
@@ -420,33 +417,37 @@ async def update_settings(request: Request):
             status_code=422,
         )
 
+    # Everything the form decides, as plain data so pydantic-settings can merge it
+    # per field. Environment-owned paths are then removed: init outranks env, so
+    # leaving them in would let an edit override an env-owned value until restart
+    # (AUG-241). What is left is exactly the YAML-owned half of the document.
+    submitted: dict = {
+        "llm": {
+            "model": llm_model,
+            "api_key": effective_api_key,
+            "base_url": effective_base_url,
+        },
+        "notifications": {
+            "urls": parsed_notification_urls,
+            "webhook_urls": parsed_webhook_urls,
+        },
+        "exa": {
+            "enabled": enable_exa,
+            "api_key": effective_exa_key,
+            "base_url": exa_base_url,
+        },
+        "secure_cookies": secure_cookies,
+        # db_path is infra-only (read-only in the UI); preserve current value.
+        "db_path": request.app.state.settings.db_path,
+        **scalar_kwargs,
+    }
+
     try:
-        new_settings = Settings(  # type: ignore[call-arg]
-            llm=LLMSettings(
-                model=llm_model,
-                api_key=effective_api_key,
-                base_url=effective_base_url,
-            ),
-            notifications=NotificationSettings(
-                urls=parsed_notification_urls,
-                webhook_urls=parsed_webhook_urls,
-            ),
-            exa=ExaSettings(
-                enabled=enable_exa,
-                api_key=effective_exa_key,
-                base_url=exa_base_url,
-            ),
-            secure_cookies=secure_cookies,
-            # db_path is infra-only (read-only in the UI); preserve current value.
-            db_path=request.app.state.settings.db_path,
-            **scalar_kwargs,
-        )
-        save_settings_to_yaml(
-            new_settings,
-            request.app.state.config_path,
-            preserve_api_key=api_key_env_sourced,
-            preserve_exa_key=exa_key_env_sourced,
-        )
+        # The result is the canonical merged object — the form's values for what YAML
+        # owns, the environment's for what it owns — so app.state and the next page
+        # render agree with what a restart would produce.
+        new_settings = Settings(**strip_env_owned(submitted))  # type: ignore[call-arg]
+        save_settings_to_yaml(new_settings, request.app.state.config_path)
         request.app.state.settings = new_settings
     except ValidationError as exc:
         return _render(

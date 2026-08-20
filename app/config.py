@@ -120,6 +120,68 @@ _API_KEY_ENV_VAR = "TOPIC_WATCH_LLM__API_KEY"
 # Env var that supplies the Exa API key (same env > YAML precedence).
 _EXA_API_KEY_ENV_VAR = "TOPIC_WATCH_EXA__API_KEY"
 
+_ENV_PREFIX = "TOPIC_WATCH_"
+_ENV_NESTED_DELIMITER = "__"
+
+
+def _env_field_path(variable: str) -> tuple[str, ...] | None:
+    """Settings field path a ``TOPIC_WATCH_*`` variable addresses, or None.
+
+    Single underscores are part of a field name; the double underscore is the
+    nesting delimiter, matching ``SettingsConfigDict``. A variable that maps to no
+    declared field (``TOPIC_WATCH_CONFIG_PATH``, a typo) yields None.
+    """
+    if not variable.upper().startswith(_ENV_PREFIX):
+        return None
+    path = tuple(variable[len(_ENV_PREFIX) :].lower().split(_ENV_NESTED_DELIMITER))
+    model: type[BaseModel] = Settings
+    for index, part in enumerate(path):
+        if part not in model.model_fields:
+            return None
+        if index == len(path) - 1:
+            return path
+        nested = _nested_model(model, part)
+        if nested is None:
+            return None
+        model = nested
+    return None
+
+
+def env_owned_field_paths(environ: Mapping[str, str] | None = None) -> frozenset[tuple[str, ...]]:
+    """Field paths the environment currently owns.
+
+    Ownership is decided by PRESENCE, not truthiness (AUG-241): pydantic-settings
+    applies ``TOPIC_WATCH_LLM__API_KEY=`` as an empty string that outranks YAML, so
+    the variable being set is what makes the field environment-owned. Every writer
+    and every UI control keys off this one function, so no field is handled by a
+    bespoke rule that can drift.
+    """
+    source = os.environ if environ is None else environ
+    owned = {path for name in source if (path := _env_field_path(name)) is not None}
+    return frozenset(owned)
+
+
+def strip_env_owned(data: dict[str, Any], environ: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Drop environment-owned paths from submitted settings data.
+
+    What is left is what the user may actually change. Removing a path from the init
+    data is what lets the environment source supply it again (init > env > YAML), so
+    an edit to an env-owned control is a visible no-op instead of a value that works
+    until the next restart and then silently reverts (AUG-241).
+    """
+    owned = env_owned_field_paths(environ)
+
+    def prune(section: dict[str, Any], prefix: tuple[str, ...]) -> dict[str, Any]:
+        kept: dict[str, Any] = {}
+        for key, value in section.items():
+            path = (*prefix, key)
+            if path in owned:
+                continue
+            kept[key] = prune(value, path) if isinstance(value, dict) else value
+        return kept
+
+    return prune(data, ())
+
 
 def is_api_key_env_sourced() -> bool:
     """Return True if the LLM API key is supplied via environment (env > YAML).
@@ -127,7 +189,7 @@ def is_api_key_env_sourced() -> bool:
     When True, the settings UI must treat the key as read-only and the save path must
     NOT materialize the env-derived secret into plaintext config.yml (OVH-003).
     """
-    return bool(os.environ.get(_API_KEY_ENV_VAR))
+    return ("llm", "api_key") in env_owned_field_paths()
 
 
 def is_exa_key_env_sourced() -> bool:
@@ -135,7 +197,7 @@ def is_exa_key_env_sourced() -> bool:
 
     Same read-only-UI and no-materialize-secret contract as the LLM key (OVH-003).
     """
-    return bool(os.environ.get(_EXA_API_KEY_ENV_VAR))
+    return ("exa", "api_key") in env_owned_field_paths()
 
 
 class LLMSettings(BaseModel):
@@ -561,27 +623,22 @@ def _merge_config_document(
     return merged
 
 
-def save_settings_to_yaml(
-    settings: "Settings",
-    config_path: Path,
-    preserve_api_key: bool = False,
-    preserve_exa_key: bool = False,
-) -> None:
+def save_settings_to_yaml(settings: "Settings", config_path: Path) -> None:
     """Write current settings back to the YAML config file.
+
+    Only values the YAML file owns are written. A field the environment supplies is
+    left exactly as the file already had it, because a ``Settings`` object cannot
+    say where each of its values came from — it carries the merged result, and
+    serializing that copies environment-derived credentials, notification URLs and
+    scalars into plaintext YAML (AUG-241). Provenance comes from
+    ``env_owned_field_paths`` instead, which covers every field rather than the two
+    API keys OVH-003 special-cased.
 
     Args:
         settings: The settings to persist.
         config_path: Destination YAML path.
-        preserve_api_key: When True, keep whatever LLM api_key is already on disk instead
-            of writing ``settings.llm.api_key``. Used when the key is env-sourced so the
-            env secret is not materialized into plaintext config.yml (OVH-003).
-        preserve_exa_key: Same as ``preserve_api_key`` but for ``settings.exa.api_key``.
     """
-    skip: set[tuple[str, ...]] = set()
-    if preserve_api_key:
-        skip.add(("llm", "api_key"))
-    if preserve_exa_key:
-        skip.add(("exa", "api_key"))
+    skip = set(env_owned_field_paths())
 
     document = _merge_config_document(
         read_config_document(config_path),
