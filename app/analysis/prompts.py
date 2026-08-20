@@ -393,8 +393,13 @@ do not add it. Also review existing facts during the merge and drop any that fai
 this test. The summary must stay tightly focused on exactly what the user asked \
 to monitor — not the broader subject area.
 
-Stay under {max_tokens} tokens. Set sufficient_data=false only if the new \
-findings are too vague or contradictory to incorporate meaningfully.
+Stay under {max_tokens} tokens. Set sufficient_data=false ONLY when the new \
+findings are entirely off-topic, carry no usable content, or are too vague to place \
+anywhere in the summary. A grounded contradiction is NOT such a case: rule 2 \
+applies — record both versions with attribution, or note the uncertainty \
+explicitly, and keep sufficient_data=true. A correction or a disputed claim is \
+information, and dropping it would leave the baseline saying the opposite of what \
+the sources now say.
 
 {rule_no_citations}
 

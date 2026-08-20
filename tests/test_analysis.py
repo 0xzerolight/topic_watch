@@ -2318,6 +2318,42 @@ class TestCitationStripEgress:
 
 
 # ============================================================
+# TestSufficientDataRules (AUG-162)
+# ============================================================
+
+
+class TestSufficientDataRules:
+    """The update prompt and the shared schema must agree on sufficient_data.
+
+    The prompt used to permit false for findings "too contradictory to
+    incorporate", while the schema reserves false for off-topic or content-free
+    input — and on false the caller keeps the old baseline yet still marks the
+    article processed, so a grounded correction was silently dropped.
+    """
+
+    def test_update_prompt_reserves_false_for_unusable_input(self) -> None:
+        system = build_knowledge_update_messages("cur", "sum", ["f"], _make_topic(), 500)[0]["content"]
+        assert "off-topic" in system
+        assert "sufficient_data=false ONLY when" in system
+
+    def test_update_prompt_does_not_allow_false_for_contradictions(self) -> None:
+        system = build_knowledge_update_messages("cur", "sum", ["f"], _make_topic(), 500)[0]["content"]
+        assert "too vague or contradictory" not in system
+        assert "grounded contradiction is NOT" in system
+
+    def test_update_prompt_requires_recording_contradictions(self) -> None:
+        system = build_knowledge_update_messages("cur", "sum", ["f"], _make_topic(), 500)[0]["content"]
+        assert "keep sufficient_data=true" in system
+        assert "attribution" in system
+
+    def test_schema_description_matches_the_prompt(self) -> None:
+        """Both halves of the contract name the same two cases."""
+        described = KnowledgeStateUpdate.model_fields["sufficient_data"].description or ""
+        assert "off-topic" in described
+        assert "no current state" in described.lower()
+
+
+# ============================================================
 # TestKnowledgePromptsUntrustedInput (AUG-016)
 # ============================================================
 
