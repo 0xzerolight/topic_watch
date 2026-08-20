@@ -2,6 +2,7 @@
 
 import sqlite3
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -1258,7 +1259,7 @@ class TestFetchNewArticlesForTopic:
         conn.commit()
         return topic
 
-    async def test_stores_new_articles(self, db_conn: sqlite3.Connection) -> None:
+    async def test_stores_new_articles(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         topic = self._make_topic(db_conn)
         topic.feed_urls = ["https://example.com/feed.xml"]
 
@@ -1274,7 +1275,7 @@ class TestFetchNewArticlesForTopic:
             patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=entries)),
             patch("app.scraping.extract_article_content", return_value="Extracted content"),
         ):
-            stored = (await fetch_new_articles_for_topic(topic, db_conn)).articles
+            stored = (await fetch_new_articles_for_topic(topic, db_path=db_path)).articles
 
         assert len(stored) == 1
         assert stored[0].title == "New Article"
@@ -1283,7 +1284,7 @@ class TestFetchNewArticlesForTopic:
         articles = list_articles_for_topic(db_conn, topic.id)
         assert len(articles) == 1
 
-    async def test_skips_duplicates(self, db_conn: sqlite3.Connection) -> None:
+    async def test_skips_duplicates(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         topic = self._make_topic(db_conn)
 
         entry = FeedEntry(
@@ -1310,11 +1311,11 @@ class TestFetchNewArticlesForTopic:
         db_conn.commit()
 
         with patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=[entry])):
-            stored = (await fetch_new_articles_for_topic(topic, db_conn)).articles
+            stored = (await fetch_new_articles_for_topic(topic, db_path=db_path)).articles
 
         assert len(stored) == 0
 
-    async def test_respects_max_articles(self, db_conn: sqlite3.Connection) -> None:
+    async def test_respects_max_articles(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         topic = self._make_topic(db_conn)
 
         entries = [
@@ -1331,19 +1332,19 @@ class TestFetchNewArticlesForTopic:
             patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=entries)),
             patch("app.scraping.extract_article_content", return_value="Content"),
         ):
-            stored = (await fetch_new_articles_for_topic(topic, db_conn, max_articles=2)).articles
+            stored = (await fetch_new_articles_for_topic(topic, db_path=db_path, max_articles=2)).articles
 
         assert len(stored) == 2
 
-    async def test_no_feeds_returns_empty(self, db_conn: sqlite3.Connection) -> None:
+    async def test_no_feeds_returns_empty(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         topic = self._make_topic(db_conn)
 
         with patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse()):
-            stored = (await fetch_new_articles_for_topic(topic, db_conn)).articles
+            stored = (await fetch_new_articles_for_topic(topic, db_path=db_path)).articles
 
         assert stored == []
 
-    async def test_content_extraction_failure_uses_fallback(self, db_conn: sqlite3.Connection) -> None:
+    async def test_content_extraction_failure_uses_fallback(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         topic = self._make_topic(db_conn)
 
         entries = [
@@ -1361,13 +1362,16 @@ class TestFetchNewArticlesForTopic:
                 side_effect=Exception("Network error"),
             ),
         ):
-            stored = (await fetch_new_articles_for_topic(topic, db_conn)).articles
+            stored = (await fetch_new_articles_for_topic(topic, db_path=db_path)).articles
 
         assert len(stored) == 1
         assert stored[0].raw_content == "Fallback summary text"
 
     async def test_partial_feed_failure_surfaced(
-        self, db_conn: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+        self,
+        db_conn: sqlite3.Connection,
+        caplog: pytest.LogCaptureFixture,
+        db_path: Path,
     ) -> None:
         """OVH-130: a degraded check (some feeds failed) propagates the counts to
         the FetchResult and logs a WARNING so it is distinguishable from healthy."""
@@ -1389,7 +1393,7 @@ class TestFetchNewArticlesForTopic:
             patch("app.scraping.extract_article_content", return_value="content"),
             caplog.at_level(logging.WARNING, logger="app.scraping"),
         ):
-            result = await fetch_new_articles_for_topic(topic, db_conn)
+            result = await fetch_new_articles_for_topic(topic, db_path=db_path)
 
         assert result.feeds_total == 3
         assert result.feeds_failed == 2
@@ -1398,7 +1402,10 @@ class TestFetchNewArticlesForTopic:
         assert "2 of 3" in partial[0]
 
     async def test_no_partial_warning_when_all_feeds_ok(
-        self, db_conn: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+        self,
+        db_conn: sqlite3.Connection,
+        caplog: pytest.LogCaptureFixture,
+        db_path: Path,
     ) -> None:
         """OVH-130: a fully-healthy fetch (no failures) must NOT log the degraded warning."""
         import logging
@@ -1413,13 +1420,16 @@ class TestFetchNewArticlesForTopic:
             patch("app.scraping.extract_article_content", return_value="content"),
             caplog.at_level(logging.WARNING, logger="app.scraping"),
         ):
-            result = await fetch_new_articles_for_topic(topic, db_conn)
+            result = await fetch_new_articles_for_topic(topic, db_path=db_path)
 
         assert result.feeds_failed == 0
         assert not [r for r in caplog.records if "partial feed-fetch failure" in r.getMessage()]
 
     async def test_feed_health_write_failure_warns(
-        self, db_conn: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+        self,
+        db_conn: sqlite3.Connection,
+        caplog: pytest.LogCaptureFixture,
+        db_path: Path,
     ) -> None:
         """OVH-132: a swallowed feed_health DB write surfaces at WARNING, not DEBUG —
         loss of health telemetry must be visible."""
@@ -1449,13 +1459,13 @@ class TestFetchNewArticlesForTopic:
             patch("app.scraping.upsert_feed_health_success", side_effect=Exception("locked")),
             caplog.at_level(logging.WARNING, logger="app.scraping"),
         ):
-            await fetch_new_articles_for_topic(topic, db_conn)
+            await fetch_new_articles_for_topic(topic, db_path=db_path)
 
         warns = [r for r in caplog.records if "Failed to record feed health" in r.getMessage()]
         assert len(warns) == 1
         assert warns[0].levelno == logging.WARNING
 
-    async def test_extraction_batch_reuses_one_pooled_client(self, db_conn: sqlite3.Connection) -> None:
+    async def test_extraction_batch_reuses_one_pooled_client(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         """OVH-128: the whole extraction batch shares ONE pooled httpx client.
 
         Every per-article extraction must receive the same non-None client (so
@@ -1493,7 +1503,7 @@ class TestFetchNewArticlesForTopic:
             patch("app.scraping.extract_article_content", side_effect=fake_extract),
             patch.object(httpx.AsyncClient, "__init__", counting_init),
         ):
-            stored = (await fetch_new_articles_for_topic(topic, db_conn)).articles
+            stored = (await fetch_new_articles_for_topic(topic, db_path=db_path)).articles
 
         assert len(stored) == 3
         # Every extraction got a real (non-None) client...
@@ -1503,7 +1513,7 @@ class TestFetchNewArticlesForTopic:
         # ...constructed exactly once for the whole batch.
         assert clients_constructed == 1
 
-    async def test_no_client_created_when_nothing_to_fetch(self, db_conn: sqlite3.Connection) -> None:
+    async def test_no_client_created_when_nothing_to_fetch(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         """OVH-128: a reuse-only batch (no network fetches) builds no extraction client."""
         topic = self._make_topic(db_conn)
 
@@ -1544,7 +1554,7 @@ class TestFetchNewArticlesForTopic:
             patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=[entry])),
             patch.object(httpx.AsyncClient, "__init__", counting_init),
         ):
-            stored = (await fetch_new_articles_for_topic(topic, db_conn)).articles
+            stored = (await fetch_new_articles_for_topic(topic, db_path=db_path)).articles
 
         assert len(stored) == 1
         assert stored[0].raw_content == "Reused body"
@@ -1565,7 +1575,7 @@ class TestPublishedAtPersistence:
         conn.commit()
         return topic
 
-    async def test_fresh_fetch_carries_published_at(self, db_conn: sqlite3.Connection) -> None:
+    async def test_fresh_fetch_carries_published_at(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         """Fresh-fetch path: published datetime on FeedEntry lands on stored Article."""
         topic = self._make_topic(db_conn)
         pub = datetime(2025, 6, 1, 8, 0, 0, tzinfo=UTC)
@@ -1580,7 +1590,7 @@ class TestPublishedAtPersistence:
             patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=[entry])),
             patch("app.scraping.extract_article_content", return_value="Body"),
         ):
-            stored = (await fetch_new_articles_for_topic(topic, db_conn)).articles
+            stored = (await fetch_new_articles_for_topic(topic, db_path=db_path)).articles
 
         assert len(stored) == 1
         assert stored[0].published_at == pub
@@ -1589,7 +1599,7 @@ class TestPublishedAtPersistence:
         loaded = list_articles_for_topic(db_conn, topic.id)
         assert loaded[0].published_at == pub
 
-    async def test_fresh_fetch_none_published_stores_none(self, db_conn: sqlite3.Connection) -> None:
+    async def test_fresh_fetch_none_published_stores_none(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         """FeedEntry with published=None stores published_at=None without error."""
         topic = self._make_topic(db_conn)
         entry = FeedEntry(
@@ -1603,12 +1613,12 @@ class TestPublishedAtPersistence:
             patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=[entry])),
             patch("app.scraping.extract_article_content", return_value="Body"),
         ):
-            stored = (await fetch_new_articles_for_topic(topic, db_conn)).articles
+            stored = (await fetch_new_articles_for_topic(topic, db_path=db_path)).articles
 
         assert len(stored) == 1
         assert stored[0].published_at is None
 
-    async def test_cross_topic_reuse_carries_published_at(self, db_conn: sqlite3.Connection) -> None:
+    async def test_cross_topic_reuse_carries_published_at(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         """Cross-topic reuse path: published_at from the new FeedEntry is stored."""
         topic_a = create_topic(db_conn, Topic(name="PubAtA", description="d"))
         topic_b = create_topic(db_conn, Topic(name="PubAtB", description="d"))
@@ -1644,7 +1654,7 @@ class TestPublishedAtPersistence:
         with (
             patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=[entry])),
         ):
-            stored = (await fetch_new_articles_for_topic(topic_b, db_conn)).articles
+            stored = (await fetch_new_articles_for_topic(topic_b, db_path=db_path)).articles
 
         assert len(stored) == 1
         reused = stored[0]
@@ -2029,25 +2039,57 @@ class TestResolveRedirectUrls:
 
 
 class TestFeedStateHelpers:
-    """Phase 1: health callback forwards validators; state loader reads the row."""
+    """AUG-171: outcomes are collected in memory, then applied in one short phase."""
 
-    def test_health_callback_forwards_validators(self, db_conn: sqlite3.Connection) -> None:
+    def test_health_collector_writes_nothing_during_the_fetch(self, db_conn: sqlite3.Connection) -> None:
         from app.crud import get_feed_health
-        from app.scraping import _make_health_callback
+        from app.scraping import FeedHealthOutcome, _make_health_collector
 
-        cb = _make_health_callback(db_conn)
+        outcomes: list[FeedHealthOutcome] = []
+        cb = _make_health_collector(outcomes)
         cb("https://ex.com/feed", True, None, 'W/"v1"', "LM1")
+
+        # The callback fires while other feeds are still in flight, so it must not
+        # have opened a write transaction: nothing is stored yet.
+        assert get_feed_health(db_conn, "https://ex.com/feed") is None
+        assert outcomes == [
+            FeedHealthOutcome(
+                feed_url="https://ex.com/feed",
+                success=True,
+                error_msg=None,
+                etag='W/"v1"',
+                last_modified="LM1",
+            )
+        ]
+
+    def test_apply_feed_health_persists_validators(self, db_conn: sqlite3.Connection) -> None:
+        from app.crud import get_feed_health
+        from app.scraping import FeedHealthOutcome, apply_feed_health
+
+        apply_feed_health(
+            db_conn,
+            [FeedHealthOutcome("https://ex.com/feed", True, None, 'W/"v1"', "LM1")],
+        )
         db_conn.commit()
         h = get_feed_health(db_conn, "https://ex.com/feed")
         assert h is not None and h.etag == 'W/"v1"' and h.last_modified == "LM1"
 
-    def test_feed_state_loader_returns_row(self, db_conn: sqlite3.Connection) -> None:
+    def test_apply_feed_health_records_failures(self, db_conn: sqlite3.Connection) -> None:
+        from app.crud import get_feed_health
+        from app.scraping import FeedHealthOutcome, apply_feed_health
+
+        apply_feed_health(db_conn, [FeedHealthOutcome("https://ex.com/feed", False, "boom")])
+        db_conn.commit()
+        h = get_feed_health(db_conn, "https://ex.com/feed")
+        assert h is not None and h.consecutive_failures == 1 and h.last_error_message == "boom"
+
+    def test_feed_state_loader_returns_row(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         from app.crud import upsert_feed_health_failure
         from app.scraping import _make_feed_state_loader
 
         upsert_feed_health_failure(db_conn, "https://ex.com/feed", "boom")
         db_conn.commit()
-        loader = _make_feed_state_loader(db_conn)
+        loader = _make_feed_state_loader(db_path)
         h = loader("https://ex.com/feed")
         assert h is not None and h.consecutive_failures == 1
         assert loader("https://missing.example/feed") is None
@@ -2204,7 +2246,7 @@ class TestManualBackoffAndValidators:
 class TestOrchestratorBackoff:
     """Phase 1: feeds_skipped propagates through the orchestrator + checker wiring."""
 
-    async def test_orchestrator_skips_backed_off_manual_feed(self, db_conn: sqlite3.Connection) -> None:
+    async def test_orchestrator_skips_backed_off_manual_feed(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         # Pre-seed a dead feed with enough failures to be deep in backoff.
         for _ in range(10):
             upsert_feed_health_failure(db_conn, "https://dead.example/feed", "boom")
@@ -2216,13 +2258,15 @@ class TestOrchestratorBackoff:
         )
         db_conn.commit()
 
-        result = await fetch_new_articles_for_topic(topic, db_conn)
+        result = await fetch_new_articles_for_topic(topic, db_path=db_path)
 
         assert result.feeds_skipped == 1
         assert result.feeds_total == 0
         assert result.articles == []
 
-    async def test_orchestrator_feeds_skipped_survives_final_return(self, db_conn: sqlite3.Connection) -> None:
+    async def test_orchestrator_feeds_skipped_survives_final_return(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
         # A live feed yields one entry AND one feed was skipped — feeds_skipped must
         # survive on the final FetchResult return, not just the early-empty path.
         topic = create_topic(
@@ -2241,7 +2285,7 @@ class TestOrchestratorBackoff:
             patch("app.scraping.fetch_feeds_for_topic", return_value=response),
             patch("app.scraping.extract_article_content", return_value="body text"),
         ):
-            result = await fetch_new_articles_for_topic(topic, db_conn)
+            result = await fetch_new_articles_for_topic(topic, db_path=db_path)
 
         assert result.feeds_skipped == 1
         assert len(result.articles) == 1

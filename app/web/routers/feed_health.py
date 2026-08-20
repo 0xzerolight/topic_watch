@@ -21,7 +21,7 @@ router = APIRouter()
 @router.get("/feeds", response_class=HTMLResponse)
 async def feed_health_page(
     request: Request,
-    conn: sqlite3.Connection = Depends(get_db_conn),
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
     settings: Settings = Depends(get_settings),
 ):
     """Global feed health dashboard."""

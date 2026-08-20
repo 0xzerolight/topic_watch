@@ -73,7 +73,7 @@ def _csv_safe(value: object) -> object:
 
 @router.get("/export/topics/json")
 async def export_all_topics_json(
-    conn: sqlite3.Connection = Depends(get_db_conn),
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
 ):
     """Export all topics as JSON."""
     topics = list_topics(conn)
@@ -95,7 +95,7 @@ async def export_all_topics_json(
 @router.get("/topics/{topic_id}/export/json")
 async def export_topic_json(
     topic_id: int,
-    conn: sqlite3.Connection = Depends(get_db_conn),
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
 ):
     """Export a topic with articles and check results as JSON."""
     topic = get_topic(conn, topic_id)
@@ -127,7 +127,7 @@ async def export_topic_json(
 @router.get("/topics/{topic_id}/export/csv")
 async def export_topic_csv(
     topic_id: int,
-    conn: sqlite3.Connection = Depends(get_db_conn),
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
 ):
     """Export check results for a topic as CSV."""
     topic = get_topic(conn, topic_id)

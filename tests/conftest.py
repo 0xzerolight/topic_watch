@@ -92,6 +92,20 @@ def _safe_lifespan_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture(autouse=True)
+def _safe_default_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Point ``get_db(None)`` / ``init_db(None)`` at a temp DB, never the real one.
+
+    The pipeline now opens its own short-lived connections from a path instead of
+    borrowing the caller's connection, so a code path that forgets to thread
+    ``db_path`` falls back to ``DEFAULT_DB_PATH`` — the developer's real
+    ``data/topic_watch.db``. Redirect the fallback so such a test fails loudly on
+    an empty database instead of quietly mutating live data. Mirrors
+    ``_safe_config_path`` and ``_safe_lifespan_db``.
+    """
+    monkeypatch.setattr("app.database.DEFAULT_DB_PATH", tmp_path / "default-fallback.db")
+
+
+@pytest.fixture(autouse=True)
 def _reset_checking_state():
     """Reset the in-progress check tracker between tests to prevent bleed.
 
@@ -114,9 +128,21 @@ def _reset_checking_state():
 
 
 @pytest.fixture
-def db_conn(tmp_path: Path) -> Generator[sqlite3.Connection, None, None]:
+def db_path(tmp_path: Path) -> Path:
+    """Path of this test's database file.
+
+    The pipeline no longer accepts a caller's connection — it opens a short-lived
+    one per phase from a path — so tests that drive ``check_topic`` /
+    ``initialize_new_topic`` / ``fetch_new_articles_for_topic`` pass this instead
+    of ``db_conn``. Request ``db_conn`` too when the test also wants to read or
+    seed rows directly; both name the same file.
+    """
+    return tmp_path / "test.db"
+
+
+@pytest.fixture
+def db_conn(db_path: Path) -> Generator[sqlite3.Connection, None, None]:
     """Provide a fresh database with schema initialized."""
-    db_path = tmp_path / "test.db"
     init_db(db_path)
     conn = get_connection(db_path)
     try:

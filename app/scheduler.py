@@ -115,33 +115,38 @@ async def _init_new_topics(settings: Settings, db_path: Path | None = None) -> N
     try:
         with get_db(db_path) as conn:
             new_topics = get_new_topics(conn, limit=1)
-            if not new_topics:
-                return
-            topic = new_topics[0]
-            if topic.id is None:
-                return
-            topic_id = topic.id
+        if not new_topics:
+            return
+        topic = new_topics[0]
+        if topic.id is None:
+            return
+        topic_id = topic.id
 
-            # In-process guard: shares the same slot the web background init
-            # (_run_init) holds, so a same-process Retry click and this tick
-            # can't both run init. Skip rather than queue behind it.
-            if not await _checking_state.start_check(topic_id):
-                logger.debug("NEW topic init: topic '%s' already being initialized; skipping", topic.name)
+        # In-process guard: shares the same slot the web background init
+        # (_run_init) holds, so a same-process Retry click and this tick
+        # can't both run init. Skip rather than queue behind it.
+        if not await _checking_state.start_check(topic_id):
+            logger.debug("NEW topic init: topic '%s' already being initialized; skipping", topic.name)
+            return
+        try:
+            # Cross-process atomic claim (NEW -> RESEARCHING): only the caller
+            # whose conditional UPDATE matched a still-NEW row proceeds (OVH-032).
+            with get_db(db_path) as conn:
+                claimed = claim_new_topic_for_init(conn, topic_id)
+                conn.commit()
+            if not claimed:
+                logger.debug(
+                    "NEW topic init: topic '%s' no longer NEW (claimed elsewhere); skipping",
+                    topic.name,
+                )
                 return
-            try:
-                # Cross-process atomic claim (NEW -> RESEARCHING): only the caller
-                # whose conditional UPDATE matched a still-NEW row proceeds (OVH-032).
-                if not claim_new_topic_for_init(conn, topic_id):
-                    logger.debug(
-                        "NEW topic init: topic '%s' no longer NEW (claimed elsewhere); skipping",
-                        topic.name,
-                    )
-                    return
-                # Reflect the won claim in the in-memory snapshot before init runs.
-                topic.status = TopicStatus.RESEARCHING
-                await initialize_new_topic(topic, conn, settings)
-            finally:
-                await _checking_state.finish_check(topic_id)
+            # Reflect the won claim in the in-memory snapshot before init runs.
+            topic.status = TopicStatus.RESEARCHING
+            # No connection is held across the init's fetch + LLM awaits: it opens
+            # its own short-lived one per phase (AUG-136).
+            await initialize_new_topic(topic, settings, db_path=db_path)
+        finally:
+            await _checking_state.finish_check(topic_id)
     except Exception:
         logger.error("NEW topic initialization failed", exc_info=True)
 

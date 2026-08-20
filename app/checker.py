@@ -8,10 +8,16 @@ state, sends notifications for genuine updates, and records the outcome.
 import asyncio
 import logging
 import sqlite3
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from app.analysis.knowledge import initialize_knowledge, update_knowledge
+from app.analysis.knowledge import (
+    KnowledgeUpdatePlan,
+    apply_knowledge_update,
+    prepare_initial_knowledge,
+    prepare_knowledge_update,
+)
 from app.analysis.llm import analyze_articles
 from app.check_context import check_id_var, generate_check_id
 from app.config import Settings
@@ -24,17 +30,27 @@ from app.crud import (
     delete_expired_notifications,
     delete_pending_notification,
     get_knowledge_state,
+    get_topic,
     get_topics_due_for_check,
     increment_notification_retry,
     list_pending_notifications,
     mark_articles_processed,
     release_stale_notification_claims,
+    topic_generation_matches,
     update_check_result_delivery,
     update_topic_init_status,
 )
 from app.database import get_db, short_conn
 from app.heartbeat import evaluate_heartbeat
-from app.models import CheckResult, NotificationDelivery, PendingNotification, Topic, TopicStatus
+from app.models import (
+    CheckResult,
+    KnowledgeRevisionSource,
+    NotificationDelivery,
+    NotifyDisposition,
+    PendingNotification,
+    Topic,
+    TopicStatus,
+)
 from app.notifications import format_notification, redact_url, send_notification, send_notification_per_url
 from app.scraping import all_sources_failed, fetch_new_articles_for_topic
 from app.web.state import _checking_state
@@ -59,23 +75,150 @@ def _summarize_exc(exc: BaseException, *, limit: int = 200) -> str:
     return summary[:limit]
 
 
+class CheckTransitionAborted(Exception):
+    """The durable transition was refused because the world moved underneath it.
+
+    Raised inside the C3 transaction when the topic was deleted and its rowid
+    recycled, or when the knowledge state advanced while this check's LLM phase
+    was running. Both mean the work in hand was computed against state that no
+    longer exists, so nothing is written and no CheckResult is recorded — the
+    next cycle re-runs cleanly against the live state.
+    """
+
+
+@dataclass
+class TopicSnapshot:
+    """Everything the pipeline reads from the database before it goes offline.
+
+    Taken under a short connection at the start of a check and carried through
+    every network/LLM phase, so no connection has to stay open to answer "what
+    did the row say?". ``generation`` and ``knowledge_version`` are the two values
+    the durable transition re-checks before writing: the first proves the topic is
+    still the same topic, the second proves the knowledge summary this check built
+    on is still current.
+    """
+
+    topic: Topic
+    generation: str
+    knowledge_version: int
+    knowledge_summary: str
+
+
+@dataclass
+class CheckOutcome:
+    """The complete set of durable changes one check wants to make.
+
+    Accumulated with no connection open, then applied by
+    ``_commit_check_transition`` in a single transaction. Keeping it a plain value
+    is what makes the transition atomic: nothing here is written until every part
+    of it can be.
+    """
+
+    result: CheckResult
+    knowledge_plan: KnowledgeUpdatePlan | None = None
+    knowledge_source: KnowledgeRevisionSource = KnowledgeRevisionSource.UPDATE
+    knowledge_change_note: str | None = None
+    article_ids: list[int] = field(default_factory=list)
+    """Articles this check evaluated, to be marked processed."""
+    failed_article_ids: list[int] = field(default_factory=list)
+    """Articles whose analysis failed. Populated by the failure-path semantics
+    task; A1 leaves it empty so the disposition rules stay in one place."""
+    notify_disposition: str | None = None
+
+
+def _snapshot_topic(conn: sqlite3.Connection, topic_id: int) -> TopicSnapshot | None:
+    """Read the live topic row and its knowledge state. ``None`` if the topic is gone.
+
+    Deliberately re-reads rather than trusting the ``Topic`` the caller passed in:
+    that object may have been loaded minutes earlier (a queued background task, a
+    scheduler snapshot taken before a slow sibling check), so its status,
+    active flag and thresholds can all be stale by the time the check runs.
+    """
+    topic = get_topic(conn, topic_id)
+    if topic is None:
+        return None
+    knowledge = get_knowledge_state(conn, topic_id)
+    return TopicSnapshot(
+        topic=topic,
+        generation=topic.generation,
+        knowledge_version=knowledge.version if knowledge else 0,
+        knowledge_summary=knowledge.summary_text if knowledge else "",
+    )
+
+
+def _commit_check_transition(
+    conn: sqlite3.Connection,
+    snapshot: TopicSnapshot,
+    outcome: CheckOutcome,
+    *,
+    settings: Settings,
+) -> CheckResult:
+    """Apply a whole check's durable state in ONE transaction. The C3 boundary.
+
+    Knowledge write, revision append, article disposition and the CheckResult were
+    previously three independent commits spread across the pipeline, so a crash or
+    a rollback between any two left a partial transition: knowledge advanced with
+    no check recorded, or a check recorded against knowledge that never landed.
+    Here they either all happen or none do.
+
+    ``BEGIN IMMEDIATE`` takes the write lock up front so the generation and
+    version guards below are evaluated against state no concurrent writer can
+    change before this transaction commits. Raises ``CheckTransitionAborted``
+    when either guard fails; the caller's connection context rolls back.
+    """
+    topic_id = snapshot.topic.id
+    if topic_id is None:
+        raise ValueError("Topic must have an ID")
+
+    conn.execute("BEGIN IMMEDIATE")
+
+    if not topic_generation_matches(conn, topic_id, snapshot.generation):
+        raise CheckTransitionAborted(f"topic_id={topic_id} was deleted or replaced during this check")
+
+    if outcome.knowledge_plan is not None:
+        applied = apply_knowledge_update(
+            conn,
+            topic_id,
+            outcome.knowledge_plan,
+            expected_version=snapshot.knowledge_version,
+            source=outcome.knowledge_source,
+            settings=settings,
+            change_note=outcome.knowledge_change_note,
+        )
+        if not applied:
+            raise CheckTransitionAborted(
+                f"knowledge for topic_id={topic_id} moved past version {snapshot.knowledge_version}"
+            )
+
+    mark_articles_processed(conn, outcome.article_ids)
+    outcome.result.notify_disposition = outcome.notify_disposition
+    created = create_check_result(conn, outcome.result)
+    conn.commit()
+    return created
+
+
 async def check_topic(
     topic: Topic,
-    conn: sqlite3.Connection,
     settings: Settings,
     *,
+    db_path: Path | None = None,
     guard: bool = True,
 ) -> CheckResult:
     """Run the full check pipeline for a single topic.
 
-    Steps:
-        1. Validate topic is in READY status
-        2. Fetch new articles (scraping + dedup)
-        3. If no new articles, return early
-        4. Analyze articles against knowledge state (LLM)
-        5. If new info found: update knowledge state, send notification
-        6. Mark articles as processed
-        7. Record and return CheckResult
+    Phases (AUG-136): the pipeline never holds a database connection across a
+    network or LLM await. It snapshots what it needs under a short connection,
+    runs fetch/analysis/knowledge-generation with nothing open, applies every
+    durable change in one transaction, and only then performs the irreversible
+    sends.
+
+        P0  snapshot (short connection)
+        P1  fetch new articles (connection-free; owns its own short phases)
+        P2  analyze against the snapshotted knowledge (connection-free)
+        P3  generate the knowledge update (connection-free)
+        C3  ONE transaction: knowledge + revision + article disposition + result
+        P4  notification and webhook sends (connection-free)
+        C4  record the delivery outcome; run the Silence Heartbeat
 
     Concurrency: ``check_topic`` is the single per-topic funnel, so it acquires
     the process-wide ``_checking_state`` guard itself (OVH-096). The scheduler
@@ -88,9 +231,10 @@ async def check_topic(
     self-blocking on the entry they already own.
 
     Args:
-        topic: The topic to check. Must have an id and be in READY status.
-        conn: Database connection for reads and writes.
+        topic: The topic to check. Must have an id; its status is re-read from
+            the database at P0, so a stale in-memory copy is safe to pass.
         settings: Application settings.
+        db_path: Database path used to open each phase's short-lived connection.
         guard: When True (default), acquire/release the per-topic in-flight
             guard. Pass False when the caller already holds it.
 
@@ -102,21 +246,21 @@ async def check_topic(
     topic_id: int = topic.id
 
     if not guard:
-        return await _check_topic_guarded(topic, conn, settings)
+        return await _check_topic_guarded(topic, settings, db_path)
 
     if not await _checking_state.start_check(topic_id):
         logger.info("Topic '%s' (id=%d) already being checked; skipping", topic.name, topic_id)
         return CheckResult(topic_id=topic_id, stage_error="skipped: already in flight")
     try:
-        return await _check_topic_guarded(topic, conn, settings)
+        return await _check_topic_guarded(topic, settings, db_path)
     finally:
         await _checking_state.finish_check(topic_id)
 
 
 async def _check_topic_guarded(
     topic: Topic,
-    conn: sqlite3.Connection,
     settings: Settings,
+    db_path: Path | None,
 ) -> CheckResult:
     """Run the pipeline with a fresh check_id (caller owns the in-flight guard)."""
     if topic.id is None:
@@ -129,15 +273,15 @@ async def _check_topic_guarded(
     token = check_id_var.set(cid)
 
     try:
-        return await _check_topic_inner(topic, conn, settings, cid)
+        return await _check_topic_inner(topic, settings, db_path, cid)
     finally:
         check_id_var.reset(token)
 
 
 async def _check_topic_inner(
     topic: Topic,
-    conn: sqlite3.Connection,
     settings: Settings,
+    db_path: Path | None,
     cid: str,
 ) -> CheckResult:
     """Inner implementation of check_topic with check_id already set."""
@@ -147,6 +291,14 @@ async def _check_topic_inner(
     result = CheckResult(topic_id=topic_id)
 
     logger.info("Starting check for topic '%s' [check_id=%s]", topic.name, cid)
+
+    # --- P0: snapshot under a short connection, then run offline.
+    with get_db(db_path) as conn:
+        snapshot = _snapshot_topic(conn, topic_id)
+    if snapshot is None:
+        logger.warning("Topic id=%d no longer exists; skipping check", topic_id)
+        return CheckResult(topic_id=topic_id, stage_error="skipped: topic no longer exists")
+    topic = snapshot.topic
 
     # Only check READY topics
     if topic.status != TopicStatus.READY:
@@ -159,13 +311,13 @@ async def _check_topic_inner(
         # it must neither alert nor claim recovery. The row it records carries no
         # stage_error, so it also breaks any running streak — harmless, since this
         # path is only reachable from a manual CLI/UI check.
-        return _record_result(conn, result)
+        return _record_result(db_path, result)
 
-    # Step 1: Fetch new articles
+    # --- P1: fetch new articles. Opens and closes its own short connections.
     try:
         fetch_result = await fetch_new_articles_for_topic(
             topic,
-            conn,
+            db_path=db_path,
             max_articles=settings.max_articles_per_check,
             feed_fetch_timeout=settings.feed_fetch_timeout,
             article_fetch_timeout=settings.article_fetch_timeout,
@@ -178,7 +330,7 @@ async def _check_topic_inner(
     except Exception as exc:
         logger.warning("Scraping failed for topic '%s'", topic.name, exc_info=True)
         result.stage_error = f"scrape_failed: {_summarize_exc(exc)}"
-        return await _finish_check(conn, topic, result, settings)
+        return await _finish_check(db_path, topic, result, settings)
 
     new_articles = fetch_result.articles
     result.articles_found = fetch_result.total_feed_entries
@@ -199,14 +351,11 @@ async def _check_topic_inner(
             detail = f"{skipped} feed(s) in backoff" if skipped else "no source configured or enabled"
             result.stage_error = f"sources_unavailable: no source attempted ({detail})"
         logger.info("Topic '%s': no new articles found", topic.name)
-        return await _finish_check(conn, topic, result, settings)
+        return await _finish_check(db_path, topic, result, settings)
 
-    # Step 2: Get current knowledge state
-    knowledge = get_knowledge_state(conn, topic_id)
-    knowledge_summary = knowledge.summary_text if knowledge else ""
-
-    # Step 3: Analyze articles for novelty (returns safe default on LLM error)
-    novelty = await analyze_articles(new_articles, knowledge_summary, topic, settings)
+    # --- P2: analyze against the knowledge snapshotted at P0, with no connection
+    # open (returns a safe default on LLM error — analyze_articles never raises).
+    novelty = await analyze_articles(new_articles, snapshot.knowledge_summary, topic, settings)
     result.has_new_info = novelty.has_new_info
     result.llm_response = novelty.model_dump_json()
     result.prompt_tokens += novelty.prompt_tokens
@@ -217,6 +366,10 @@ async def _check_topic_inner(
     # broken analysis is not byte-identical to a clean "nothing new" run.
     if novelty.error:
         result.stage_error = f"analysis_failed: {novelty.error}"
+
+    # Why this check will or will not notify, recorded truthfully on the row so
+    # "we chose not to send" is never indistinguishable from "we sent" (m026).
+    disposition: str = NotifyDisposition.ANALYSIS_FAILED if novelty.error else NotifyDisposition.NO_NEW_INFO
 
     # Effective thresholds: per-topic override (NULL = inherit global).
     confidence_threshold = (
@@ -230,15 +383,16 @@ async def _check_topic_inner(
     # which every importance score passes.
     importance_threshold = topic.importance_threshold if topic.importance_threshold is not None else 1
 
-    # Step 4: If new info above thresholds, update knowledge. The notification
-    # /webhook SENDS are deferred to Step 6 — AFTER the durable state is
-    # committed — so an irreversible alert is never dispatched inside the same
-    # transaction window that could later roll back (OVH-066).
+    # --- P3: if new info clears the thresholds, generate the knowledge update.
+    # Still connection-free: this is another multi-second LLM round-trip, and the
+    # plan it produces is not written until the C3 transaction below.
     knowledge_update_failed = False
     should_notify = False
     notification: tuple[str, str] | None = None
+    knowledge_plan: KnowledgeUpdatePlan | None = None
     if novelty.has_new_info:
         if novelty.confidence < confidence_threshold:
+            disposition = NotifyDisposition.BELOW_CONFIDENCE
             logger.info(
                 "Topic '%s': new info detected but confidence %.2f below threshold %.2f, skipping notification",
                 topic.name,
@@ -246,6 +400,7 @@ async def _check_topic_inner(
                 confidence_threshold,
             )
         elif novelty.relevance < relevance_threshold:
+            disposition = NotifyDisposition.BELOW_RELEVANCE
             logger.info(
                 "Topic '%s': new info detected but relevance %.2f below threshold %.2f, skipping notification",
                 topic.name,
@@ -259,6 +414,7 @@ async def _check_topic_inner(
             # knowledge state still absorbs it — otherwise the same trivial fact
             # would re-flag as "new" every cycle.
             should_notify = novelty.importance >= importance_threshold
+            disposition = NotifyDisposition.PENDING if should_notify else NotifyDisposition.SUPPRESSED_IMPORTANCE
             if not should_notify:
                 logger.info(
                     "Topic '%s': new info importance %d below threshold %d, updating knowledge without notification",
@@ -267,9 +423,12 @@ async def _check_topic_inner(
                     importance_threshold,
                 )
             try:
-                write_result = await update_knowledge(topic, novelty, conn, settings)
-                result.prompt_tokens += write_result.usage.prompt_tokens
-                result.completion_tokens += write_result.usage.completion_tokens
+                plan = await prepare_knowledge_update(topic, novelty, snapshot.knowledge_summary, settings)
+                result.prompt_tokens += plan.usage.prompt_tokens
+                result.completion_tokens += plan.usage.completion_tokens
+                # An insufficient-data verdict preserves the existing state, so
+                # there is nothing to apply.
+                knowledge_plan = plan if plan.sufficient_data else None
             except Exception as exc:
                 logger.warning(
                     "Knowledge update failed for topic '%s'",
@@ -285,29 +444,40 @@ async def _check_topic_inner(
             if should_notify:
                 notification = format_notification(topic.name, novelty)
 
-    # Step 5: Mark articles as processed. "processed" means "we've evaluated
-    # this article" — set even for below-threshold (new-but-not-notified) and
-    # not-new articles, so they are never re-analyzed. Leaving them unprocessed
-    # would re-fetch + re-analyze them every cycle after retention deletion +
-    # feed reappearance, wasting LLM quota.
+    # Article disposition. "processed" means "we've evaluated this article" — set
+    # even for below-threshold (new-but-not-notified) and not-new articles, so
+    # they are never re-analyzed. Leaving them unprocessed would re-fetch +
+    # re-analyze them every cycle after retention deletion + feed reappearance,
+    # wasting LLM quota.
     #
     # Exception (OVH-009): when the knowledge update failed, the recorded
     # knowledge state is now stale. Leave these articles unprocessed so the next
     # cycle re-fetches and re-attempts the update instead of silently diverging.
-    if not knowledge_update_failed:
-        article_ids = [a.id for a in new_articles if a.id is not None]
-        if article_ids:
-            mark_articles_processed(conn, article_ids)
+    article_ids = [] if knowledge_update_failed else [a.id for a in new_articles if a.id is not None]
 
-    # Step 6: Durable-state commit boundary (OVH-066). Persist the knowledge
-    # update + processed flags + CheckResult in one explicit write transaction
-    # BEFORE any irreversible network send. If this commit fails, no alert has
-    # gone out and the next cycle re-runs cleanly. Creating the CheckResult here
-    # also gives the webhook queue a real check_result_id (OVH-101).
-    result = create_check_result(conn, result)
-    conn.commit()
+    # --- C3: THE durable transition. Knowledge + revision + article disposition
+    # + CheckResult in one commit, fenced by the P0 generation and knowledge
+    # version, and completed BEFORE any irreversible send — so a failure here
+    # leaves nothing behind and the next cycle re-runs cleanly (OVH-066), while a
+    # crash after it leaves a complete, self-consistent record.
+    outcome = CheckOutcome(
+        result=result,
+        knowledge_plan=knowledge_plan,
+        knowledge_source=KnowledgeRevisionSource.UPDATE,
+        knowledge_change_note=novelty.summary,
+        article_ids=article_ids,
+        notify_disposition=disposition,
+    )
+    try:
+        with get_db(db_path) as conn:
+            result = _commit_check_transition(conn, snapshot, outcome, settings=settings)
+    except CheckTransitionAborted as exc:
+        logger.warning("Check for topic '%s' aborted at the durable transition: %s", topic.name, exc)
+        result.stage_error = f"transition_aborted: {exc}"
+        return result
 
-    # Step 7: Irreversible network sends, now that durable state is committed.
+    # --- P4: irreversible network sends, now that durable state is committed and
+    # no connection is open.
     if should_notify and notification is not None:
         title, body = notification
         # Deliver per-URL so a partial failure (one channel down) re-queues only
@@ -319,22 +489,27 @@ async def _check_topic_inner(
         if failed:
             # Surface the first/aggregated reason without leaking a raw URL.
             result.notification_error = _summarize_delivery_failures(failed)
-            # Correlate queued rows to this check (OVH-040 traceability), mirroring
-            # the webhook path which already threads check_result_id.
-            _queue_failed_notifications(conn, topic_id, title, body, deliveries, check_result_id=result.id)
+            # TW-AUD-005: commit the retry intents on their own short connection
+            # BEFORE the webhook I/O below. Staging them on a connection that then
+            # awaited webhook delivery held the WAL writer across that await, and a
+            # cancellation rolled the intents back — losing the record that these
+            # channels still owe a delivery. Correlated to this check (OVH-040).
+            with get_db(db_path) as conn:
+                _queue_failed_notifications(conn, topic_id, title, body, deliveries, check_result_id=result.id)
+                conn.commit()
 
-        # Send webhooks (independent of Apprise success/failure). Pass the
-        # connection + topic_id + check_result_id so failed deliveries are
-        # enqueued to pending_webhooks (correlated to this check) for retry
-        # instead of being dropped.
+        # Send webhooks (independent of Apprise success/failure). Pass db_path +
+        # topic_id + check_result_id so failed deliveries are enqueued to
+        # pending_webhooks (correlated to this check) for retry instead of being
+        # dropped — on a short connection of their own, never this caller's.
         try:
             await send_webhooks(
                 topic.name,
                 novelty,
                 settings,
-                conn=conn,
                 topic_id=topic_id,
                 check_result_id=result.id,
+                db_path=db_path,
             )
         except Exception:
             logger.warning(
@@ -343,20 +518,21 @@ async def _check_topic_inner(
                 exc_info=True,
             )
 
-        # Step 8: Record the post-send delivery outcome onto the committed row.
+        # --- C4: record the post-send delivery outcome onto the committed row.
         if result.id is not None:
-            update_check_result_delivery(
-                conn,
-                result.id,
-                notification_sent=result.notification_sent,
-                notification_error=result.notification_error,
-            )
-            conn.commit()
+            with get_db(db_path) as conn:
+                update_check_result_delivery(
+                    conn,
+                    result.id,
+                    notification_sent=result.notification_sent,
+                    notification_error=result.notification_error,
+                )
+                conn.commit()
 
     # Reaching analysis proves the sources are alive: clear any outstanding
     # Silence Heartbeat (and announce the recovery once). The CheckResult was
-    # committed at the Step 6 boundary above, so the streak query sees it.
-    await _run_heartbeat(conn, topic, result.id, settings)
+    # committed at the C3 boundary above, so the streak query sees it.
+    await _run_heartbeat(db_path, topic, result.id, settings)
 
     logger.info(
         "Topic '%s': %d articles, new_info=%s, notified=%s",
@@ -369,27 +545,28 @@ async def _check_topic_inner(
     return result
 
 
-def _record_result(conn: sqlite3.Connection, result: CheckResult) -> CheckResult:
-    """Persist a CheckResult and commit (used by the no-send early-return paths)."""
-    created = create_check_result(conn, result)
-    conn.commit()
+def _record_result(db_path: Path | None, result: CheckResult) -> CheckResult:
+    """Persist a CheckResult on a short connection (the no-send early-return paths)."""
+    with get_db(db_path) as conn:
+        created = create_check_result(conn, result)
+        conn.commit()
     return created
 
 
 async def _finish_check(
-    conn: sqlite3.Connection,
+    db_path: Path | None,
     topic: Topic,
     result: CheckResult,
     settings: Settings,
 ) -> CheckResult:
     """Persist a no-send check result, then run the Silence Heartbeat over it."""
-    recorded = _record_result(conn, result)
-    await _run_heartbeat(conn, topic, recorded.id, settings)
+    recorded = _record_result(db_path, result)
+    await _run_heartbeat(db_path, topic, recorded.id, settings)
     return recorded
 
 
 async def _run_heartbeat(
-    conn: sqlite3.Connection,
+    db_path: Path | None,
     topic: Topic,
     check_result_id: int | None,
     settings: Settings,
@@ -402,6 +579,9 @@ async def _run_heartbeat(
     boundary: a crash mid-send costs one missed message instead of re-alerting on
     every subsequent check. The conditional UPDATE also makes the send
     exactly-once when a CLI check-all races the server.
+
+    Each database interaction runs on its own short connection, so the send below
+    never has one open behind it.
     """
     try:
         if topic.id is None:
@@ -411,24 +591,28 @@ async def _run_heartbeat(
             # Switching the feature off must also reset the latch, silently.
             # Otherwise a topic latched during an outage keeps that state parked
             # and fires a phantom "recovered" whenever the feature is re-enabled.
-            if topic.heartbeat_alerted_at is not None and clear_heartbeat_alert(conn, topic.id):
-                conn.commit()
+            if topic.heartbeat_alerted_at is not None:
+                with get_db(db_path) as conn:
+                    if clear_heartbeat_alert(conn, topic.id):
+                        conn.commit()
             return
 
-        action = evaluate_heartbeat(conn, topic, settings.silence_heartbeat_checks)
-        if action is None:
-            return
+        with get_db(db_path) as conn:
+            action = evaluate_heartbeat(conn, topic, settings.silence_heartbeat_checks)
+            if action is None:
+                return
 
-        if action.kind == "alert":
-            won = claim_heartbeat_alert(conn, topic.id, datetime.now(UTC))
-        else:
-            won = clear_heartbeat_alert(conn, topic.id)
-        if not won:
-            # Another checker (e.g. a CLI run against the live server) already sent
-            # this one. Release the implicit write transaction the UPDATE opened.
-            conn.rollback()
-            return
-        conn.commit()
+            if action.kind == "alert":
+                won = claim_heartbeat_alert(conn, topic.id, datetime.now(UTC))
+            else:
+                won = clear_heartbeat_alert(conn, topic.id)
+            if not won:
+                # Another checker (e.g. a CLI run against the live server) already
+                # sent this one. Release the implicit write transaction the UPDATE
+                # opened.
+                conn.rollback()
+                return
+            conn.commit()
 
         deliveries = await send_notification_per_url(action.title, action.body, settings)
         failed = [d for d in deliveries if not d.ok]
@@ -438,15 +622,16 @@ async def _run_heartbeat(
                 topic.name,
                 _summarize_delivery_failures(failed),
             )
-            _queue_failed_notifications(
-                conn,
-                topic.id,
-                action.title,
-                action.body,
-                deliveries,
-                check_result_id=check_result_id,
-            )
-            conn.commit()
+            with get_db(db_path) as conn:
+                _queue_failed_notifications(
+                    conn,
+                    topic.id,
+                    action.title,
+                    action.body,
+                    deliveries,
+                    check_result_id=check_result_id,
+                )
+                conn.commit()
     except Exception:
         logger.warning("Silence Heartbeat failed for topic '%s'", topic.name, exc_info=True)
 
@@ -638,7 +823,7 @@ async def check_all_topics(
         short-lived connections internally (snapshot, send with none held,
         commit per item)
       * the due-topics query — one connection
-      * each topic check — a fresh connection per topic
+      * each topic check — ``check_topic`` opens its own per-phase connections
 
     Each topic is checked independently. Errors in one topic do not
     affect others.
@@ -705,8 +890,11 @@ async def _check_all_topics_inner(
     async def _check_one(topic: Topic) -> CheckResult | None:
         async with semaphore:
             try:
-                with get_db(db_path) as conn:
-                    return await check_topic(topic, conn, settings)
+                # No connection is opened here: check_topic owns its own
+                # short-lived per-phase connections (AUG-136). Wrapping this call
+                # in one held the handle — and, via the feed-health callback, the
+                # WAL writer — across every fetch/LLM/send await in the pipeline.
+                return await check_topic(topic, settings, db_path=db_path)
             except Exception:
                 logger.error(
                     "Unexpected error checking topic '%s'",
@@ -726,21 +914,69 @@ async def _check_all_topics_inner(
     return results
 
 
+def _commit_init_transition(
+    conn: sqlite3.Connection,
+    snapshot: TopicSnapshot,
+    plan: KnowledgeUpdatePlan,
+    article_ids: list[int],
+    settings: Settings,
+) -> None:
+    """Land a whole initialization in ONE transaction: knowledge + articles + READY.
+
+    Mirrors ``_commit_check_transition``. Previously the knowledge write, the
+    revision, the article disposition and the READY status were four separate
+    commits, so an interruption between any two left a topic that was READY with
+    no knowledge, or carried knowledge while still showing RESEARCHING.
+    """
+    topic_id = snapshot.topic.id
+    if topic_id is None:
+        raise ValueError("Topic must have an ID")
+
+    conn.execute("BEGIN IMMEDIATE")
+
+    if not topic_generation_matches(conn, topic_id, snapshot.generation):
+        raise CheckTransitionAborted(f"topic_id={topic_id} was deleted or replaced during initialization")
+
+    if not apply_knowledge_update(
+        conn,
+        topic_id,
+        plan,
+        expected_version=snapshot.knowledge_version,
+        source=KnowledgeRevisionSource.INIT,
+        settings=settings,
+    ):
+        raise CheckTransitionAborted(
+            f"knowledge for topic_id={topic_id} moved past version {snapshot.knowledge_version}"
+        )
+
+    mark_articles_processed(conn, article_ids)
+    update_topic_init_status(
+        conn,
+        topic_id,
+        status=TopicStatus.READY,
+        status_changed_at=datetime.now(UTC),
+        error_message=None,
+        init_attempts=0,
+    )
+    conn.commit()
+
+
 async def initialize_new_topic(
     topic: Topic,
-    conn: sqlite3.Connection,
     settings: Settings,
+    *,
+    db_path: Path | None = None,
 ) -> None:
     """Initialize a topic's knowledge state from its first batch of articles.
 
     Transitions: NEW/RESEARCHING → RESEARCHING → READY (or ERROR on failure).
     Called by both the web layer (background task) and the scheduler (gradual init).
 
-    Connection invariant (OVH-099): every status write below commits eagerly, and
-    the fetch (OVH-007) + LLM (``initialize_knowledge`` writes only after its
-    await) phases hold no write transaction across their awaits. So while the
-    caller's connection is passed in, no write lock spans the fetch/LLM awaits —
-    a concurrent WAL writer is never starved during initialization.
+    Connection invariant (AUG-136): no connection is open across the fetch or LLM
+    awaits. Status writes each take a short connection of their own, the fetch and
+    ``prepare_initial_knowledge`` phases run offline, and the knowledge state,
+    its revision, the article disposition and the READY transition land together
+    in one fenced transaction.
     """
     if topic.id is None:
         raise ValueError("Topic must have an ID")
@@ -760,15 +996,16 @@ async def initialize_new_topic(
 
     def _set_init_status(status: TopicStatus, *, error_message: str | None, init_attempts: int) -> None:
         now = datetime.now(UTC)
-        update_topic_init_status(
-            conn,
-            topic_id,
-            status=status,
-            status_changed_at=now,
-            error_message=error_message,
-            init_attempts=init_attempts,
-        )
-        conn.commit()
+        with get_db(db_path) as conn:
+            update_topic_init_status(
+                conn,
+                topic_id,
+                status=status,
+                status_changed_at=now,
+                error_message=error_message,
+                init_attempts=init_attempts,
+            )
+            conn.commit()
         topic.status = status
         topic.status_changed_at = now
         topic.error_message = error_message
@@ -777,12 +1014,19 @@ async def initialize_new_topic(
     # Immediately mark as RESEARCHING (concurrency guard: UI shows spinner, prevents re-trigger).
     _set_init_status(TopicStatus.RESEARCHING, error_message=None, init_attempts=topic.init_attempts)
 
+    with get_db(db_path) as conn:
+        snapshot = _snapshot_topic(conn, topic_id)
+    if snapshot is None:
+        logger.warning("Topic id=%d no longer exists; skipping initialization", topic_id)
+        check_id_var.reset(token)
+        return
+
     logger.info("Initializing knowledge for topic '%s' (id=%d) [check_id=%s]", topic.name, topic_id, cid)
 
     try:
         fetch_result = await fetch_new_articles_for_topic(
             topic,
-            conn,
+            db_path=db_path,
             max_articles=settings.max_articles_per_check,
             feed_fetch_timeout=settings.feed_fetch_timeout,
             article_fetch_timeout=settings.article_fetch_timeout,
@@ -823,16 +1067,17 @@ async def initialize_new_topic(
             )
             return
 
-        # create_knowledge_state uses INSERT OR REPLACE, so re-init works atomically
-        write_result = await initialize_knowledge(topic, articles, conn, settings)
+        # LLM phase, still connection-free; the plan is persisted below.
+        plan = await prepare_initial_knowledge(topic, articles, settings)
 
         article_ids = [a.id for a in articles if a.id is not None]
-        if article_ids:
-            mark_articles_processed(conn, article_ids)
+        with get_db(db_path) as conn:
+            _commit_init_transition(conn, snapshot, plan, article_ids, settings)
+        topic.status = TopicStatus.READY
+        topic.error_message = None
+        topic.init_attempts = 0
 
-        _set_init_status(TopicStatus.READY, error_message=None, init_attempts=0)
-
-        if write_result.sufficient_data:
+        if plan.sufficient_data:
             logger.info("Knowledge initialized for topic '%s' — now READY", topic.name)
         else:
             logger.warning(

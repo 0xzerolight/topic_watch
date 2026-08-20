@@ -3,6 +3,7 @@
 import json
 import sqlite3
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import patch
 
 import httpx
@@ -395,7 +396,9 @@ class TestExaDispatch:
 
 
 class TestExaPipelineStore:
-    async def test_stores_exa_articles_with_provider_and_prefetched_content(self, db_conn: sqlite3.Connection) -> None:
+    async def test_stores_exa_articles_with_provider_and_prefetched_content(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
         """End to end: Exa text lands as raw_content, source_provider='exa', published_at tz-aware."""
         topic = create_topic(db_conn, Topic(name="AI", description="ai news", feed_mode=FeedMode.EXA, feed_urls=[]))
         db_conn.commit()
@@ -411,7 +414,7 @@ class TestExaPipelineStore:
             original_init(self_client, **kwargs)
 
         with patch.object(httpx.AsyncClient, "__init__", patched_init):
-            result = await fetch_new_articles_for_topic(topic, db_conn, max_articles=5, exa_settings=_ENABLED)
+            result = await fetch_new_articles_for_topic(topic, db_path=db_path, max_articles=5, exa_settings=_ENABLED)
 
         assert len(result.articles) == 1
         stored = list_articles_for_topic(db_conn, topic.id)
@@ -421,7 +424,7 @@ class TestExaPipelineStore:
         assert isinstance(stored[0].published_at, datetime)
         assert stored[0].published_at.tzinfo is not None
 
-    async def test_check_records_exa_feed_health(self, db_conn: sqlite3.Connection) -> None:
+    async def test_check_records_exa_feed_health(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         """An EXA-mode check writes a feed_health row keyed on the Exa endpoint."""
         topic = create_topic(db_conn, Topic(name="AI", description="ai news", feed_mode=FeedMode.EXA, feed_urls=[]))
         db_conn.commit()
@@ -434,7 +437,7 @@ class TestExaPipelineStore:
             original_init(self_client, **kwargs)
 
         with patch.object(httpx.AsyncClient, "__init__", patched_init):
-            await fetch_new_articles_for_topic(topic, db_conn, max_articles=5, exa_settings=_ENABLED)
+            await fetch_new_articles_for_topic(topic, db_path=db_path, max_articles=5, exa_settings=_ENABLED)
 
         health = get_feed_health(db_conn, _EXA_ENDPOINT)
         assert health is not None

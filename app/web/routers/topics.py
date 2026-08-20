@@ -69,7 +69,7 @@ async def topic_add_form(request: Request, settings: Settings = Depends(get_sett
 async def create_topic_handler(
     request: Request,
     background_tasks: BackgroundTasks,
-    conn: sqlite3.Connection = Depends(get_db_conn),
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
     settings: Settings = Depends(get_settings),
     name: str = Form(...),
     description: str = Form(...),
@@ -195,7 +195,7 @@ def _feed_source_context(conn: sqlite3.Connection, topic: Topic) -> dict:
 async def topic_detail(
     request: Request,
     topic_id: int,
-    conn: sqlite3.Connection = Depends(get_db_conn),
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
     settings: Settings = Depends(get_settings),
     page: int = 1,
 ):
@@ -259,7 +259,7 @@ async def topic_status(
     request: Request,
     topic_id: int,
     since: str | None = None,
-    conn: sqlite3.Connection = Depends(get_db_conn),
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
     settings: Settings = Depends(get_settings),
 ):
     """HTMX partial: knowledge state fragment for polling during research.
@@ -307,7 +307,7 @@ async def topic_knowledge_diff(
     request: Request,
     topic_id: int,
     revision_id: int,
-    conn: sqlite3.Connection = Depends(get_db_conn),
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
 ):
     """Render the diff between a knowledge revision and the one before it.
 
@@ -356,7 +356,7 @@ async def topic_knowledge_diff(
 async def topic_feed_source(
     request: Request,
     topic_id: int,
-    conn: sqlite3.Connection = Depends(get_db_conn),
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
 ):
     """HTMX partial: feed-source health fragment, polled every 30s from the detail page.
 
@@ -425,7 +425,7 @@ async def topic_row(
     request: Request,
     topic_id: int,
     since: str | None = None,
-    conn: sqlite3.Connection = Depends(get_db_conn),
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
 ):
     """HTMX partial: single dashboard row, polled while a topic is new/researching.
 
@@ -454,7 +454,7 @@ async def check_topic_handler(
     request: Request,
     topic_id: int,
     background_tasks: BackgroundTasks,
-    conn: sqlite3.Connection = Depends(get_db_conn),
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
     settings: Settings = Depends(get_settings),
 ):
     """Manual check trigger.
@@ -490,7 +490,7 @@ async def check_topic_handler(
 async def toggle_active(
     request: Request,
     topic_id: int,
-    conn: sqlite3.Connection = Depends(get_db_conn),
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
 ):
     """Toggle a topic's is_active flag."""
     topic = get_topic(conn, topic_id)
@@ -518,7 +518,7 @@ async def reinit_topic(
     request: Request,
     topic_id: int,
     background_tasks: BackgroundTasks,
-    conn: sqlite3.Connection = Depends(get_db_conn),
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
     settings: Settings = Depends(get_settings),
 ):
     """Re-trigger initial research for error recovery."""
@@ -545,7 +545,7 @@ async def reinit_topic(
 @router.post("/topics/{topic_id}/delete", dependencies=[Depends(verify_csrf)])
 async def delete_topic_handler(
     topic_id: int,
-    conn: sqlite3.Connection = Depends(get_db_conn),
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
 ):
     """Delete a topic and redirect to dashboard."""
     delete_topic(conn, topic_id)
@@ -557,7 +557,7 @@ async def delete_topic_handler(
 async def topic_edit_form(
     request: Request,
     topic_id: int,
-    conn: sqlite3.Connection = Depends(get_db_conn),
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
     settings: Settings = Depends(get_settings),
 ):
     """Render the edit topic form."""
@@ -587,7 +587,7 @@ async def topic_edit_form(
 async def edit_topic_handler(
     request: Request,
     topic_id: int,
-    conn: sqlite3.Connection = Depends(get_db_conn),
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
     settings: Settings = Depends(get_settings),
     name: str = Form(...),
     description: str = Form(...),
@@ -668,7 +668,7 @@ async def edit_topic_handler(
 @router.post("/topics/bulk-delete", dependencies=[Depends(verify_csrf)])
 async def bulk_delete_handler(
     request: Request,
-    conn: sqlite3.Connection = Depends(get_db_conn),
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
 ):
     """Delete multiple topics at once."""
     form = await request.form()
@@ -686,7 +686,7 @@ async def bulk_delete_handler(
 async def bulk_check_handler(
     request: Request,
     background_tasks: BackgroundTasks,
-    conn: sqlite3.Connection = Depends(get_db_conn),
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
     settings: Settings = Depends(get_settings),
 ):
     """Trigger checks for multiple topics."""
@@ -735,7 +735,7 @@ async def force_notify(
     request: Request,
     topic_id: int,
     check_id: int,
-    conn: sqlite3.Connection = Depends(get_db_conn),
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
     settings: Settings = Depends(get_settings),
 ):
     """Re-send notification for a specific check result."""

@@ -319,7 +319,7 @@ async def run_live(
             scratch.commit()
             fetch_result = await fetch_new_articles_for_topic(
                 scratch_topic,
-                scratch,
+                db_path=scratch_path,
                 max_articles=settings.max_articles_per_check,
                 feed_fetch_timeout=settings.feed_fetch_timeout,
                 article_fetch_timeout=settings.article_fetch_timeout,

@@ -7,12 +7,12 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from app.analysis.knowledge import KnowledgeWriteResult
+from app.analysis.knowledge import KnowledgeUpdatePlan
 from app.analysis.llm import TokenUsage
 from app.config import LLMSettings, NotificationSettings, Settings
 from app.crud import create_topic, get_topic
 from app.database import get_connection, init_db
-from app.models import Article, KnowledgeState, Topic, TopicStatus
+from app.models import Article, Topic, TopicStatus
 from app.scraping import FetchResult
 from app.web.routers.background import _run_check_all, _run_init
 
@@ -188,10 +188,11 @@ class TestRunInitTimeout:
                 return_value=FetchResult(articles=[fake_article], total_feed_entries=1),
             ),
             patch(
-                "app.checker.initialize_knowledge",
+                "app.checker.prepare_initial_knowledge",
                 new_callable=AsyncMock,
-                return_value=KnowledgeWriteResult(
-                    state=KnowledgeState(topic_id=topic_id, summary_text="s", token_count=0),
+                return_value=KnowledgeUpdatePlan(
+                    summary_text="s",
+                    token_count=0,
                     usage=TokenUsage(),
                     sufficient_data=True,
                 ),

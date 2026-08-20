@@ -11,6 +11,8 @@ Modules:
     stub_llm          -- context managers stubbing the LLM boundary (no live calls).
 """
 
+from tests.helpers.db_paths import conn_db_path
+from tests.helpers.knowledge_writes import apply_plan, init_knowledge, update_knowledge
 from tests.helpers.redirect_transport import build_redirect_transport
 from tests.helpers.rss_fixtures import (
     RssEntry,
@@ -31,8 +33,12 @@ __all__ = [
     "build_redirect_transport",
     "build_rss_transport",
     "build_rss_xml",
+    "apply_plan",
+    "conn_db_path",
+    "init_knowledge",
     "make_compressed_knowledge",
     "make_knowledge_update",
     "make_novelty_result",
     "stub_llm_boundary",
+    "update_knowledge",
 ]

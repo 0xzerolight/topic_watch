@@ -230,8 +230,25 @@ class TestCmdDoctor:
             conn.close()
 
 
+@pytest.fixture
+def cli_db(db_conn: sqlite3.Connection, db_path: Path, monkeypatch: pytest.MonkeyPatch) -> sqlite3.Connection:
+    """Make the default database path resolve to this test's database.
+
+    CLI commands hand the pipeline a path rather than a connection, and each phase
+    opens its own short-lived one, so redirecting the ``app.cli.get_db`` name is no
+    longer enough — every layer must land on the same file. ``_cmd_*`` resolve
+    ``db_path=None``, which is exactly the default this redirects.
+    """
+    monkeypatch.setattr("app.database.DEFAULT_DB_PATH", db_path)
+    return db_conn
+
+
 class TestCmdCheck:
     """Tests for the 'check' CLI command."""
+
+    @pytest.fixture(autouse=True)
+    def _use_cli_db(self, cli_db):
+        return cli_db
 
     async def test_check_existing_topic(self, db_conn: sqlite3.Connection) -> None:
         create_topic(
@@ -244,15 +261,12 @@ class TestCmdCheck:
         with (
             patch("app.cli.load_settings", return_value=settings),
             patch("app.cli.init_db"),
-            patch("app.cli.get_db") as mock_get_db,
             patch(
                 "app.checker.fetch_new_articles_for_topic",
                 new_callable=AsyncMock,
                 return_value=FetchResult(articles=[], total_feed_entries=0),
             ),
         ):
-            mock_get_db.return_value.__enter__ = lambda s: db_conn
-            mock_get_db.return_value.__exit__ = lambda s, *a: None
             await _cmd_check("CLI Topic")
 
     async def test_check_nonexistent_topic_exits(self, db_conn: sqlite3.Connection) -> None:
@@ -261,16 +275,17 @@ class TestCmdCheck:
         with (
             patch("app.cli.load_settings", return_value=settings),
             patch("app.cli.init_db"),
-            patch("app.cli.get_db") as mock_get_db,
+            pytest.raises(SystemExit, match="1"),
         ):
-            mock_get_db.return_value.__enter__ = lambda s: db_conn
-            mock_get_db.return_value.__exit__ = lambda s, *a: None
-            with pytest.raises(SystemExit, match="1"):
-                await _cmd_check("Nonexistent")
+            await _cmd_check("Nonexistent")
 
 
 class TestCmdInit:
     """Tests for the 'init' CLI command — the most complex CLI path."""
+
+    @pytest.fixture(autouse=True)
+    def _use_cli_db(self, cli_db):
+        return cli_db
 
     async def test_init_nonexistent_topic_exits(self, db_conn: sqlite3.Connection) -> None:
         settings = _make_settings()
@@ -278,12 +293,9 @@ class TestCmdInit:
         with (
             patch("app.cli.load_settings", return_value=settings),
             patch("app.cli.init_db"),
-            patch("app.cli.get_db") as mock_get_db,
+            pytest.raises(SystemExit, match="1"),
         ):
-            mock_get_db.return_value.__enter__ = lambda s: db_conn
-            mock_get_db.return_value.__exit__ = lambda s, *a: None
-            with pytest.raises(SystemExit, match="1"):
-                await _cmd_init("Nonexistent")
+            await _cmd_init("Nonexistent")
 
     async def test_init_ready_topic_reinitializes(self, db_conn: sqlite3.Connection) -> None:
         """READY topics should be re-initialized, not rejected."""
@@ -317,7 +329,6 @@ class TestCmdInit:
         with (
             patch("app.cli.load_settings", return_value=settings),
             patch("app.cli.init_db"),
-            patch("app.cli.get_db") as mock_get_db,
             patch(
                 "app.scraping.fetch_new_articles_for_topic",
                 new_callable=AsyncMock,
@@ -329,8 +340,6 @@ class TestCmdInit:
                 return_value=llm_result,
             ),
         ):
-            mock_get_db.return_value.__enter__ = lambda s: db_conn
-            mock_get_db.return_value.__exit__ = lambda s, *a: None
             await _cmd_init("Ready")
 
         updated = get_topic(db_conn, topic.id)
@@ -352,17 +361,14 @@ class TestCmdInit:
         with (
             patch("app.cli.load_settings", return_value=settings),
             patch("app.cli.init_db"),
-            patch("app.cli.get_db") as mock_get_db,
             patch(
                 "app.scraping.fetch_feeds_for_topic",
                 new_callable=AsyncMock,
                 side_effect=Exception("Network error"),
             ),
+            pytest.raises(SystemExit, match="1"),
         ):
-            mock_get_db.return_value.__enter__ = lambda s: db_conn
-            mock_get_db.return_value.__exit__ = lambda s, *a: None
-            with pytest.raises(SystemExit, match="1"):
-                await _cmd_init("ScrapeErr")
+            await _cmd_init("ScrapeErr")
 
         updated = get_topic(db_conn, topic.id)
         assert updated.status == TopicStatus.ERROR
@@ -379,17 +385,14 @@ class TestCmdInit:
         with (
             patch("app.cli.load_settings", return_value=settings),
             patch("app.cli.init_db"),
-            patch("app.cli.get_db") as mock_get_db,
             patch(
                 "app.scraping.fetch_feeds_for_topic",
                 new_callable=AsyncMock,
                 return_value=FeedResponse(),
             ),
+            pytest.raises(SystemExit, match="1"),
         ):
-            mock_get_db.return_value.__enter__ = lambda s: db_conn
-            mock_get_db.return_value.__exit__ = lambda s, *a: None
-            with pytest.raises(SystemExit, match="1"):
-                await _cmd_init("NoArticles")
+            await _cmd_init("NoArticles")
 
         updated = get_topic(db_conn, topic.id)
         assert updated.status == TopicStatus.ERROR
@@ -409,17 +412,14 @@ class TestCmdInit:
         with (
             patch("app.cli.load_settings", return_value=settings),
             patch("app.cli.init_db"),
-            patch("app.cli.get_db") as mock_get_db,
             patch(
                 "app.scraping.fetch_feeds_for_topic",
                 new_callable=AsyncMock,
                 return_value=FeedResponse(provider_name="exa", feeds_total=1, feeds_failed=1),
             ),
+            pytest.raises(SystemExit, match="1"),
         ):
-            mock_get_db.return_value.__enter__ = lambda s: db_conn
-            mock_get_db.return_value.__exit__ = lambda s, *a: None
-            with pytest.raises(SystemExit, match="1"):
-                await _cmd_init("ExaKeyBad")
+            await _cmd_init("ExaKeyBad")
 
         updated = get_topic(db_conn, topic.id)
         assert updated.status == TopicStatus.ERROR
@@ -450,7 +450,6 @@ class TestCmdInit:
         with (
             patch("app.cli.load_settings", return_value=settings),
             patch("app.cli.init_db"),
-            patch("app.cli.get_db") as mock_get_db,
             patch(
                 "app.scraping.fetch_new_articles_for_topic",
                 new_callable=AsyncMock,
@@ -461,11 +460,9 @@ class TestCmdInit:
                 new_callable=AsyncMock,
                 side_effect=Exception("LLM error"),
             ),
+            pytest.raises(SystemExit, match="1"),
         ):
-            mock_get_db.return_value.__enter__ = lambda s: db_conn
-            mock_get_db.return_value.__exit__ = lambda s, *a: None
-            with pytest.raises(SystemExit, match="1"):
-                await _cmd_init("KnowledgeFail")
+            await _cmd_init("KnowledgeFail")
 
         updated = get_topic(db_conn, topic.id)
         assert updated.status == TopicStatus.ERROR
@@ -480,6 +477,10 @@ class TestCmdInitPersistence:
     ERROR status survived — proving ``sys.exit`` no longer fires inside the
     ``get_db`` context and rolls the write back.
     """
+
+    @pytest.fixture(autouse=True)
+    def _use_cli_db(self, cli_db):
+        return cli_db
 
     async def test_scrape_failure_commits_error_status(self, tmp_path: Path) -> None:
         db_path = _real_db(tmp_path)
@@ -597,6 +598,10 @@ class TestCmdInitPersistence:
 class TestCmdInitResearchingClaim:
     """OVH-018: CLI init claims RESEARCHING and excludes a concurrent init."""
 
+    @pytest.fixture(autouse=True)
+    def _use_cli_db(self, cli_db):
+        return cli_db
+
     async def test_claims_researching_before_long_work(self, tmp_path: Path) -> None:
         """The RESEARCHING claim must be committed *before* fetch/LLM run, so a
         concurrent scheduler/CLI init observing the topic sees it as taken."""
@@ -660,6 +665,10 @@ class TestCmdInitResearchingClaim:
 class TestCmdLogging:
     """OVH-042: CLI logs carry the check_id correlation id."""
 
+    @pytest.fixture(autouse=True)
+    def _use_cli_db(self, cli_db):
+        return cli_db
+
     def test_cli_consolidates_onto_shared_setup_logging(self) -> None:
         """The duplicate _setup_logging is gone; main uses the shared config."""
         import app.cli as cli_mod
@@ -715,13 +724,14 @@ class TestCmdLogging:
 class TestCmdList:
     """Tests for the 'list' CLI command."""
 
+    @pytest.fixture(autouse=True)
+    def _use_cli_db(self, cli_db):
+        return cli_db
+
     def test_list_empty(self, db_conn: sqlite3.Connection, capsys) -> None:
         with (
             patch("app.cli.init_db"),
-            patch("app.cli.get_db") as mock_get_db,
         ):
-            mock_get_db.return_value.__enter__ = lambda s: db_conn
-            mock_get_db.return_value.__exit__ = lambda s, *a: None
             _cmd_list()
 
         captured = capsys.readouterr()
@@ -745,10 +755,7 @@ class TestCmdList:
 
         with (
             patch("app.cli.init_db"),
-            patch("app.cli.get_db") as mock_get_db,
         ):
-            mock_get_db.return_value.__enter__ = lambda s: db_conn
-            mock_get_db.return_value.__exit__ = lambda s, *a: None
             _cmd_list()
 
         captured = capsys.readouterr()

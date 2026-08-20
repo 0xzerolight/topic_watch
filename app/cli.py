@@ -29,7 +29,6 @@ from app.crud import (
     get_topic_by_name,
     list_all_feed_health,
     list_topics,
-    mark_articles_processed,
     update_topic,
 )
 from app.database import get_db, get_schema_version, init_db
@@ -49,11 +48,13 @@ async def _cmd_check(topic_name: str) -> None:
 
     with get_db() as conn:
         topic = get_topic_by_name(conn, topic_name)
-        if topic is None:
-            logger.error("Topic not found: '%s'", topic_name)
-            sys.exit(1)
+    if topic is None:
+        logger.error("Topic not found: '%s'", topic_name)
+        sys.exit(1)
 
-        result = await check_topic(topic, conn, settings)
+    # No connection is held across the pipeline: check_topic opens its own per
+    # phase (AUG-136).
+    result = await check_topic(topic, settings)
 
     print(f"Check complete for '{topic_name}':")
     print(f"  Articles found: {result.articles_found}")
@@ -85,73 +86,84 @@ async def _cmd_init(topic_name: str) -> None:
     settings = load_settings()
     init_db()
 
-    # Track an exit code to apply AFTER the get_db() context closes. Calling
-    # sys.exit() inside the `with` raises SystemExit, which get_db treats as a
-    # failure and rolls back — discarding the ERROR-status write the operator/UI
-    # rely on (OVH-002). Set the error state, commit, flag the failure, and exit
-    # once the connection has committed and closed.
-    failed = False
-
     with get_db() as conn:
         topic = get_topic_by_name(conn, topic_name)
-        if topic is None:
-            logger.error("Topic not found: '%s'", topic_name)
-            failed = True
-        elif topic.status == TopicStatus.RESEARCHING:
-            # Another init (scheduler gradual init or a second CLI run) already
-            # holds the RESEARCHING claim — cooperate and bail (OVH-018).
-            logger.error(
-                "Topic '%s' is already being researched; skipping concurrent init.",
-                topic_name,
-            )
-            failed = True
-        else:
-            assert topic.id is not None
-            if topic.status == TopicStatus.READY:
-                print(f"Re-initializing knowledge for '{topic_name}'...")
-            else:
-                print(f"Initializing knowledge for '{topic_name}'...")
 
-            # Claim the topic before the long fetch+LLM work so the scheduler's
-            # gradual init (and a second CLI init) are excluded by the same
-            # RESEARCHING status guard (OVH-018). Commit so the claim is durable
-            # and visible to concurrent connections immediately.
-            topic.status = TopicStatus.RESEARCHING
-            topic.status_changed_at = datetime.now(UTC)
-            topic.error_message = None
-            update_topic(conn, topic)
-            conn.commit()
+    if topic is None:
+        logger.error("Topic not found: '%s'", topic_name)
+        sys.exit(1)
+    if topic.status == TopicStatus.RESEARCHING:
+        # Another init (scheduler gradual init or a second CLI run) already
+        # holds the RESEARCHING claim — cooperate and bail (OVH-018).
+        logger.error(
+            "Topic '%s' is already being researched; skipping concurrent init.",
+            topic_name,
+        )
+        sys.exit(1)
 
-            failed = await _run_init(topic, topic_name, conn, settings)
+    assert topic.id is not None
+    if topic.status == TopicStatus.READY:
+        print(f"Re-initializing knowledge for '{topic_name}'...")
+    else:
+        print(f"Initializing knowledge for '{topic_name}'...")
 
-    if failed:
+    # Claim the topic before the long fetch+LLM work so the scheduler's gradual
+    # init (and a second CLI init) are excluded by the same RESEARCHING status
+    # guard (OVH-018). Commit so the claim is durable and visible to concurrent
+    # connections immediately.
+    topic.status = TopicStatus.RESEARCHING
+    topic.status_changed_at = datetime.now(UTC)
+    topic.error_message = None
+    with get_db() as conn:
+        update_topic(conn, topic)
+        conn.commit()
+
+    if await _run_init(topic, topic_name, settings):
         sys.exit(1)
 
 
-async def _run_init(topic: Topic, topic_name: str, conn: sqlite3.Connection, settings: Settings) -> bool:
+def _fail_init(topic: Topic, message: str) -> bool:
+    """Persist a terminal ERROR status on its own short connection. Returns True.
+
+    Committed here rather than left to the caller so the operator/UI see the real
+    reason even though the command exits non-zero straight afterwards (OVH-002).
+    """
+    topic.status = TopicStatus.ERROR
+    topic.status_changed_at = datetime.now(UTC)
+    topic.error_message = message
+    with get_db() as conn:
+        update_topic(conn, topic)
+        conn.commit()
+    return True
+
+
+async def _run_init(topic: Topic, topic_name: str, settings: Settings) -> bool:
     """Fetch + build knowledge for a claimed (RESEARCHING) topic.
 
-    Persists a terminal ERROR or READY status, committing explicitly so the
-    write survives even though the caller exits non-zero on failure (OVH-002).
-    Returns True if the init failed (caller should exit 1).
+    Holds no connection across the fetch or LLM awaits (AUG-136): each phase
+    opens its own short-lived one. Returns True if the init failed (caller should
+    exit 1).
     """
-    from app.analysis.knowledge import initialize_knowledge
+    from app.analysis.knowledge import prepare_initial_knowledge
+    from app.checker import CheckTransitionAborted, _commit_init_transition, _snapshot_topic
     from app.scraping import all_sources_failed, fetch_new_articles_for_topic
+
+    assert topic.id is not None
+    with get_db() as conn:
+        snapshot = _snapshot_topic(conn, topic.id)
+    if snapshot is None:
+        logger.error("Topic '%s' disappeared before initialization could start", topic_name)
+        return True
 
     # Fetch articles
     try:
         fetch_result = await fetch_new_articles_for_topic(
-            topic, conn, max_articles=settings.max_articles_per_check, exa_settings=settings.exa
+            topic, max_articles=settings.max_articles_per_check, exa_settings=settings.exa
         )
         articles = fetch_result.articles
     except Exception:
         logger.error("Failed to fetch articles for '%s'", topic_name, exc_info=True)
-        topic.status = TopicStatus.ERROR
-        topic.status_changed_at = datetime.now(UTC)
-        topic.error_message = "Failed to fetch articles during initialization"
-        update_topic(conn, topic)
-        conn.commit()
-        return True
+        return _fail_init(topic, "Failed to fetch articles during initialization")
 
     if not articles:
         # Mode-agnostic message: EXA topics have no feed URLs, so don't tell the operator
@@ -159,50 +171,37 @@ async def _run_init(topic: Topic, topic_name: str, conn: sqlite3.Connection, set
         # differently from a genuinely empty result.
         sources_down = all_sources_failed(fetch_result.feeds_total, fetch_result.feeds_failed)
         logger.error("No articles found for '%s' (check feed sources / credentials; see logs).", topic_name)
-        topic.status = TopicStatus.ERROR
-        topic.status_changed_at = datetime.now(UTC)
-        topic.error_message = (
+        return _fail_init(
+            topic,
             "All feed source(s) failed during initialization (check credentials/connectivity; see logs)"
             if sources_down
-            else "No articles found during initialization"
+            else "No articles found during initialization",
         )
-        update_topic(conn, topic)
-        conn.commit()
-        return True
 
     print(f"  Fetched {len(articles)} articles")
 
-    # Build initial knowledge state (create_knowledge_state uses INSERT OR REPLACE,
-    # so re-init of READY topics works without a separate delete step)
-    assert topic.id is not None
     try:
-        write_result = await initialize_knowledge(topic, articles, conn, settings)
+        plan = await prepare_initial_knowledge(topic, articles, settings)
     except Exception:
         logger.error(
             "Knowledge initialization failed for '%s'",
             topic_name,
             exc_info=True,
         )
-        topic.status = TopicStatus.ERROR
-        topic.status_changed_at = datetime.now(UTC)
-        topic.error_message = "LLM failed during knowledge initialization"
-        update_topic(conn, topic)
-        conn.commit()
+        return _fail_init(topic, "LLM failed during knowledge initialization")
+
+    # Knowledge state, revision, article disposition and READY in one transaction.
+    article_ids = [a.id for a in articles if a.id is not None]
+    try:
+        with get_db() as conn:
+            _commit_init_transition(conn, snapshot, plan, article_ids, settings)
+    except CheckTransitionAborted as exc:
+        logger.error("Initialization for '%s' aborted: %s", topic_name, exc)
         return True
 
-    # Mark articles as processed
-    article_ids = [a.id for a in articles if a.id is not None]
-    if article_ids:
-        mark_articles_processed(conn, article_ids)
-
-    # Transition to READY
     topic.status = TopicStatus.READY
-    topic.status_changed_at = datetime.now(UTC)
     topic.error_message = None
-    update_topic(conn, topic)
-    conn.commit()
-
-    print(f"  Knowledge state built ({write_result.state.token_count} tokens)")
+    print(f"  Knowledge state built ({plan.token_count} tokens)")
     print(f"  Topic '{topic_name}' is now READY")
     return False
 

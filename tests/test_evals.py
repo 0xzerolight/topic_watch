@@ -464,7 +464,7 @@ async def test_run_live_uses_scratch_topic_and_reads_prod_readonly(tmp_path, mon
 
     captured: dict[str, object] = {}
 
-    async def fake_fetch(topic: Topic, conn, **_kw: object) -> FetchResult:
+    async def fake_fetch(topic: Topic, **_kw: object) -> FetchResult:
         captured["topic_id"] = topic.id
         art = Article(
             topic_id=topic.id,  # type: ignore[arg-type]
@@ -513,7 +513,7 @@ async def test_run_live_freeze_writes_replayable_scenario(tmp_path, monkeypatch)
     conn.commit()
     conn.close()
 
-    async def fake_fetch(topic: Topic, conn, **_kw: object) -> FetchResult:
+    async def fake_fetch(topic: Topic, **_kw: object) -> FetchResult:
         art = Article(
             topic_id=topic.id,  # type: ignore[arg-type]
             title="fetched",

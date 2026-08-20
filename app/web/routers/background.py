@@ -38,22 +38,27 @@ async def _run_init(topic_id: int, settings: Settings, db_path: Path | None = No
     try:
         with get_db(db_path) as conn:
             topic = get_topic(conn, topic_id)
-            if topic is None:
-                logger.error("Init background task: topic %d not found", topic_id)
-                return
+        if topic is None:
+            logger.error("Init background task: topic %d not found", topic_id)
+            return
 
-            try:
-                await asyncio.wait_for(initialize_new_topic(topic, conn, settings), timeout=_INIT_TIMEOUT_SECONDS)
-            except TimeoutError:
-                logger.error(
-                    "Init timed out for topic '%s' after %d seconds",
-                    topic.name,
-                    _INIT_TIMEOUT_SECONDS,
-                )
-                topic.status = TopicStatus.ERROR
-                topic.status_changed_at = datetime.now(UTC)
-                topic.error_message = "Research timed out. Click Retry."
+        try:
+            await asyncio.wait_for(
+                initialize_new_topic(topic, settings, db_path=db_path),
+                timeout=_INIT_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            logger.error(
+                "Init timed out for topic '%s' after %d seconds",
+                topic.name,
+                _INIT_TIMEOUT_SECONDS,
+            )
+            topic.status = TopicStatus.ERROR
+            topic.status_changed_at = datetime.now(UTC)
+            topic.error_message = "Research timed out. Click Retry."
+            with get_db(db_path) as conn:
                 update_topic(conn, topic)
+                conn.commit()
     finally:
         await _checking_state.finish_check(topic_id)
 
@@ -77,8 +82,8 @@ async def _run_single_check(topic_id: int, settings: Settings, db_path: Path | N
     try:
         with get_db(db_path) as conn:
             topic = get_topic(conn, topic_id)
-            if topic:
-                await check_topic(topic, conn, settings, guard=False)
+        if topic:
+            await check_topic(topic, settings, db_path=db_path, guard=False)
     except Exception:
         logger.error("Background check failed for topic %d", topic_id, exc_info=True)
     finally:

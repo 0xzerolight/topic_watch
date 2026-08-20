@@ -334,7 +334,7 @@ class TestSingleCheckGuard:
 
         runs = 0
 
-        async def _slow_check(t, conn, settings, *, guard=True):
+        async def _slow_check(t, settings, **kwargs):
             nonlocal runs
             runs += 1
             await asyncio.sleep(0.05)

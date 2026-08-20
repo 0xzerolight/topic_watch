@@ -9,6 +9,7 @@ import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import httpx
@@ -21,6 +22,7 @@ from app.crud import (
     upsert_feed_health_failure,
     upsert_feed_health_success,
 )
+from app.database import get_connection, get_db
 from app.models import Article, FeedHealth, Topic
 from app.scraping.content import extract_article_content
 from app.scraping.google_news import is_google_news_url, resolve_google_news_urls
@@ -85,16 +87,62 @@ def _insert_or_count_dup(
         return False
 
 
-def _make_health_callback(conn: sqlite3.Connection):
-    """Build the per-feed health-recording callback used during feed fetch.
+@dataclass
+class FeedHealthOutcome:
+    """One feed fetch's health verdict, captured in memory during source I/O.
 
-    The callback writes feed_health rows on ``conn``; a swallowed write is
-    surfaced at WARNING because feed_health is the ONLY persisted record of
-    per-feed failures, so silently losing it would leave the dashboard showing
-    stale health while feeds break (OVH-132). On success it also persists the
-    response's conditional-GET validators; a 304 passes ``None`` for both, which
-    ``upsert_feed_health_success`` preserves via COALESCE.
+    The fetch layer reports per-feed outcomes through a callback that fires while
+    other feeds are still in flight. Writing them to SQLite from inside that
+    callback opened a WAL write transaction that stayed open across every
+    remaining feed await — in MANUAL mode a fast feed could own the single writer
+    while ``gather`` waited on a slow one, and in AUTO mode the primary's outcome
+    could own it across the fallback fetch. Past the 5-second busy timeout that
+    fails concurrent UI and scheduler writes outright, and a cancellation
+    discarded health outcomes that had already been observed (AUG-171).
+
+    Collecting them as plain values and applying the batch afterwards, in one
+    short no-await phase, removes both failure modes.
     """
+
+    feed_url: str
+    success: bool
+    error_msg: str | None = None
+    etag: str | None = None
+    last_modified: str | None = None
+
+
+def apply_feed_health(conn: sqlite3.Connection, outcomes: list[FeedHealthOutcome]) -> None:
+    """Persist collected feed-health outcomes. Contains no awaits; caller commits.
+
+    A swallowed write is surfaced at WARNING because feed_health is the ONLY
+    persisted record of per-feed failures, so silently losing it would leave the
+    dashboard showing stale health while feeds break (OVH-132). On success the
+    response's conditional-GET validators are stored too; a 304 carries ``None``
+    for both, which ``upsert_feed_health_success`` preserves via COALESCE.
+    """
+    for outcome in outcomes:
+        try:
+            if outcome.success:
+                upsert_feed_health_success(conn, outcome.feed_url, outcome.etag, outcome.last_modified)
+            else:
+                upsert_feed_health_failure(conn, outcome.feed_url, outcome.error_msg or "Unknown error")
+        except Exception:
+            logger.warning("Failed to record feed health for %s", outcome.feed_url, exc_info=True)
+
+
+def _commit_feed_health(db_path: Path | None, outcomes: list[FeedHealthOutcome]) -> None:
+    """Apply and commit collected health outcomes on their own short connection."""
+    if not outcomes:
+        return
+    try:
+        with get_db(db_path) as conn:
+            apply_feed_health(conn, outcomes)
+    except Exception:
+        logger.warning("Failed to persist feed health outcomes", exc_info=True)
+
+
+def _make_health_collector(outcomes: list[FeedHealthOutcome]):
+    """Build the per-feed health callback that appends to ``outcomes`` in memory."""
 
     def callback(
         feed_url: str,
@@ -103,27 +151,40 @@ def _make_health_callback(conn: sqlite3.Connection):
         etag: str | None = None,
         last_modified: str | None = None,
     ) -> None:
-        try:
-            if success:
-                upsert_feed_health_success(conn, feed_url, etag, last_modified)
-            else:
-                upsert_feed_health_failure(conn, feed_url, error_msg or "Unknown error")
-        except Exception:
-            logger.warning("Failed to record feed health for %s", feed_url, exc_info=True)
+        outcomes.append(
+            FeedHealthOutcome(
+                feed_url=feed_url,
+                success=success,
+                error_msg=error_msg,
+                etag=etag,
+                last_modified=last_modified,
+            )
+        )
 
     return callback
 
 
-def _make_feed_state_loader(conn: sqlite3.Connection):
+def _make_feed_state_loader(db_path: Path | None):
     """Build a per-feed health-row loader (one SELECT, reused for validators + backoff).
 
     Returns the stored ``FeedHealth`` for a URL (or ``None`` if untracked), so the
     fetch layer can both send conditional-GET validators and decide backoff skips
     from a single lookup.
+
+    Each lookup opens and closes its own connection. The loader is called from
+    inside the fetch coroutine, interleaved with network awaits, so a connection
+    held for the loader's lifetime would be a connection held across those awaits
+    — the exact invariant AUG-136/AUG-171 exist to restore. Each individual call
+    is synchronous and await-free, so nothing is ever open while I/O is pending;
+    the cost is one sub-millisecond local open per configured feed.
     """
 
     def loader(feed_url: str) -> FeedHealth | None:
-        return get_feed_health(conn, feed_url)
+        conn = get_connection(db_path)
+        try:
+            return get_feed_health(conn, feed_url)
+        finally:
+            conn.close()
 
     return loader
 
@@ -328,7 +389,8 @@ def _store_articles(
 
 async def fetch_new_articles_for_topic(
     topic: Topic,
-    conn: sqlite3.Connection,
+    *,
+    db_path: Path | None = None,
     max_articles: int = 10,
     feed_fetch_timeout: float = 15.0,
     article_fetch_timeout: float = 20.0,
@@ -340,9 +402,15 @@ async def fetch_new_articles_for_topic(
 ) -> FetchResult:
     """Fetch feeds, dedup against DB, extract content, and store new articles.
 
+    Connection lifetime (AUG-136/AUG-171): this function owns its database access
+    and never accepts a caller's connection, because every phase boundary here is
+    a network await. It opens exactly two short-lived connections — one to apply
+    feed health and run the dedup SELECTs, one to insert the surviving articles —
+    and holds neither across any I/O.
+
     Args:
         topic: The topic to fetch articles for (must have an id).
-        conn: Database connection for dedup checks and article storage.
+        db_path: Database path used to open the short-lived phase connections.
         max_articles: Maximum number of new articles to process per call.
         feed_fetch_timeout: Timeout in seconds for RSS feed fetches.
         article_fetch_timeout: Timeout in seconds for article content fetches.
@@ -356,64 +424,67 @@ async def fetch_new_articles_for_topic(
     if topic.id is None:
         raise ValueError("Topic must have an ID")
 
-    # 1. Fetch all feed entries. The health callback writes feed_health rows on
-    # ``conn``; commit immediately afterwards so that write lock is NOT held
-    # across the later content-extraction await (OVH-007: WAL single-writer
-    # starvation). From here the connection performs only SELECTs until the
-    # final article-insert phase, so no write transaction spans the awaits.
-    response = await fetch_feeds_for_topic(
-        topic,
-        timeout=feed_fetch_timeout,
-        max_attempts=feed_max_retries,
-        health_callback=_make_health_callback(conn),
-        feed_state_loader=_make_feed_state_loader(conn),
-        backoff_base_minutes=feed_backoff_base_minutes,
-        backoff_cap_hours=feed_backoff_cap_hours,
-        exa_settings=exa_settings,
-        max_results=max_articles,
-    )
-    conn.commit()
-    entries = response.entries
+    # --- P1: fetch all feed entries with NO connection open. Per-feed health
+    # verdicts accumulate in memory; they are applied below in one short phase.
+    health_outcomes: list[FeedHealthOutcome] = []
+    try:
+        response = await fetch_feeds_for_topic(
+            topic,
+            timeout=feed_fetch_timeout,
+            max_attempts=feed_max_retries,
+            health_callback=_make_health_collector(health_outcomes),
+            feed_state_loader=_make_feed_state_loader(db_path),
+            backoff_base_minutes=feed_backoff_base_minutes,
+            backoff_cap_hours=feed_backoff_cap_hours,
+            exa_settings=exa_settings,
+            max_results=max_articles,
+        )
+    except BaseException:
+        # A partial fetch still observed real per-feed failures. Persist what was
+        # collected before propagating (including on cancellation), so an aborted
+        # cycle does not silently reset the dashboard's only failure record.
+        _commit_feed_health(db_path, health_outcomes)
+        raise
 
+    entries = response.entries
     feeds_total = response.feeds_total
     feeds_failed = response.feeds_failed
     _log_feed_coverage(topic, feeds_total, feeds_failed)
 
-    if not entries:
-        return FetchResult(
-            articles=[],
-            total_feed_entries=0,
-            feeds_total=feeds_total,
-            feeds_failed=feeds_failed,
-            feeds_skipped=response.feeds_skipped,
-        )
-
-    # 2. Dedup against the DB and split into reuse vs. fetch-needed.
-    new_entries, reuse_entries = _split_dedup_candidates(entries, conn, topic.id)
-    if not new_entries and not reuse_entries:
-        return FetchResult(
-            articles=[],
-            total_feed_entries=len(entries),
-            feeds_total=feeds_total,
-            feeds_failed=feeds_failed,
-            feeds_skipped=response.feeds_skipped,
-        )
-
-    # 3. Combine, sort recency-first, and apply the limit.
-    reuse_batch, fetch_batch = _select_candidates(new_entries, reuse_entries, max_articles)
-
-    # 3b. Resolve provider redirect URLs for entries needing a content fetch.
-    await _resolve_redirect_urls(fetch_batch, response, feed_fetch_timeout)
-
-    # 4. Extract content concurrently (only for entries needing fetch).
-    contents = await _extract_contents(fetch_batch, article_fetch_timeout, concurrency)
-
-    # 5. Normalize both batches and run a single insert loop.
-    stored, dropped_duplicates = _store_articles(
-        reuse_batch, fetch_batch, contents, topic, response.provider_name, conn
+    empty_result = FetchResult(
+        articles=[],
+        total_feed_entries=len(entries),
+        feeds_total=feeds_total,
+        feeds_failed=feeds_failed,
+        feeds_skipped=response.feeds_skipped,
     )
 
-    conn.commit()
+    # --- C1: one short connection applies the health batch and runs the dedup
+    # SELECTs, then closes before the redirect/extraction awaits below.
+    with get_db(db_path) as conn:
+        apply_feed_health(conn, health_outcomes)
+        conn.commit()
+        if not entries:
+            return empty_result
+        new_entries, reuse_entries = _split_dedup_candidates(entries, conn, topic.id)
+
+    if not new_entries and not reuse_entries:
+        return empty_result
+
+    # Combine, sort recency-first, and apply the limit.
+    reuse_batch, fetch_batch = _select_candidates(new_entries, reuse_entries, max_articles)
+
+    # --- P1b: redirect resolution and content extraction, still connection-free.
+    await _resolve_redirect_urls(fetch_batch, response, feed_fetch_timeout)
+    contents = await _extract_contents(fetch_batch, article_fetch_timeout, concurrency)
+
+    # --- C2: one short connection normalizes both batches and inserts.
+    with get_db(db_path) as conn:
+        stored, dropped_duplicates = _store_articles(
+            reuse_batch, fetch_batch, contents, topic, response.provider_name, conn
+        )
+        conn.commit()
+
     if dropped_duplicates:
         logger.warning(
             "Topic '%s': %d article(s) dropped as duplicates during concurrent inserts",

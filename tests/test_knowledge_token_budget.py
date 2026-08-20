@@ -5,11 +5,12 @@ import re
 import sqlite3
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.analysis.knowledge import _truncate_to_budget, compress_knowledge, initialize_knowledge, update_knowledge
+from app.analysis.knowledge import _truncate_to_budget, compress_knowledge
 from app.analysis.llm import CompressedKnowledge, KnowledgeStateUpdate, NoveltyResult
 from app.config import LLMSettings, Settings
 from app.crud import create_knowledge_state, create_topic, get_knowledge_state
 from app.models import Article, KnowledgeState, Topic
+from tests.helpers import init_knowledge, update_knowledge
 
 # --- Helpers ---
 
@@ -335,7 +336,7 @@ class TestInitializeKnowledgeBudget:
             ),
             patch("app.analysis.knowledge.count_tokens", side_effect=_heavy_word_count),
         ):
-            state = (await initialize_knowledge(topic, [], db_conn, settings)).state
+            state = (await init_knowledge(topic, [], db_conn, settings)).state
 
         assert state.token_count <= 500
         assert state.summary_text == "S1 S2 S3."
@@ -373,7 +374,7 @@ class TestInitializeKnowledgeBudget:
             ),
             patch("app.analysis.knowledge.count_tokens", side_effect=_heavy_word_count),
         ):
-            state = (await initialize_knowledge(topic, [], db_conn, settings)).state
+            state = (await init_knowledge(topic, [], db_conn, settings)).state
 
         assert state.token_count <= 500
         assert "Sentence three here." not in state.summary_text
@@ -402,7 +403,7 @@ class TestInitializeKnowledgeBudget:
             patch("app.analysis.knowledge.compress_knowledge_summary", compress_mock),
             patch("app.analysis.knowledge.count_tokens", side_effect=_word_count_tokens),
         ):
-            state = (await initialize_knowledge(topic, [], db_conn, settings)).state
+            state = (await init_knowledge(topic, [], db_conn, settings)).state
 
         assert state.summary_text == short_summary
         compress_mock.assert_not_called()
@@ -693,7 +694,7 @@ class TestCompressionTriggerBoundary:
             ),
             patch("app.analysis.knowledge.compress_knowledge_summary", compress_mock),
         ):
-            state = (await initialize_knowledge(topic, [], db_conn, settings)).state
+            state = (await init_knowledge(topic, [], db_conn, settings)).state
 
         compress_mock.assert_not_called()
         assert state.summary_text == summary
@@ -726,7 +727,7 @@ class TestCompressionTriggerBoundary:
             # Recompute of the compressed output fits the budget (1 word = 1 token).
             patch("app.analysis.knowledge.count_tokens", side_effect=_word_count_tokens),
         ):
-            state = (await initialize_knowledge(topic, [], db_conn, settings)).state
+            state = (await init_knowledge(topic, [], db_conn, settings)).state
 
         compress_mock.assert_awaited_once()
         assert state.summary_text == "Tight."

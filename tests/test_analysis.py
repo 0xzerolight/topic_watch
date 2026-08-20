@@ -10,7 +10,6 @@ import pytest
 from pydantic import ValidationError
 
 from app.analysis.citations import strip_index_citations, strip_reliability_notes
-from app.analysis.knowledge import initialize_knowledge, update_knowledge
 from app.analysis.llm import (
     _OUTPUT_TOKEN_CAP,
     CompressedKnowledge,
@@ -34,6 +33,8 @@ from app.analysis.prompts import (
 from app.config import LLMSettings, Settings
 from app.crud import create_knowledge_state, create_topic, get_knowledge_state
 from app.models import Article, KnowledgeState, Topic
+from tests.helpers import init_knowledge as initialize_knowledge
+from tests.helpers import update_knowledge
 
 # --- Fixtures ---
 

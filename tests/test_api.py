@@ -1,8 +1,10 @@
 """Tests for the JSON API endpoints."""
 
 import sqlite3
+from pathlib import Path
 from unittest.mock import AsyncMock
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.config import LLMSettings, Settings
@@ -270,6 +272,15 @@ class TestAPIKnowledge:
 
 
 class TestAPITriggerCheck:
+    @pytest.fixture(autouse=True)
+    def _lifespan_uses_test_db(self, db_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The trigger endpoint opens its own short connections from app.state.db_path.
+
+        It no longer takes a request-scoped connection (AUG-202), so overriding
+        get_db_conn no longer points it at the test database — the lifespan does.
+        """
+        monkeypatch.setattr("app.main.resolve_db_path", lambda settings: db_path)
+
     def test_trigger_check_happy_path(self, db_conn: sqlite3.Connection, monkeypatch):
         # OVH-016: the only mutation endpoint's success-path response contract.
         topic = _seed_topic(db_conn, status="ready")
@@ -277,7 +288,7 @@ class TestAPITriggerCheck:
 
         fake_result = CheckResult(id=42, topic_id=topic.id, has_new_info=True, articles_found=3, articles_new=1)
 
-        async def _fake_check_topic(t, conn, settings, *, guard=True):
+        async def _fake_check_topic(t, settings, *, db_path=None, guard=True):
             assert t.id == topic.id
             # API path holds the in-flight guard itself, so it calls with guard=False.
             assert guard is False
@@ -371,7 +382,7 @@ class TestAPITriggerCheck:
         async def _noop(topic_id: int) -> None:
             return None
 
-        async def _should_not_run(t, conn, settings, *, guard=True):
+        async def _should_not_run(t, settings, *, db_path=None, guard=True):
             raise AssertionError("check_topic must not run while topic is already in flight")
 
         monkeypatch.setattr("app.web.api._checking_state.start_check", _slot_taken)
@@ -407,7 +418,7 @@ class TestAPITriggerCheck:
         monkeypatch.setattr("app.web.api._checking_state.finish_check", finish)
         monkeypatch.setattr("app.web.api._checking_state.clear_stale", AsyncMock(return_value=[]))
 
-        async def _boom(t, conn, settings, *, guard=True):
+        async def _boom(t, settings, *, db_path=None, guard=True):
             raise RuntimeError("pipeline blew up")
 
         monkeypatch.setattr("app.web.api.check_topic", _boom)

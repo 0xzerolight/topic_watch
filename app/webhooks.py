@@ -127,6 +127,8 @@ async def send_webhooks(
     conn: sqlite3.Connection | None = None,
     topic_id: int | None = None,
     check_result_id: int | None = None,
+    *,
+    db_path: Path | None = None,
 ) -> int:
     """Send webhook notifications to all configured webhook URLs.
 
@@ -138,6 +140,9 @@ async def send_webhooks(
             failed deliveries are enqueued to pending_webhooks for retry.
         topic_id: Topic id used when enqueuing failed deliveries.
         check_result_id: Optional originating check result id (for traceability).
+        db_path: Path used to open a short-lived connection for the enqueue when
+            no ``conn`` is supplied. The pipeline passes this rather than its own
+            connection, so no caller's handle is held across the POSTs above.
 
     Returns:
         Number of successfully delivered webhooks.
@@ -152,24 +157,26 @@ async def send_webhooks(
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     success_count = 0
-    can_queue = conn is not None and topic_id is not None
-    queued = False
+    can_queue = topic_id is not None and (conn is not None or db_path is not None)
+    failed_urls: list[str] = []
     for url, result in zip(webhook_urls, results, strict=True):
         if isinstance(result, bool) and result:
             success_count += 1
         elif can_queue:
-            # Persist the failed delivery so a later cycle can retry it
-            # instead of dropping it (fire-and-forget loses failures).
-            try:
-                assert conn is not None and topic_id is not None
-                create_pending_webhook(conn, topic_id, url, payload, check_result_id)
-                queued = True
-            except Exception:
-                logger.warning("Failed to enqueue webhook for retry (url=%s)", redact_url(url), exc_info=True)
+            failed_urls.append(url)
 
-    if queued:
-        assert conn is not None
-        conn.commit()
+    if failed_urls:
+        # Persist the failed deliveries so a later cycle can retry them instead
+        # of dropping them (fire-and-forget loses failures). One short
+        # transaction, opened after every POST has returned.
+        assert topic_id is not None
+        with short_conn(conn, db_path) as queue_conn:
+            for url in failed_urls:
+                try:
+                    create_pending_webhook(queue_conn, topic_id, url, payload, check_result_id)
+                except Exception:
+                    logger.warning("Failed to enqueue webhook for retry (url=%s)", redact_url(url), exc_info=True)
+            queue_conn.commit()
 
     if success_count < len(webhook_urls):
         logger.warning(

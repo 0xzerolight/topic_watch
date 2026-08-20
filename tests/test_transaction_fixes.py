@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from app.analysis.knowledge import KnowledgeWriteResult
+from app.analysis.knowledge import KnowledgeUpdatePlan
 from app.analysis.llm import NoveltyResult, TokenUsage
 from app.checker import check_topic, initialize_new_topic
 from app.config import LLMSettings, NotificationSettings, Settings
@@ -71,9 +71,10 @@ def _ready_topic(conn: sqlite3.Connection, **overrides) -> Topic:
     return topic
 
 
-def _write_result() -> KnowledgeWriteResult:
-    return KnowledgeWriteResult(
-        state=KnowledgeState(topic_id=1, summary_text="state", token_count=0),
+def _write_result() -> KnowledgeUpdatePlan:
+    return KnowledgeUpdatePlan(
+        summary_text="state",
+        token_count=0,
         usage=TokenUsage(prompt_tokens=0, completion_tokens=0),
         sufficient_data=True,
     )
@@ -312,7 +313,9 @@ class TestNoWriteLockAcrossExtractionAwait:
     """OVH-007: fetch_new_articles_for_topic must not hold a write lock across
     the content-extraction await (WAL single-writer starvation)."""
 
-    async def test_concurrent_write_succeeds_during_extraction(self, db_conn: sqlite3.Connection) -> None:
+    async def test_concurrent_write_succeeds_during_extraction(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
         """A concurrent short write on a second connection succeeds while the
         pipeline is mid content-extraction await — proving no write transaction
         is held across that await.
@@ -377,7 +380,7 @@ class TestNoWriteLockAcrossExtractionAwait:
                 side_effect=_extract_with_concurrent_write,
             ),
         ):
-            result = await fetch_new_articles_for_topic(topic, db_conn)
+            result = await fetch_new_articles_for_topic(topic, db_path=db_path)
 
         # The article was still stored despite the restructuring.
         assert len(result.articles) == 1
@@ -394,7 +397,9 @@ class TestCommitBeforeSendOrdering:
     sends, so a late DB failure cannot occur after a notification already went
     out (which would re-spam on the next cycle)."""
 
-    async def test_record_failure_cannot_follow_a_sent_notification(self, db_conn: sqlite3.Connection) -> None:
+    async def test_record_failure_cannot_follow_a_sent_notification(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
         """If persisting the check result raises, the notification must NOT have
         been sent yet (commit precedes send)."""
         topic = _ready_topic(db_conn, name="OrderingTopic")
@@ -426,7 +431,7 @@ class TestCommitBeforeSendOrdering:
                 return_value=FetchResult(articles=[article], total_feed_entries=1),
             ),
             patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
-            patch("app.checker.update_knowledge", new_callable=AsyncMock, return_value=_write_result()),
+            patch("app.checker.prepare_knowledge_update", new_callable=AsyncMock, return_value=_write_result()),
             patch("app.checker.send_notification_per_url", side_effect=_record_send),
             patch("app.checker.send_webhooks", new_callable=AsyncMock, return_value=0),
             patch(
@@ -435,13 +440,15 @@ class TestCommitBeforeSendOrdering:
             ),
             pytest.raises(RuntimeError, match="simulated persist failure"),
         ):
-            await check_topic(topic, db_conn, settings)
+            await check_topic(topic, settings, db_path=db_path)
 
         # The persist failed; because the durable commit precedes the send, the
         # notification must NOT have been dispatched.
         assert send_attempted["value"] is False
 
-    async def test_marks_processed_committed_before_notification(self, db_conn: sqlite3.Connection) -> None:
+    async def test_marks_processed_committed_before_notification(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
         """When the notification fires, the article is already marked processed
         and the knowledge state is already updated (durable-before-deliver)."""
         topic = _ready_topic(db_conn, name="OrderingTopic2")
@@ -476,16 +483,16 @@ class TestCommitBeforeSendOrdering:
                 return_value=FetchResult(articles=[article], total_feed_entries=1),
             ),
             patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
-            patch("app.checker.update_knowledge", new_callable=AsyncMock, return_value=_write_result()),
+            patch("app.checker.prepare_knowledge_update", new_callable=AsyncMock, return_value=_write_result()),
             patch("app.checker.send_notification_per_url", side_effect=_check_processed_on_send),
             patch("app.checker.send_webhooks", new_callable=AsyncMock, return_value=0),
         ):
-            result = await check_topic(topic, db_conn, settings)
+            result = await check_topic(topic, settings, db_path=db_path)
 
         assert result.notification_sent is True
         assert processed_at_send.get("processed") is True
 
-    async def test_persisted_row_records_delivery_outcome(self, db_conn: sqlite3.Connection) -> None:
+    async def test_persisted_row_records_delivery_outcome(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         """The check_result row created before the send is updated afterwards with
         the real delivery outcome (post-send UPDATE landed and committed)."""
         from app.crud import get_check_result
@@ -508,7 +515,7 @@ class TestCommitBeforeSendOrdering:
                 return_value=FetchResult(articles=[article], total_feed_entries=1),
             ),
             patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
-            patch("app.checker.update_knowledge", new_callable=AsyncMock, return_value=_write_result()),
+            patch("app.checker.prepare_knowledge_update", new_callable=AsyncMock, return_value=_write_result()),
             # Delivery fails -> row must record notification_sent=0 + the reason.
             patch(
                 "app.checker.send_notification_per_url",
@@ -517,7 +524,7 @@ class TestCommitBeforeSendOrdering:
             ),
             patch("app.checker.send_webhooks", new_callable=AsyncMock, return_value=0),
         ):
-            result = await check_topic(topic, db_conn, settings)
+            result = await check_topic(topic, settings, db_path=db_path)
 
         assert result.id is not None
         persisted = get_check_result(db_conn, result.id)
@@ -532,7 +539,7 @@ class TestWebhookCheckResultId:
     """OVH-101: the originating CheckResult must be created before send_webhooks
     so a queued webhook carries a non-NULL check_result_id."""
 
-    async def test_queued_webhook_has_check_result_id(self, db_conn: sqlite3.Connection) -> None:
+    async def test_queued_webhook_has_check_result_id(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         topic = _ready_topic(db_conn, name="WebhookCRTopic")
         create_knowledge_state(
             db_conn,
@@ -554,7 +561,7 @@ class TestWebhookCheckResultId:
                 return_value=FetchResult(articles=[article], total_feed_entries=1),
             ),
             patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
-            patch("app.checker.update_knowledge", new_callable=AsyncMock, return_value=_write_result()),
+            patch("app.checker.prepare_knowledge_update", new_callable=AsyncMock, return_value=_write_result()),
             patch(
                 "app.checker.send_notification_per_url",
                 new_callable=AsyncMock,
@@ -563,7 +570,7 @@ class TestWebhookCheckResultId:
             # Force the webhook POST to fail so it is enqueued for retry.
             patch("app.webhooks.send_webhook", new_callable=AsyncMock, return_value=False),
         ):
-            result = await check_topic(topic, db_conn, settings)
+            result = await check_topic(topic, settings, db_path=db_path)
 
         assert result.id is not None
         pending = list_pending_webhooks(db_conn)
@@ -575,7 +582,7 @@ class TestInitNoConnectionAcrossAwaits:
     """OVH-099: initialize_new_topic must not hold a write transaction across
     its fetch + LLM awaits."""
 
-    async def test_no_write_lock_during_init_fetch(self, db_conn: sqlite3.Connection) -> None:
+    async def test_no_write_lock_during_init_fetch(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         """Drive the REAL fetch pipeline through init: a feed-health write must
         not pin a transaction across the content-extraction await."""
         topic = _ready_topic(db_conn, name="InitLockTopic", status=TopicStatus.NEW)
@@ -625,12 +632,12 @@ class TestInitNoConnectionAcrossAwaits:
                 side_effect=_extract_with_concurrent_write,
             ),
             patch(
-                "app.checker.initialize_knowledge",
+                "app.checker.prepare_initial_knowledge",
                 new_callable=AsyncMock,
                 return_value=_write_result(),
             ),
         ):
-            await initialize_new_topic(topic, db_conn, settings)
+            await initialize_new_topic(topic, settings, db_path=db_path)
 
         assert topic.status == TopicStatus.READY
         assert observed.get("concurrent_write_ok") is True, observed.get("error")
