@@ -3,6 +3,7 @@
 import asyncio
 import sqlite3
 import time
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -278,7 +279,9 @@ def _patch_empty_fetch(monkeypatch):
     monkeypatch.setattr("app.checker.fetch_new_articles_for_topic", _no_articles)
 
 
-async def test_check_topic_skips_when_already_in_flight(db_conn: sqlite3.Connection, monkeypatch, clean_state) -> None:
+async def test_check_topic_skips_when_already_in_flight(
+    db_conn: sqlite3.Connection, monkeypatch, clean_state, db_path: Path
+) -> None:
     """A second check_topic on an already-claimed topic skips the pipeline (OVH-096)."""
     from app.checker import check_topic
 
@@ -291,13 +294,15 @@ async def test_check_topic_skips_when_already_in_flight(db_conn: sqlite3.Connect
 
     # Simulate an in-flight check by pre-claiming the per-topic slot.
     assert await clean_state.start_check(topic.id) is True
-    result = await check_topic(topic, db_conn, settings)
+    result = await check_topic(topic, settings, db_path=db_path)
 
     assert result.stage_error == "skipped: already in flight"
     fetch_spy.assert_not_awaited()
 
 
-async def test_check_topic_acquires_and_releases_guard(db_conn: sqlite3.Connection, monkeypatch, clean_state) -> None:
+async def test_check_topic_acquires_and_releases_guard(
+    db_conn: sqlite3.Connection, monkeypatch, clean_state, db_path: Path
+) -> None:
     """check_topic claims the per-topic guard for the run and releases it after (OVH-096)."""
     from app.checker import check_topic
 
@@ -307,14 +312,17 @@ async def test_check_topic_acquires_and_releases_guard(db_conn: sqlite3.Connecti
     _patch_empty_fetch(monkeypatch)
 
     assert await clean_state.is_checking(topic.id) is False
-    await check_topic(topic, db_conn, settings)
+    await check_topic(topic, settings, db_path=db_path)
     # Released in finally -> startable again.
     assert await clean_state.is_checking(topic.id) is False
     assert await clean_state.start_check(topic.id) is True
 
 
 async def test_check_topic_guard_false_does_not_touch_state(
-    db_conn: sqlite3.Connection, monkeypatch, clean_state
+    db_conn: sqlite3.Connection,
+    monkeypatch,
+    clean_state,
+    db_path: Path,
 ) -> None:
     """guard=False runs even when the slot is taken (caller owns the guard)."""
     from app.checker import check_topic
@@ -326,7 +334,7 @@ async def test_check_topic_guard_false_does_not_touch_state(
 
     # Caller already holds the slot; guard=False must still execute the pipeline.
     assert await clean_state.start_check(topic.id) is True
-    result = await check_topic(topic, db_conn, settings, guard=False)
+    result = await check_topic(topic, settings, db_path=db_path, guard=False)
     assert result.stage_error != "skipped: already in flight"
     # The slot the caller owns is untouched by the inner run.
     assert await clean_state.is_checking(topic.id) is True
@@ -358,8 +366,7 @@ async def test_concurrent_check_topic_only_one_runs_pipeline(
     monkeypatch.setattr("app.checker.fetch_new_articles_for_topic", _slow_fetch)
 
     async def _do_check():
-        with get_db(db_path) as conn:
-            return await check_topic(topic, conn, settings)
+        return await check_topic(topic, settings, db_path=db_path)
 
     results = await asyncio.gather(_do_check(), _do_check())
     skipped = [r for r in results if r.stage_error == "skipped: already in flight"]
@@ -456,7 +463,10 @@ async def test_concurrent_init_claim_only_one_wins(tmp_path) -> None:
 
 
 async def test_cross_entry_point_check_topic_blocks_api_trigger(
-    db_conn: sqlite3.Connection, monkeypatch, clean_state
+    db_conn: sqlite3.Connection,
+    monkeypatch,
+    clean_state,
+    db_path: Path,
 ) -> None:
     """The real shared ``_checking_state`` singleton dedups across entry points.
 
@@ -468,11 +478,21 @@ async def test_cross_entry_point_check_topic_blocks_api_trigger(
     second entry point must be deduped — here a 409 — instead of launching a
     duplicate fetch+analyze+notify that double-spends the LLM and double-notifies.
     """
+    from types import SimpleNamespace
+
     from fastapi import HTTPException
 
     from app.checker import check_topic
     from app.scraping import FetchResult
     from app.web.api import api_trigger_check
+
+    def _request_with_db(path: Path) -> SimpleNamespace:
+        """Minimal stand-in for the Request the handler reads ``db_path`` from.
+
+        ``api_trigger_check`` no longer takes a request-scoped connection
+        (AUG-202); it opens short ones from ``app.state.db_path``.
+        """
+        return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(db_path=path)))
 
     topic = create_topic(db_conn, Topic(name="CrossEntry", description="d", status=TopicStatus.READY))
     db_conn.commit()
@@ -490,13 +510,13 @@ async def test_cross_entry_point_check_topic_blocks_api_trigger(
 
     monkeypatch.setattr("app.checker.fetch_new_articles_for_topic", _slow_fetch)
 
-    pipeline = asyncio.create_task(check_topic(topic, db_conn, settings))
+    pipeline = asyncio.create_task(check_topic(topic, settings, db_path=db_path))
     try:
         await asyncio.wait_for(in_flight.wait(), timeout=1.0)
         # check_topic is mid-flight and owns the slot. The API entry point shares
         # the same singleton, so it must reject with 409 (not run the pipeline).
         with pytest.raises(HTTPException) as exc_info:
-            await api_trigger_check(topic.id, conn=db_conn, settings=settings)
+            await api_trigger_check(_request_with_db(db_path), topic.id, settings=settings)
         assert exc_info.value.status_code == 409
     finally:
         release.set()

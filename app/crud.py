@@ -19,6 +19,7 @@ from app.models import (
     PendingWebhook,
     Topic,
     TopicStatus,
+    to_db_utc,
 )
 
 logger = logging.getLogger(__name__)
@@ -33,11 +34,12 @@ def create_topic(conn: sqlite3.Connection, topic: Topic) -> Topic:
     cursor = conn.execute(
         """INSERT INTO topics (name, description, feed_urls, feed_mode,
            created_at, status_changed_at, is_active, status, error_message, check_interval_minutes, tags,
-           confidence_threshold, relevance_threshold, novelty_instruction, importance_threshold, init_attempts)
+           confidence_threshold, relevance_threshold, novelty_instruction, importance_threshold, init_attempts,
+           generation)
            VALUES (:name, :description, :feed_urls, :feed_mode,
            :created_at, :status_changed_at, :is_active, :status, :error_message, :check_interval_minutes, :tags,
            :confidence_threshold, :relevance_threshold, :novelty_instruction, :importance_threshold,
-           :init_attempts)""",
+           :init_attempts, :generation)""",
         data,
     )
     topic.id = cursor.lastrowid
@@ -438,8 +440,8 @@ def create_knowledge_state(conn: sqlite3.Connection, state: KnowledgeState) -> K
     """
     data = state.to_insert_dict()
     cursor = conn.execute(
-        """INSERT OR REPLACE INTO knowledge_states (topic_id, summary_text, token_count, updated_at)
-           VALUES (:topic_id, :summary_text, :token_count, :updated_at)""",
+        """INSERT OR REPLACE INTO knowledge_states (topic_id, summary_text, token_count, updated_at, version)
+           VALUES (:topic_id, :summary_text, :token_count, :updated_at, :version)""",
         data,
     )
     state.id = cursor.lastrowid
@@ -471,6 +473,50 @@ def update_knowledge_state(conn: sqlite3.Connection, state: KnowledgeState) -> K
         data,
     )
     return state
+
+
+def update_knowledge_state_cas(
+    conn: sqlite3.Connection,
+    topic_id: int,
+    *,
+    summary_text: str,
+    token_count: int,
+    expected_version: int,
+    updated_at: datetime | None = None,
+) -> bool:
+    """Compare-and-swap a topic's knowledge state. Returns False on conflict.
+
+    The knowledge summary is produced by a multi-second LLM round-trip that must
+    run with no connection open, so the state read at snapshot time and the state
+    written afterwards are separated by an unbounded gap. Guarding the UPDATE on
+    the version observed at snapshot time turns a lost update into a visible
+    ``False``: the loser's summary — built from a now-stale base — is discarded
+    instead of overwriting the winner's.
+
+    ``expected_version`` of 0 also matches a state row that predates migration 026
+    (the column's DEFAULT), so the first post-upgrade write is not spuriously
+    rejected. Does NOT commit — the caller owns the transaction.
+    """
+    stamp = to_db_utc(updated_at or datetime.now(UTC))
+    cursor = conn.execute(
+        """UPDATE knowledge_states
+              SET summary_text = ?, token_count = ?, updated_at = ?, version = version + 1
+            WHERE topic_id = ? AND version = ?""",
+        (summary_text, token_count, stamp, topic_id, expected_version),
+    )
+    return cursor.rowcount > 0
+
+
+def topic_generation_matches(conn: sqlite3.Connection, topic_id: int, generation: str) -> bool:
+    """True when the live topic row still carries the generation captured earlier.
+
+    The fence for every durable write that follows a long await: ``topic_id`` is a
+    recyclable rowid, so a delete+recreate can put a different topic behind the id
+    a worker is holding. A blank stored generation (a row written before migration
+    026 backfilled it) never matches, which fails closed.
+    """
+    row = conn.execute("SELECT generation FROM topics WHERE id = ?", (topic_id,)).fetchone()
+    return bool(row) and bool(generation) and row["generation"] == generation
 
 
 # --- KnowledgeRevision CRUD ---
@@ -577,10 +623,12 @@ def create_check_result(conn: sqlite3.Connection, result: CheckResult) -> CheckR
     cursor = conn.execute(
         """INSERT INTO check_results (topic_id, checked_at, articles_found,
            articles_new, has_new_info, llm_response, notification_sent,
-           notification_error, prompt_tokens, completion_tokens, stage_error)
+           notification_error, prompt_tokens, completion_tokens, stage_error,
+           notify_disposition)
            VALUES (:topic_id, :checked_at, :articles_found, :articles_new,
            :has_new_info, :llm_response, :notification_sent,
-           :notification_error, :prompt_tokens, :completion_tokens, :stage_error)""",
+           :notification_error, :prompt_tokens, :completion_tokens, :stage_error,
+           :notify_disposition)""",
         data,
     )
     result.id = cursor.lastrowid

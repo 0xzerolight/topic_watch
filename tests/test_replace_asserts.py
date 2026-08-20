@@ -9,12 +9,18 @@ from pathlib import Path
 
 import pytest
 
-from app.analysis.knowledge import initialize_knowledge, update_knowledge
-from app.checker import check_topic
+from app.analysis.knowledge import KnowledgeUpdatePlan
+from app.checker import (
+    CheckOutcome,
+    TopicSnapshot,
+    _commit_check_transition,
+    _commit_init_transition,
+    check_topic,
+)
 from app.config import LLMSettings, Settings
 from app.crud import update_knowledge_state, update_topic
 from app.database import get_connection, init_db
-from app.models import KnowledgeState, Topic
+from app.models import CheckResult, KnowledgeState, Topic
 
 
 def _make_settings() -> Settings:
@@ -53,28 +59,25 @@ def test_update_knowledge_state_raises_value_error_when_id_is_none(db_conn: sqli
 
 
 @pytest.mark.asyncio
-async def test_check_topic_raises_value_error_when_id_is_none(db_conn: sqlite3.Connection):
+async def test_check_topic_raises_value_error_when_id_is_none(db_conn: sqlite3.Connection, db_path: Path):
     topic = _topic_without_id()
     settings = _make_settings()
     with pytest.raises(ValueError, match="Topic must have an ID"):
-        await check_topic(topic, db_conn, settings)
+        await check_topic(topic, settings, db_path=db_path)
 
 
-@pytest.mark.asyncio
-async def test_initialize_knowledge_raises_value_error_when_id_is_none(db_conn: sqlite3.Connection):
-    topic = _topic_without_id()
-    settings = _make_settings()
+def _snapshot_without_id() -> TopicSnapshot:
+    return TopicSnapshot(topic=_topic_without_id(), generation="gen", knowledge_version=0, knowledge_summary="")
+
+
+def test_commit_check_transition_raises_value_error_when_id_is_none(db_conn: sqlite3.Connection):
+    """The durable write refuses an id-less topic (the knowledge helpers' old guard)."""
+    outcome = CheckOutcome(result=CheckResult(topic_id=1))
     with pytest.raises(ValueError, match="Topic must have an ID"):
-        await initialize_knowledge(topic, [], db_conn, settings)
+        _commit_check_transition(db_conn, _snapshot_without_id(), outcome, settings=_make_settings())
 
 
-@pytest.mark.asyncio
-async def test_update_knowledge_raises_value_error_when_id_is_none(db_conn: sqlite3.Connection):
-    topic = _topic_without_id()
-    settings = _make_settings()
-    # NoveltyResult is needed; use a mock to avoid any LLM calls
-    from app.analysis.llm import NoveltyResult
-
-    novelty_result = NoveltyResult(has_new_info=False, summary="none", confidence=0.0)
+def test_commit_init_transition_raises_value_error_when_id_is_none(db_conn: sqlite3.Connection):
+    plan = KnowledgeUpdatePlan(summary_text="s", token_count=1)
     with pytest.raises(ValueError, match="Topic must have an ID"):
-        await update_knowledge(topic, novelty_result, db_conn, settings)
+        _commit_init_transition(db_conn, _snapshot_without_id(), plan, [], _make_settings())

@@ -10,6 +10,7 @@ Verifies that:
 import logging
 import sqlite3
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from app.crud import create_article, create_topic, find_article_by_hash
@@ -164,7 +165,7 @@ class TestFetchNewArticlesCrossTopicDedup:
             source_feed="https://example.com/feed.xml",
         )
 
-    async def test_reuses_content_from_another_topic(self, db_conn: sqlite3.Connection) -> None:
+    async def test_reuses_content_from_another_topic(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         """When another topic already fetched an article, reuse its content."""
         topic_a = _make_topic(db_conn, "Topic A")
         topic_b = _make_topic(db_conn, "Topic B")
@@ -193,7 +194,7 @@ class TestFetchNewArticlesCrossTopicDedup:
             patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=[entry])),
             patch("app.scraping.extract_article_content", extract_mock),
         ):
-            stored = (await fetch_new_articles_for_topic(topic_b, db_conn)).articles
+            stored = (await fetch_new_articles_for_topic(topic_b, db_path=db_path)).articles
 
         # Article should be created for topic_b
         assert len(stored) == 1
@@ -204,7 +205,7 @@ class TestFetchNewArticlesCrossTopicDedup:
         # HTTP fetch should NOT have been called
         extract_mock.assert_not_called()
 
-    async def test_reused_article_carries_resolved_url(self, db_conn: sqlite3.Connection) -> None:
+    async def test_reused_article_carries_resolved_url(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         """OVH-025: reuse path stores the resolved publisher URL, not the Google redirect.
 
         Both topics fetch the same Google News entry, so the content_hash (computed
@@ -240,7 +241,7 @@ class TestFetchNewArticlesCrossTopicDedup:
             patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=[entry])),
             patch("app.scraping.extract_article_content", extract_mock),
         ):
-            stored = (await fetch_new_articles_for_topic(topic_b, db_conn)).articles
+            stored = (await fetch_new_articles_for_topic(topic_b, db_path=db_path)).articles
 
         assert len(stored) == 1
         # The stored URL is the resolved publisher URL, not the Google redirect.
@@ -250,7 +251,7 @@ class TestFetchNewArticlesCrossTopicDedup:
         assert stored[0].raw_content == "Pre-fetched content from topic A"
         extract_mock.assert_not_called()
 
-    async def test_reused_article_keeps_new_entry_provenance(self, db_conn: sqlite3.Connection) -> None:
+    async def test_reused_article_keeps_new_entry_provenance(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         """OVH-084: reuse inherits ONLY raw_content; url/title/source_feed stay the new entry's.
 
         The point of cross-topic dedup is to reuse the expensive raw_content while
@@ -304,7 +305,7 @@ class TestFetchNewArticlesCrossTopicDedup:
             patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=[entry])),
             patch("app.scraping.extract_article_content", extract_mock),
         ):
-            stored = (await fetch_new_articles_for_topic(topic_b, db_conn)).articles
+            stored = (await fetch_new_articles_for_topic(topic_b, db_path=db_path)).articles
 
         assert len(stored) == 1
         reused = stored[0]
@@ -322,7 +323,9 @@ class TestFetchNewArticlesCrossTopicDedup:
         # No HTTP fetch happened — content was reused.
         extract_mock.assert_not_called()
 
-    async def test_reused_article_carries_originating_provider(self, db_conn: sqlite3.Connection) -> None:
+    async def test_reused_article_carries_originating_provider(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
         """OVH-114: a reused row keeps the ORIGINATING provider, not the current one.
 
         source_provider (m009) records which provider actually fetched the content.
@@ -362,7 +365,7 @@ class TestFetchNewArticlesCrossTopicDedup:
             ),
             patch("app.scraping.extract_article_content", extract_mock),
         ):
-            stored = (await fetch_new_articles_for_topic(topic_b, db_conn)).articles
+            stored = (await fetch_new_articles_for_topic(topic_b, db_path=db_path)).articles
 
         assert len(stored) == 1
         reused = stored[0]
@@ -372,7 +375,7 @@ class TestFetchNewArticlesCrossTopicDedup:
         assert reused.source_provider == "Bing News"
         extract_mock.assert_not_called()
 
-    async def test_fetches_normally_when_no_cross_topic_match(self, db_conn: sqlite3.Connection) -> None:
+    async def test_fetches_normally_when_no_cross_topic_match(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         """When no cross-topic article exists, content is fetched normally."""
         topic = _make_topic(db_conn, "Topic A")
         entry = self._make_entry()
@@ -383,13 +386,15 @@ class TestFetchNewArticlesCrossTopicDedup:
             patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=[entry])),
             patch("app.scraping.extract_article_content", extract_mock),
         ):
-            stored = (await fetch_new_articles_for_topic(topic, db_conn)).articles
+            stored = (await fetch_new_articles_for_topic(topic, db_path=db_path)).articles
 
         assert len(stored) == 1
         assert stored[0].raw_content == "Freshly fetched content"
         extract_mock.assert_called_once()
 
-    async def test_does_not_reuse_when_existing_has_no_raw_content(self, db_conn: sqlite3.Connection) -> None:
+    async def test_does_not_reuse_when_existing_has_no_raw_content(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
         """If the cross-topic article has no raw_content, fetch content normally."""
         topic_a = _make_topic(db_conn, "Topic A")
         topic_b = _make_topic(db_conn, "Topic B")
@@ -417,14 +422,14 @@ class TestFetchNewArticlesCrossTopicDedup:
             patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=[entry])),
             patch("app.scraping.extract_article_content", extract_mock),
         ):
-            stored = (await fetch_new_articles_for_topic(topic_b, db_conn)).articles
+            stored = (await fetch_new_articles_for_topic(topic_b, db_path=db_path)).articles
 
         assert len(stored) == 1
         assert stored[0].raw_content == "Freshly fetched content"
         # Should have fetched because existing had no content
         extract_mock.assert_called_once()
 
-    async def test_within_topic_dedup_still_works(self, db_conn: sqlite3.Connection) -> None:
+    async def test_within_topic_dedup_still_works(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         """Cross-topic dedup must NOT create duplicates within the same topic."""
         topic = _make_topic(db_conn, "Topic A")
 
@@ -441,13 +446,15 @@ class TestFetchNewArticlesCrossTopicDedup:
             patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=[entry])),
             patch("app.scraping.extract_article_content", extract_mock),
         ):
-            stored = (await fetch_new_articles_for_topic(topic, db_conn)).articles
+            stored = (await fetch_new_articles_for_topic(topic, db_path=db_path)).articles
 
         # Should be skipped — already exists for this topic
         assert len(stored) == 0
         extract_mock.assert_not_called()
 
-    async def test_within_topic_dedup_takes_priority_over_cross_topic(self, db_conn: sqlite3.Connection) -> None:
+    async def test_within_topic_dedup_takes_priority_over_cross_topic(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
         """article_hash_exists check fires before find_article_by_hash."""
         topic_a = _make_topic(db_conn, "Topic A")
         topic_b = _make_topic(db_conn, "Topic B")
@@ -476,13 +483,13 @@ class TestFetchNewArticlesCrossTopicDedup:
             patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=[entry])),
             patch("app.scraping.extract_article_content", extract_mock),
         ):
-            stored = (await fetch_new_articles_for_topic(topic_b, db_conn)).articles
+            stored = (await fetch_new_articles_for_topic(topic_b, db_path=db_path)).articles
 
         # topic_b already has it — must be skipped
         assert len(stored) == 0
         extract_mock.assert_not_called()
 
-    async def test_only_matching_articles_reuse_content(self, db_conn: sqlite3.Connection) -> None:
+    async def test_only_matching_articles_reuse_content(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         """Only the cross-topic article is reused; others are fetched normally."""
         topic_a = _make_topic(db_conn, "Topic A")
         topic_b = _make_topic(db_conn, "Topic B")
@@ -518,7 +525,7 @@ class TestFetchNewArticlesCrossTopicDedup:
             patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=entries)),
             patch("app.scraping.extract_article_content", extract_mock),
         ):
-            stored = (await fetch_new_articles_for_topic(topic_b, db_conn)).articles
+            stored = (await fetch_new_articles_for_topic(topic_b, db_path=db_path)).articles
 
         assert len(stored) == 2
 
@@ -553,7 +560,7 @@ class TestDuplicateRaceObservable:
             source_feed="https://example.com/feed.xml",
         )
 
-    async def test_race_drop_is_counted_in_result(self, db_conn: sqlite3.Connection) -> None:
+    async def test_race_drop_is_counted_in_result(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         """A losing concurrent insert (IntegrityError) is counted in dropped_duplicates."""
         topic = _make_topic(db_conn, "Topic A")
         entry = self._make_entry("https://example.com/raced", "Raced Article")
@@ -581,13 +588,13 @@ class TestDuplicateRaceObservable:
             patch("app.scraping.extract_article_content", AsyncMock(return_value="loser content")),
             patch("app.scraping.create_article", side_effect=racing_create),
         ):
-            result = await fetch_new_articles_for_topic(topic, db_conn)
+            result = await fetch_new_articles_for_topic(topic, db_path=db_path)
 
         # The racing insert lost — no article returned for it, but it must be counted.
         assert result.articles == []
         assert result.dropped_duplicates == 1
 
-    async def test_race_drop_is_logged_at_warning(self, db_conn: sqlite3.Connection, caplog) -> None:
+    async def test_race_drop_is_logged_at_warning(self, db_conn: sqlite3.Connection, caplog, db_path: Path) -> None:
         """The dropped duplicate is logged at WARNING, not swallowed at DEBUG."""
         topic = _make_topic(db_conn, "Topic A")
         entry = self._make_entry("https://example.com/raced2", "Raced Article 2")
@@ -614,7 +621,7 @@ class TestDuplicateRaceObservable:
             patch("app.scraping.create_article", side_effect=racing_create),
             caplog.at_level(logging.WARNING, logger="app.scraping"),
         ):
-            await fetch_new_articles_for_topic(topic, db_conn)
+            await fetch_new_articles_for_topic(topic, db_path=db_path)
 
         assert any(
             record.levelno >= logging.WARNING and "duplicate" in record.message.lower() for record in caplog.records

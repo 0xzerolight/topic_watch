@@ -265,9 +265,13 @@ class TestScheduledCheck:
             # Should not raise
             await _scheduled_check(settings, db_path)
 
-    async def test_uses_fresh_connection_per_topic(self, tmp_path: Path) -> None:
-        """The check cycle must open a new short-lived connection per topic check
-        rather than holding one connection across the whole cycle."""
+    async def test_passes_a_path_not_a_connection_per_topic(self, tmp_path: Path) -> None:
+        """AUG-136: the cycle hands each check a path, never an open connection.
+
+        It used to wrap every per-topic check in ``with get_db(...)``, so the
+        handle — and, through the feed-health callback, the single WAL writer —
+        stayed open across that topic's fetch, LLM and notification awaits.
+        """
         db_path = tmp_path / "test.db"
         from app.database import get_connection, init_db
 
@@ -279,10 +283,11 @@ class TestScheduledCheck:
         topics = [_make_ready_topic(conn, name=f"T{i}") for i in range(2)]
         conn.close()
 
-        seen_conn_ids: list[int] = []
+        calls: list[tuple] = []
 
-        async def fake_check_topic(topic, c, s):
-            seen_conn_ids.append(id(c))
+        async def fake_check_topic(topic, s, **kwargs):
+            calls.append((topic.id, args_seen := kwargs.get("db_path")))
+            assert args_seen == db_path
             from app.models import CheckResult
 
             return CheckResult(topic_id=topic.id)
@@ -300,9 +305,8 @@ class TestScheduledCheck:
         ):
             await _run_check_cycle(settings, db_path)
 
-        # Each topic check received a distinct connection object.
-        assert len(seen_conn_ids) == 2
-        assert len(set(seen_conn_ids)) == 2
+        assert len(calls) == 2
+        assert {t for t, _ in calls} == {t.id for t in topics}
 
 
 class TestVacuumDb:
@@ -361,7 +365,7 @@ class TestInitNewTopics:
         _checking_state._topics.clear()
         captured: list[int] = []
 
-        async def _fake_init(t, conn, settings):
+        async def _fake_init(t, settings, **kwargs):
             # The claim has already flipped the row to RESEARCHING.
             captured.append(t.id)
             assert t.status == TopicStatus.RESEARCHING

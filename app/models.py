@@ -6,6 +6,7 @@ data transfer between layers, and serialization to/from SQLite rows.
 
 import json
 import logging
+import secrets
 import sqlite3
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -14,6 +15,34 @@ from typing import ClassVar, Self
 from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger(__name__)
+
+
+def to_db_utc(dt: datetime) -> str:
+    """Serialize a datetime as canonical UTC TEXT with an explicit ``+00:00`` offset.
+
+    Durable due-times and timestamps are compared and ordered as TEXT (``<=`` on
+    a bare column so SQLite can use the index — see ``_DELETE_OLD_ARTICLES_SQL``).
+    That is only correct when every writer spells the same instant identically, so
+    a value carrying a local offset (``...+02:00``) would sort and compare wrong
+    against a ``+00:00`` sibling despite naming the same moment. Naive datetimes
+    are assumed to already be UTC, matching how the DB stores them.
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC).isoformat()
+
+
+def new_generation() -> str:
+    """Mint a topic's never-reused lifecycle identity.
+
+    ``topics.id`` is a recyclable SQLite rowid: deleting a topic frees its id for
+    the next INSERT, so a long-running check that captured only the id can wake up
+    and write its results onto an unrelated replacement topic. The generation is
+    captured alongside the id at snapshot time and re-checked before any durable
+    write, which makes that stale apply a no-op. 8 random bytes, matching the
+    ``lower(hex(randomblob(8)))`` backfill in migration 026.
+    """
+    return secrets.token_hex(8)
 
 
 def _coerce_dt(value: object) -> datetime | None:
@@ -220,6 +249,10 @@ class Topic(SQLiteModel):
     # excluded from the create_topic/update_topic column lists (mirroring
     # CheckResult.seen_at), so a topic edit carrying a stale Topic cannot reset it.
     heartbeat_alerted_at: datetime | None = None
+    # Never-reused lifecycle identity (see ``new_generation``). Written once by
+    # ``crud.create_topic`` and deliberately absent from ``update_topic``'s column
+    # list, so an edit carrying a stale Topic can never rotate or blank it.
+    generation: str = Field(default_factory=new_generation)
 
     @field_validator("confidence_threshold", "relevance_threshold", mode="before")
     @classmethod
@@ -312,6 +345,10 @@ class KnowledgeState(SQLiteModel):
     summary_text: str
     token_count: int = 0
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    # Compare-and-swap counter, bumped by every knowledge write. A check snapshots
+    # the version before its (conn-free) LLM phase and the write is rejected when
+    # the row moved meanwhile, so two overlapping checks cannot lose an update.
+    version: int = 0
 
 
 class KnowledgeRevision(SQLiteModel):
@@ -376,6 +413,23 @@ def is_source_failure(stage_error: str | None) -> bool:
     return stage_error is not None and stage_error.startswith(SOURCE_FAILURE_PREFIXES)
 
 
+class NotifyDisposition(StrEnum):
+    """Why a check did (or did not) notify — ``check_results.notify_disposition``.
+
+    Distinct from ``notification_error``, which only says a delivery failed: this
+    records the pipeline's own decision, so "we chose not to send" is never
+    indistinguishable from "we sent and it worked".
+    """
+
+    SENT = "sent"
+    PENDING = "pending"
+    NO_NEW_INFO = "no_new_info"
+    BELOW_CONFIDENCE = "below_confidence"
+    BELOW_RELEVANCE = "below_relevance"
+    SUPPRESSED_IMPORTANCE = "suppressed_importance"
+    ANALYSIS_FAILED = "analysis_failed"
+
+
 class CheckResult(SQLiteModel):
     """Record of a single check cycle for a topic."""
 
@@ -405,6 +459,9 @@ class CheckResult(SQLiteModel):
     # exception summary). NULL on clean runs. Distinct from notification_error,
     # which only covers delivery.
     stage_error: str | None = None
+    # Why this check did or did not notify (see ``NotifyDisposition``). NULL on
+    # rows written before migration 026.
+    notify_disposition: str | None = None
     # When the user first opened a topic whose latest check carried new info. NULL
     # = unseen. Gates only the dashboard "new info" badge (has_new_info AND
     # seen_at IS NULL); ``has_new_info`` itself is never mutated, so the detail-page

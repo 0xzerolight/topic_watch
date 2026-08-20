@@ -8,7 +8,6 @@ import logging
 import re
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 
 from app.analysis.llm import (
     KnowledgeStateUpdate,
@@ -23,9 +22,8 @@ from app.config import Settings
 from app.crud import (
     create_knowledge_revision,
     create_knowledge_state,
-    get_knowledge_state,
     prune_knowledge_revisions,
-    update_knowledge_state,
+    update_knowledge_state_cas,
 )
 from app.models import Article, KnowledgeRevision, KnowledgeRevisionSource, KnowledgeState, Topic
 
@@ -33,22 +31,29 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class KnowledgeWriteResult:
-    """Outcome of an init/update knowledge write, with cost + sufficiency signals.
+class KnowledgeUpdatePlan:
+    """A knowledge summary the LLM produced but nobody has persisted yet.
+
+    Knowledge generation is a multi-second LLM round-trip, so it runs with no
+    database connection open; the resulting plan is a plain value that the
+    caller's single durable transaction applies later, alongside the article
+    disposition and the CheckResult. Splitting the LLM call from the write is
+    what lets those become one commit instead of three independent ones.
 
     Fields:
-        state: The persisted (or, for an insufficient update, the preserved
-            existing) ``KnowledgeState``.
-        usage: ``TokenUsage`` consumed by the LLM call (prompt/completion tokens;
-            both 0 if the provider omitted usage).
-        sufficient_data: The LLM's ``sufficient_data`` verdict. For init, ``False``
-            means thin/off-topic articles (the state was still stored with an
-            explanation and the topic still goes READY); ``True`` means good
-            knowledge was built. For update, ``False`` means the existing state
-            was preserved unchanged.
+        summary_text: The summary to persist (already fitted to the token budget).
+        token_count: Its authoritative ``count_tokens`` value.
+        usage: ``TokenUsage`` for the generation call plus any compression
+            round-trip (both 0 if the provider omitted usage).
+        sufficient_data: The LLM's verdict. On the update path ``False`` means the
+            findings were too vague to merge, so ``summary_text`` is the unchanged
+            current summary and the caller must NOT apply the plan. On the init
+            path ``False`` means thin/off-topic articles; the explanatory summary
+            is still stored as the baseline and the topic still goes READY.
     """
 
-    state: KnowledgeState
+    summary_text: str
+    token_count: int
     usage: TokenUsage = field(default_factory=TokenUsage)
     sufficient_data: bool = True
 
@@ -203,74 +208,18 @@ async def _compress_if_over_budget(
     return compress_usage
 
 
-def _record_revision(
-    conn: sqlite3.Connection,
-    topic: Topic,
-    result: KnowledgeStateUpdate,
-    source: KnowledgeRevisionSource,
-    settings: Settings,
-    change_note: str | None = None,
-) -> None:
-    """Append a snapshot of a knowledge write, then prune to the retention cap.
-
-    MUST be called AFTER the caller has committed the knowledge-state write.
-    ``SQLITE_FULL``/``SQLITE_IOERR`` roll back the entire transaction rather
-    than just the failing statement, so appending inside the caller's
-    transaction could silently discard the state write while the caller still
-    reported success — the checker would then mark articles processed and notify
-    against knowledge that was never saved (OVH-009). Running afterwards makes
-    the state durable first, so this can fail harmlessly.
-
-    Every failure is therefore swallowed: the history is a read-only audit trail
-    the checker never reads, and raising here would flip the topic to ERROR on
-    the init path (checker.py:750) with a misleading "LLM failed" message
-    (cli.py:188). Worst case is one missing revision row.
-    """
-    if topic.id is None:  # unreachable at runtime; both callers pre-check. Kept for mypy.
-        return
-    try:
-        create_knowledge_revision(
-            conn,
-            KnowledgeRevision(
-                topic_id=topic.id,
-                summary_text=result.updated_summary,
-                token_count=result.token_count,
-                source=source,
-                change_note=change_note,
-            ),
-        )
-        prune_knowledge_revisions(conn, topic.id, settings.knowledge_revision_limit)
-        conn.commit()
-    except Exception:
-        logger.warning(
-            "Failed to record knowledge revision for topic '%s'; the knowledge write is already committed",
-            topic.name,
-            exc_info=True,
-        )
-        conn.rollback()
-
-
-async def initialize_knowledge(
+async def prepare_initial_knowledge(
     topic: Topic,
     articles: list[Article],
-    conn: sqlite3.Connection,
     settings: Settings,
-) -> KnowledgeWriteResult:
-    """Build an initial knowledge state from articles and store it.
+) -> KnowledgeUpdatePlan:
+    """Build an initial knowledge summary from articles. Writes nothing.
 
-    Raises on LLM failure — the caller should set the topic status to 'error'.
-
-    Returns a ``KnowledgeWriteResult``. ``result.sufficient_data`` is the clean,
-    string-free signal the caller can branch on:
-
-    * raises (hard error) -> set topic status to 'error'
-    * ``sufficient_data is False`` -> thin/off-topic articles; the explanatory
-      summary was still persisted as the baseline and the topic still goes READY
-    * ``sufficient_data is True`` -> good knowledge was built and stored
+    Raises on LLM failure — the caller sets the topic status to 'error'.
+    ``sufficient_data is False`` means thin/off-topic articles; the explanatory
+    summary is still worth storing as the baseline and the topic still goes READY,
+    so the caller applies the plan either way.
     """
-    if topic.id is None:
-        raise ValueError("Topic must have an ID")
-
     result = await generate_initial_knowledge(articles, topic, settings)
     # Track total LLM cost: the generation call plus any compression round-trip
     # that fires below (OVH-129).
@@ -283,59 +232,33 @@ async def initialize_knowledge(
             result.confidence,
             result.updated_summary,
         )
-        # Still store it — the summary explains what's missing, which is useful
-        # context for the next check cycle. The topic still transitions to READY.
 
     compress_usage = await _compress_if_over_budget(result, topic, settings)
-    usage = TokenUsage(
-        usage.prompt_tokens + compress_usage.prompt_tokens,
-        usage.completion_tokens + compress_usage.completion_tokens,
-    )
-
-    state = KnowledgeState(
-        topic_id=topic.id,
+    return KnowledgeUpdatePlan(
         summary_text=result.updated_summary,
         token_count=result.token_count,
-    )
-    created = create_knowledge_state(conn, state)
-    conn.commit()
-    _record_revision(conn, topic, result, KnowledgeRevisionSource.INIT, settings)
-
-    logger.info(
-        "Initialized knowledge for topic '%s' (%d tokens)",
-        topic.name,
-        result.token_count,
-    )
-    return KnowledgeWriteResult(
-        state=created,
-        usage=usage,
+        usage=TokenUsage(
+            usage.prompt_tokens + compress_usage.prompt_tokens,
+            usage.completion_tokens + compress_usage.completion_tokens,
+        ),
         sufficient_data=result.sufficient_data,
     )
 
 
-async def update_knowledge(
+async def prepare_knowledge_update(
     topic: Topic,
     novelty_result: NoveltyResult,
-    conn: sqlite3.Connection,
+    current_summary: str,
     settings: Settings,
-) -> KnowledgeWriteResult:
-    """Update the knowledge state with new findings and persist.
+) -> KnowledgeUpdatePlan:
+    """Merge new findings into ``current_summary``. Writes nothing.
 
-    Raises ValueError if no existing knowledge state is found.
-    Raises on LLM failure — the caller should handle gracefully.
-
-    Returns a ``KnowledgeWriteResult`` carrying the persisted (or preserved)
-    state, the LLM ``usage``, and ``sufficient_data`` (``False`` means the LLM
-    found the new findings too vague to merge, so the existing state was kept).
+    Raises on LLM failure — the caller records that distinctly and leaves the
+    stored knowledge untouched. ``sufficient_data is False`` means the findings
+    were too vague to merge: the returned plan carries the unchanged
+    ``current_summary`` and the caller must not apply it.
     """
-    if topic.id is None:
-        raise ValueError("Topic must have an ID")
-
-    current = get_knowledge_state(conn, topic.id)
-    if current is None:
-        raise ValueError(f"No knowledge state found for topic '{topic.name}' (id={topic.id})")
-
-    result = await generate_knowledge_update(current.summary_text, novelty_result, topic, settings)
+    result = await generate_knowledge_update(current_summary, novelty_result, topic, settings)
     usage = TokenUsage(result.prompt_tokens, result.completion_tokens)
 
     if not result.sufficient_data:
@@ -343,33 +266,87 @@ async def update_knowledge(
             "Knowledge update for topic '%s' had insufficient data, preserving existing state",
             topic.name,
         )
-        return KnowledgeWriteResult(state=current, usage=usage, sufficient_data=False)
+        return KnowledgeUpdatePlan(
+            summary_text=current_summary,
+            token_count=0,
+            usage=usage,
+            sufficient_data=False,
+        )
 
     # Fold the compression round-trip's cost into the reported usage (OVH-129).
     compress_usage = await _compress_if_over_budget(result, topic, settings)
-    usage = TokenUsage(
-        usage.prompt_tokens + compress_usage.prompt_tokens,
-        usage.completion_tokens + compress_usage.completion_tokens,
+    return KnowledgeUpdatePlan(
+        summary_text=result.updated_summary,
+        token_count=result.token_count,
+        usage=TokenUsage(
+            usage.prompt_tokens + compress_usage.prompt_tokens,
+            usage.completion_tokens + compress_usage.completion_tokens,
+        ),
+        sufficient_data=True,
     )
 
-    current.summary_text = result.updated_summary
-    current.token_count = result.token_count
-    current.updated_at = datetime.now(UTC)
 
-    update_knowledge_state(conn, current)
-    conn.commit()
-    _record_revision(
+def apply_knowledge_update(
+    conn: sqlite3.Connection,
+    topic_id: int,
+    plan: KnowledgeUpdatePlan,
+    *,
+    expected_version: int,
+    source: KnowledgeRevisionSource,
+    settings: Settings,
+    change_note: str | None = None,
+) -> bool:
+    """Persist a prepared plan plus its revision. Does NOT commit.
+
+    Returns ``False`` when the knowledge state moved since ``expected_version``
+    was snapshotted — another check finished first, so this plan was built on a
+    summary that is no longer current and applying it would lose the winner's
+    update. The caller aborts its transaction rather than recording a success.
+
+    The revision append and prune run inside the caller's transaction, not after
+    it. That is the point of the design: knowledge state, revision history,
+    article disposition and the CheckResult become one commit, so a failure at
+    any step leaves none of them — never a knowledge write the check never
+    recorded, or a recorded check whose knowledge was rolled back (OVH-009).
+    """
+    applied = update_knowledge_state_cas(
         conn,
-        topic,
-        result,
-        KnowledgeRevisionSource.UPDATE,
-        settings,
-        change_note=novelty_result.summary,
+        topic_id,
+        summary_text=plan.summary_text,
+        token_count=plan.token_count,
+        expected_version=expected_version,
     )
+    if not applied:
+        # Either the row moved (a real conflict) or there is no row yet (first
+        # init). Distinguishing them takes one SELECT under the write lock the
+        # CAS already holds, so no third writer can slip between the two.
+        exists = conn.execute("SELECT 1 FROM knowledge_states WHERE topic_id = ?", (topic_id,)).fetchone()
+        if exists:
+            logger.warning(
+                "Knowledge state for topic_id=%d moved since version %d; discarding this update",
+                topic_id,
+                expected_version,
+            )
+            return False
+        create_knowledge_state(
+            conn,
+            KnowledgeState(
+                topic_id=topic_id,
+                summary_text=plan.summary_text,
+                token_count=plan.token_count,
+                version=1,
+            ),
+        )
 
-    logger.info(
-        "Updated knowledge for topic '%s' (%d tokens)",
-        topic.name,
-        result.token_count,
+    create_knowledge_revision(
+        conn,
+        KnowledgeRevision(
+            topic_id=topic_id,
+            summary_text=plan.summary_text,
+            token_count=plan.token_count,
+            source=source,
+            change_note=change_note,
+        ),
     )
-    return KnowledgeWriteResult(state=current, usage=usage, sufficient_data=True)
+    prune_knowledge_revisions(conn, topic_id, settings.knowledge_revision_limit)
+    return True

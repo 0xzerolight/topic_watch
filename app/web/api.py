@@ -6,7 +6,7 @@ to trigger topic checks. Reuses existing CRUD functions and Pydantic models.
 
 import sqlite3
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.checker import check_topic
 from app.config import Settings
@@ -17,6 +17,7 @@ from app.crud import (
     list_check_results,
     list_topics,
 )
+from app.database import get_db
 from app.models import KnowledgeState, Topic, TopicStatus
 from app.web.csrf import verify_csrf
 from app.web.dependencies import get_db_conn, get_settings
@@ -29,7 +30,7 @@ router = APIRouter(prefix="/api/v1", tags=["api"])
 async def api_list_topics(
     active: bool | None = None,
     tag: str | None = None,
-    conn: sqlite3.Connection = Depends(get_db_conn),
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
 ) -> list[Topic]:
     """List all topics with optional filters.
 
@@ -42,7 +43,7 @@ async def api_list_topics(
 @router.get("/topics/{topic_id}")
 async def api_get_topic(
     topic_id: int,
-    conn: sqlite3.Connection = Depends(get_db_conn),
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
 ) -> dict:
     """Get a single topic with its knowledge state."""
     topic = get_topic(conn, topic_id)
@@ -57,7 +58,7 @@ async def api_list_checks(
     topic_id: int,
     page: int = 1,
     per_page: int = 20,
-    conn: sqlite3.Connection = Depends(get_db_conn),
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
 ) -> dict:
     """Get check history for a topic with pagination."""
     topic = get_topic(conn, topic_id)
@@ -83,7 +84,7 @@ async def api_list_checks(
 @router.get("/topics/{topic_id}/knowledge")
 async def api_get_knowledge(
     topic_id: int,
-    conn: sqlite3.Connection = Depends(get_db_conn),
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
 ) -> KnowledgeState:
     """Get the current knowledge state for a topic."""
     topic = get_topic(conn, topic_id)
@@ -97,8 +98,8 @@ async def api_get_knowledge(
 
 @router.post("/topics/{topic_id}/check", dependencies=[Depends(verify_csrf)])
 async def api_trigger_check(
+    request: Request,
     topic_id: int,
-    conn: sqlite3.Connection = Depends(get_db_conn),
     settings: Settings = Depends(get_settings),
 ) -> dict:
     """Trigger a check for a specific topic.
@@ -108,8 +109,16 @@ async def api_trigger_check(
     concurrent check of the same topic (two API POSTs, or an API call racing a
     UI 'Check now') returns 409 instead of launching a duplicate pipeline that
     would double-spend the LLM and double-notify (OVH-019).
+
+    AUG-202: this handler takes no request-scoped connection. Passing one into
+    ``check_topic`` pinned it for the whole pipeline — feed, content, LLM and
+    notification awaits — which is minutes of held request and SQLite resources
+    on the one path the web remediation had left behind. The precondition reads
+    below use a short connection and ``check_topic`` opens its own per phase.
     """
-    topic = get_topic(conn, topic_id)
+    db_path = getattr(request.app.state, "db_path", None)
+    with get_db(db_path) as conn:
+        topic = get_topic(conn, topic_id)
     if topic is None:
         raise HTTPException(status_code=404, detail="Topic not found")
     if topic.status != TopicStatus.READY:
@@ -121,7 +130,7 @@ async def api_trigger_check(
     if not await _checking_state.start_check(topic_id):
         raise HTTPException(status_code=409, detail="A check for this topic is already in progress")
     try:
-        result = await check_topic(topic, conn, settings, guard=False)
+        result = await check_topic(topic, settings, db_path=db_path, guard=False)
     finally:
         await _checking_state.finish_check(topic_id)
     return {"status": "checked", "has_new_info": result.has_new_info, "check_result_id": result.id}

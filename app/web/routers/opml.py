@@ -20,7 +20,7 @@ router = APIRouter()
 
 @router.get("/export/opml")
 async def export_opml_handler(
-    conn: sqlite3.Connection = Depends(get_db_conn),
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
 ):
     """Export all topics as OPML XML."""
     from app.opml import export_opml
@@ -39,7 +39,7 @@ async def export_opml_handler(
 @router.post("/import/opml", dependencies=[Depends(verify_csrf)])
 async def import_opml_handler(
     request: Request,
-    conn: sqlite3.Connection = Depends(get_db_conn),
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
     settings: Settings = Depends(get_settings),
 ):
     """Import topics from an OPML file."""

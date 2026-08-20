@@ -287,7 +287,7 @@ class TestTopicCheckConcurrency:
         in_flight = 0
         max_in_flight = 0
 
-        async def fake_check_topic(topic, conn, settings):
+        async def fake_check_topic(topic, settings, **kwargs):
             nonlocal in_flight, max_in_flight
             in_flight += 1
             max_in_flight = max(max_in_flight, in_flight)
@@ -320,7 +320,7 @@ class TestTopicCheckConcurrency:
         in_flight = 0
         max_in_flight = 0
 
-        async def fake_check_topic(topic, conn, settings):
+        async def fake_check_topic(topic, settings, **kwargs):
             nonlocal in_flight, max_in_flight
             in_flight += 1
             max_in_flight = max(max_in_flight, in_flight)

@@ -323,8 +323,8 @@ def _one_article(topic_id: int):
 
 class TestRevisionWritePath:
     async def test_initialize_records_init_revision(self, db_conn: sqlite3.Connection) -> None:
-        from app.analysis.knowledge import initialize_knowledge
         from app.crud import get_knowledge_revision, list_knowledge_revision_headers
+        from tests.helpers import init_knowledge as initialize_knowledge
         from tests.helpers import make_knowledge_update, stub_llm_boundary
 
         topic = _seed_topic(db_conn, "Init Topic")
@@ -341,8 +341,8 @@ class TestRevisionWritePath:
 
     async def test_initialize_with_insufficient_data_still_records(self, db_conn: sqlite3.Connection) -> None:
         """Thin/off-topic articles still persist a baseline state, so they get a revision."""
-        from app.analysis.knowledge import initialize_knowledge
         from app.crud import list_knowledge_revision_headers
+        from tests.helpers import init_knowledge as initialize_knowledge
         from tests.helpers import make_knowledge_update, stub_llm_boundary
 
         topic = _seed_topic(db_conn, "Thin Topic")
@@ -354,9 +354,8 @@ class TestRevisionWritePath:
         assert len(list_knowledge_revision_headers(db_conn, topic.id, limit=10)) == 1
 
     async def test_update_records_update_revision_with_change_note(self, db_conn: sqlite3.Connection) -> None:
-        from app.analysis.knowledge import update_knowledge
         from app.crud import create_knowledge_state, get_knowledge_revision, list_knowledge_revision_headers
-        from tests.helpers import make_knowledge_update, make_novelty_result, stub_llm_boundary
+        from tests.helpers import make_knowledge_update, make_novelty_result, stub_llm_boundary, update_knowledge
 
         topic = _seed_topic(db_conn, "Update Topic")
         create_knowledge_state(db_conn, KnowledgeState(topic_id=topic.id, summary_text="Old.", token_count=3))
@@ -374,9 +373,8 @@ class TestRevisionWritePath:
         assert full.change_note == "Court ruled on Tuesday."
 
     async def test_insufficient_update_records_no_revision(self, db_conn: sqlite3.Connection) -> None:
-        from app.analysis.knowledge import update_knowledge
         from app.crud import create_knowledge_state, list_knowledge_revision_headers
-        from tests.helpers import make_knowledge_update, make_novelty_result, stub_llm_boundary
+        from tests.helpers import make_knowledge_update, make_novelty_result, stub_llm_boundary, update_knowledge
 
         topic = _seed_topic(db_conn, "Insufficient Topic")
         create_knowledge_state(db_conn, KnowledgeState(topic_id=topic.id, summary_text="Old.", token_count=2))
@@ -390,9 +388,8 @@ class TestRevisionWritePath:
         assert list_knowledge_revision_headers(db_conn, topic.id, limit=10) == []
 
     async def test_prunes_to_configured_limit(self, db_conn: sqlite3.Connection) -> None:
-        from app.analysis.knowledge import update_knowledge
         from app.crud import create_knowledge_state, get_knowledge_revision, list_knowledge_revision_headers
-        from tests.helpers import make_knowledge_update, make_novelty_result, stub_llm_boundary
+        from tests.helpers import make_knowledge_update, make_novelty_result, stub_llm_boundary, update_knowledge
 
         settings = _revision_settings(knowledge_revision_limit=2)
         topic = _seed_topic(db_conn, "Prune Topic")
@@ -412,34 +409,41 @@ class TestRevisionWritePath:
             "Summary 2.",
         ]
 
-    async def test_revision_failure_does_not_break_the_write(self, db_conn: sqlite3.Connection, caplog) -> None:
-        """History is secondary: an append failure must never fail the knowledge write."""
-        import logging
+    async def test_revision_failure_rolls_the_whole_write_back(self, db_conn: sqlite3.Connection) -> None:
+        """The revision append is part of the durable transition, not an afterthought.
+
+        It used to run after the state write had already committed and swallow its
+        own failures, which meant a full disk could leave knowledge advanced while
+        the check that produced it was never recorded. Inside the one transaction
+        the failure takes the state write with it, so the next cycle re-runs from a
+        consistent starting point.
+        """
         from unittest.mock import patch
 
-        from app.analysis.knowledge import update_knowledge
-        from app.crud import create_knowledge_state, get_knowledge_state
-        from tests.helpers import make_knowledge_update, make_novelty_result, stub_llm_boundary
+        from app.analysis.knowledge import prepare_knowledge_update
+        from app.crud import create_knowledge_state, get_knowledge_state, list_knowledge_revision_headers
+        from app.models import KnowledgeRevisionSource
+        from tests.helpers import apply_plan, make_knowledge_update, make_novelty_result, stub_llm_boundary
 
         topic = _seed_topic(db_conn, "Resilient Topic")
         create_knowledge_state(db_conn, KnowledgeState(topic_id=topic.id, summary_text="Old.", token_count=2))
         db_conn.commit()
 
+        with stub_llm_boundary(knowledge_init=make_knowledge_update("Never lands.")):
+            plan = await prepare_knowledge_update(topic, make_novelty_result(), "Old.", _revision_settings())
+
         with (
-            caplog.at_level(logging.WARNING),
             patch(
                 "app.analysis.knowledge.create_knowledge_revision",
                 side_effect=sqlite3.OperationalError("database or disk is full"),
             ),
-            stub_llm_boundary(knowledge_init=make_knowledge_update("Survives.")),
+            pytest.raises(sqlite3.OperationalError),
         ):
-            result = await update_knowledge(topic, make_novelty_result(), db_conn, _revision_settings())
+            apply_plan(db_conn, topic, plan, KnowledgeRevisionSource.UPDATE, _revision_settings())
+        db_conn.rollback()
 
-        assert result.sufficient_data is True
-        # The state write is already committed before the append is attempted,
-        # so even a whole-transaction abort cannot take it with it.
-        assert get_knowledge_state(db_conn, topic.id).summary_text == "Survives."
-        assert "revision" in caplog.text.lower()
+        assert get_knowledge_state(db_conn, topic.id).summary_text == "Old."
+        assert list_knowledge_revision_headers(db_conn, topic.id, limit=10) == []
 
 
 class TestSplitSegments:

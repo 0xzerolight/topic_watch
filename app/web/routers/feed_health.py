@@ -81,7 +81,7 @@ def _build_feed_health_rows(feeds: list[FeedHealth], topics: list[Topic], exa_en
 @router.get("/feeds", response_class=HTMLResponse)
 async def feed_health_page(
     request: Request,
-    conn: sqlite3.Connection = Depends(get_db_conn),
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
     settings: Settings = Depends(get_settings),
 ):
     """Global feed health dashboard: per-source health with owning-topic links."""

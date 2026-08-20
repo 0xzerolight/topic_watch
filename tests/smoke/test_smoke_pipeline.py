@@ -24,6 +24,7 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -41,7 +42,7 @@ from app.crud import (
     list_pending_webhooks,
 )
 from app.models import CheckResult, FeedMode, NotificationDelivery, Topic, TopicStatus
-from tests.helpers import RssEntry, build_rss_transport, build_rss_xml, stub_llm_boundary
+from tests.helpers import RssEntry, build_rss_transport, build_rss_xml, conn_db_path, stub_llm_boundary
 
 _FEED_URL = "https://example.com/feed.xml"
 _ARTICLE_1 = "https://example.com/article-1"
@@ -129,7 +130,7 @@ def _build_transport(entries: list[RssEntry]) -> httpx.MockTransport:
     )
 
 
-async def test_initialize_then_check_pipeline(db_conn: sqlite3.Connection) -> None:
+async def test_initialize_then_check_pipeline(db_conn: sqlite3.Connection, db_path: Path) -> None:
     """Init builds + persists knowledge; a later check records a CheckResult and notifies."""
     settings = _settings()
     topic = _make_topic(db_conn)
@@ -148,7 +149,7 @@ async def test_initialize_then_check_pipeline(db_conn: sqlite3.Connection) -> No
         _inject_transport(_build_transport(init_entries)),
         stub_llm_boundary(),
     ):
-        await initialize_new_topic(topic, db_conn, settings)
+        await initialize_new_topic(topic, settings, db_path=db_path)
 
     # initialize_new_topic mutates `topic` in place, transitioning it to READY.
     assert topic.status == TopicStatus.READY
@@ -192,7 +193,7 @@ async def test_initialize_then_check_pipeline(db_conn: sqlite3.Connection) -> No
         ) as mock_notify,
         patch("app.checker.send_webhooks", new=AsyncMock(return_value=0)),
     ):
-        result = await check_topic(topic, db_conn, settings)
+        result = await check_topic(topic, settings, db_path=db_path)
 
     # A CheckResult was produced and recorded with the novelty outcome.
     assert isinstance(result, CheckResult)
@@ -253,7 +254,7 @@ def _build_webhook_failing_transport(entries: list[RssEntry]) -> httpx.MockTrans
     return httpx.MockTransport(handler)
 
 
-async def test_check_topic_queues_webhook_through_held_conn_on_500(db_conn: sqlite3.Connection) -> None:
+async def test_check_topic_queues_webhook_through_held_conn_on_500(db_conn: sqlite3.Connection, db_path: Path) -> None:
     """OVH-073: a failed webhook delivery is queued through check_topic's held conn.
 
     Unlike the other smoke test, ``send_webhooks`` is NOT patched — it runs for
@@ -286,7 +287,7 @@ async def test_check_topic_queues_webhook_through_held_conn_on_500(db_conn: sqli
         _inject_transport(_build_transport(init_entries)),
         stub_llm_boundary(),
     ):
-        await initialize_new_topic(topic, db_conn, settings)
+        await initialize_new_topic(topic, settings, db_path=db_path)
     assert topic.status == TopicStatus.READY
 
     # --- Phase 2: check against a new article; the webhook POST fails (500) ---
@@ -318,7 +319,7 @@ async def test_check_topic_queues_webhook_through_held_conn_on_500(db_conn: sqli
         # Let the real webhook POST reach the MockTransport (skip the SSRF DNS check).
         patch("app.webhooks.is_private_url", return_value=False),
     ):
-        result = await check_topic(topic, db_conn, settings)
+        result = await check_topic(topic, settings, db_path=db_path)
 
     # The CheckResult was created and committed (queued webhook correlates to it).
     assert isinstance(result, CheckResult)
@@ -339,6 +340,7 @@ async def test_check_topic_queues_webhook_through_held_conn_on_500(db_conn: sqli
 
 async def _init_ready_topic(db_conn: sqlite3.Connection, settings: Settings) -> Topic:
     """Initialize a topic to READY through the real pipeline (shared smoke setup)."""
+    db_path = conn_db_path(db_conn)
     topic = _make_topic(db_conn)
     init_entries = [
         RssEntry(
@@ -352,12 +354,12 @@ async def _init_ready_topic(db_conn: sqlite3.Connection, settings: Settings) -> 
         _inject_transport(_build_transport(init_entries)),
         stub_llm_boundary(),
     ):
-        await initialize_new_topic(topic, db_conn, settings)
+        await initialize_new_topic(topic, settings, db_path=db_path)
     assert topic.status == TopicStatus.READY
     return topic
 
 
-async def test_below_threshold_suppresses_notification_end_to_end(db_conn: sqlite3.Connection) -> None:
+async def test_below_threshold_suppresses_notification_end_to_end(db_conn: sqlite3.Connection, db_path: Path) -> None:
     """OVH-161: has_new_info=True but below the confidence threshold => no notify,
     no knowledge update, but the article is still marked processed.
 
@@ -398,7 +400,7 @@ async def test_below_threshold_suppresses_notification_end_to_end(db_conn: sqlit
         patch("app.checker.send_notification_per_url", new=AsyncMock()) as mock_notify,
         patch("app.checker.send_webhooks", new=AsyncMock()) as mock_webhooks,
     ):
-        result = await check_topic(topic, db_conn, settings)
+        result = await check_topic(topic, settings, db_path=db_path)
 
     # Detected new info, but no delivery was attempted at all.
     assert result.has_new_info is True
@@ -421,7 +423,9 @@ async def test_below_threshold_suppresses_notification_end_to_end(db_conn: sqlit
     assert article_two.processed is True
 
 
-async def test_delivery_failure_queues_pending_notification_end_to_end(db_conn: sqlite3.Connection) -> None:
+async def test_delivery_failure_queues_pending_notification_end_to_end(
+    db_conn: sqlite3.Connection, db_path: Path
+) -> None:
     """OVH-161: an above-threshold notify whose delivery fails is queued for retry.
 
     ``send_notification_per_url`` returns a failed ``NotificationDelivery`` (the
@@ -459,7 +463,7 @@ async def test_delivery_failure_queues_pending_notification_end_to_end(db_conn: 
         ),
         patch("app.checker.send_webhooks", new=AsyncMock(return_value=0)),
     ):
-        result = await check_topic(topic, db_conn, settings)
+        result = await check_topic(topic, settings, db_path=db_path)
 
     # The check committed a CheckResult flagging the delivery failure.
     assert result.id is not None
@@ -474,7 +478,7 @@ async def test_delivery_failure_queues_pending_notification_end_to_end(db_conn: 
     assert queued.topic_id == topic.id
 
 
-async def test_compression_path_runs_offline_end_to_end(db_conn: sqlite3.Connection) -> None:
+async def test_compression_path_runs_offline_end_to_end(db_conn: sqlite3.Connection, db_path: Path) -> None:
     """OVH-162: a tiny knowledge budget drives the real over-budget compression
     branch through the full pipeline, served entirely by the stub (no live call).
 
@@ -509,7 +513,7 @@ async def test_compression_path_runs_offline_end_to_end(db_conn: sqlite3.Connect
         _inject_transport(_build_transport(init_entries)),
         stub_llm_boundary(knowledge_init=init_update, compressed=compressed),
     ):
-        await initialize_new_topic(topic, db_conn, settings)
+        await initialize_new_topic(topic, settings, db_path=db_path)
 
     assert topic.status == TopicStatus.READY
     knowledge = get_knowledge_state(db_conn, topic.id)

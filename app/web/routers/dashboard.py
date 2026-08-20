@@ -17,7 +17,7 @@ router = APIRouter()
 
 
 @router.get("/health")
-async def health_check(conn: sqlite3.Connection = Depends(get_db_conn)):
+async def health_check(conn: sqlite3.Connection = Depends(get_db_conn, scope="function")):
     """Health check endpoint for load balancers and container orchestrators."""
     topic_count = conn.execute("SELECT COUNT(*) FROM topics").fetchone()[0]
     return {"status": "ok", "topics": topic_count}
@@ -26,7 +26,7 @@ async def health_check(conn: sqlite3.Connection = Depends(get_db_conn)):
 @router.get("/", response_class=HTMLResponse)
 async def dashboard(
     request: Request,
-    conn: sqlite3.Connection = Depends(get_db_conn),
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
     tag: str | None = None,
     error: str | None = None,
 ):
@@ -73,7 +73,7 @@ async def dashboard(
 @router.get("/topics/search", response_class=HTMLResponse)
 async def search_topics(
     request: Request,
-    conn: sqlite3.Connection = Depends(get_db_conn),
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
     q: str = "",
     status: str = "all",
 ):

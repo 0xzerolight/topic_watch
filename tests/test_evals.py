@@ -928,7 +928,7 @@ async def test_run_live_uses_scratch_topic_and_reads_prod_readonly(tmp_path, mon
 
     captured: dict[str, object] = {}
 
-    async def fake_fetch(topic: Topic, conn, **_kw: object) -> FetchResult:
+    async def fake_fetch(topic: Topic, **_kw: object) -> FetchResult:
         captured["topic_id"] = topic.id
         art = Article(
             topic_id=topic.id,  # type: ignore[arg-type]
@@ -975,7 +975,7 @@ async def test_run_live_passes_exa_settings_to_fetch(tmp_path, monkeypatch) -> N
 
     captured_kwargs: dict[str, object] = {}
 
-    async def fake_fetch(topic: Topic, conn, **kwargs: object) -> FetchResult:
+    async def fake_fetch(topic: Topic, **kwargs: object) -> FetchResult:
         captured_kwargs.update(kwargs)
         return FetchResult(articles=[], total_feed_entries=0)
 
@@ -1011,7 +1011,7 @@ async def test_run_live_freeze_writes_replayable_scenario(tmp_path, monkeypatch)
     conn.commit()
     conn.close()
 
-    async def fake_fetch(topic: Topic, conn, **_kw: object) -> FetchResult:
+    async def fake_fetch(topic: Topic, **_kw: object) -> FetchResult:
         art = Article(
             topic_id=topic.id,  # type: ignore[arg-type]
             title="fetched",

@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from pathlib import Path
 from unittest.mock import patch
 
 import httpx
@@ -419,7 +420,9 @@ class TestGoogleNewsIntegration:
         conn.commit()
         return topic
 
-    async def test_google_news_urls_resolved_before_content_extraction(self, db_conn: sqlite3.Connection) -> None:
+    async def test_google_news_urls_resolved_before_content_extraction(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
         """Google News redirect URLs are resolved to actual article URLs before content extraction."""
         topic = self._make_topic(db_conn)
 
@@ -446,7 +449,7 @@ class TestGoogleNewsIntegration:
             patch("app.scraping.extract_article_content", side_effect=mock_extract),
             patch("app.scraping.resolve_google_news_urls", return_value={_GOOGLE_RSS_URL: _REAL_ARTICLE_URL}),
         ):
-            result = await fetch_new_articles_for_topic(topic, db_conn)
+            result = await fetch_new_articles_for_topic(topic, db_path=db_path)
 
         assert len(result.articles) == 1
         # Content extraction should have been called with the resolved URL, not the Google redirect
@@ -454,7 +457,7 @@ class TestGoogleNewsIntegration:
         # Stored article should have the resolved URL
         assert result.articles[0].url == _REAL_ARTICLE_URL
 
-    async def test_unresolvable_urls_still_processed(self, db_conn: sqlite3.Connection) -> None:
+    async def test_unresolvable_urls_still_processed(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         """Articles with unresolvable Google News URLs still go through the pipeline."""
         topic = self._make_topic(db_conn)
 
@@ -475,7 +478,7 @@ class TestGoogleNewsIntegration:
             patch("app.scraping.extract_article_content", return_value="Some content"),
             patch("app.scraping.resolve_google_news_urls", return_value={}),  # Resolution fails
         ):
-            result = await fetch_new_articles_for_topic(topic, db_conn)
+            result = await fetch_new_articles_for_topic(topic, db_path=db_path)
 
         # Article should still be stored with original URL
         assert len(result.articles) == 1
