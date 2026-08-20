@@ -17,9 +17,13 @@ from urllib.parse import quote, urlparse
 
 import httpx
 
+from app.scraping.source import host_matches, url_hostname
 from app.url_validation import safe_get, safe_send
 
 logger = logging.getLogger(__name__)
+
+GOOGLE_NEWS_HOST = "news.google.com"
+"""The only host whose entry links are opaque Google News redirects."""
 
 # Cookie to bypass GDPR consent page on news.google.com.
 # Without this, European IPs get redirected to consent.google.com
@@ -42,15 +46,22 @@ _USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like G
 
 
 def is_google_news_url(url: str) -> bool:
-    """Check if a URL is a Google News redirect that needs resolution."""
-    return "news.google.com/" in url and ("/articles/" in url or "/read/" in url)
+    """Check if a URL is a Google News redirect that needs resolution.
+
+    Identity is the parsed hostname plus Google's documented redirect paths
+    (TW-AUD-031). The previous raw-URL substring test matched any host that
+    merely mentioned ``news.google.com/`` in its path or query, which routed
+    arbitrary feed URLs into Google's resolver, and missed nothing a host check
+    does not already cover.
+    """
+    return host_matches(url_hostname(url), GOOGLE_NEWS_HOST) and _extract_article_id(url) is not None
 
 
 def _extract_article_id(url: str) -> str | None:
     """Extract the base64 article ID from a Google News URL."""
     parsed = urlparse(url)
     parts = parsed.path.split("/")
-    if len(parts) > 1 and parts[-2] in ("articles", "read"):
+    if len(parts) > 1 and parts[-2] in ("articles", "read") and parts[-1]:
         return parts[-1]
     return None
 

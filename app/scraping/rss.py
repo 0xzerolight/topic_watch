@@ -23,11 +23,12 @@ import httpx
 from app.feed_backoff import feed_backoff_until
 from app.log_redaction import redact_url
 from app.models import FeedMode, Topic
+from app.scraping.google_news import GOOGLE_NEWS_HOST
 from app.scraping.providers import provider_identity
 from app.scraping.source import FeedEntry as FeedEntry
 from app.scraping.source import FeedHealthCallback as FeedHealthCallback
 from app.scraping.source import FeedResponse as FeedResponse
-from app.scraping.source import SourceRequest, register_source
+from app.scraping.source import SourceRequest, host_matches, register_source, url_hostname
 from app.scraping.source import fetch_feeds_for_topic as fetch_feeds_for_topic
 from app.url_validation import is_private_url, safe_get
 
@@ -35,6 +36,9 @@ if TYPE_CHECKING:
     from app.models import FeedHealth
 
 logger = logging.getLogger(__name__)
+
+BING_HOST = "bing.com"
+"""Bing News RSS and its apiclick redirects are served from this domain."""
 
 _USER_AGENT = "TopicWatch/1.0.0 (RSS reader)"
 _FEED_FETCH_TIMEOUT = 15.0
@@ -77,8 +81,13 @@ def _resolve_google_news_url(link: str, description: str) -> str:
     requests. When it fails (e.g. Google embeds the same redirect URL in the
     description), the async resolver in google_news.py handles it later in
     the pipeline.
+
+    Only entries whose link really is hosted on Google News take this path
+    (TW-AUD-031): a raw-URL substring test let any feed mentioning
+    ``news.google.com/`` in a path or query have its stored URL replaced by an
+    arbitrary href from its own description.
     """
-    if "news.google.com/" not in link:
+    if not host_matches(url_hostname(link), GOOGLE_NEWS_HOST):
         return link
     match = _GOOGLE_NEWS_HREF_RE.search(description)
     if match:
@@ -88,7 +97,7 @@ def _resolve_google_news_url(link: str, description: str) -> str:
         # safe Google redirect link rather than become the article URL.
         if (
             real_url
-            and not real_url.startswith("https://news.google.com/")
+            and not host_matches(url_hostname(real_url), GOOGLE_NEWS_HOST)
             and urlparse(real_url).scheme.lower() in ("http", "https")
         ):
             return real_url
@@ -102,7 +111,7 @@ def _is_bing_apiclick(parsed: ParseResult) -> bool:
     so a ``www.bing.com:80`` netloc still matches) and the case-folded path.
     """
     host = (parsed.hostname or "").lower()
-    return (host == "bing.com" or host.endswith(".bing.com")) and parsed.path.lower() == "/news/apiclick.aspx"
+    return host_matches(host, BING_HOST) and parsed.path.lower() == "/news/apiclick.aspx"
 
 
 def _resolve_bing_news_url(link: str) -> str:

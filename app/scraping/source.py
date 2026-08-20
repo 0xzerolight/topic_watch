@@ -25,6 +25,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING
+from urllib.parse import urlparse
 
 from pydantic import BaseModel
 
@@ -44,6 +45,32 @@ FeedHealthCallback = Callable[
 
 FeedStateLoader = Callable[[str], "FeedHealth | None"]
 """Returns the stored health row for a feed URL, or None when untracked."""
+
+
+def url_hostname(url: str) -> str:
+    """The lowercased hostname of a URL, or ``""`` when it has none.
+
+    ``urlparse`` already strips userinfo and port and lowercases the host, so a
+    crafted ``https://news.google.com@evil.example/`` yields ``evil.example``.
+    A trailing root dot is dropped so ``example.com.`` and ``example.com`` are
+    the same host.
+    """
+    try:
+        host = urlparse(url).hostname or ""
+    except ValueError:  # malformed netloc (bad port, unbalanced IPv6 brackets)
+        return ""
+    return host.lower().rstrip(".")
+
+
+def host_matches(host: str, domain: str) -> bool:
+    """True when ``host`` is ``domain`` itself or a subdomain of it.
+
+    Source identity is a host fact, so it is decided on the parsed hostname and
+    never on a substring of the raw URL (TW-AUD-031): ``news.google.com`` in a
+    path or query belongs to whoever owns the host, and ``news.google.com.evil``
+    is a different host that happens to start with the same labels.
+    """
+    return host == domain or host.endswith(f".{domain}")
 
 
 class FeedEntry(BaseModel):

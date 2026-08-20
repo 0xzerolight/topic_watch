@@ -659,6 +659,25 @@ class TestResolveGoogleNewsUrl:
         result = _resolve_google_news_url(google_url, "No links here")
         assert result == google_url
 
+    def test_only_the_real_google_host_takes_the_fast_path(self) -> None:
+        """TW-AUD-031: a foreign feed cannot get its link rewritten from its own HTML.
+
+        The fast path used to trigger on the substring ``news.google.com/``
+        anywhere in the link, so any feed whose entry URL merely mentioned it
+        had its stored URL replaced by an arbitrary href from the description.
+        """
+        foreign = "https://evil.example/read?src=news.google.com/articles/x"
+        description = '<a href="https://attacker.example/payload">Title</a>'
+        assert _resolve_google_news_url(foreign, description) == foreign
+
+        lookalike = "https://news.google.com.evil.example/rss/articles/CBMi"
+        assert _resolve_google_news_url(lookalike, description) == lookalike
+
+    def test_subdomain_of_google_news_still_resolves(self) -> None:
+        google_url = "https://NEWS.GOOGLE.COM/rss/articles/CBMiQ2h0dHBz..."
+        description = '<a href="https://publisher.example/story">Title</a>'
+        assert _resolve_google_news_url(google_url, description) == "https://publisher.example/story"
+
     def test_empty_description(self) -> None:
         google_url = "https://news.google.com/rss/articles/CBMiQ2h0dHBz..."
         result = _resolve_google_news_url(google_url, "")
@@ -783,6 +802,45 @@ class TestBingStubRegression:
                 content = await extract_article_content(entry.url, fallback_summary=entry.summary, client=client)
         assert len(content) >= _STUB_CONTENT_MIN_CHARS
         assert _content_quality_tag(content) == ""
+
+
+class TestSourceHostClassification:
+    """TW-AUD-031: source labels come from the parsed hostname, not URL substrings.
+
+    The display filter lives in the web layer, but what it classifies is source
+    identity, so its regression lives beside the other source-identity tests.
+    """
+
+    def test_documented_endpoints_get_their_brand(self) -> None:
+        from app.web.routers.templates import _feed_source_name
+
+        assert _feed_source_name("https://news.google.com/rss/search?q=x") == "Google News"
+        assert _feed_source_name("https://www.bing.com/news/search?q=x&format=rss") == "Bing News"
+        assert _feed_source_name("https://bing.com/news/search?q=x") == "Bing News"
+
+    def test_lookalike_hosts_render_as_themselves(self) -> None:
+        from app.web.routers.templates import _feed_source_name
+
+        assert _feed_source_name("https://fake-google.com/feed") == "fake-google.com"
+        assert _feed_source_name("https://notgoogle.com.evil.net/feed") == "notgoogle.com.evil.net"
+        assert _feed_source_name("https://mybing.com.evil.net/feed") == "mybing.com.evil.net"
+
+    def test_brand_in_path_or_query_is_not_identity(self) -> None:
+        from app.web.routers.templates import _feed_source_name
+
+        assert _feed_source_name("https://example.com/news.google.com/feed") == "example.com"
+        assert _feed_source_name("https://example.com/feed?ref=www.bing.com") == "example.com"
+
+    def test_other_google_properties_are_not_google_news(self) -> None:
+        from app.web.routers.templates import _feed_source_name
+
+        assert _feed_source_name("https://blog.google.com/feed") == "blog.google.com"
+
+    def test_ordinary_feed_hosts_keep_their_canonical_form(self) -> None:
+        from app.web.routers.templates import _feed_source_name
+
+        assert _feed_source_name("https://feeds.arstechnica.com/arstechnica/index") == "arstechnica.com"
+        assert _feed_source_name("not a url") == "not a url"
 
 
 class TestSourceRegistry:
