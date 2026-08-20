@@ -411,6 +411,121 @@ async def test_run_scenario_surfaces_swallowed_llm_error() -> None:
     assert "boom" in art.final_error
 
 
+async def test_run_scenario_error_skips_expectation_match() -> None:
+    """AUG-296: a swallowed LLM failure must not be reportable as MATCH.
+
+    The safe default is has_new_info=False, which numerically satisfies an
+    `expect: {has_new_info: false}` — but that "match" would be a lie: the
+    model never actually judged anything. An errored run must collapse to a
+    single failing execution check instead of the normal per-field checks.
+    """
+    from evals.runner import run_scenario
+    from evals.scenario import Expectation, Scenario, ScenarioArticle, ScenarioTopic
+
+    inner = MagicMock()
+    inner.chat.completions.create_with_completion = AsyncMock(side_effect=RuntimeError("provider down"))
+    sc = Scenario(
+        kind="novelty",
+        topic=ScenarioTopic(name="T", description="d"),
+        articles=[ScenarioArticle(title="a", url="http://x", content="c", source_feed="http://f")],
+        expect=Expectation(has_new_info=False),
+        name="s",
+    )
+    art = await run_scenario(sc, _settings(), inner=inner)
+
+    assert art.final_error is not None
+    assert len(art.expect_results) == 1
+    check = art.expect_results[0]
+    assert check.ok is False
+    assert check.check != "has_new_info"  # not evaluated as a normal field match
+
+
+async def test_run_scenario_raising_kind_returns_evidence_instead_of_raising() -> None:
+    """knowledge_init/update/compress raise on failure (production invariant), but
+    the harness must still finalize an artifact as evidence (AUG-296) rather than
+    losing the run entirely to an uncaught traceback."""
+    from evals.runner import run_scenario
+    from evals.scenario import Scenario, ScenarioArticle, ScenarioTopic
+
+    inner = MagicMock()
+    inner.chat.completions.create_with_completion = AsyncMock(side_effect=RuntimeError("provider down"))
+    sc = Scenario(
+        kind="knowledge_init",
+        topic=ScenarioTopic(name="T", description="d"),
+        articles=[ScenarioArticle(title="a", url="http://x", content="c", source_feed="http://f")],
+        name="s",
+    )
+    art = await run_scenario(sc, _settings(), inner=inner)  # must not raise
+
+    assert art.final is None
+    assert art.final_error is not None
+    assert "provider down" in art.final_error
+
+
+# --- __main__: exit codes (AUG-296) ---
+
+
+def test_exit_code_zero_for_clean_match() -> None:
+    from evals.__main__ import _exit_code
+    from evals.scenario import ExpectCheck, RunArtifact, Scenario, ScenarioTopic
+
+    art = RunArtifact(
+        name="s",
+        kind="novelty",
+        final={"has_new_info": False},
+        expect_results=[ExpectCheck(check="has_new_info", ok=True, detail="")],
+        scenario=Scenario(topic=ScenarioTopic(name="T", description="d")),
+    )
+    assert _exit_code(art, strict=False) == 0
+    assert _exit_code(art, strict=True) == 0
+
+
+def test_exit_code_nonzero_for_final_error_even_without_strict() -> None:
+    from evals.__main__ import _exit_code
+    from evals.scenario import ExpectCheck, RunArtifact, Scenario, ScenarioTopic
+
+    art = RunArtifact(
+        name="s",
+        kind="novelty",
+        final={"has_new_info": False},
+        final_error="RuntimeError: boom",
+        expect_results=[ExpectCheck(check="execution", ok=False, detail="")],
+        scenario=Scenario(topic=ScenarioTopic(name="T", description="d")),
+    )
+    assert _exit_code(art, strict=False) == 1
+    assert _exit_code(art, strict=True) == 1
+
+
+def test_exit_code_mismatch_nonzero_only_when_strict() -> None:
+    from evals.__main__ import _exit_code
+    from evals.scenario import ExpectCheck, RunArtifact, Scenario, ScenarioTopic
+
+    art = RunArtifact(
+        name="s",
+        kind="novelty",
+        final={"has_new_info": True},
+        expect_results=[ExpectCheck(check="has_new_info", ok=False, detail="")],
+        scenario=Scenario(topic=ScenarioTopic(name="T", description="d")),
+    )
+    assert _exit_code(art, strict=False) == 0
+    assert _exit_code(art, strict=True) == 1
+
+
+def test_exit_code_replay_diff_nonzero_only_when_strict() -> None:
+    from evals.__main__ import _exit_code
+    from evals.scenario import RunArtifact, Scenario, ScenarioTopic
+
+    art = RunArtifact(
+        name="s",
+        kind="novelty",
+        final={"has_new_info": True},
+        scenario=Scenario(topic=ScenarioTopic(name="T", description="d")),
+    )
+    assert _exit_code(art, strict=False, diff=["final.has_new_info: False -> True"]) == 0
+    assert _exit_code(art, strict=True, diff=["final.has_new_info: False -> True"]) == 1
+    assert _exit_code(art, strict=True, diff=[]) == 0
+
+
 # --- runner: run_live (prod read-only + scratch isolation) ---
 
 

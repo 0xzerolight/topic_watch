@@ -147,7 +147,18 @@ def _result_text(result: BaseModel) -> str:
     return ""
 
 
-def _evaluate_expect(expect: Expectation, result: BaseModel) -> list[ExpectCheck]:
+def _evaluate_expect(expect: Expectation, result: BaseModel | None, error: str | None) -> list[ExpectCheck]:
+    """Evaluate soft expectation checks against a run's result.
+
+    A run that produced no trustworthy result (``error`` set, e.g. a
+    swallowed novelty LLM failure or a caught knowledge-stage exception)
+    collapses to a single failing "execution" check instead of the normal
+    per-field comparisons — otherwise a safe-default value could coincidentally
+    satisfy an expectation and render as MATCH, hiding a provider/harness
+    failure behind a green result (AUG-296).
+    """
+    if error is not None or result is None:
+        return [ExpectCheck(check="execution", ok=False, detail=f"run failed, expectations not evaluated: {error}")]
     checks: list[ExpectCheck] = []
 
     def add(check: str, ok: bool, detail: str) -> None:
@@ -192,12 +203,19 @@ def _to_captured(record: CallRecord) -> CapturedCall:
 def build_artifact(
     scenario: Scenario,
     settings: Settings,
-    result: BaseModel,
+    result: BaseModel | None,
     records: list[CallRecord],
     *,
+    error: str | None = None,
     created_at: str | None = None,
 ) -> RunArtifact:
-    """Assemble a RunArtifact from a stage result and its captured calls."""
+    """Assemble a RunArtifact from a stage result (or a caught run error) and
+    its captured calls. ``error`` takes precedence over a result's own
+    ``error`` attribute (e.g. NoveltyResult.error) — both funnel into the
+    same ``final_error`` outcome field so callers have one place to check for
+    a failed run.
+    """
+    final_error = error if error is not None else getattr(result, "error", None)
     return RunArtifact(
         name=scenario.name,
         kind=scenario.kind,
@@ -205,9 +223,9 @@ def build_artifact(
         temperature=settings.llm_temperature,
         created_at=created_at or datetime.now(UTC).isoformat(),
         calls=[_to_captured(r) for r in records],
-        final=result.model_dump(mode="json"),
-        final_error=getattr(result, "error", None),
-        expect_results=_evaluate_expect(scenario.expect, result) if scenario.expect else [],
+        final=result.model_dump(mode="json") if result is not None else None,
+        final_error=final_error,
+        expect_results=_evaluate_expect(scenario.expect, result, final_error) if scenario.expect else [],
         scenario=scenario,
     )
 
@@ -223,11 +241,24 @@ async def run_scenario(
 
     ``inner`` is the recorder's inner client — None uses the real one; offline
     tests inject a mock. No DB/HTTP for any of the four offline kinds.
+
+    novelty's ``analyze_articles`` never raises (production fail-safe
+    invariant) — its failure surfaces as ``result.error``. The other three
+    kinds DO raise on failure (production invariant: knowledge init/update are
+    critical); the harness catches that here so a harder failure still
+    finalizes an artifact as evidence instead of vanishing into an uncaught
+    traceback with nothing saved (AUG-296). Either path funnels into
+    ``final_error`` via ``build_artifact``.
     """
     adapter = KIND_DISPATCH[scenario.kind]
+    result: BaseModel | None = None
+    error: str | None = None
     with recording_client(inner=inner) as records:
-        result = await adapter.run(scenario, settings)
-    return build_artifact(scenario, settings, result, records, created_at=created_at)
+        try:
+            result = await adapter.run(scenario, settings)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+    return build_artifact(scenario, settings, result, records, error=error, created_at=created_at)
 
 
 # --- live run (real fetch, prod read-only, scratch-DB isolation) ---
