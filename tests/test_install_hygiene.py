@@ -142,3 +142,13 @@ def test_install_and_update_scripts_exit_nonzero_on_failed_health_check() -> Non
     failure_pos = update_sh.index('error "Health check failed after update!"')
     exit_pos = update_sh.index("exit 1", failure_pos)
     assert exit_pos > failure_pos
+
+
+def test_update_sh_reads_port_from_persisted_env_not_process_env_only() -> None:
+    """AUG-060 remnant: update.sh must fall back to the port persisted in the
+    install's .env (the same source docker-compose.yml reads), not only the
+    invoking process's environment, or a custom-port install gets health
+    checked on the wrong port after the process env is gone."""
+    update_sh = (_ROOT / "scripts" / "update.sh").read_text()
+    assert "read_env TOPIC_WATCH_PORT" in update_sh
+    assert 'PORT="${TOPIC_WATCH_PORT:-$(read_env TOPIC_WATCH_PORT "$ENV_FILE")}"' in update_sh
