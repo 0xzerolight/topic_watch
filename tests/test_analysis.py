@@ -24,6 +24,7 @@ from app.analysis.llm import (
     KnowledgeStateUpdate,
     NoveltyResult,
     _bounded_max_tokens,
+    _filter_restated_key_facts,
     analyze_articles,
     compress_knowledge_summary,
     count_tokens,
@@ -1901,52 +1902,124 @@ class TestRestatementFilter:
         assert result.key_facts == []
 
 
-class TestLongestContiguousRun:
-    """OVH-079: direct unit tests for the longest-common-substring DP that backs
-    restatement filtering. Exercised only end-to-end before, so an off-by-one
-    (len-1) or a repeated-adjacent-token bug was invisible."""
+class TestSharedRun:
+    """OVH-079 / AUG-033: direct unit tests for the token-run check that backs
+    restatement filtering. Exercised only end-to-end before, so an off-by-one or a
+    repeated-adjacent-token bug was invisible."""
 
-    def test_empty_fact_returns_zero(self) -> None:
-        from app.analysis.llm import _longest_contiguous_run
+    @staticmethod
+    def _run(fact_words: list[str], summary_words: list[str], required: int) -> bool:
+        from app.analysis.llm import _has_shared_run
+        from app.analysis.restatement import _word_positions
 
-        assert _longest_contiguous_run([], ["a", "b"]) == 0
+        return _has_shared_run(fact_words, summary_words, _word_positions(summary_words), required)
 
-    def test_empty_summary_returns_zero(self) -> None:
-        from app.analysis.llm import _longest_contiguous_run
+    def test_empty_fact_is_false(self) -> None:
+        assert self._run([], ["a", "b"], 1) is False
 
-        assert _longest_contiguous_run(["a"], []) == 0
+    def test_empty_summary_is_false(self) -> None:
+        assert self._run(["a"], [], 1) is False
 
-    def test_both_empty_returns_zero(self) -> None:
-        from app.analysis.llm import _longest_contiguous_run
+    def test_required_longer_than_fact_is_false(self) -> None:
+        assert self._run(["a", "b"], ["a", "b"], 3) is False
 
-        assert _longest_contiguous_run([], []) == 0
+    def test_full_match(self) -> None:
+        assert self._run(["a", "b", "c"], ["a", "b", "c"], 3) is True
 
-    def test_full_match_returns_len(self) -> None:
-        from app.analysis.llm import _longest_contiguous_run
+    def test_embedded_run(self) -> None:
+        assert self._run(["a", "b", "c"], ["x", "a", "b", "c", "y"], 3) is True
 
-        assert _longest_contiguous_run(["a", "b", "c"], ["a", "b", "c"]) == 3
+    def test_repeated_tokens(self) -> None:
+        """['a','a'] inside ['a','a','a'] is a run of 2 — but not one of 4."""
+        assert self._run(["a", "a"], ["a", "a", "a"], 2) is True
+        assert self._run(["a", "a"], ["a", "a", "a"], 4) is False
 
-    def test_embedded_run_returns_run_length(self) -> None:
-        from app.analysis.llm import _longest_contiguous_run
+    def test_no_overlap(self) -> None:
+        assert self._run(["a", "b"], ["x", "y", "z"], 2) is False
 
-        assert _longest_contiguous_run(["a", "b", "c"], ["x", "a", "b", "c", "y"]) == 3
+    def test_partial_then_restart(self) -> None:
+        """A false start ('a' alone) must not hide the later full run ('a','b')."""
+        assert self._run(["a", "b"], ["a", "x", "a", "b"], 2) is True
 
-    def test_repeated_tokens_returns_two(self) -> None:
-        """['a','a'] inside ['a','a','a'] is a contiguous run of length 2, not 1 or 3."""
-        from app.analysis.llm import _longest_contiguous_run
+    def test_run_at_the_summary_tail_is_not_read_past_the_end(self) -> None:
+        assert self._run(["b", "c"], ["a", "b"], 2) is False
 
-        assert _longest_contiguous_run(["a", "a"], ["a", "a", "a"]) == 2
 
-    def test_no_overlap_returns_zero(self) -> None:
-        from app.analysis.llm import _longest_contiguous_run
+class TestRestatementTokenBoundaries:
+    """AUG-165: matching happens on word tokens, never on raw characters.
 
-        assert _longest_contiguous_run(["a", "b"], ["x", "y", "z"]) == 0
+    Character containment treated a fact as already known whenever its text
+    appeared anywhere inside the summary's — including across word and subject
+    boundaries — so an entity-specific correction was dropped from key_facts,
+    notifications, webhooks and the knowledge-update input.
+    """
 
-    def test_partial_then_restart_returns_two(self) -> None:
-        """A false start ('a' alone) must not block the later full run ('a','b')."""
-        from app.analysis.llm import _longest_contiguous_run
+    def test_different_subject_is_not_a_restatement(self) -> None:
+        from app.analysis.llm import _is_restatement
 
-        assert _longest_contiguous_run(["a", "b"], ["a", "x", "a", "b"]) == 2
+        # "he won." is a character substring of "she won.".
+        assert _is_restatement("He won.", "She won.") is False
+
+    def test_short_token_inside_a_longer_word_is_not_a_restatement(self) -> None:
+        from app.analysis.llm import _is_restatement
+
+        assert _is_restatement("The art is ready", "The article is ready") is False
+
+    def test_correction_differing_only_in_subject_is_kept(self) -> None:
+        from app.analysis.llm import _filter_restated_key_facts
+
+        summary = "Confirmed Facts: The publisher confirmed the delay to March 2027."
+        facts = ["The developer confirmed the delay to March 2027"]
+        assert _filter_restated_key_facts(facts, summary) == facts
+
+    def test_word_boundary_match_still_filters_a_real_restatement(self) -> None:
+        from app.analysis.llm import _filter_restated_key_facts
+
+        summary = "Confirmed Facts: The release date is March 2026."
+        assert _filter_restated_key_facts(["The release date is March 2026"], summary) == []
+
+    def test_punctuation_differences_still_match(self) -> None:
+        """Tokens ignore punctuation, so a re-punctuated repeat is still caught."""
+        from app.analysis.llm import _filter_restated_key_facts
+
+        summary = "Confirmed Facts: the release date is March 2026, per the publisher."
+        assert _filter_restated_key_facts(["The release date is March 2026!"], summary) == []
+
+
+class TestRestatementFilterCost:
+    """AUG-033: the filter runs synchronously after every LLM response, so its
+    cost is the event loop's. The old per-fact O(fact x summary) matrix could
+    execute tens of millions of comparisons for one valid verbose completion."""
+
+    def test_worst_case_batch_stays_fast(self) -> None:
+        import time
+
+        # Maximum-shaped inputs: a 10k-token knowledge summary against 50 long facts.
+        vocabulary = [f"word{i}" for i in range(400)]
+        summary = " ".join(vocabulary[i % len(vocabulary)] for i in range(10_000))
+        facts = [" ".join(f"unmatched{i}word{j}" for j in range(100)) for i in range(50)]
+
+        started = time.perf_counter()
+        kept = _filter_restated_key_facts(facts, summary)
+        elapsed = time.perf_counter() - started
+
+        assert kept == facts  # nothing shared, so nothing is dropped
+        assert elapsed < 1.0, f"restatement filtering took {elapsed:.2f}s"
+
+    def test_repetitive_text_stays_fast_and_keeps_the_fact(self) -> None:
+        """Extreme token repetition exhausts the probe budget; the safe direction
+        is to KEEP the fact, never to hide it."""
+        import time
+
+        summary = " ".join(["same"] * 10_000)
+        facts = [" ".join(["same"] * 50 + ["mismatch"] + ["same"] * 49)] * 20
+
+        started = time.perf_counter()
+        kept = _filter_restated_key_facts(facts, summary)
+        elapsed = time.perf_counter() - started
+
+        assert kept == facts
+        assert elapsed < 1.0, f"restatement filtering took {elapsed:.2f}s"
 
 
 class TestRateLimitRetry:

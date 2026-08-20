@@ -30,14 +30,14 @@ from app.analysis.prompts import (
     build_knowledge_update_messages,
     build_novelty_messages,
 )
+from app.analysis.restatement import (
+    _has_shared_run as _has_shared_run,
+)
 
 # Back-compat re-exports: the restatement-filter algorithm moved to
 # app/analysis/restatement.py (OVH-178); keep these importable from here.
 from app.analysis.restatement import (
     _is_restatement as _is_restatement,
-)
-from app.analysis.restatement import (
-    _longest_contiguous_run as _longest_contiguous_run,
 )
 from app.analysis.restatement import (
     _normalize_for_match as _normalize_for_match,
