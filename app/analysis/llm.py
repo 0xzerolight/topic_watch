@@ -847,9 +847,12 @@ async def _create_structured(
                 settings.llm.model,
                 next_mode.value,
             )
-            # Remember the hop immediately: a rate-limit retry re-enters this
-            # helper, and without this it would replay the same rejected mode.
-            _remember_mode(hint_key, next_mode)
+            # The hop lives in this local only. Remembering it here would cache a
+            # mode nothing has accepted yet: if the next attempt then failed for
+            # an unrelated reason (rate limit, timeout), that unconfirmed mode
+            # would be applied for the whole TTL to every later call sharing the
+            # hint key — across topics. A transport retry re-enters this helper
+            # and re-probes from the hinted mode instead, one extra request.
             mode = next_mode
         else:
             _remember_mode(hint_key, mode)

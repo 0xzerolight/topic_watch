@@ -874,11 +874,41 @@ class TestStructuredOutputModeFallback:
         assert result.error is not None
         assert "structured output rejected" in result.error
 
-    async def test_rate_limit_mid_chain_resumes_from_the_working_mode(self) -> None:
-        """Test 5: TOOLS 400 -> JSON 429 -> backoff -> JSON ok.
+    async def test_untested_fallback_mode_is_not_cached(self) -> None:
+        """A mode is remembered only once it has actually worked.
 
-        The rate-limit retry re-enters ``_create_structured``; before AUG-032 it
-        restarted from TOOLS and paid the same rejection again.
+        Caching the hop as it happened pinned an untested mode for the whole TTL
+        on the first non-400 failure after it (rate limit, timeout) — and the hint
+        is keyed on (model, base_url, response_model), so every later call for
+        that model, across topics, started in a mode nothing had accepted.
+        """
+
+        def handler(kwargs: dict) -> ModelResponse:
+            if "tool_choice" in kwargs:
+                raise _tool_choice_error()
+            raise _make_rate_limit_error()
+
+        settings = _make_settings(llm=LLMSettings(model="deepseek/deepseek-reasoner", api_key="k"), llm_max_retries=1)
+
+        async def _no_sleep(_delay: float) -> None:
+            return None
+
+        with (
+            _fake_acompletion(handler),
+            patch("app.analysis.llm.asyncio.sleep", side_effect=_no_sleep),
+        ):
+            result = await analyze_articles([_make_article()], "Known facts.", _make_topic(), settings)
+
+        assert result.has_new_info is False
+        assert result.error is not None
+        assert llm_module._mode_hints == {}
+
+    async def test_rate_limit_mid_chain_reprobes_the_unconfirmed_mode(self) -> None:
+        """Test 5: TOOLS 400 -> JSON 429 -> backoff -> TOOLS 400 -> JSON ok.
+
+        The rate-limit retry re-enters ``_create_structured``, which starts from
+        the hint — and JSON is not hinted yet, because nothing has accepted it.
+        One extra rejected request buys not caching a mode that never worked.
         """
         expected = NoveltyResult(
             has_new_info=True, summary="Fresh development.", confidence=0.7, relevance=0.8, importance=4
@@ -909,10 +939,12 @@ class TestStructuredOutputModeFallback:
 
         assert result.has_new_info is True
         assert result.error is None
-        # TOOLS(400) + JSON(429), backoff, JSON(ok) = 3 calls, 1 sleep.
-        assert len(calls) == 3
+        # TOOLS(400) + JSON(429), backoff, TOOLS(400) + JSON(ok) = 4 calls, 1 sleep.
+        assert len(calls) == 4
         assert len(sleeps) == 1
-        assert "tool_choice" not in calls[2]
+        assert "tool_choice" not in calls[3]
+        # Only the mode that finally answered is remembered.
+        assert {mode for mode, _expiry in llm_module._mode_hints.values()} == {instructor.Mode.JSON}
 
     async def test_working_mode_is_reused_by_the_next_call(self) -> None:
         """AUG-032: a fallback-only provider pays the rejection once per TTL, not
