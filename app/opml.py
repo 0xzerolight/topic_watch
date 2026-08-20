@@ -4,6 +4,7 @@ Handles parsing OPML files from RSS readers (FreshRSS, Miniflux, Tiny Tiny RSS)
 and exporting topics as OPML for backup/migration.
 """
 
+import json
 import logging
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
@@ -11,12 +12,32 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from urllib.parse import urlparse
 
+from app.models import normalize_tags
 from app.url_validation import validate_feed_url
 
 logger = logging.getLogger(__name__)
 
 MAX_IMPORT_TOPICS = 500
 MAX_OUTLINE_DEPTH = 10
+
+# Feed URLs one imported topic may accumulate. Merging used to be keyed on
+# display text alone, so an arbitrary number of same-named third-party feeds
+# could land in one topic and fan out to that many concurrent fetches per check
+# (AUG-204).
+MAX_FEEDS_PER_TOPIC = 20
+
+# Longest imported topic name kept. The name comes from an attribute a third
+# party wrote and is persisted, rendered in every list, and used as a search
+# query; an unbounded one wrecks the table it lands in (AUG-330).
+MAX_TOPIC_NAME_CHARS = 120
+
+# Attributes Topic Watch writes on its own export. Their presence — and only
+# their presence — makes two outlines part of the same topic, so third-party
+# display text is never treated as stable identity (AUG-204). ``TOPIC_ATTR``
+# names the owning topic; ``TAGS_ATTR`` carries the full tag list as JSON, which
+# the folder structure alone cannot express (TW-AUD-026).
+TOPIC_ATTR = "topicWatchTopic"
+TAGS_ATTR = "topicWatchTags"
 
 # Bound on concurrent feed-URL validations (each does a blocking getaddrinfo).
 # Caps both wall-clock time and resolver fan-out for a large import so a handful
@@ -44,6 +65,9 @@ class _Candidate:
     name: str
     url: str
     tags: list[str]
+    group: str | None = None
+    """Owning Topic Watch topic, from ``TOPIC_ATTR``. ``None`` for third-party
+    OPML, whose outlines are never merged with each other."""
 
 
 def _derive_name_from_url(url: str) -> str:
@@ -53,6 +77,30 @@ def _derive_name_from_url(url: str) -> str:
         return parsed.hostname or url
     except Exception:
         return url
+
+
+def _parse_tags_attr(raw: str | None) -> list[str] | None:
+    """Read the JSON tag list Topic Watch's own export writes, or ``None``."""
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(value, list):
+        return None
+    return normalize_tags(str(tag) for tag in value)
+
+
+def _disambiguate(name: str, url: str, taken: set[str]) -> str:
+    """Make ``name`` unique within this import by appending the feed's host."""
+    host = _derive_name_from_url(url)
+    candidate = f"{name} ({host})"[:MAX_TOPIC_NAME_CHARS]
+    suffix = 2
+    while candidate in taken:
+        candidate = f"{name} ({host} {suffix})"[:MAX_TOPIC_NAME_CHARS]
+        suffix += 1
+    return candidate
 
 
 def _walk_outlines(
@@ -65,7 +113,8 @@ def _walk_outlines(
 
     Pure structural pass: no DNS / SSRF validation and no cross-import dedup, so
     parse correctness is unit-testable without sockets. It only extracts
-    ``(name, url, tags)``. Validation, dedup, and capping happen in ``parse_opml``.
+    ``(name, url, tags, group)``. Validation, dedup, and capping happen in
+    ``parse_opml``.
     """
     if depth > MAX_OUTLINE_DEPTH:
         return
@@ -80,7 +129,15 @@ def _walk_outlines(
             if not xml_url:
                 continue
             name = text.strip() if text.strip() else _derive_name_from_url(xml_url)
-            candidates.append(_Candidate(name=name, url=xml_url, tags=list(parent_tags)))
+            own_tags = _parse_tags_attr(outline.get(TAGS_ATTR))
+            candidates.append(
+                _Candidate(
+                    name=name[:MAX_TOPIC_NAME_CHARS],
+                    url=xml_url,
+                    tags=own_tags if own_tags is not None else normalize_tags(parent_tags),
+                    group=outline.get(TOPIC_ATTR),
+                )
+            )
         else:
             # This is a folder — use its text as a tag for children
             folder_name = text.strip()
@@ -169,6 +226,9 @@ def parse_opml(
     # 2c. Apply pass (no network): consume validation results in document order,
     # preserving the original merge / name-collision accounting.
     name_dupes_seen: set[str] = set()
+    by_group: dict[str, dict] = {}
+    taken_names: set[str] = set()
+    disambiguated = 0
     for candidate in survivors:
         error = errors_by_url.get(candidate.url)
         if error:
@@ -176,11 +236,15 @@ def parse_opml(
             result.warnings.append(error)
             continue
 
-        # Merge feeds that share a topic name so a multi-feed topic round-trips
-        # intact (export writes one <outline> per feed_url, all sharing the name).
-        existing_topic = next((t for t in result.topics if t["name"] == candidate.name), None)
-        if existing_topic is not None:
-            existing_topic["feed_urls"].append(candidate.url)
+        # Merge only within one Topic Watch group, so a multi-feed topic still
+        # round-trips through our own export while two unrelated third-party feeds
+        # that happen to share display text stay two topics (AUG-204).
+        group_topic = by_group.get(candidate.group) if candidate.group else None
+        if group_topic is not None:
+            if len(group_topic["feed_urls"]) < MAX_FEEDS_PER_TOPIC:
+                group_topic["feed_urls"].append(candidate.url)
+            else:
+                result.skipped_dupes += 1
             continue
 
         # Name collision with an existing DB topic — skip (counted once per name).
@@ -190,12 +254,23 @@ def parse_opml(
                 result.skipped_name_dupes += 1
             continue
 
-        result.topics.append(
-            {
-                "name": candidate.name,
-                "feed_urls": [candidate.url],
-                "tags": list(candidate.tags),
-            }
+        # Two unmerged feeds sharing a name would collide on the UNIQUE topic
+        # name, so make the second one distinguishable rather than dropping it.
+        name = candidate.name
+        if name in taken_names:
+            name = _disambiguate(name, candidate.url, taken_names)
+            disambiguated += 1
+        taken_names.add(name)
+
+        topic = {"name": name, "feed_urls": [candidate.url], "tags": list(candidate.tags)}
+        result.topics.append(topic)
+        if candidate.group:
+            by_group[candidate.group] = topic
+
+    if disambiguated:
+        result.warnings.append(
+            f"{disambiguated} feed(s) shared a name with another feed in this file "
+            f"and were imported as separate topics with the source host appended."
         )
 
     if not result.topics:
@@ -216,12 +291,36 @@ def parse_opml(
     return result
 
 
-def export_opml(topics: list[dict]) -> str:
+def _feed_outline(parent: ET.Element, topic: dict, url: str) -> None:
+    """Write one feed outline, carrying its topic identity and full tag list.
+
+    ``text``/``xmlUrl``/``type`` are what any RSS reader consumes. The two extra
+    attributes are Topic Watch's own round-trip extension: they say which topic
+    the outline belongs to (so re-import merges exactly the feeds that were one
+    topic, and nothing else — AUG-204) and carry every tag, which the one-folder
+    -per-topic structure cannot express (TW-AUD-026).
+    """
+    attrs = {
+        "text": topic["name"],
+        "xmlUrl": url,
+        "type": "rss",
+        TOPIC_ATTR: topic["name"],
+    }
+    tags = topic.get("tags", [])
+    if tags:
+        attrs[TAGS_ATTR] = json.dumps(tags, ensure_ascii=False)
+    ET.SubElement(parent, "outline", attrs)
+
+
+def export_opml(topics: list[dict], omitted_count: int = 0) -> str:
     """Export topics as OPML XML string.
 
     Args:
         topics: List of dicts with 'name', 'feed_urls', and 'tags' keys.
                Typically from [t.model_dump() for t in topic_list].
+        omitted_count: Topics the caller could not represent because they have
+               no stored feed URLs (AUTO and Exa sources). Recorded as a comment
+               so the file never passes for a complete backup (TW-AUD-026).
 
     Returns:
         Valid OPML 2.0 XML string.
@@ -234,6 +333,14 @@ def export_opml(topics: list[dict]) -> str:
     date_created.text = datetime.now(UTC).strftime("%a, %d %b %Y %H:%M:%S %z")
 
     body = ET.SubElement(opml, "body")
+    if omitted_count:
+        body.append(
+            ET.Comment(
+                f" {omitted_count} topic(s) omitted: no stored feed URLs. Automatic and "
+                f"Exa search sources have no feed to write here — use the JSON export "
+                f"for a complete backup. "
+            )
+        )
 
     # Group topics by first tag for folder structure
     folders: dict[str, list[dict]] = {}
@@ -250,13 +357,13 @@ def export_opml(topics: list[dict]) -> str:
     # Add ungrouped topics at root level
     for topic in no_tag:
         for url in topic.get("feed_urls", []):
-            ET.SubElement(body, "outline", text=topic["name"], xmlUrl=url, type="rss")
+            _feed_outline(body, topic, url)
 
     # Add grouped topics in folders
     for folder_name, folder_topics in sorted(folders.items()):
         folder_el = ET.SubElement(body, "outline", text=folder_name)
         for topic in folder_topics:
             for url in topic.get("feed_urls", []):
-                ET.SubElement(folder_el, "outline", text=topic["name"], xmlUrl=url, type="rss")
+                _feed_outline(folder_el, topic, url)
 
     return ET.tostring(opml, encoding="unicode", xml_declaration=True)

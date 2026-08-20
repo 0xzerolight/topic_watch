@@ -235,6 +235,70 @@ class TestParseOPMLNameCollision:
         assert result.topics == []
 
 
+class TestParseOPMLGroupIdentity:
+    """AUG-204: display text is not identity — only our own group marker is."""
+
+    def test_third_party_same_name_feeds_stay_separate(self):
+        opml = """<?xml version="1.0"?>
+        <opml version="2.0"><body>
+            <outline text="Politics"><outline text="News" xmlUrl="https://a.example.com/feed" /></outline>
+            <outline text="Sport"><outline text="News" xmlUrl="https://b.example.com/feed" /></outline>
+        </body></opml>"""
+        with patch("app.opml.validate_feed_url", return_value=None):
+            result = parse_opml(opml, set())
+
+        assert len(result.topics) == 2
+        # The second keeps its own folder tag instead of being dropped into the first.
+        by_tag = {t["tags"][0]: t for t in result.topics}
+        assert set(by_tag) == {"Politics", "Sport"}
+        assert by_tag["Sport"]["feed_urls"] == ["https://b.example.com/feed"]
+        # The duplicate name is disambiguated, not silently merged or lost.
+        assert len({t["name"] for t in result.topics}) == 2
+        assert any("shared a name" in w for w in result.warnings)
+
+    def test_marked_outlines_still_merge(self):
+        from app.opml import TOPIC_ATTR
+
+        opml = f"""<?xml version="1.0"?>
+        <opml version="2.0"><body>
+            <outline text="Multi" {TOPIC_ATTR}="Multi" xmlUrl="https://a.example.com/feed" />
+            <outline text="Multi" {TOPIC_ATTR}="Multi" xmlUrl="https://b.example.com/feed" />
+        </body></opml>"""
+        with patch("app.opml.validate_feed_url", return_value=None):
+            result = parse_opml(opml, set())
+
+        assert len(result.topics) == 1
+        assert len(result.topics[0]["feed_urls"]) == 2
+
+    def test_per_topic_feed_cap(self):
+        from app.opml import MAX_FEEDS_PER_TOPIC, TOPIC_ATTR
+
+        feeds = "".join(
+            f'<outline text="Multi" {TOPIC_ATTR}="Multi" xmlUrl="https://e{i}.example.com/feed" />'
+            for i in range(MAX_FEEDS_PER_TOPIC + 3)
+        )
+        opml = f'<?xml version="1.0"?><opml version="2.0"><body>{feeds}</body></opml>'
+        with patch("app.opml.validate_feed_url", return_value=None):
+            result = parse_opml(opml, set())
+
+        assert len(result.topics) == 1
+        assert len(result.topics[0]["feed_urls"]) == MAX_FEEDS_PER_TOPIC
+
+    def test_imported_name_is_length_capped(self):
+        from app.opml import MAX_TOPIC_NAME_CHARS
+
+        long_name = "N" * (MAX_TOPIC_NAME_CHARS + 200)
+        opml = (
+            f'<?xml version="1.0"?><opml version="2.0"><body>'
+            f'<outline text="{long_name}" xmlUrl="https://a.example.com/feed" />'
+            f"</body></opml>"
+        )
+        with patch("app.opml.validate_feed_url", return_value=None):
+            result = parse_opml(opml, set())
+
+        assert len(result.topics[0]["name"]) == MAX_TOPIC_NAME_CHARS
+
+
 class TestExportOPML:
     def test_export_basic(self):
         topics = [
@@ -290,6 +354,25 @@ class TestExportOPML:
             "https://a.example.com/feed",
             "https://b.example.com/feed",
         }
+
+    def test_round_trip_preserves_every_tag(self):
+        """TW-AUD-026: folders carry one tag; the export carries them all."""
+        original_topics = [
+            {"name": "Multi Tag", "feed_urls": ["https://a.example.com/feed"], "tags": ["Policy, Europe", "Energy"]},
+        ]
+        xml = export_opml(original_topics)
+        result = parse_opml(xml, set())
+        assert result.topics[0]["tags"] == ["Policy, Europe", "Energy"]
+
+    def test_omitted_topics_are_disclosed_in_the_file(self):
+        """TW-AUD-026: an OPML download must not pass for a complete backup."""
+        xml = export_opml([{"name": "Kept", "feed_urls": ["https://a.example.com/feed"], "tags": []}], omitted_count=3)
+        assert "3 topic(s) omitted" in xml
+        assert "JSON export" in xml
+
+    def test_nothing_omitted_adds_no_note(self):
+        xml = export_opml([{"name": "Kept", "feed_urls": ["https://a.example.com/feed"], "tags": []}])
+        assert "omitted" not in xml
 
     def test_round_trip_multi_feed_topic_in_folder(self):
         """Multi-feed topic inside a tag folder also merges into one topic."""

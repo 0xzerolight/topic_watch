@@ -16,6 +16,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.crud import (
+    count_articles_for_topic,
+    count_check_results,
     get_knowledge_state,
     get_topic,
     list_articles_for_topic,
@@ -81,6 +83,10 @@ async def export_all_topics_json(
     data = {
         "topics": [t.model_dump(mode="json") for t in topics],
         "exported_at": datetime.now(UTC).isoformat(),
+        # Every topic is included — this list is not capped — but say so, so the
+        # file's completeness is a stated fact rather than an assumption
+        # (TW-AUD-026).
+        "export": {"topics_total": len(topics), "topics_returned": len(topics), "truncated": False},
     }
 
     content = json.dumps(data, indent=2, default=str)
@@ -105,12 +111,28 @@ async def export_topic_json(
     articles = list_articles_for_topic(conn, topic_id, limit=_EXPORT_ROW_CAP, offset=0)
     checks = list_check_results(conn, topic_id, limit=_EXPORT_ROW_CAP, offset=0)
     knowledge = get_knowledge_state(conn, topic_id)
+    articles_total = count_articles_for_topic(conn, topic_id)
+    checks_total = count_check_results(conn, topic_id)
 
     data = {
         "topic": topic.model_dump(mode="json"),
         "knowledge_state": knowledge.model_dump(mode="json") if knowledge else None,
         "articles": [a.model_dump(mode="json") for a in articles],
         "check_results": [c.model_dump(mode="json") for c in checks],
+        # The row cap is deliberate (bounded memory, OVH-051), but a capped file
+        # used to look exactly like a complete one, so a partial download could be
+        # kept as a backup or migration artifact (TW-AUD-026). State the totals and
+        # whether anything was left behind.
+        "export": {
+            "exported_at": datetime.now(UTC).isoformat(),
+            "row_cap": _EXPORT_ROW_CAP,
+            "articles_total": articles_total,
+            "articles_returned": len(articles),
+            "articles_truncated": articles_total > len(articles),
+            "check_results_total": checks_total,
+            "check_results_returned": len(checks),
+            "check_results_truncated": checks_total > len(checks),
+        },
     }
 
     content = json.dumps(data, indent=2, default=str)
@@ -171,6 +193,13 @@ async def export_topic_csv(
                 _csv_safe(check.stage_error or ""),
             ]
         )
+
+    # A capped CSV used to be indistinguishable from a complete one. Only say so
+    # when rows were actually left behind, so the ordinary file keeps its exact
+    # shape (TW-AUD-026).
+    total = count_check_results(conn, topic_id)
+    if total > len(checks):
+        writer.writerow([f"# truncated: most recent {len(checks)} of {total} check results"])
 
     content = output.getvalue()
     safe_name = _slug_for_filename(topic.name)
