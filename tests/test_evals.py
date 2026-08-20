@@ -277,6 +277,93 @@ def test_load_scenario_parses_handauthored_yaml(tmp_path) -> None:
     assert sc.articles[0].published.year == 2025
 
 
+def test_load_scenario_rejects_a_typo_d_top_level_key(tmp_path) -> None:
+    """AUG-050: a misspelled top-level key (e.g. `expects:` instead of
+    `expect:`) used to be silently discarded — the scenario would still run
+    against the real LLM, just without the check its author intended, and
+    the artifact would look like a valid run."""
+    import pydantic
+
+    from evals.scenario import load_scenario
+
+    p = tmp_path / "typo.yml"
+    p.write_text(
+        textwrap.dedent(
+            """
+            kind: novelty
+            topic:
+              name: "Acme"
+              description: "track acme funding"
+            articles:
+              - title: "dup"
+                url: "http://a"
+                content: "c"
+                source_feed: "http://feed"
+            expects:
+              has_new_info: false
+            """
+        )
+    )
+    with pytest.raises(pydantic.ValidationError):
+        load_scenario(p)
+
+
+def test_load_scenario_rejects_a_typo_d_topic_key(tmp_path) -> None:
+    """A typo'd extra key alongside otherwise-valid, complete fields — not a
+    missing-required-field error, which would mask whether extras are
+    actually forbidden."""
+    import pydantic
+
+    from evals.scenario import load_scenario
+
+    p = tmp_path / "typo_topic.yml"
+    p.write_text(
+        textwrap.dedent(
+            """
+            kind: novelty
+            topic:
+              name: "Acme"
+              description: "track acme funding"
+              descripton: "typo duplicate"
+            articles:
+              - title: "dup"
+                url: "http://a"
+                content: "c"
+                source_feed: "http://feed"
+            """
+        )
+    )
+    with pytest.raises(pydantic.ValidationError):
+        load_scenario(p)
+
+
+def test_load_scenario_rejects_a_typo_d_expectation_key(tmp_path) -> None:
+    import pydantic
+
+    from evals.scenario import load_scenario
+
+    p = tmp_path / "typo_expect.yml"
+    p.write_text(
+        textwrap.dedent(
+            """
+            kind: novelty
+            topic:
+              name: "Acme"
+              description: "track acme funding"
+            articles:
+              - title: "dup"
+                url: "http://a"
+                content: "c"
+                source_feed: "http://feed"
+            expect:
+              has_new_infoo: false
+            """
+        )
+    )
+    with pytest.raises(pydantic.ValidationError):
+        load_scenario(p)
+
+
 def test_run_artifact_save_load_round_trip(tmp_path) -> None:
     from evals.scenario import (
         CapturedCall,

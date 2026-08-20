@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 ScenarioKind = Literal["novelty", "knowledge_init", "knowledge_update", "compress"]
 
@@ -55,6 +55,8 @@ class ScenarioTopic(BaseModel):
     reaches an LLM prompt.
     """
 
+    model_config = ConfigDict(extra="forbid")
+
     name: str
     description: str
     confidence_threshold: float | None = None
@@ -65,6 +67,8 @@ class ScenarioTopic(BaseModel):
 class ScenarioArticle(BaseModel):
     """One article fed to the LLM stage (becomes an app ``Article``)."""
 
+    model_config = ConfigDict(extra="forbid")
+
     title: str
     url: str
     content: str = ""
@@ -74,6 +78,8 @@ class ScenarioArticle(BaseModel):
 
 class Expectation(BaseModel):
     """Optional soft checks rendered as MATCH/MISMATCH — never a hard gate."""
+
+    model_config = ConfigDict(extra="forbid")
 
     has_new_info: bool | None = None
     min_confidence: float | None = None
@@ -86,6 +92,13 @@ class Expectation(BaseModel):
 
 class Scenario(BaseModel):
     """A reproducible input definition for one LLM stage."""
+
+    # Input-side models forbid unknown keys (AUG-050): a typo'd scenario/topic/
+    # article/expectation key would otherwise be silently discarded under
+    # Pydantic's default forward-compatible policy, quietly dropping the check
+    # its author meant to run before a billed LLM call. RunArtifact and its
+    # nested output models stay tolerant — they're read back, not authored.
+    model_config = ConfigDict(extra="forbid")
 
     kind: ScenarioKind = "novelty"
     topic: ScenarioTopic
