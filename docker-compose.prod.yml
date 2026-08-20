@@ -37,3 +37,7 @@ services:
       # (the install script writes these to .env automatically).
       - PUID=${PUID:-1000}
       - PGID=${PGID:-1000}
+      # Only send cookies over HTTPS. TOPIC_WATCH_SECURE_COOKIES in .env
+      # reaches the container through this line — uncommenting it there alone
+      # is not enough, since .env only fills in ${...} placeholders here.
+      - TOPIC_WATCH_SECURE_COOKIES=${TOPIC_WATCH_SECURE_COOKIES:-false}

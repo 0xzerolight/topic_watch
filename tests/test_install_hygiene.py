@@ -107,3 +107,12 @@ def test_entrypoint_repairs_existing_required_files_not_just_the_directory() -> 
     dir_check_pos = entrypoint.index('if [ "$dir_uid" != "$PUID" ]')
     file_repair_pos = entrypoint.index('chown_path_if_needed "$DATA_DIR/config.yml"')
     assert file_repair_pos > dir_check_pos
+
+
+def test_compose_files_pass_through_secure_cookies() -> None:
+    """AUG-058: the documented ``TOPIC_WATCH_SECURE_COOKIES`` .env switch must
+    actually reach the container — Compose's .env only fills ${...}
+    placeholders, it does not become the container environment on its own."""
+    for compose_file in ("docker-compose.yml", "docker-compose.prod.yml"):
+        text = (_ROOT / compose_file).read_text()
+        assert "TOPIC_WATCH_SECURE_COOKIES" in text, f"{compose_file} does not pass through TOPIC_WATCH_SECURE_COOKIES"
