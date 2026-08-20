@@ -2,20 +2,80 @@
 
 import asyncio
 import sqlite3
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse
 
 from app.config import Settings
-from app.crud import list_all_feed_health
+from app.crud import list_all_feed_health, list_topics
 from app.feed_backoff import feed_backoff_until
+from app.models import FeedHealth, FeedMode, Topic
+from app.scraping.routing import router as provider_router
 from app.web.csrf import verify_csrf
 from app.web.dependencies import get_db_conn, get_settings
 from app.web.routers.templates import templates
 from app.web.state import _check_rate_limit
 
 router = APIRouter()
+
+# Mirrors app.scraping.exa's own fallback. Kept as a local literal rather than
+# importing that module's private constant — Exa's shared search endpoint is
+# what every EXA-mode topic's feed_health row is keyed on.
+_EXA_DEFAULT_BASE_URL = "https://api.exa.ai"
+
+
+def _exa_endpoint(settings: Settings) -> str:
+    """The endpoint every EXA-mode topic's health is recorded under."""
+    base = (settings.exa.base_url or _EXA_DEFAULT_BASE_URL).rstrip("/")
+    return f"{base}/search"
+
+
+def _topic_owned_urls(topic: Topic, exa_endpoint: str) -> list[str]:
+    """URLs a topic currently resolves to (mirrors topics._feed_source_context).
+
+    AUTO topics own every provider URL, not just the currently-active one, so a
+    standby provider's health still traces back to its topic. EXA topics all
+    share one endpoint. MANUAL topics own their configured list.
+    """
+    if topic.feed_mode == FeedMode.AUTO:
+        return [p.build_feed_url(topic) for p in provider_router.providers]
+    if topic.feed_mode == FeedMode.EXA:
+        return [exa_endpoint]
+    return list(topic.feed_urls)
+
+
+@dataclass
+class FeedHealthRow:
+    """One Feed Health table row: a feed_health record plus its topic ownership.
+
+    feed_health has no topic_id column — a feed URL can be shared by topics, or
+    left behind by a topic edit/delete — so ownership is derived at render time
+    from current topic state instead of stored (AUG-105).
+    """
+
+    feed: FeedHealth
+    is_exa: bool
+    owners: list[Topic]
+
+    @property
+    def orphaned(self) -> bool:
+        return not self.owners
+
+
+def _build_feed_health_rows(feeds: list[FeedHealth], topics: list[Topic], exa_endpoint: str) -> list[FeedHealthRow]:
+    owners_by_url: dict[str, list[Topic]] = {}
+    for topic in topics:
+        for url in _topic_owned_urls(topic, exa_endpoint):
+            owners_by_url.setdefault(url, []).append(topic)
+
+    rows = []
+    for feed in feeds:
+        owners = owners_by_url.get(feed.feed_url, [])
+        is_exa = feed.feed_url == exa_endpoint or any(t.feed_mode == FeedMode.EXA for t in owners)
+        rows.append(FeedHealthRow(feed=feed, is_exa=is_exa, owners=owners))
+    return rows
 
 
 @router.get("/feeds", response_class=HTMLResponse)
@@ -24,8 +84,11 @@ async def feed_health_page(
     conn: sqlite3.Connection = Depends(get_db_conn),
     settings: Settings = Depends(get_settings),
 ):
-    """Global feed health dashboard."""
+    """Global feed health dashboard: per-source health with owning-topic links."""
     feeds = list_all_feed_health(conn)
+    topics = list_topics(conn)
+    rows = _build_feed_health_rows(feeds, topics, _exa_endpoint(settings))
+
     now = datetime.now(UTC)
     backoff_map: dict[str, str] = {}
     for feed in feeds:
@@ -40,7 +103,7 @@ async def feed_health_page(
     return templates.TemplateResponse(
         request,
         "feed_health.html",
-        {"feeds": feeds, "backoff_map": backoff_map},
+        {"rows": rows, "backoff_map": backoff_map},
     )
 
 

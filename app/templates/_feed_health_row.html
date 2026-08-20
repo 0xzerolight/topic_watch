@@ -1,8 +1,26 @@
-{# One feed-health row for the Feeds data-table. Expects `feed` (FeedHealth) and
-   the imported `feed_status` macro in scope. Every <td> carries a data-label so
-   components.css can collapse the table to cards <768px. #}
-<tr{% if feed.consecutive_failures > 2 %} class="row-problem"{% endif %}>
-    <td class="cell-stack" data-label="Status">
+{# One feed-health row for the Feeds data-table. Expects `row` (FeedHealthRow:
+   .feed / .is_exa / .owners / .orphaned) and the imported `feed_status` macro
+   in scope. Every <td> carries a data-label so components.css can collapse
+   the table to cards <768px. #}
+{% set feed = row.feed %}
+<tr{% if row.orphaned %} class="row-inactive"{% elif feed.consecutive_failures > 2 %} class="row-problem"{% endif %}>
+    <td class="cell-stack" data-label="Source">
+        {% if row.is_exa %}
+            <span class="chip" title="{{ feed.feed_url }}">Exa search</span>
+            <small class="quiet">AI search API &mdash; not a fetchable feed URL</small>
+        {% else %}
+            <strong>{{ feed.feed_url|feed_source_name }}</strong>
+            <a href="{{ feed.feed_url }}" target="_blank" class="feed-url" title="{{ feed.feed_url }}"><small>{{ feed.feed_url|truncate(45) }}</small></a>
+        {% endif %}
+    </td>
+    <td class="cell-stack" data-label="Used by">
+        {% if row.owners %}
+            {% for topic in row.owners %}<a href="/topics/{{ topic.id }}">{{ topic.name }}</a>{% if not loop.last %}, {% endif %}{% endfor %}
+        {% else %}
+            <span class="quiet">Orphaned &mdash; no topic uses this source</span>
+        {% endif %}
+    </td>
+    <td class="cell-stack" data-label="Health">
         {%- if feed.consecutive_failures == 0 -%}
             {{ feed_status("healthy", "Healthy") }}
         {%- elif feed.consecutive_failures <= 2 -%}
@@ -10,26 +28,30 @@
         {%- else -%}
             {{ feed_status("unhealthy", "Unhealthy (%d consecutive failures)" % feed.consecutive_failures) }}
         {%- endif -%}
-        {% set backoff = backoff_map.get(feed.feed_url) if backoff_map is defined else None %}
-        {% if backoff %}<small class="quiet" title="Persistently failing — automatically backing off, then retried">Backing off ({{ backoff }})</small>{% endif %}
-    </td>
-    <td data-label="Feed URL"><a href="{{ feed.feed_url }}" target="_blank" class="feed-url" title="{{ feed.feed_url }}"><small>{{ feed.feed_url|truncate(45) }}</small></a></td>
-    <td data-label="Last Success">{{ feed.last_success_at|timeago if feed.last_success_at else "Never" }}</td>
-    <td class="cell-stack" data-label="Last Error">
+        <small class="quiet">
+            {{ feed.last_success_at|timeago if feed.last_success_at else "Never succeeded" }}
+            {% if feed.total_fetches > 0 %}&middot; {{ "%.0f"|format(feed.total_failures / feed.total_fetches * 100) }}% fail ({{ feed.total_fetches }} fetches){% endif %}
+        </small>
         {% if feed.last_error_at %}
-            <span title="{{ feed.last_error_message }}">{{ feed.last_error_at|timeago }}</span>
-            {{ feed.last_error_message | sanitize_error }}
-        {% else %}
-            Never
+        <span title="{{ feed.last_error_message }}">Last error {{ feed.last_error_at|timeago }}</span>
+        {{ feed.last_error_message | sanitize_error }}
         {% endif %}
     </td>
-    <td data-label="Consec. Fail" class="num">{{ feed.consecutive_failures }}</td>
-    <td data-label="Fetches" class="num">{{ feed.total_fetches }}</td>
-    <td data-label="Fail %" class="num">
-        {% if feed.total_fetches > 0 %}
-            {{ "%.0f"|format(feed.total_failures / feed.total_fetches * 100) }}%
+    <td data-label="Next retry">
+        {% set backoff = backoff_map.get(feed.feed_url) if backoff_map is defined else None %}
+        {% if backoff %}
+            <span title="Persistently failing — automatically backing off, then retried">Backing off ({{ backoff }})</span>
         {% else %}
             -
+        {% endif %}
+    </td>
+    <td data-label="Repair">
+        {% if row.is_exa %}
+            <a href="/settings" role="button" class="btn-sm outline secondary">Check Exa settings</a>
+        {% elif row.owners %}
+            <a href="/topics/{{ row.owners[0].id }}/edit" role="button" class="btn-sm outline secondary">Edit topic</a>
+        {% else %}
+            <span class="quiet">-</span>
         {% endif %}
     </td>
 </tr>

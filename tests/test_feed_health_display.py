@@ -160,6 +160,75 @@ class TestFeedHealthPage:
         assert "Unhealthy" in response.text
 
 
+class TestFeedHealthOwnership:
+    """AUG-105: Feed Health rows are derived from current topic ownership.
+
+    Exa's shared search endpoint renders as a typed search source (not a
+    clickable "feed URL"), every row links back to the topic(s) that use it,
+    and a row nothing references anymore is labeled orphaned rather than
+    presented — or silently dropped — as if it still belonged to a topic.
+    """
+
+    async def test_manual_feed_links_to_owning_topic(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """A feed_health row for a URL a topic still uses shows a link to it."""
+        url = "https://example.com/feed.xml"
+        topic = _make_topic(db_conn, name="Owner Topic", feed_urls=[url])
+        upsert_feed_health_success(db_conn, url)
+        db_conn.commit()
+
+        response = await client.get("/feeds")
+        assert response.status_code == 200
+        assert f'href="/topics/{topic.id}"' in response.text
+        assert "Owner Topic" in response.text
+        assert "Orphaned" not in response.text
+
+    async def test_orphaned_feed_is_labeled_not_dropped(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """A feed_health row no topic references anymore (deleted/edited away) is labeled."""
+        url = "https://gone.example.com/feed.xml"
+        upsert_feed_health_success(db_conn, url)
+        db_conn.commit()
+
+        response = await client.get("/feeds")
+        assert response.status_code == 200
+        assert "Orphaned" in response.text
+        assert "gone.example.com" in response.text
+
+    async def test_exa_endpoint_renders_as_search_source(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """Exa's shared POST /search endpoint is a typed search source, not a fake feed URL."""
+        topic = _make_topic(db_conn, name="Exa Topic", feed_mode=FeedMode.EXA, feed_urls=[])
+        upsert_feed_health_success(db_conn, "https://api.exa.ai/search")
+        db_conn.commit()
+
+        response = await client.get("/feeds")
+        assert response.status_code == 200
+        assert "Exa search" in response.text
+        assert f'href="/topics/{topic.id}"' in response.text
+        assert "Exa Topic" in response.text
+        # Not rendered as a clickable RSS feed link like a manual/auto row.
+        assert 'class="feed-url"' not in response.text
+
+    async def test_repair_links_to_owning_topic_edit_page(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """A failing owned feed's repair action points at its topic's edit page."""
+        url = "https://broken.example.com/feed.xml"
+        topic = _make_topic(db_conn, name="Broken Owner", feed_urls=[url])
+        upsert_feed_health_failure(db_conn, url, "connection refused")
+        upsert_feed_health_failure(db_conn, url, "connection refused")
+        upsert_feed_health_failure(db_conn, url, "connection refused")
+        db_conn.commit()
+
+        response = await client.get("/feeds")
+        assert response.status_code == 200
+        assert f'href="/topics/{topic.id}/edit"' in response.text
+
+
 # --- Topic detail page feed health indicators tests ---
 
 
