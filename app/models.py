@@ -428,6 +428,14 @@ class NotifyDisposition(StrEnum):
 
     SENT = "sent"
     PENDING = "pending"
+    PENDING_KNOWLEDGE_STALE = "pending_knowledge_stale"
+    """Notifying, but the knowledge state behind the alert did not advance.
+
+    The merge was refused as too vague to apply (``knowledge_insufficient``) or it
+    raised (``knowledge_update_failed``) — ``stage_error`` says which. The alert is
+    still worth sending, so recording it as an ordinary send would claim the
+    baseline absorbed evidence it never saw (TW-AUD-003).
+    """
     NO_NEW_INFO = "no_new_info"
     BELOW_CONFIDENCE = "below_confidence"
     BELOW_RELEVANCE = "below_relevance"

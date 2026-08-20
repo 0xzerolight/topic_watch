@@ -125,8 +125,10 @@ class CheckOutcome:
     article_ids: list[int] = field(default_factory=list)
     """Articles this check evaluated, to be marked processed."""
     failed_article_ids: list[int] = field(default_factory=list)
-    """Articles whose analysis failed. Populated by the failure-path semantics
-    task; A1 leaves it empty so the disposition rules stay in one place."""
+    """Articles this check did not finish with — the analysis failed, or the
+    knowledge merge they justified never landed. They stay unprocessed and take an
+    attempt, so the next cycle re-analyzes them and a hopeless one is eventually
+    abandoned (see ``crud.record_article_analysis_failure``)."""
     notify_disposition: str | None = None
 
 
@@ -433,7 +435,10 @@ async def _check_topic_inner(
     # --- P3: if new info clears the thresholds, generate the knowledge update.
     # Still connection-free: this is another multi-second LLM round-trip, and the
     # plan it produces is not written until the C3 transaction below.
-    knowledge_update_failed = False
+    # True when the knowledge state did NOT advance this cycle — the merge raised,
+    # or the model refused it as insufficient. Both leave the stored baseline
+    # behind the evidence, so both leave the articles unfinished.
+    knowledge_stale = False
     should_notify = False
     notification: tuple[str, str] | None = None
     knowledge_plan: KnowledgeUpdatePlan | None = None
@@ -473,9 +478,23 @@ async def _check_topic_inner(
                 plan = await prepare_knowledge_update(topic, novelty, snapshot.knowledge_summary, settings)
                 result.prompt_tokens += plan.usage.prompt_tokens
                 result.completion_tokens += plan.usage.completion_tokens
-                # An insufficient-data verdict preserves the existing state, so
-                # there is nothing to apply.
-                knowledge_plan = plan if plan.sufficient_data else None
+                if plan.sufficient_data:
+                    knowledge_plan = plan
+                else:
+                    # The merge was refused: the findings were too vague to fold
+                    # in, so the stored summary stays as it was. Recording that is
+                    # the whole point — a check that alerts on evidence its own
+                    # baseline never absorbed will keep re-detecting the same fact
+                    # as new, and used to look identical to a clean update
+                    # (TW-AUD-003).
+                    knowledge_stale = True
+                    result.stage_error = (
+                        "knowledge_insufficient: findings too vague to merge; knowledge state unchanged"
+                    )
+                    logger.warning(
+                        "Topic '%s': knowledge merge refused as insufficient; baseline unchanged",
+                        topic.name,
+                    )
             except Exception as exc:
                 logger.warning(
                     "Knowledge update failed for topic '%s'",
@@ -486,10 +505,12 @@ async def _check_topic_inner(
                 # but record the failure distinctly and do NOT mark these
                 # new-info-bearing articles processed, so the next cycle
                 # re-attempts the knowledge update (no silent drift).
-                knowledge_update_failed = True
+                knowledge_stale = True
                 result.stage_error = f"knowledge_update_failed: {_summarize_exc(exc)}"
             if should_notify:
                 notification = format_notification(topic.name, novelty)
+                if knowledge_stale:
+                    disposition = NotifyDisposition.PENDING_KNOWLEDGE_STALE
 
     # Article disposition. "processed" means "we've evaluated this article" — set
     # even for below-threshold (new-but-not-notified) and not-new articles, so
@@ -504,7 +525,7 @@ async def _check_topic_inner(
     # re-analyzes them and a permanently failing article is eventually abandoned
     # instead of retried forever (TW-AUD-001).
     batch_ids = [a.id for a in articles if a.id is not None]
-    unfinished = bool(novelty.error) or knowledge_update_failed
+    unfinished = bool(novelty.error) or knowledge_stale
     article_ids = [] if unfinished else batch_ids
     failed_article_ids = batch_ids if unfinished else []
 

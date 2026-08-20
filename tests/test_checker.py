@@ -27,6 +27,7 @@ from app.models import (
     FeedMode,
     KnowledgeState,
     NotificationDelivery,
+    NotifyDisposition,
     PendingNotification,
     Topic,
     TopicStatus,
@@ -2198,3 +2199,102 @@ class TestAnalysisFailureIsResumable:
         assert [a.id for a in analyzed] == [article.id]
         row = db_conn.execute("SELECT processed FROM articles WHERE id = ?", (article.id,)).fetchone()
         assert row["processed"] == 1
+
+
+class TestInsufficientKnowledgeIsRecorded:
+    """A soft knowledge rejection is not a clean notified success (TW-AUD-003)."""
+
+    async def _check_with_insufficient_merge(
+        self,
+        db_conn: sqlite3.Connection,
+        db_path: Path,
+        topic: Topic,
+        article: Article,
+        settings: Settings,
+        send,
+    ):
+        novelty = NoveltyResult(
+            has_new_info=True,
+            summary="Something new",
+            confidence=0.9,
+            relevance=0.9,
+            importance=3,
+        )
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[article], total_feed_entries=1),
+            ),
+            patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
+            patch(
+                "app.checker.prepare_knowledge_update",
+                new_callable=AsyncMock,
+                return_value=_make_write_result(sufficient_data=False),
+            ),
+            patch("app.checker.send_notification_per_url", send),
+            patch("app.checker.send_webhooks", new_callable=AsyncMock, return_value=0),
+        ):
+            return await check_topic(get_topic(db_conn, topic.id), settings, db_path=db_path)
+
+    async def test_notifies_but_records_the_unchanged_knowledge(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """The alert still fires; the row says the baseline never absorbed it."""
+        topic = _make_topic(db_conn, name="ThinMerge")
+        create_knowledge_state(
+            db_conn,
+            KnowledgeState(topic_id=topic.id, summary_text="Baseline.", token_count=9, version=1),
+        )
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
+        db_conn.commit()
+        send = _per_url_mock(ok=True)
+
+        result = await self._check_with_insufficient_merge(db_conn, db_path, topic, article, _make_settings(), send)
+
+        send.assert_awaited_once()
+        assert result.notification_sent is True
+        assert result.id is not None
+        assert result.stage_error is not None
+        assert result.stage_error.startswith("knowledge_insufficient")
+        assert result.notify_disposition == NotifyDisposition.PENDING_KNOWLEDGE_STALE
+        stored = db_conn.execute(
+            "SELECT stage_error, notify_disposition FROM check_results WHERE id = ?", (result.id,)
+        ).fetchone()
+        assert stored["stage_error"].startswith("knowledge_insufficient")
+        assert stored["notify_disposition"] == "pending_knowledge_stale"
+
+        # The prior knowledge is preserved, with no revision claiming otherwise.
+        state = db_conn.execute(
+            "SELECT summary_text, version FROM knowledge_states WHERE topic_id = ?", (topic.id,)
+        ).fetchone()
+        assert state["summary_text"] == "Baseline."
+        assert state["version"] == 1
+        assert db_conn.execute("SELECT COUNT(*) FROM knowledge_revisions").fetchone()[0] == 0
+
+        # The evidence stays queued for another attempt rather than being consumed.
+        row = db_conn.execute(
+            "SELECT processed, analysis_attempts FROM articles WHERE id = ?", (article.id,)
+        ).fetchone()
+        assert row["processed"] == 0
+        assert row["analysis_attempts"] == 1
+
+    async def test_importance_suppressed_check_still_records_the_rejection(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """No send to describe, so the disposition stays the suppression reason."""
+        topic = _make_topic(db_conn, name="ThinAndQuiet", importance_threshold=5)
+        create_knowledge_state(
+            db_conn,
+            KnowledgeState(topic_id=topic.id, summary_text="Baseline.", token_count=9, version=1),
+        )
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
+        db_conn.commit()
+        send = _per_url_mock(ok=True)
+
+        result = await self._check_with_insufficient_merge(db_conn, db_path, topic, article, _make_settings(), send)
+
+        send.assert_not_awaited()
+        assert result.notify_disposition == NotifyDisposition.SUPPRESSED_IMPORTANCE
+        assert result.stage_error is not None
+        assert result.stage_error.startswith("knowledge_insufficient")
