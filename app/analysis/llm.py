@@ -932,8 +932,9 @@ async def analyze_articles(
 ) -> NoveltyResult:
     """Analyze articles for novelty against the current knowledge state.
 
-    Returns a safe default (has_new_info=False) on any LLM error
-    to prevent spurious notifications. On success, ``prompt_tokens`` /
+    Returns a safe default (has_new_info=False) on any LLM error to prevent
+    spurious notifications, with ``error`` set and the provider's own text kept on
+    ``raw_response`` when there was one. On success, ``prompt_tokens`` /
     ``completion_tokens`` are populated from the raw completion's usage, and
     ``key_facts`` that merely restate the knowledge summary are dropped.
     """

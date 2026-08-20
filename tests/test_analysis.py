@@ -5,6 +5,7 @@ import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import UTC
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import instructor
@@ -18,12 +19,14 @@ from app.analysis.citations import strip_index_citations, strip_reliability_note
 from app.analysis.knowledge import initialize_knowledge, update_knowledge
 from app.analysis.llm import (
     _OUTPUT_TOKEN_CAP,
+    _RAW_RESPONSE_MAX_CHARS,
     CompressedKnowledge,
     KnowledgeStateUpdate,
     NoveltyResponse,
     NoveltyResult,
     _bounded_max_tokens,
     _filter_restated_key_facts,
+    _salvage_raw_response,
     analyze_articles,
     compress_knowledge_summary,
     count_tokens,
@@ -1226,6 +1229,40 @@ class TestLiveNoveltyContract:
 
         assert result.has_new_info is True
         assert result.raw_response is None
+
+    def test_salvage_reads_tool_call_arguments(self) -> None:
+        """In TOOLS mode the rejected payload is in the tool call, not in
+        ``content`` — the salvage has to look there too."""
+        payload = '{"has_new_info": true, "summary": "Date announced"}'
+        exc = RuntimeError("boom")
+        exc.last_completion = SimpleNamespace(  # type: ignore[attr-defined]
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=None,
+                        tool_calls=[SimpleNamespace(function=SimpleNamespace(arguments=payload))],
+                    )
+                )
+            ]
+        )
+
+        assert _salvage_raw_response(exc) == payload
+
+    def test_salvage_bounds_a_runaway_completion(self) -> None:
+        exc = RuntimeError("boom")
+        exc.last_completion = SimpleNamespace(  # type: ignore[attr-defined]
+            choices=[SimpleNamespace(message=SimpleNamespace(content="x" * 50_000, tool_calls=None))]
+        )
+
+        salvaged = _salvage_raw_response(exc)
+        assert salvaged is not None
+        assert len(salvaged) == _RAW_RESPONSE_MAX_CHARS
+
+    def test_salvage_tolerates_an_unfamiliar_completion_shape(self) -> None:
+        exc = RuntimeError("boom")
+        exc.last_completion = {"choices": [{"message": {"content": "nope"}}]}  # type: ignore[attr-defined]
+
+        assert _salvage_raw_response(exc) is None
 
     async def test_explicit_zero_relevance_is_not_a_violation(self) -> None:
         """Omission is the defect; a model that deliberately scores 0.0 is obeyed."""
