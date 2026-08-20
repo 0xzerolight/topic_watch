@@ -15,7 +15,7 @@ from app.analysis.llm import (
     InstructorRetryException,
     KnowledgeStateUpdate,
     NoveltyResult,
-    _call_with_rate_limit_retry,
+    _call_with_transport_retry,
     _fallback_mode,
     _unwrap_bad_request,
     analyze_articles,
@@ -116,17 +116,17 @@ def _mock_instructor_client(return_value):
 
 
 # ============================================================
-# TestCallWithRateLimitRetry
+# TestCallWithTransportRetry
 # ============================================================
 
 
-class TestCallWithRateLimitRetry:
+class TestCallWithTransportRetry:
     async def test_succeeds_on_first_try(self) -> None:
         """When no error occurs, returns the result immediately."""
         call_func = AsyncMock(return_value="ok")
 
         with patch("app.analysis.llm.asyncio.sleep") as mock_sleep:
-            result = await _call_with_rate_limit_retry(call_func)
+            result = await _call_with_transport_retry(call_func)
 
         assert result == "ok"
         call_func.assert_called_once()
@@ -138,23 +138,94 @@ class TestCallWithRateLimitRetry:
         call_func = AsyncMock(side_effect=[rate_error, rate_error, "success"])
 
         with patch("app.analysis.llm.asyncio.sleep") as mock_sleep:
-            result = await _call_with_rate_limit_retry(call_func)
+            result = await _call_with_transport_retry(call_func)
 
         assert result == "success"
         assert call_func.call_count == 3
         assert mock_sleep.call_count == 2
 
     async def test_uses_exponential_backoff_delays(self) -> None:
-        """Verifies backoff delays follow base_delay * (multiplier ** attempt)."""
+        """Backoff grows as base_delay * (multiplier ** attempt), plus jitter."""
         rate_error = _make_rate_limit_error()
         call_func = AsyncMock(side_effect=[rate_error, rate_error, "ok"])
 
         with patch("app.analysis.llm.asyncio.sleep") as mock_sleep:
-            await _call_with_rate_limit_retry(call_func, base_delay=5.0, backoff_multiplier=3.0)
+            await _call_with_transport_retry(call_func, base_delay=5.0, backoff_multiplier=3.0)
 
         delays = [call.args[0] for call in mock_sleep.call_args_list]
-        # attempt=0: 5 * 3^0 = 5, attempt=1: 5 * 3^1 = 15
-        assert delays == [5.0, 15.0]
+        # attempt=0: 5 * 3^0 = 5, attempt=1: 5 * 3^1 = 15, each plus up to 25%
+        # upward jitter so concurrent topics do not re-fire in lockstep.
+        assert len(delays) == 2
+        assert 5.0 <= delays[0] <= 6.25
+        assert 15.0 <= delays[1] <= 18.75
+
+    async def test_delay_is_capped(self) -> None:
+        """AUG-160: the uncapped 5 * 3**attempt reached 98,415s on the last sleep
+        at the supported maximum llm_max_retries=10 — a ~41-hour stall of the
+        single-instance scheduler job. No individual sleep may exceed the cap."""
+        rate_error = _make_rate_limit_error()
+        call_func = AsyncMock(side_effect=[rate_error] * 11)
+
+        with patch("app.analysis.llm.asyncio.sleep") as mock_sleep, pytest.raises(litellm.RateLimitError):
+            await _call_with_transport_retry(call_func, max_retries=10, base_delay=5.0, backoff_multiplier=3.0)
+
+        delays = [call.args[0] for call in mock_sleep.call_args_list]
+        assert delays, "expected at least one backoff sleep"
+        ceiling = llm_module._RETRY_MAX_DELAY_SECONDS * (1 + llm_module._RETRY_JITTER_FRACTION)
+        assert max(delays) <= ceiling
+
+    async def test_total_retry_budget_stops_the_loop(self) -> None:
+        """The monotonic total budget bounds the whole sequence, whatever
+        llm_max_retries says — this is what makes the worst case finite."""
+        rate_error = _make_rate_limit_error()
+        call_func = AsyncMock(side_effect=[rate_error] * 11)
+        clock = {"now": 0.0}
+
+        async def _advance(delay: float) -> None:
+            clock["now"] += delay
+
+        with (
+            patch("app.analysis.llm.asyncio.sleep", side_effect=_advance),
+            patch("app.analysis.llm.time.monotonic", side_effect=lambda: clock["now"]),
+            pytest.raises(litellm.RateLimitError),
+        ):
+            await _call_with_transport_retry(call_func, max_retries=10, base_delay=5.0, backoff_multiplier=3.0)
+
+        # Budget exhausted long before the 11th attempt.
+        assert call_func.call_count < 11
+        assert clock["now"] <= llm_module._RETRY_TOTAL_BUDGET_SECONDS
+
+    async def test_retries_transient_server_error(self) -> None:
+        """AUG-325: a 5xx used to be replayed inside instructor with zero delay.
+        It belongs to this loop, which waits between attempts."""
+        server_error = litellm.InternalServerError(message="upstream boom", llm_provider="openai", model="gpt-4")
+        call_func = AsyncMock(side_effect=[server_error, "ok"])
+
+        with patch("app.analysis.llm.asyncio.sleep") as mock_sleep:
+            result = await _call_with_transport_retry(call_func)
+
+        assert result == "ok"
+        assert mock_sleep.call_count == 1
+
+    async def test_does_not_retry_permanent_status_from_generic_error(self) -> None:
+        """A gateway raising a generic APIError(status_code=422) describes a
+        permanent failure; classification is by STATUS, not exception type."""
+        generic = litellm.APIError(status_code=422, message="unprocessable", llm_provider="x", model="m")
+        call_func = AsyncMock(side_effect=generic)
+
+        with patch("app.analysis.llm.asyncio.sleep") as mock_sleep, pytest.raises(litellm.APIError):
+            await _call_with_transport_retry(call_func)
+
+        call_func.assert_called_once()
+        mock_sleep.assert_not_called()
+
+    async def test_retries_connection_error(self) -> None:
+        """A network failure never reached the provider — same request, retry it."""
+        conn_error = litellm.APIConnectionError(message="connection reset", llm_provider="x", model="m")
+        call_func = AsyncMock(side_effect=[conn_error, "ok"])
+
+        with patch("app.analysis.llm.asyncio.sleep"):
+            assert await _call_with_transport_retry(call_func) == "ok"
 
     async def test_raises_after_exhausting_retries(self) -> None:
         """Re-raises the last RateLimitError after max_retries attempts."""
@@ -163,7 +234,7 @@ class TestCallWithRateLimitRetry:
         call_func = AsyncMock(side_effect=[rate_error] * 4)
 
         with patch("app.analysis.llm.asyncio.sleep"), pytest.raises(litellm.RateLimitError):
-            await _call_with_rate_limit_retry(call_func, max_retries=3)
+            await _call_with_transport_retry(call_func, max_retries=3)
 
         assert call_func.call_count == 4
 
@@ -172,7 +243,7 @@ class TestCallWithRateLimitRetry:
         call_func = AsyncMock(side_effect=ValueError("bad input"))
 
         with patch("app.analysis.llm.asyncio.sleep") as mock_sleep, pytest.raises(ValueError, match="bad input"):
-            await _call_with_rate_limit_retry(call_func)
+            await _call_with_transport_retry(call_func)
 
         call_func.assert_called_once()
         mock_sleep.assert_not_called()
@@ -186,7 +257,7 @@ class TestCallWithRateLimitRetry:
             patch("app.analysis.llm.asyncio.sleep"),
             patch("app.analysis.llm.logger") as mock_logger,
         ):
-            await _call_with_rate_limit_retry(call_func, max_retries=3)
+            await _call_with_transport_retry(call_func, max_retries=3)
 
         mock_logger.warning.assert_called_once()
         warning_msg = mock_logger.warning.call_args.args[0]
@@ -467,24 +538,27 @@ class TestRealInstructorStackBackoff:
         # immediately re-fire on the 429.
         assert counter["calls"] == 3
 
-    async def test_validation_retry_still_works_for_non_rate_limit(self) -> None:
-        """Instructor still retries genuine validation failures (not 429s).
+    async def test_validation_retry_still_works_for_transport_failures(self) -> None:
+        """Restricting instructor to parse failures must not disable its
+        structured-output validation retries.
 
-        Disabling instructor's retry-on-RateLimitError must not disable its
-        structured-output validation retries. A persistent validation failure
-        should still be attempted ``llm_max_retries + 1`` times by instructor
-        within a SINGLE backoff attempt (no rate-limit sleep involved).
+        A response that never satisfies the schema is still re-prompted
+        ``llm_max_retries + 1`` times inside a SINGLE transport attempt, with no
+        backoff sleep (this is not a transport failure).
         """
         settings = _make_settings(llm_max_retries=2)
 
-        def _validation_error() -> Exception:
-            # Not a RateLimitError: instructor owns the retry for this one.
-            return litellm.APIError(
-                status_code=400,
-                message="bad output",
-                llm_provider="openai",
-                model="gpt-4",
-            )
+        def _schema_violation() -> Exception:
+            from pydantic import BaseModel
+
+            class _Req(BaseModel):
+                x: int
+
+            try:
+                _Req.model_validate({})
+            except Exception as exc:  # pydantic.ValidationError
+                return exc
+            raise AssertionError("expected a ValidationError")
 
         sleeps: list[float] = []
 
@@ -492,21 +566,42 @@ class TestRealInstructorStackBackoff:
             sleeps.append(delay)
 
         with (
-            _real_instructor_raising(_validation_error) as counter,
+            _real_instructor_raising(_schema_violation) as counter,
             patch("app.analysis.llm.asyncio.sleep", side_effect=_record_sleep),
         ):
             result = await analyze_articles([_make_article()], "Known facts.", _make_topic(), settings)
 
-        # Fail-safe result, and no rate-limit *backoff* delay (this is not a 429).
-        # Instructor's own between-retry waits are 0.0 (no wait policy); our
-        # rate-limit backoff would inject a positive base_delay, which it must not.
         assert result.has_new_info is False
+        # Instructor's own between-retry waits are 0.0 (no wait policy); the
+        # transport backoff would inject a positive base_delay, which it must not.
         assert all(d == 0 for d in sleeps)
-        # Instructor retried the non-429 itself: max_retries + 1 = 3 attempts.
-        # NB: a bare ``APIError(status_code=400)`` is NOT a ``BadRequestError``, so
-        # the permanent-4xx exclusion (issue #53) does not apply — it stays retried.
-        # This pins the exclusion to exception TYPE, not HTTP status code.
         assert counter["calls"] == 3
+
+    async def test_generic_status_400_is_not_replayed_in_the_same_mode(self) -> None:
+        """AUG-325: a generic ``APIError(status_code=400)`` is a permanent
+        rejection of THIS request shape.
+
+        It used to be replayed ``max_retries + 1`` times unchanged (the negative
+        type filter only excluded ``BadRequestError`` subclasses) and could not
+        reach the TOOLS -> JSON -> MD_JSON fallback. Now each mode is tried at
+        most once, and the mode hop — a genuinely different request — is what
+        recovers.
+        """
+        expected = NoveltyResult(has_new_info=True, confidence=0.9, relevance=0.8, importance=4)
+
+        def handler(kwargs: dict) -> ModelResponse:
+            if "tool_choice" in kwargs:
+                raise litellm.APIError(status_code=400, message="mode rejected", llm_provider="x", model="m")
+            return _completion_for(expected)
+
+        settings = _make_settings(llm=LLMSettings(model="openai/gpt-4o-mini", api_key="k"), llm_max_retries=2)
+
+        with _fake_acompletion(handler) as calls:
+            result = await analyze_articles([_make_article()], "Known facts.", _make_topic(), settings)
+
+        assert result.has_new_info is True
+        assert len(calls) == 2  # one TOOLS attempt, then JSON — not 3 TOOLS replays
+        assert "tool_choice" not in calls[1]
 
 
 # ============================================================

@@ -1902,7 +1902,7 @@ class TestRateLimitRetry:
             patch("app.analysis.llm.asyncio.sleep", new=AsyncMock()),
             pytest.raises(litellm.RateLimitError),
         ):
-            await llm_module._call_with_rate_limit_retry(_always_rate_limited, max_retries=4)
+            await llm_module._call_with_transport_retry(_always_rate_limited, max_retries=4)
 
         assert attempts == 5  # initial attempt + 4 retries
 
@@ -1919,7 +1919,7 @@ class TestRateLimitRetry:
             return "ok"
 
         with patch("app.analysis.llm.asyncio.sleep", new=AsyncMock()):
-            result = await llm_module._call_with_rate_limit_retry(_flaky, max_retries=3)
+            result = await llm_module._call_with_transport_retry(_flaky, max_retries=3)
 
         assert result == "ok"
         assert attempts == 2

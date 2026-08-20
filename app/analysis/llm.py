@@ -5,17 +5,23 @@ validation retry. All LLM calls go through this module.
 """
 
 import asyncio
+import json
 import logging
-from collections.abc import Callable
+import random
+import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any, TypeVar, cast
 
 import instructor
 import litellm
 from instructor import Mode
+from instructor.core import AsyncValidationError as InstructorAsyncValidationError
 from instructor.core import InstructorRetryException
+from instructor.core import ResponseParsingError as InstructorResponseParsingError
 from pydantic import BaseModel, Field, model_validator
-from tenacity import AsyncRetrying, retry_if_not_exception_type, stop_after_attempt
+from pydantic import ValidationError as PydanticValidationError
+from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt
 
 from app.analysis.citations import strip_index_citations, strip_reliability_notes
 from app.analysis.prompts import (
@@ -250,106 +256,133 @@ def _summarize_exc(exc: BaseException, *, limit: int = 200) -> str:
     return summary[:limit]
 
 
-# Permanent client-side 4xx errors: retrying them is pointless (the same request
-# fails identically) and, worse, instructor's retry loop buries the provider's
-# real message inside an opaque ``RetryError[<Future ... raised BadRequestError>]``
-# — the exact symptom reported for a new topic's first check (issue #53). Excluding
-# them from instructor's retry set makes the call fail once with the real error
-# surfaced (readable in ``str`` and bare on ``__cause__``). Exclusion is by TYPE,
-# not HTTP status, so a bare ``APIError(status_code=400)`` stays retryable and
-# ``BadRequestError`` subclasses (``ContextWindowExceededError`` etc.) are covered
-# via ``isinstance``.
-_NON_RETRYABLE_LLM_ERRORS = (
-    litellm.BadRequestError,  # 400
-    litellm.AuthenticationError,  # 401
-    litellm.PermissionDeniedError,  # 403
-    litellm.NotFoundError,  # 404 (unknown model/route)
-    litellm.UnprocessableEntityError,  # 422
+# Parse failures instructor is *supposed* to retry: the model returned something
+# that does not fit the response schema, so re-prompting it with the validation
+# error genuinely can fix the next attempt. Everything else that can come out of
+# a call is a TRANSPORT outcome and belongs to ``_call_with_transport_retry``,
+# which is the only layer that waits between attempts (AUG-325). These are the
+# same types instructor's own retry loop classifies as re-askable.
+_RETRYABLE_PARSE_ERRORS: tuple[type[BaseException], ...] = (
+    PydanticValidationError,
+    json.JSONDecodeError,
+    InstructorAsyncValidationError,
+    InstructorResponseParsingError,
 )
+
+# HTTP statuses no retry can fix: the identical request fails identically. A 400
+# may still MODE-HOP first (see ``_fallback_mode``) — that changes the request,
+# which is why it is not simply "permanent" — but it is never re-sent unchanged.
+_PERMANENT_STATUS_CODES = frozenset({400, 401, 403, 404, 405, 413, 422})
+# Statuses worth re-sending the same request for, after a wait.
+_TRANSIENT_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 
 
 def _instructor_retries(max_retries: int) -> AsyncRetrying:
-    """Build instructor's per-call retry policy.
+    """Build instructor's per-call retry policy: validation re-prompts ONLY.
 
     Instructor's ``max_retries`` governs structured-output *validation* retries
-    (re-prompting when the LLM's response fails Pydantic validation). We keep
-    those, but exclude two families from instructor's retry set:
-
-    - ``RateLimitError`` (429): propagates *bare* to ``_call_with_rate_limit_retry``,
-      which owns the rate-limit backoff. Otherwise instructor would swallow the 429
-      inside an ``InstructorRetryException`` and immediately re-fire it
-      ``max_retries`` times with zero delay — hammering the throttled provider and
-      hiding the rate limit from operators (OVH-008).
-    - ``_NON_RETRYABLE_LLM_ERRORS`` (permanent 4xx): retrying can't help and only
-      masks the provider's real message behind an opaque ``RetryError`` — the
-      issue #53 symptom. Excluding them fails fast with the true error visible.
-
-    ``ValidationError`` is deliberately absent from both, so structured-output
-    re-prompting is preserved.
+    (re-prompting when the response fails Pydantic validation), and the classifier
+    is POSITIVE — only ``_RETRYABLE_PARSE_ERRORS`` are retried here (AUG-325).
+    A negative "retry everything except these types" list let transport failures
+    into this loop, where they were re-fired ``max_retries`` times with ZERO delay
+    and no ``Retry-After`` handling: a throttled provider got hammered (OVH-008), a
+    transient 5xx got no backoff, and a permanent error was replayed and then
+    buried inside an opaque ``RetryError[...]`` (issue #53). Every provider
+    exception now leaves instructor after one attempt, with the real error on
+    ``__cause__``, and ``_call_with_transport_retry`` decides its fate.
     """
     return AsyncRetrying(
         stop=stop_after_attempt(max_retries + 1),
-        retry=retry_if_not_exception_type((litellm.RateLimitError, *_NON_RETRYABLE_LLM_ERRORS)),
+        retry=retry_if_exception_type(_RETRYABLE_PARSE_ERRORS),
     )
 
 
+def _iter_error_chain(exc: BaseException) -> Iterator[BaseException]:
+    """Yield ``exc`` and every exception reachable from it, once each.
+
+    Instructor's v2 retry stack re-wraps a provider error as
+    ``InstructorRetryException``: it stringifies the error into ``args``, may
+    record it in ``failed_attempts``, and chains the real one onto ``__cause__``.
+    Callers therefore have to look past the wrapper to classify what happened —
+    all three places are walked here (cycle-guarded) so each classifier below is
+    a one-line filter over this iterator.
+    """
+    seen: set[int] = set()
+    queue: list[BaseException] = [exc]
+    while queue:
+        cur = queue.pop(0)
+        if cur is None or id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        yield cur
+        if isinstance(cur, InstructorRetryException):
+            queue.extend(arg for arg in cur.args if isinstance(arg, BaseException))
+            for attempt in cur.failed_attempts or []:
+                attempt_exc = getattr(attempt, "exception", None)
+                if isinstance(attempt_exc, BaseException):
+                    queue.append(attempt_exc)
+        for nxt in (cur.__cause__, cur.__context__):
+            if nxt is not None:
+                queue.append(nxt)
+
+
 def _unwrap_rate_limit(exc: BaseException) -> litellm.RateLimitError | None:
-    """Return the underlying ``RateLimitError`` if ``exc`` represents a 429.
+    """Return the underlying ``RateLimitError`` if ``exc`` represents a 429."""
+    return next((e for e in _iter_error_chain(exc) if isinstance(e, litellm.RateLimitError)), None)
 
-    Belt-and-suspenders for the rate-limit backoff: a bare ``RateLimitError`` is
-    returned as-is, and an ``InstructorRetryException`` is inspected (its args and
-    ``failed_attempts``) for an underlying ``RateLimitError`` in case a
-    provider/instructor path still wraps it despite ``_instructor_retries``.
-    Instructor's v2 retry path (1.15.x) populates neither of those — it stringifies
-    the error into ``args`` and leaves ``failed_attempts`` empty — but chains the
-    real ``RateLimitError`` onto ``__cause__``, so the final fallback walks the
-    ``__cause__``/``__context__`` chain (cycle-guarded) to find it.
+
+def _status_code(exc: BaseException) -> int | None:
+    """HTTP status carried by ``exc`` or anything in its chain, else None.
+
+    Classification is by STATUS, not by exception type: a gateway or adapter that
+    raises a generic ``litellm.APIError(status_code=400)`` instead of the specific
+    ``BadRequestError`` subclass described the same permanent failure, and used to
+    be treated as retryable purely because of its Python type (AUG-325).
     """
-    if isinstance(exc, litellm.RateLimitError):
-        return exc
-    if isinstance(exc, InstructorRetryException):
-        for arg in exc.args:
-            if isinstance(arg, litellm.RateLimitError):
-                return arg
-        for attempt in exc.failed_attempts or []:
-            attempt_exc = getattr(attempt, "exception", None)
-            if isinstance(attempt_exc, litellm.RateLimitError):
-                return attempt_exc
-    seen: set[int] = set()
-    cur: BaseException | None = exc
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
-        nxt = cur.__cause__ or cur.__context__
-        if isinstance(nxt, litellm.RateLimitError):
-            return nxt
-        cur = nxt
+    for candidate in _iter_error_chain(exc):
+        code = getattr(candidate, "status_code", None)
+        if isinstance(code, int):
+            return code
+        if isinstance(code, str) and code.isdigit():
+            return int(code)
     return None
 
 
-def _unwrap_bad_request(exc: BaseException) -> litellm.BadRequestError | None:
-    """Return the underlying ``BadRequestError`` (400) in ``exc``'s chain, else None.
+def _unwrap_bad_request(exc: BaseException) -> BaseException | None:
+    """Return the 400 in ``exc``'s chain, else None.
 
-    A bare ``BadRequestError`` is returned as-is. Otherwise the ``__cause__`` /
-    ``__context__`` chain is walked (cycle-guarded), because instructor's v2 retry
-    stack re-wraps an excluded 400 as ``InstructorRetryException`` with the real
-    error chained on ``__cause__`` (pinned by
-    test_llm_rate_limit_backoff.py:535); a bare 400 never propagates from
-    ``create_with_completion``. Returns ``None`` when no ``BadRequestError`` is in
-    the chain — e.g. a rate-limit wrapper — so 429s keep flowing untouched to
-    ``_call_with_rate_limit_retry``. Mirrors the final-fallback stanza of
-    ``_unwrap_rate_limit``.
+    A bare 400 is returned as-is; otherwise the wrapper chain is walked, because
+    instructor re-wraps an unretried 400 as ``InstructorRetryException`` with the
+    real error on ``__cause__`` — a bare 400 never propagates from
+    ``create_with_completion``. Returns ``None`` for anything that is not a 400
+    (e.g. a rate-limit wrapper), so those keep flowing untouched to their own
+    handler.
     """
-    if isinstance(exc, litellm.BadRequestError):
-        return exc
-    seen: set[int] = set()
-    cur: BaseException | None = exc
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
-        nxt = cur.__cause__ or cur.__context__
-        if isinstance(nxt, litellm.BadRequestError):
-            return nxt
-        cur = nxt
-    return None
+    return next(
+        (e for e in _iter_error_chain(exc) if isinstance(e, litellm.BadRequestError) or _has_status(e, 400)),
+        None,
+    )
+
+
+def _has_status(exc: BaseException, code: int) -> bool:
+    status = getattr(exc, "status_code", None)
+    return status == code or (isinstance(status, str) and status.isdigit() and int(status) == code)
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """True when re-sending the SAME request after a wait could plausibly work.
+
+    Transient: 429/408/5xx and network-level failures (no response at all).
+    Permanent: every other classified status, and anything unclassifiable — an
+    unknown failure is not replayed, so a bug in this module cannot turn one
+    check into a retry storm.
+    """
+    if any(isinstance(e, litellm.APIConnectionError | litellm.Timeout) for e in _iter_error_chain(exc)):
+        return True
+    status = _status_code(exc)
+    if status is None:
+        return False
+    return status in _TRANSIENT_STATUS_CODES or (status >= 500 and status not in _PERMANENT_STATUS_CODES)
 
 
 # Ordered structured-output fallback chain. TOOLS sends a forced named
@@ -376,8 +409,11 @@ def _fallback_mode(mode: instructor.Mode, exc: BaseException) -> instructor.Mode
       MD_JSON stays the terminal no matter how an unknown gateway words its
       rejection.
 
-    Anything that is not an unwrapped ``BadRequestError`` (e.g. a 429 wrapper)
-    returns ``None`` so it propagates to its own handler untouched.
+    Anything that is not an unwrapped 400 (e.g. a 429 wrapper) returns ``None`` so
+    it propagates to its own handler untouched. A 400 is recognized by STATUS as
+    well as by type, so a gateway raising a generic ``APIError(status_code=400)``
+    for a rejected structured-output mode still mode-hops instead of being
+    replayed in the same mode (AUG-325).
     """
     bad_request = _unwrap_bad_request(exc)
     if bad_request is None or isinstance(bad_request, litellm.ContextWindowExceededError):
@@ -486,39 +522,77 @@ def count_tokens(text: str, model: str) -> int:
         return len(text) // 4
 
 
-async def _call_with_rate_limit_retry(
+# Bounds on the transport backoff (AUG-160). Uncapped ``base_delay *
+# multiplier**attempt`` reached 98,415s on the tenth sleep at the supported
+# maximum ``llm_max_retries=10`` — one throttled check held the scheduler's
+# single job instance for ~41 hours, skipping every later minute tick. Both are
+# module constants, not settings: they are liveness bounds on a shared runtime,
+# not a per-deployment preference.
+#
+# The total budget is the load-bearing one — it is what makes the worst case
+# finite regardless of ``llm_max_retries`` — and 120s sits well under
+# ``interval.MIN_INTERVAL_MINUTES`` (10 minutes), so even the shortest check
+# interval cannot be overrun by backoff alone.
+_RETRY_MAX_DELAY_SECONDS = 60.0
+_RETRY_TOTAL_BUDGET_SECONDS = 120.0
+# Jitter spreads the retries of concurrently-checked topics that hit the same
+# provider limit in the same tick, so they do not re-fire in lockstep.
+_RETRY_JITTER_FRACTION = 0.25
+
+
+def _backoff_delay(attempt: int, base_delay: float, backoff_multiplier: float) -> float:
+    """Capped exponential delay with bounded upward jitter."""
+    delay = min(base_delay * (backoff_multiplier**attempt), _RETRY_MAX_DELAY_SECONDS)
+    # Not a security decision — retry spacing only (hence the S311 exemption).
+    return delay + random.uniform(0, delay * _RETRY_JITTER_FRACTION)  # noqa: S311
+
+
+async def _call_with_transport_retry(
     call_func: Any,
     max_retries: int = 3,
     base_delay: float = 5.0,
     backoff_multiplier: float = 3.0,
 ) -> Any:
-    """Wrap an async LLM call with exponential backoff on rate limit errors.
+    """Wrap an async LLM call with the ONE delayed retry policy for transport failures.
 
-    On a rate-limit error, waits ``base_delay * (backoff_multiplier ** attempt)``
-    seconds and retries up to ``max_retries`` times. Rate limits are detected via
-    ``_unwrap_rate_limit`` so this fires whether the call raises a bare
-    ``RateLimitError`` (the expected path now that instructor is told not to
-    retry 429s — see ``_instructor_retries``) or an ``InstructorRetryException``
-    that still wraps one. All other exceptions are re-raised immediately.
+    Retries only what re-sending the same request can fix — 429, 408, 5xx and
+    network failures (``_is_transient``) — waiting ``_backoff_delay`` between
+    attempts. Permanent failures and structured-output rejections are re-raised
+    immediately for their own handlers (``_fallback_mode``, the callers' safe-false
+    / raise split).
+
+    Two bounds hold the worst case (AUG-160): each delay is capped, and the whole
+    sequence stops at ``_RETRY_TOTAL_BUDGET_SECONDS`` measured on the event loop's
+    MONOTONIC clock, whichever comes first. ``max_retries`` is therefore an upper
+    bound on attempts, not a promise of them.
     """
+    deadline = time.monotonic() + _RETRY_TOTAL_BUDGET_SECONDS
     last_exc: BaseException | None = None
     for attempt in range(max_retries + 1):
         try:
             return await call_func()
         except Exception as exc:
-            rate_limit = _unwrap_rate_limit(exc)
-            if rate_limit is None:
+            if not _is_transient(exc):
                 raise
             last_exc = exc
             if attempt >= max_retries:
                 break
-            delay = base_delay * (backoff_multiplier**attempt)
-            logger.warning(
-                "Rate limit hit (attempt %d/%d), retrying in %.0fs",
-                attempt + 1,
-                max_retries,
-                delay,
-            )
+            delay = _backoff_delay(attempt, base_delay, backoff_multiplier)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning("Retry budget of %.0fs exhausted; giving up", _RETRY_TOTAL_BUDGET_SECONDS)
+                break
+            delay = min(delay, remaining)
+            if _unwrap_rate_limit(exc) is not None:
+                logger.warning("Rate limit hit (attempt %d/%d), retrying in %.0fs", attempt + 1, max_retries, delay)
+            else:
+                logger.warning(
+                    "Transient LLM error (attempt %d/%d), retrying in %.0fs: %s",
+                    attempt + 1,
+                    max_retries,
+                    delay,
+                    _summarize_exc(exc),
+                )
             await asyncio.sleep(delay)
     assert last_exc is not None
     raise last_exc
@@ -619,7 +693,7 @@ async def analyze_articles(
     """
 
     try:
-        result, completion = await _call_with_rate_limit_retry(
+        result, completion = await _call_with_transport_retry(
             lambda: _create_structured(
                 settings,
                 response_model=NoveltyResponse,
@@ -681,7 +755,7 @@ async def generate_initial_knowledge(
     Raises on failure — knowledge initialization is critical.
     """
 
-    raw_result, completion = await _call_with_rate_limit_retry(
+    raw_result, completion = await _call_with_transport_retry(
         lambda: _create_structured(
             settings,
             response_model=KnowledgeStateUpdate,
@@ -714,7 +788,7 @@ async def compress_knowledge_summary(
     completion's usage so this round-trip's cost is not lost (OVH-129).
     """
 
-    raw_result, completion = await _call_with_rate_limit_retry(
+    raw_result, completion = await _call_with_transport_retry(
         lambda: _create_structured(
             settings,
             response_model=CompressedKnowledge,
@@ -749,7 +823,7 @@ async def generate_knowledge_update(
     Raises on failure — knowledge updates are critical.
     """
 
-    raw_result, completion = await _call_with_rate_limit_retry(
+    raw_result, completion = await _call_with_transport_retry(
         lambda: _create_structured(
             settings,
             response_model=KnowledgeStateUpdate,
