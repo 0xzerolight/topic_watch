@@ -242,6 +242,16 @@ class TestDashboard:
         response = await client.get("/")
         assert "Check Now" not in response.text
 
+    async def test_dashboard_notification_tag_is_per_topic_row(self, client: httpx.AsyncClient) -> None:
+        """AUG-219: the fresh-check browser notification is tagged with the row id.
+
+        A fixed shared tag let one topic's alert silently replace another's; the tag
+        must now be scoped to the row so distinct topics never collide.
+        """
+        response = await client.get("/")
+        assert "tag: detailTarget.id" in response.text
+        assert 'tag: "topic-watch"' not in response.text
+
 
 class TestDashboardStatsFreshness:
     """The Active/Total stat cards must reflect mutations on the very next load.
@@ -1254,6 +1264,24 @@ class TestBrowserNotificationRobustness:
         # The fire condition requires the just-checked marker alongside new-info.
         assert 'justChecked === "true"' in html
 
+    def test_show_reports_construction_failure(self) -> None:
+        """AUG-128: show() returns a boolean capability result instead of failing
+        silently, so callers can tell permission-granted from actually-displayed."""
+        js = self._notifications_js()
+        ctor_idx = js.find("n = new Notification(")
+        catch_idx = js.find("} catch", ctor_idx)
+        catch_body = js[catch_idx : catch_idx + 80]
+        assert "return false" in catch_body
+        # The success path returns true after scheduling the auto-close.
+        assert "return true;" in js[catch_idx:]
+
+    def test_notification_tag_is_not_hardcoded_shared(self) -> None:
+        """AUG-219: no fixed "topic-watch" tag — same tag replaces same-origin
+        notifications, so a shared literal collapsed alerts across topics."""
+        js = self._notifications_js()
+        assert 'tag: "topic-watch"' not in js
+        assert "options.tag" in js
+
 
 # --- Re-init ---
 
@@ -1491,6 +1519,19 @@ class TestSettings:
         assert response.status_code == 200
         assert "set via environment" in response.text.lower()
         assert "test-key-12345678" not in response.text
+
+    async def test_settings_browser_notif_reflects_display_failure(self, client: httpx.AsyncClient) -> None:
+        """AUG-128: enabling notifications checks show()'s return value before claiming Active."""
+        page = await client.get("/settings")
+        assert "var displayed = TopicWatchNotifications.show(" in page.text
+        assert "Notifications can't display on this device" in page.text
+        assert "updateBrowserNotifUI(true)" in page.text
+
+    async def test_settings_browser_notifications_use_distinct_tags(self, client: httpx.AsyncClient) -> None:
+        """AUG-219: settings-page test notifications no longer share the "topic-watch" tag."""
+        page = await client.get("/settings")
+        assert '{ tag: "topic-watch-enable-test" }' in page.text
+        assert '{ tag: "topic-watch-test-notification" }' in page.text
 
 
 # --- CSRF Protection ---

@@ -32,13 +32,24 @@
      * Show a browser notification if enabled and permitted.
      * @param {string} title
      * @param {string} body
-     * @param {object} options - optional: { url: string }
+     * @param {object} options - optional: { url: string, tag: string }
+     * @returns {boolean} true if a notification was actually constructed. AUG-128:
+     *   callers that need to know whether the platform can really display
+     *   notifications (not just whether permission was granted) must check this.
      */
     function show(title, body, options) {
-        if (!isSupported() || !isEnabled()) return;
-        if (Notification.permission !== "granted") return;
+        if (!isSupported() || !isEnabled()) return false;
+        if (Notification.permission !== "granted") return false;
 
-        var opts = { body: body, tag: "topic-watch" };
+        // AUG-219: no shared fixed tag. The Notifications API replaces any
+        // same-origin notification sharing a tag, so a fixed tag collapsed
+        // alerts from different topics into one visible notification. Callers
+        // that want a topic-scoped tag (e.g. to replace only that topic's own
+        // prior alert) pass options.tag; otherwise each notification is distinct.
+        var opts = { body: body };
+        if (options && options.tag) {
+            opts.tag = options.tag;
+        }
 
         // On some platforms (e.g. Android Chrome) the Notification constructor is
         // present and permission can be "granted", yet `new Notification()` throws
@@ -50,7 +61,7 @@
         try {
             n = new Notification(title, opts);
         } catch (e) {
-            return;
+            return false;
         }
 
         if (options && options.url) {
@@ -63,6 +74,7 @@
 
         // Auto-close after 10 seconds
         setTimeout(function () { n.close(); }, 10000);
+        return true;
     }
 
     // --- Non-blocking on-page toast (always visible, no permission needed) ---

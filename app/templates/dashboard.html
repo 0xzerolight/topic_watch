@@ -207,10 +207,12 @@ document.body.addEventListener("htmx:afterSwap", function(event) {
         var topicName = target.getAttribute("data-topic-name");
         if (justChecked === "true" && newInfo === "true" && topicName) {
             var link = target.querySelector("a");
+            // AUG-219: tag scoped to this topic's row id, so a fresh alert for one
+            // topic never replaces an unread alert for another.
             TopicWatchNotifications.show(
                 "New Info: " + topicName,
                 "Topic Watch found new information for \"" + topicName + "\".",
-                { url: link ? link.href : "/" }
+                { url: link ? link.href : "/", tag: detailTarget.id }
             );
         }
     }

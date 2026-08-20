@@ -345,12 +345,22 @@ function toggleBrowserNotifications(enabled) {
         TopicWatchNotifications.requestPermission().then(function(permission) {
             if (permission === "granted") {
                 TopicWatchNotifications.setEnabled(true);
-                updateBrowserNotifUI();
-                // Send a test browser notification
-                TopicWatchNotifications.show(
+                // Send a test browser notification. AUG-128: permission can be
+                // "granted" while the platform still can't construct a real
+                // notification (e.g. Android Chrome without a service worker) —
+                // don't claim Active unless one actually displayed.
+                var displayed = TopicWatchNotifications.show(
                     "Topic Watch",
-                    "Browser notifications are now enabled!"
+                    "Browser notifications are now enabled!",
+                    { tag: "topic-watch-enable-test" }
                 );
+                if (!displayed) {
+                    document.getElementById("browser-notif-toggle").checked = false;
+                    TopicWatchNotifications.setEnabled(false);
+                    updateBrowserNotifUI(true);
+                    return;
+                }
+                updateBrowserNotifUI();
             } else {
                 // Permission denied — uncheck and show help
                 document.getElementById("browser-notif-toggle").checked = false;
@@ -372,7 +382,7 @@ function toggleBrowserNotifications(enabled) {
     }
 }
 
-function updateBrowserNotifUI() {
+function updateBrowserNotifUI(displayFailed) {
     var toggle = document.getElementById("browser-notif-toggle");
     var status = document.getElementById("browser-notif-status");
     var denied = document.getElementById("browser-notif-denied");
@@ -380,6 +390,16 @@ function updateBrowserNotifUI() {
     if (!TopicWatchNotifications.isSupported()) {
         toggle.disabled = true;
         status.textContent = "Not supported in this browser";
+        return;
+    }
+
+    // AUG-128: permission was granted but the notification could not actually
+    // be constructed — report the real capability, not just the permission.
+    if (displayFailed) {
+        toggle.checked = false;
+        denied.style.display = "none";
+        status.textContent = "Notifications can't display on this device";
+        status.style.color = "var(--pico-del-color, #c62828)";
         return;
     }
 
@@ -410,7 +430,8 @@ document.body.addEventListener("htmx:afterSwap", function(event) {
         if (html.indexOf("sent successfully") !== -1) {
             TopicWatchNotifications.show(
                 "Topic Watch Test",
-                "This is a test notification from Topic Watch. Notifications are working!"
+                "This is a test notification from Topic Watch. Notifications are working!",
+                { tag: "topic-watch-test-notification" }
             );
         }
     }
