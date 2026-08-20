@@ -7,6 +7,7 @@ to trigger topic checks. Reuses existing CRUD functions and Pydantic models.
 import sqlite3
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
 
 from app.checker import check_topic
 from app.config import Settings
@@ -24,6 +25,28 @@ from app.web.dependencies import get_db_conn, get_settings
 from app.web.state import _checking_state
 
 router = APIRouter(prefix="/api/v1", tags=["api"])
+
+
+class CheckTriggerResponse(BaseModel):
+    """Outcome of a triggered check.
+
+    The pipeline is deliberately fail-safe: an unreachable source, a failed
+    analysis and a failed delivery all record themselves on the CheckResult and
+    return HTTP 200 with ``has_new_info`` false. Returning only status,
+    ``has_new_info`` and the row id therefore gave automation the same shape for
+    a broken run and a clean quiet one (AUG-203). The recorded outcome fields
+    are carried here so a script can tell them apart without a second request.
+    """
+
+    status: str
+    check_result_id: int | None
+    has_new_info: bool
+    articles_found: int
+    articles_new: int
+    stage_error: str | None
+    notification_sent: bool
+    notification_error: str | None
+    notify_disposition: str | None
 
 
 @router.get("/topics")
@@ -101,7 +124,7 @@ async def api_trigger_check(
     request: Request,
     topic_id: int,
     settings: Settings = Depends(get_settings),
-) -> dict:
+) -> CheckTriggerResponse:
     """Trigger a check for a specific topic.
 
     Runs synchronously and may take several seconds; returns the check result.
@@ -133,4 +156,14 @@ async def api_trigger_check(
         result = await check_topic(topic, settings, db_path=db_path, guard=False)
     finally:
         await _checking_state.finish_check(topic_id)
-    return {"status": "checked", "has_new_info": result.has_new_info, "check_result_id": result.id}
+    return CheckTriggerResponse(
+        status="checked",
+        check_result_id=result.id,
+        has_new_info=result.has_new_info,
+        articles_found=result.articles_found,
+        articles_new=result.articles_new,
+        stage_error=result.stage_error,
+        notification_sent=result.notification_sent,
+        notification_error=result.notification_error,
+        notify_disposition=result.notify_disposition,
+    )
