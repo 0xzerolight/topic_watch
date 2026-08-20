@@ -5,7 +5,41 @@ on:
     tags: ["v*"]
 
 jobs:
+  test:
+    # Same-SHA test gate (TW-AUD-033): a pushed tag must not publish an image
+    # built from an untested commit — e.g. a hotfix pushed straight to a tag
+    # without going through a PR. Runs the full suite against the exact tag
+    # commit; `publish` below cannot start until this passes.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install --require-hashes -r requirements-dev.txt && pip install --no-deps -e .
+
+      - name: Verify the tag matches the released package version
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          pkg_version="$(grep -m1 '^version = ' pyproject.toml | sed -E 's/version = "(.*)"/\1/')"
+          if [ "$tag_version" != "$pkg_version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match pyproject.toml version $pkg_version" >&2
+            exit 1
+          fi
+
+      - name: Run tests
+        run: pytest --tb=short
+        env:
+          TOPIC_WATCH_LLM__MODEL: "openai/gpt-4o-mini"
+          TOPIC_WATCH_LLM__API_KEY: "test-key-not-real"
+
   publish:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
