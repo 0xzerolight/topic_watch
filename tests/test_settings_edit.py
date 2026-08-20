@@ -186,16 +186,21 @@ class TestSaveSettingsToYaml:
         data = yaml.safe_load(config_file.read_text())
         assert data["notifications"]["urls"] == ["ntfy://alerts", "discord://webhook/123"]
 
-    async def test_empty_notification_urls_omitted(self, tmp_path: Path) -> None:
-        """Empty notification URLs list is omitted from the YAML."""
+    async def test_empty_notification_urls_written_as_empty_list(self, tmp_path: Path) -> None:
+        """An emptied URL list is written, not omitted.
+
+        The writer patches the existing document (TW-AUD-028), so omitting the key
+        would leave the previous targets on disk and resurrect them at the next load.
+        """
         from app.config import save_settings_to_yaml
 
-        settings = _make_settings(notifications=NotificationSettings(urls=[]))
         config_file = tmp_path / "config.yml"
+        config_file.write_text('notifications:\n  urls:\n    - "ntfy://previous"\n')
+        settings = _make_settings(notifications=NotificationSettings(urls=[]))
         save_settings_to_yaml(settings, config_file)
 
         data = yaml.safe_load(config_file.read_text())
-        assert "urls" not in data.get("notifications", {})
+        assert data["notifications"]["urls"] == []
 
     async def test_writes_scalar_settings(self, tmp_path: Path) -> None:
         """Scalar settings (interval, max articles, etc.) are written correctly."""
@@ -315,11 +320,12 @@ class TestExaSettingsPersistence:
         assert data["exa"]["api_key"] != "exa-env-secret"
 
     async def test_corrupt_config_preserve_does_not_raise(self, tmp_path: Path) -> None:
-        """_read_existing_secret swallows a corrupt file: both preserved keys blank, no raise."""
+        """A corrupt file still saves, and a preserved secret is left out entirely."""
         from app.config import save_settings_to_yaml
 
         config_file = tmp_path / "config.yml"
-        # Unparseable YAML — the preserve read must degrade to "" for both sections.
+        # Unparseable YAML — there is no prior value to preserve, so the key is
+        # simply not written. Writing it would materialize the env secret.
         config_file.write_text("llm: [unterminated\n  exa: :::\n")
         settings = _make_settings(
             llm=LLMSettings(model="openai/gpt-4o-mini", api_key="llm-env-secret"),
@@ -328,8 +334,8 @@ class TestExaSettingsPersistence:
         save_settings_to_yaml(settings, config_file, preserve_api_key=True, preserve_exa_key=True)
 
         data = yaml.safe_load(config_file.read_text())
-        assert data["llm"]["api_key"] == ""
-        assert data["exa"]["api_key"] == ""
+        assert "api_key" not in data["llm"]
+        assert "api_key" not in data["exa"]
 
 
 # ---------------------------------------------------------------------------

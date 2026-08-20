@@ -5,12 +5,15 @@ Environment variables use the prefix TOPIC_WATCH_ with double underscore
 for nested keys (e.g., TOPIC_WATCH_LLM__API_KEY).
 """
 
+import hashlib
 import logging
 import os
 import shutil
-from collections.abc import Mapping
+import tempfile
+from collections.abc import Callable, Mapping
+from contextlib import suppress
 from pathlib import Path
-from typing import Self
+from typing import Any, Self
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -285,19 +288,19 @@ class Settings(BaseSettings):
     def migrate_check_interval_hours(cls, data: dict) -> dict:  # type: ignore[override]
         """Backward compat: convert old check_interval_hours to check_interval string.
 
-        Also warns about any remaining unrecognized top-level keys, which extra='ignore'
-        silently drops (OVH-004). Migration runs first so renamed-but-handled keys
-        (check_interval_hours) do not produce a spurious warning.
+        Also warns about any remaining unrecognized key, at every level, which
+        extra='ignore' silently drops (OVH-004, TW-AUD-028). Migration runs first so
+        renamed-but-handled keys (check_interval_hours) do not produce a spurious
+        warning. The keys are only ignored for this object — ``save_settings_to_yaml``
+        keeps them in the file, so a forward-compatible config is never erased.
         """
         if isinstance(data, dict):
             if "check_interval_hours" in data:
                 hours = data.pop("check_interval_hours")
                 if "check_interval" not in data and hours is not None:
                     data["check_interval"] = f"{int(hours)}h"
-            known = set(cls.model_fields)
-            for key in data:
-                if key not in known:
-                    logger.warning("Unknown config key '%s' ignored (renamed or removed?)", key)
+            for path in _unknown_key_paths(data, cls):
+                logger.warning("Unknown config key '%s' ignored (renamed or removed?)", path)
         return data
 
     @model_validator(mode="after")
@@ -337,6 +340,29 @@ class Settings(BaseSettings):
             env_settings,
             YamlConfigSettingsSource(settings_cls, yaml_file=yaml_file),
         )
+
+
+def _nested_model(model: type[BaseModel], field: str) -> type[BaseModel] | None:
+    """The submodel type behind ``field``, or None when the field is a scalar."""
+    info = model.model_fields.get(field)
+    annotation = info.annotation if info is not None else None
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation
+    return None
+
+
+def _unknown_key_paths(data: Mapping[str, Any], model: type[BaseModel], prefix: str = "") -> list[str]:
+    """Dotted paths in ``data`` that ``model`` does not declare, at any depth."""
+    unknown: list[str] = []
+    for key, value in data.items():
+        path = f"{prefix}{key}"
+        if key not in model.model_fields:
+            unknown.append(path)
+            continue
+        nested = _nested_model(model, key)
+        if nested is not None and isinstance(value, Mapping):
+            unknown.extend(_unknown_key_paths(value, nested, prefix=f"{path}."))
+    return unknown
 
 
 def _is_close(a: str, b: str) -> bool:
@@ -407,21 +433,132 @@ def load_settings(config_path: Path | None = None) -> Settings:
         _yaml_file_override = None
 
 
-def _read_existing_secret(path: Path, section: str, key: str) -> str:
-    """Return the on-disk secret at ``data[section][key]``, or '' if absent/unreadable.
+def read_config_document(path: Path) -> dict[str, Any]:
+    """Return the config file's current top-level mapping, or {} when there is none.
 
-    Used to preserve an env-derived secret across a settings save so it is never
-    materialized into plaintext config.yml (OVH-003). A missing file, corrupt YAML, or
-    absent section all yield '' rather than raising.
+    A missing file, unreadable file, corrupt YAML or non-mapping document all yield
+    an empty document rather than raising: a save must never be blocked by whatever
+    was there before, it just cannot preserve anything from it.
     """
     if not path.exists():
-        return ""
+        return {}
     try:
-        existing = yaml.safe_load(path.read_text()) or {}
+        loaded = yaml.safe_load(path.read_text()) or {}
     except (OSError, yaml.YAMLError):
-        logger.warning("Could not read existing config to preserve %s.%s; leaving it blank", section, key)
-        return ""
-    return (existing.get(section) or {}).get(key, "") or ""
+        logger.warning("Could not read %s; keys it holds that this version does not know will not be preserved", path)
+        return {}
+    if not isinstance(loaded, dict):
+        logger.warning("%s does not contain a YAML mapping; replacing it with the current settings", path)
+        return {}
+    return loaded
+
+
+def config_revision(path: Path) -> str:
+    """Opaque marker of the config file's current content.
+
+    Rendered into the settings form so a save can tell whether the file changed
+    underneath it — an external edit, another tab, or a key rotated on disk
+    (AUG-291). A missing file has its own stable marker.
+    """
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return "absent"
+
+
+# Config files carry provider and delivery credentials, so they are owner-only.
+_CONFIG_FILE_MODE = 0o600
+
+
+def _target_mode(path: Path) -> int:
+    """Permissions for the written file: 0600 when new, tightened when it exists.
+
+    First-run copies the tracked 0644 example, so an existing permissive mode is
+    corrected rather than carried forward (AUG-198). Owner bits the user widened
+    deliberately are kept; group and other are always cleared.
+    """
+    try:
+        return (path.stat().st_mode & 0o777) & ~0o077 or _CONFIG_FILE_MODE
+    except OSError:
+        return _CONFIG_FILE_MODE
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Persist a rename in the directory entry, where the platform supports it."""
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return  # Windows and some network filesystems: the rename is all we get.
+    try:
+        os.fsync(fd)
+    except OSError:
+        logger.debug("Could not fsync %s after replacing the config file", directory)
+    finally:
+        os.close(fd)
+
+
+def _atomic_write(path: Path, render: Callable[[Any], None]) -> None:
+    """Write ``path`` via a same-directory temp file and one atomic rename.
+
+    ``open(path, "w")`` truncated the last valid configuration before serialization
+    even started, so an error or an interrupt destroyed it (AUG-198). Here the
+    destination is only touched by ``os.replace``, which is atomic: a reader sees
+    either the old file or the new one, never a half-written one.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    temp_path = Path(temp_name)
+    try:
+        # mkstemp already creates 0600; widen/keep only what the destination needs.
+        with suppress(OSError, NotImplementedError):
+            os.chmod(temp_path, _target_mode(path))
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            render(handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
+    _fsync_directory(path.parent)
+
+
+def _merge_config_document(
+    existing: dict[str, Any],
+    desired: Mapping[str, Any],
+    *,
+    skip: set[tuple[str, ...]],
+    prefix: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Patch ``desired`` onto ``existing``, leaving everything else in place.
+
+    Three rules, and they are the whole codec (TW-AUD-028):
+
+    - a path in ``skip`` is not written at all — whatever the file already had for
+      it stays, which is how an environment-owned value never gets materialized;
+    - a ``None`` value deletes its key, so a cleared optional setting does not come
+      back from the old document on the next load;
+    - anything the model does not declare is left untouched, so a forward-compatible
+      or hand-added key survives a save instead of being silently dropped.
+    """
+    merged = dict(existing)
+    for key, value in desired.items():
+        path = (*prefix, key)
+        if path in skip:
+            continue
+        if isinstance(value, Mapping):
+            nested = merged.get(key)
+            merged[key] = _merge_config_document(
+                nested if isinstance(nested, dict) else {},
+                value,
+                skip=skip,
+                prefix=path,
+            )
+        elif value is None:
+            merged.pop(key, None)
+        else:
+            merged[key] = value
+    return merged
 
 
 def save_settings_to_yaml(
@@ -440,70 +577,20 @@ def save_settings_to_yaml(
             env secret is not materialized into plaintext config.yml (OVH-003).
         preserve_exa_key: Same as ``preserve_api_key`` but for ``settings.exa.api_key``.
     """
-    effective_path = config_path
-
-    api_key_to_write = settings.llm.api_key
+    skip: set[tuple[str, ...]] = set()
     if preserve_api_key:
-        api_key_to_write = _read_existing_secret(effective_path, "llm", "api_key")
-
-    exa_key_to_write = settings.exa.api_key
+        skip.add(("llm", "api_key"))
     if preserve_exa_key:
-        exa_key_to_write = _read_existing_secret(effective_path, "exa", "api_key")
+        skip.add(("exa", "api_key"))
 
-    data: dict = {
-        "llm": {
-            "model": settings.llm.model,
-            "api_key": api_key_to_write,
-        },
-        "exa": {
-            "enabled": settings.exa.enabled,
-            "api_key": exa_key_to_write,
-        },
-        "notifications": {},
-        "check_interval": settings.check_interval,
-        "max_articles_per_check": settings.max_articles_per_check,
-        "knowledge_state_max_tokens": settings.knowledge_state_max_tokens,
-        "knowledge_revision_limit": settings.knowledge_revision_limit,
-        "article_retention_days": settings.article_retention_days,
-        "db_path": settings.db_path,
-        "feed_fetch_timeout": settings.feed_fetch_timeout,
-        "article_fetch_timeout": settings.article_fetch_timeout,
-        "llm_analysis_timeout": settings.llm_analysis_timeout,
-        "llm_knowledge_timeout": settings.llm_knowledge_timeout,
-        "apprise_timeout_seconds": settings.apprise_timeout_seconds,
-        "web_page_size": settings.web_page_size,
-        "feed_max_retries": settings.feed_max_retries,
-        "feed_backoff_base_minutes": settings.feed_backoff_base_minutes,
-        "feed_backoff_cap_hours": settings.feed_backoff_cap_hours,
-        "content_fetch_concurrency": settings.content_fetch_concurrency,
-        "topic_check_concurrency": settings.topic_check_concurrency,
-        "scheduler_misfire_grace_time": settings.scheduler_misfire_grace_time,
-        "scheduler_jitter_seconds": settings.scheduler_jitter_seconds,
-        "llm_max_retries": settings.llm_max_retries,
-        "llm_temperature": settings.llm_temperature,
-        "min_confidence_threshold": settings.min_confidence_threshold,
-        "min_relevance_threshold": settings.min_relevance_threshold,
-        "silence_heartbeat_checks": settings.silence_heartbeat_checks,
-        "secure_cookies": settings.secure_cookies,
-    }
+    document = _merge_config_document(
+        read_config_document(config_path),
+        settings.model_dump(mode="json"),
+        skip=skip,
+    )
 
-    # base_url is written whenever set (honored for every provider); omitted when unset.
-    if settings.llm.base_url:
-        data["llm"]["base_url"] = settings.llm.base_url
-
-    # Exa base_url mirrors the llm block: written only when set, else omitted.
-    if settings.exa.base_url:
-        data["exa"]["base_url"] = settings.exa.base_url
-
-    if settings.notifications.urls:
-        data["notifications"]["urls"] = settings.notifications.urls
-    if settings.notifications.webhook_urls:
-        data["notifications"]["webhook_urls"] = settings.notifications.webhook_urls
-
-    # Ensure the parent directory exists (first-run / fresh data/ dir).
-    effective_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(effective_path, "w") as f:
-        yaml.dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
-
-    logger.info("Settings saved to %s", effective_path)
+    _atomic_write(
+        config_path,
+        lambda handle: yaml.dump(document, handle, default_flow_style=False, sort_keys=False, allow_unicode=True),
+    )
+    logger.info("Settings saved to %s", config_path)
