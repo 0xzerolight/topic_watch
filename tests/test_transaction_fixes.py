@@ -12,8 +12,18 @@ Pipeline transaction safety (OVH-007/066/099/101):
     fetch + LLM awaits.
   * The originating ``CheckResult`` is created before ``send_webhooks`` so a
     queued webhook carries a non-NULL ``check_result_id``.
+
+Connection lifetime and durable transition (AUG-136/171/202/209, TW-AUD-005):
+  * No connection is open at all during a stubbed fetch/analysis/knowledge/send
+    await — not merely no write transaction.
+  * Feed-health outcomes observed before a fetch failure are still persisted.
+  * The failed-Apprise retry row is committed before webhook I/O begins, and a
+    cancellation mid-send leaves the committed transition intact.
+  * The transition refuses to write when the topic was replaced or its knowledge
+    moved while the check was offline.
 """
 
+import asyncio
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -21,6 +31,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from app import database
 from app.analysis.knowledge import KnowledgeUpdatePlan
 from app.analysis.llm import NoveltyResult, TokenUsage
 from app.checker import check_topic, initialize_new_topic
@@ -35,6 +46,7 @@ from app.crud import (
     recover_stuck_researching,
     recover_stuck_topics,
 )
+from app.database import get_connection
 from app.models import Article, KnowledgeState, NotificationDelivery, Topic, TopicStatus
 from app.scraping import FetchResult
 from app.scraping.rss import FeedEntry, FeedResponse
@@ -642,3 +654,349 @@ class TestInitNoConnectionAcrossAwaits:
         assert topic.status == TopicStatus.READY
         assert observed.get("concurrent_write_ok") is True, observed.get("error")
         assert observed.get("in_transaction") is False
+
+
+class _OpenConnectionCounter:
+    """Count how many connections are open at any moment.
+
+    ``sqlite3.Connection.close`` is read-only, so the count is kept by a
+    subclass installed as the connection factory rather than by patching the
+    method on each instance.
+    """
+
+    def __init__(self) -> None:
+        self.live = 0
+        self.opened = 0
+        outer = self
+
+        class _Counted(sqlite3.Connection):
+            def close(self) -> None:
+                outer.live -= 1
+                super().close()
+
+        self._factory = _Counted
+
+    def open(self, path: Path | None = None) -> sqlite3.Connection:
+        target = path or database.DEFAULT_DB_PATH
+        conn = sqlite3.connect(str(target), check_same_thread=False, factory=self._factory)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA foreign_keys=ON")
+        self.live += 1
+        self.opened += 1
+        return conn
+
+
+class TestNoConnectionOpenDuringAwaits:
+    """AUG-136/AUG-171: the pipeline holds no connection at all during its awaits.
+
+    The earlier lock tests prove no *write transaction* spans a network await.
+    These prove the stronger property the phase structure buys: no connection is
+    even open, so a check can no longer pin a SQLite handle (or a request's
+    resources) for the minutes its fetch, LLM and send phases take.
+    """
+
+    async def test_zero_connections_open_during_each_stubbed_await(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        topic = _ready_topic(db_conn, name="OpenCountTopic")
+        settings = _pipeline_settings()
+        article = _make_article(id=None, topic_id=topic.id)
+        article = create_article(db_conn, article)
+        db_conn.commit()
+
+        counter = _OpenConnectionCounter()
+        peak_during_awaits = 0
+
+        def _sample() -> None:
+            nonlocal peak_during_awaits
+            peak_during_awaits = max(peak_during_awaits, counter.live)
+
+        async def _fetch(*_args, **_kwargs):
+            await asyncio.sleep(0)
+            _sample()
+            return FetchResult(articles=[article], total_feed_entries=1)
+
+        async def _analyze(*_args, **_kwargs):
+            await asyncio.sleep(0)
+            _sample()
+            return NoveltyResult(has_new_info=True, summary="s", confidence=0.9, relevance=0.9, importance=5)
+
+        async def _prepare(*_args, **_kwargs):
+            await asyncio.sleep(0)
+            _sample()
+            return _write_result()
+
+        async def _send(*_args, **_kwargs):
+            await asyncio.sleep(0)
+            _sample()
+            return [NotificationDelivery(url="json://localhost", ok=True)]
+
+        with (
+            patch("app.database.get_connection", side_effect=counter.open),
+            patch("app.checker.fetch_new_articles_for_topic", side_effect=_fetch),
+            patch("app.checker.analyze_articles", side_effect=_analyze),
+            patch("app.checker.prepare_knowledge_update", side_effect=_prepare),
+            patch("app.checker.send_notification_per_url", side_effect=_send),
+            patch("app.checker.send_webhooks", new_callable=AsyncMock, return_value=0),
+        ):
+            result = await check_topic(topic, settings, db_path=db_path)
+
+        assert result.id is not None
+        # Guard against a vacuous pass: the pipeline really did use the counter.
+        assert counter.opened >= 3
+        assert peak_during_awaits == 0, "a connection was open while the pipeline awaited I/O"
+        assert counter.live == 0, "the pipeline leaked a connection"
+
+    async def test_concurrent_writer_is_never_blocked_in_any_phase(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """A second connection writes immediately during fetch, analysis and send.
+
+        A 200ms busy timeout is far below the seconds-to-minutes a real phase
+        takes, so any transaction held across one of these awaits fails here
+        rather than passing slowly.
+        """
+        topic = _ready_topic(db_conn, name="ConcurrentWriterTopic")
+        settings = _pipeline_settings()
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
+        db_conn.commit()
+
+        blocked: list[str] = []
+
+        def _write_from_a_second_connection(phase: str) -> None:
+            side = sqlite3.connect(str(db_path), check_same_thread=False)
+            side.execute("PRAGMA busy_timeout=200")
+            try:
+                side.execute(
+                    "INSERT INTO topics (name, description, feed_urls, created_at, status, generation)"
+                    " VALUES (?, 'sidecar', '[]', '2026-01-01T00:00:00+00:00', 'new', 'g')",
+                    (f"Sidecar {phase}",),
+                )
+                side.commit()
+            except sqlite3.OperationalError:
+                blocked.append(phase)
+            finally:
+                side.close()
+
+        async def _fetch(*_args, **_kwargs):
+            _write_from_a_second_connection("fetch")
+            return FetchResult(articles=[article], total_feed_entries=1)
+
+        async def _analyze(*_args, **_kwargs):
+            _write_from_a_second_connection("analysis")
+            return NoveltyResult(has_new_info=True, summary="s", confidence=0.9, relevance=0.9, importance=5)
+
+        async def _prepare(*_args, **_kwargs):
+            _write_from_a_second_connection("knowledge")
+            return _write_result()
+
+        async def _send(*_args, **_kwargs):
+            _write_from_a_second_connection("send")
+            return [NotificationDelivery(url="json://localhost", ok=True)]
+
+        with (
+            patch("app.checker.fetch_new_articles_for_topic", side_effect=_fetch),
+            patch("app.checker.analyze_articles", side_effect=_analyze),
+            patch("app.checker.prepare_knowledge_update", side_effect=_prepare),
+            patch("app.checker.send_notification_per_url", side_effect=_send),
+            patch("app.checker.send_webhooks", new_callable=AsyncMock, return_value=0),
+        ):
+            result = await check_topic(topic, settings, db_path=db_path)
+
+        assert result.id is not None
+        assert blocked == [], f"a writer was blocked during: {blocked}"
+
+
+class TestFeedHealthSurvivesPartialFailure:
+    """AUG-171: outcomes observed before a fetch blows up are still persisted."""
+
+    async def test_health_outcomes_persist_when_the_fetch_raises(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        from app.crud import get_feed_health
+        from app.scraping import fetch_new_articles_for_topic
+
+        topic = _ready_topic(db_conn, name="PartialFetchTopic")
+
+        async def _fetch_feeds_then_fail(*_args, **kwargs):
+            callback = kwargs["health_callback"]
+            callback("https://ok.example/feed", True, None, 'W/"e1"', "LM1")
+            callback("https://bad.example/feed", False, "boom", None, None)
+            raise RuntimeError("provider exploded after two feeds")
+
+        with (
+            patch("app.scraping.fetch_feeds_for_topic", side_effect=_fetch_feeds_then_fail),
+            pytest.raises(RuntimeError, match="provider exploded"),
+        ):
+            await fetch_new_articles_for_topic(topic, db_path=db_path)
+
+        ok = get_feed_health(db_conn, "https://ok.example/feed")
+        bad = get_feed_health(db_conn, "https://bad.example/feed")
+        assert ok is not None and ok.etag == 'W/"e1"'
+        assert bad is not None and bad.consecutive_failures == 1
+
+
+class TestSendPhaseDurability:
+    """TW-AUD-005 + the C3 boundary: what survives an interruption mid-send."""
+
+    async def _run_to_send(self, conn, topic, settings, db_path, *, send, webhooks):
+        article = create_article(conn, _make_article(id=None, topic_id=topic.id))
+        conn.commit()
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[article], total_feed_entries=1),
+            ),
+            patch(
+                "app.checker.analyze_articles",
+                new_callable=AsyncMock,
+                return_value=NoveltyResult(has_new_info=True, summary="s", confidence=0.9, relevance=0.9, importance=5),
+            ),
+            patch("app.checker.prepare_knowledge_update", new_callable=AsyncMock, return_value=_write_result()),
+            patch("app.checker.send_notification_per_url", side_effect=send),
+            patch("app.checker.send_webhooks", side_effect=webhooks),
+        ):
+            return await check_topic(topic, settings, db_path=db_path)
+
+    async def test_failed_apprise_queue_row_is_committed_before_webhook_io(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """The retry intent must be durable before the webhook POSTs start.
+
+        It used to be staged on the connection that then awaited webhook
+        delivery, so the writer transaction spanned that I/O and a cancellation
+        rolled the intent back -- losing the only record that a channel still
+        owed a delivery.
+        """
+        topic = _ready_topic(db_conn, name="QueueBeforeWebhook")
+        settings = _pipeline_settings()
+        observed: dict[str, object] = {}
+
+        async def _send(*_args, **_kwargs):
+            return [NotificationDelivery(url="json://down", ok=False, error="unreachable")]
+
+        async def _webhooks(*_args, **_kwargs):
+            # Read the queue from a SEPARATE connection: it can only see the row
+            # if the queueing transaction has already committed.
+            side = get_connection(db_path)
+            try:
+                observed["queued_before_webhook_io"] = side.execute(
+                    "SELECT COUNT(*) FROM pending_notifications"
+                ).fetchone()[0]
+            finally:
+                side.close()
+            return 0
+
+        await self._run_to_send(db_conn, topic, settings, db_path, send=_send, webhooks=_webhooks)
+
+        assert observed.get("queued_before_webhook_io") == 1
+
+    async def test_cancellation_mid_send_keeps_the_committed_transition(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """A cancelled send loses only the send: C3's state is already durable."""
+        topic = _ready_topic(db_conn, name="CancelMidSend")
+        settings = _pipeline_settings()
+
+        async def _send(*_args, **_kwargs):
+            raise asyncio.CancelledError
+
+        async def _webhooks(*_args, **_kwargs):  # pragma: no cover - never reached
+            return 0
+
+        with pytest.raises(asyncio.CancelledError):
+            await self._run_to_send(db_conn, topic, settings, db_path, send=_send, webhooks=_webhooks)
+
+        # The knowledge write, the article disposition and the CheckResult all
+        # landed before the send was attempted, and none of them rolled back.
+        assert db_conn.execute("SELECT COUNT(*) FROM check_results WHERE topic_id = ?", (topic.id,)).fetchone()[0] == 1
+        state = db_conn.execute(
+            "SELECT summary_text, version FROM knowledge_states WHERE topic_id = ?", (topic.id,)
+        ).fetchone()
+        assert state is not None and state["summary_text"] == "state"
+        assert db_conn.execute("SELECT COUNT(*) FROM articles WHERE processed = 1").fetchone()[0] == 1
+
+
+class TestDurableTransitionGuards:
+    """C3 refuses to write against state that moved while the check was offline."""
+
+    async def _check_with_stubs(self, topic, settings, db_path, *, before_commit=None):
+        article = _make_article(id=None, topic_id=topic.id)
+
+        async def _prepare(*_args, **_kwargs):
+            if before_commit is not None:
+                before_commit()
+            return _write_result()
+
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[article], total_feed_entries=1),
+            ),
+            patch(
+                "app.checker.analyze_articles",
+                new_callable=AsyncMock,
+                return_value=NoveltyResult(has_new_info=True, summary="s", confidence=0.9, relevance=0.9, importance=1),
+            ),
+            patch("app.checker.prepare_knowledge_update", side_effect=_prepare),
+            patch("app.checker.send_notification_per_url", new_callable=AsyncMock, return_value=[]),
+        ):
+            return await check_topic(topic, settings, db_path=db_path)
+
+    async def test_knowledge_moving_mid_check_aborts_without_recording(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """A rival check that finishes first keeps its summary; the loser writes nothing."""
+        topic = _ready_topic(db_conn, name="CasLoser")
+        create_knowledge_state(db_conn, KnowledgeState(topic_id=topic.id, summary_text="base"))
+        db_conn.commit()
+        settings = _pipeline_settings()
+
+        def _rival_finishes_first() -> None:
+            side = get_connection(db_path)
+            try:
+                side.execute(
+                    "UPDATE knowledge_states SET summary_text = 'rival', version = version + 1 WHERE topic_id = ?",
+                    (topic.id,),
+                )
+                side.commit()
+            finally:
+                side.close()
+
+        result = await self._check_with_stubs(topic, settings, db_path, before_commit=_rival_finishes_first)
+
+        assert result.id is None
+        assert result.stage_error is not None and result.stage_error.startswith("transition_aborted:")
+        row = db_conn.execute("SELECT summary_text FROM knowledge_states WHERE topic_id = ?", (topic.id,)).fetchone()
+        assert row["summary_text"] == "rival"
+        assert db_conn.execute("SELECT COUNT(*) FROM check_results").fetchone()[0] == 0
+        assert db_conn.execute("SELECT COUNT(*) FROM articles WHERE processed = 1").fetchone()[0] == 0
+
+    async def test_recycled_topic_rowid_aborts_the_transition(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
+        """A delete+recreate onto the same rowid must not receive the old check's work."""
+        topic = _ready_topic(db_conn, name="Recycled")
+        settings = _pipeline_settings()
+
+        def _delete_and_recreate() -> None:
+            side = get_connection(db_path)
+            try:
+                side.execute("DELETE FROM topics WHERE id = ?", (topic.id,))
+                side.execute(
+                    "INSERT INTO topics (id, name, description, feed_urls, created_at, status, generation)"
+                    " VALUES (?, ?, 'd', '[]', ?, 'ready', 'brand-new-generation')",
+                    (topic.id, "Replacement", "2026-01-01T00:00:00+00:00"),
+                )
+                side.commit()
+            finally:
+                side.close()
+
+        result = await self._check_with_stubs(topic, settings, db_path, before_commit=_delete_and_recreate)
+
+        assert result.id is None
+        assert "deleted or replaced" in (result.stage_error or "")
+        assert db_conn.execute("SELECT COUNT(*) FROM check_results").fetchone()[0] == 0
+        assert db_conn.execute("SELECT COUNT(*) FROM knowledge_states").fetchone()[0] == 0
