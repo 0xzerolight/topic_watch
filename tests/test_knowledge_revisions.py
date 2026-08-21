@@ -417,6 +417,12 @@ class TestRevisionWritePath:
         the check that produced it was never recorded. Inside the one transaction
         the failure takes the state write with it, so the next cycle re-runs from a
         consistent starting point.
+
+        AUG-053: failing inside ``create_knowledge_revision`` itself (as this test
+        used to) never lets its own INSERT run, so it stays green even without any
+        rollback discipline at all. Pruning runs after that INSERT commits within
+        the transaction, so failing there is what actually proves a later step can
+        unwind an already-applied revision write.
         """
         from unittest.mock import patch
 
@@ -434,16 +440,30 @@ class TestRevisionWritePath:
 
         with (
             patch(
-                "app.analysis.knowledge.create_knowledge_revision",
+                "app.analysis.knowledge.prune_knowledge_revisions",
                 side_effect=sqlite3.OperationalError("database or disk is full"),
             ),
             pytest.raises(sqlite3.OperationalError),
         ):
             apply_plan(db_conn, topic, plan, KnowledgeRevisionSource.UPDATE, _revision_settings())
+
+        # The revision INSERT really ran before pruning failed — visible on this
+        # same connection while the transaction is still open.
+        assert (
+            db_conn.execute("SELECT COUNT(*) FROM knowledge_revisions WHERE topic_id = ?", (topic.id,)).fetchone()[0]
+            == 1
+        )
+
         db_conn.rollback()
 
+        assert not db_conn.in_transaction
         assert get_knowledge_state(db_conn, topic.id).summary_text == "Old."
         assert list_knowledge_revision_headers(db_conn, topic.id, limit=10) == []
+
+        # No stuck write transaction blocks a fresh writer on the same connection.
+        db_conn.execute("UPDATE knowledge_states SET summary_text = 'proof' WHERE topic_id = ?", (topic.id,))
+        db_conn.commit()
+        assert get_knowledge_state(db_conn, topic.id).summary_text == "proof"
 
 
 class TestSplitSegments:
@@ -529,6 +549,40 @@ class TestDiffSegments:
         segments = diff_segments(old, new)
         assert {s.kind for s in segments} == {"insert"}
         assert segments[0].text == "- New fact 0."
+
+    def test_exact_cap_still_uses_the_real_matcher(self) -> None:
+        """At exactly MAX_DIFF_SEGMENTS the matcher still runs; only strictly
+        more than the cap degrades to the all-insert snapshot fallback."""
+        from app.analysis.knowledge_diff import MAX_DIFF_SEGMENTS, diff_segments
+
+        text = "\n".join(f"- Fact {i}." for i in range(MAX_DIFF_SEGMENTS))
+        segments = diff_segments(text, text)  # identical input either way
+        assert {s.kind for s in segments} == {"equal"}  # fallback would say "insert"
+
+    def test_repeated_segments_use_exact_matching_not_autojunk(self) -> None:
+        """AUG-052: below the 1500 cap but past difflib's 200-item autojunk
+        threshold, a segment that recurs in >1% of the sequence — a common
+        shape for LLM-written knowledge summaries with repeated bullet
+        wording — is exactly the case ``autojunk=False`` exists for. With the
+        default heuristic left on, this same 250-segment input with one
+        inserted line renders as 125 wholesale deletions plus 126 insertions
+        instead of the one real insertion, making the audit timeline
+        materially misleading.
+        """
+        from app.analysis.knowledge_diff import diff_segments
+
+        old_lines = ["- Fact confirmed."] * 250
+        new_lines = old_lines[:125] + ["- New fact inserted here."] + old_lines[125:]
+        old = "\n".join(old_lines)
+        new = "\n".join(new_lines)
+
+        segments = diff_segments(old, new)
+
+        assert [s.kind for s in segments if s.kind == "delete"] == []
+        assert [s.text for s in segments if s.kind == "insert"] == ["- New fact inserted here."]
+        # old/new reconstruct exactly from the segment stream, in document order.
+        assert [s.text for s in segments if s.kind in ("equal", "delete")] == old_lines
+        assert [s.text for s in segments if s.kind in ("equal", "insert")] == new_lines
 
 
 CSRF_TEST_TOKEN = "test-csrf-token-for-tests"
@@ -627,6 +681,29 @@ class TestKnowledgeHistoryUI:
         assert "diff-ins" in response.text
         assert "diff-del" in response.text
         assert "+4" in response.text  # token delta renders its sign
+
+    async def test_diff_route_offloads_the_diff_to_a_worker_thread(self, client, db_conn: sqlite3.Connection) -> None:
+        """AUG-054: replacing the ``asyncio.to_thread`` offload with a direct
+        ``diff_segments(...)`` call would block the event loop (documented at
+        up to ~0.32s on repetitive input at the cap) while still rendering
+        identical output — so only pinning the offload itself catches it.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from app.analysis.knowledge_diff import diff_segments
+
+        topic = _seed_topic(db_conn, "Diff Offload Topic")
+        _seed_revision(db_conn, topic.id, "Alpha fact.\nBravo fact.", token_count=5)
+        newer = _seed_revision(db_conn, topic.id, "Alpha fact.\nCharlie fact.", token_count=9)
+
+        with patch(
+            "app.web.routers.topics.asyncio.to_thread",
+            new=AsyncMock(side_effect=lambda fn, *args: fn(*args)),
+        ) as mock_to_thread:
+            response = await client.get(f"/topics/{topic.id}/knowledge-diff/{newer.id}")
+
+        assert response.status_code == 200
+        mock_to_thread.assert_awaited_once_with(diff_segments, "Alpha fact.\nBravo fact.", "Alpha fact.\nCharlie fact.")
 
     async def test_diff_fragment_shows_change_note(self, client, db_conn: sqlite3.Connection) -> None:
         topic = _seed_topic(db_conn, "Note Topic")
