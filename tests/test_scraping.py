@@ -411,6 +411,45 @@ class TestParseEntry:
         assert entry is not None
         assert entry.updated == datetime(2025, 1, 3, 10, 0, tzinfo=UTC)
 
+    def test_the_publisher_suffix_is_stripped_from_an_aggregator_title(self) -> None:
+        """AUG-180: Google appends ' - Publisher'; Bing hands over the bare headline.
+
+        The suffix is the aggregator's annotation, not part of the headline, so
+        leaving it on gave the two default providers different story keys for one
+        story — stored, fetched and analysed twice at every changeover.
+        """
+        raw = {
+            "title": "Minister resigns - BBC News",
+            "link": "https://publisher.example/story",
+            "source": {"href": "https://www.bbc.co.uk", "title": "BBC News"},
+        }
+        entry = _parse_entry(raw, "feed")
+        assert entry is not None
+        assert entry.title == "Minister resigns"
+
+    def test_a_headline_without_the_declared_suffix_is_untouched(self) -> None:
+        raw = {
+            "title": "Minister resigns - and takes the whip with him",
+            "link": "https://publisher.example/story",
+            "source": {"title": "BBC News"},
+        }
+        entry = _parse_entry(raw, "feed")
+        assert entry is not None
+        assert entry.title == "Minister resigns - and takes the whip with him"
+
+    def test_a_headline_that_is_only_the_publisher_name_is_kept(self) -> None:
+        """Stripping must never empty a title and discard the entry."""
+        raw = {"title": "BBC News", "link": "https://publisher.example/story", "source": {"title": "BBC News"}}
+        entry = _parse_entry(raw, "feed")
+        assert entry is not None
+        assert entry.title == "BBC News"
+
+    def test_a_feed_declaring_no_source_keeps_its_title(self) -> None:
+        raw = {"title": "Minister resigns - BBC News", "link": "https://publisher.example/story"}
+        entry = _parse_entry(raw, "feed")
+        assert entry is not None
+        assert entry.title == "Minister resigns - BBC News"
+
     def test_missing_title_returns_none(self) -> None:
         raw = {"link": "https://example.com/test"}
         assert _parse_entry(raw, "feed") is None
