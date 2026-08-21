@@ -95,13 +95,14 @@ _DELIVERY_CONCURRENCY = 5
 _RETRY_DRAIN_LIMIT = 20
 
 # Delivery failures that will not change on a retry: the target is an unedited
-# example URL, one Apprise cannot even parse, or one the SSRF gate refuses.
-# Three more attempts only delay the abandonment (AUG-245).
+# example URL, or one Apprise cannot even parse. Three more attempts only delay
+# the abandonment (AUG-245). A target the SSRF gate refuses is NOT in here: that
+# gate fails closed, so its verdict is also what an unresolvable host looks like,
+# and a resolver blip must not destroy the alert on its first attempt.
 _TERMINAL_DELIVERY_ERRORS = frozenset(
     {
         "placeholder notification URL",
         "invalid notification URL",
-        "blocked notification target",
     }
 )
 

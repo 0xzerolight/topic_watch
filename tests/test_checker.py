@@ -1981,6 +1981,37 @@ class TestDeliveryIntentDurability:
         assert released == 1
         assert len(list_pending_notifications(db_conn)) == 1
 
+    @pytest.mark.parametrize(
+        ("error", "status"),
+        [
+            ("placeholder notification URL", "abandoned"),
+            ("invalid notification URL", "abandoned"),
+            # The SSRF gate fails closed on resolution failure, so "blocked" also
+            # means "the resolver could not answer" — which a later attempt can.
+            ("blocked notification target", "pending"),
+        ],
+    )
+    async def test_only_a_permanently_unusable_target_skips_the_retry_budget(
+        self, db_conn: sqlite3.Connection, error: str, status: str
+    ) -> None:
+        topic = _make_topic(db_conn)
+        create_pending_notification(
+            db_conn, PendingNotification(topic_id=topic.id, title="T", body="B", url="json://x")
+        )
+        db_conn.commit()
+        settings = _make_settings()
+
+        async def blocked(title, body, url, timeout_s):  # noqa: ANN001
+            return NotificationDelivery(url=url, ok=False, error=error)
+
+        with patch("app.checker.send_single_notification", side_effect=blocked):
+            await retry_pending_notifications(db_conn, settings)
+
+        row = db_conn.execute("SELECT status, retry_count, next_attempt_at FROM pending_notifications").fetchone()
+        assert row["status"] == status
+        assert row["retry_count"] == 1
+        assert (row["next_attempt_at"] is not None) is (status == "pending")
+
     async def test_an_escaping_send_error_still_records_a_retryable_failure(self, db_conn: sqlite3.Connection) -> None:
         """An exception must land an outcome, or the row is stuck 'sending' for good.
 

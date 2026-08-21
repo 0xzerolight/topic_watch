@@ -141,8 +141,10 @@ async def send_webhook(url: str, payload: dict, timeout: float = _WEBHOOK_TIMEOU
     DNS-rebinding TOCTOU window between this check and the POST is a
     pre-existing, architectural limitation shared by all outbound fetches.
 
-    A blocked URL is terminal, not a failure to retry: a private address or a
-    non-http(s) scheme will still be one on the next attempt.
+    A non-http(s) scheme and a URL that will not parse are terminal — neither
+    becomes valid on the next attempt. The SSRF gate's verdict is not: it fails
+    closed on resolution failure, so "private/reserved" is also what an
+    unresolvable host looks like, and that one recovers (see below).
     """
     try:
         async with asyncio.timeout(timeout):
@@ -172,8 +174,13 @@ async def _send_webhook_within_deadline(url: str, payload: dict, timeout: float)
             return WebhookOutcome(ok=False, retryable=False, error="non-http(s) URL")
 
         if await asyncio.to_thread(is_private_url, url):
-            logger.warning("Blocked webhook to private/reserved URL: %s", redact_url(url))
-            return WebhookOutcome(ok=False, retryable=False, error="private/reserved URL")
+            # Retryable: is_private_url fails closed, so this same verdict covers a
+            # host DNS could not answer for — a resolver restart, a container that
+            # started before its DNS, a lookup that hit the resolve timeout. Making
+            # it terminal destroyed the alert on the first attempt with no retry
+            # budget spent. The send is still blocked; only the finality is gone.
+            logger.warning("Blocked webhook to private/reserved or unresolvable URL: %s", redact_url(url))
+            return WebhookOutcome(ok=False, error="private/reserved or unresolvable URL")
     except Exception:
         logger.warning("Blocked webhook to malformed URL: %s", redact_url(url), exc_info=True)
         return WebhookOutcome(ok=False, retryable=False, error="malformed URL")
