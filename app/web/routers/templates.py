@@ -204,11 +204,14 @@ def _confidence_badge(llm_response: str | None) -> str:
 
     try:
         data = json_mod.loads(llm_response)
-        confidence = data.get("confidence")
     except json_mod.JSONDecodeError:
         return "-"
+    # json.loads() also accepts arrays, scalars, booleans, and null; only a dict
+    # has a ``confidence`` key to read (AUG-215, mirrors _importance_score()).
+    if not isinstance(data, dict):
+        return "-"
 
-    return _confidence_value(confidence)
+    return _confidence_value(data.get("confidence"))
 
 
 def _importance_score(llm_response: str | None) -> int | None:
