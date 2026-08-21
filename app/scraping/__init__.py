@@ -231,14 +231,20 @@ def _prepare_entries(entries: list[FeedEntry]) -> list[FeedEntry]:
     """Normalize what the source returned before anything spends budget on it.
 
     Two source-agnostic corrections, applied once for every provider rather than
-    per fetcher: impossible publication dates are discarded so they cannot own
-    the top of the recency ranking (AUG-184), and entries describing one article
-    collapse to their best copy so repeats stop consuming article slots and
-    content fetches (AUG-179).
+    per fetcher: impossible dates are discarded so they cannot own the top of the
+    recency ranking (AUG-184), and entries describing one article collapse to
+    their best copy so repeats stop consuming article slots and content fetches
+    (AUG-179).
+
+    ``updated`` goes through the same skew guard as ``published``, because it is
+    the signal that says an article was revised: a publisher whose clock runs
+    hours fast had every entry read as a revision, which bypasses the story rule
+    permanently and re-stores the whole feed on every check.
     """
     now = datetime.now(UTC)
     for entry in entries:
         entry.published = normalize_published(entry.published, now=now)
+        entry.updated = normalize_published(entry.updated, now=now)
     return collapse_duplicate_entries(entries)
 
 

@@ -2902,6 +2902,40 @@ class TestStoryDedup:
         assert len(stored) == 1
         assert stored[0].raw_content == "Corrected body"
 
+    async def test_a_clock_skewed_updated_stamp_is_not_a_revision(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """AUG-184/AUG-320: a fast publisher clock must not revise every entry.
+
+        ``published`` was already guarded against an impossible date while
+        ``updated`` was not, so a publisher stamping every entry a few hours ahead
+        of us had all of them read as revisions — permanently bypassing the story
+        rule and re-storing the whole feed on every check.
+        """
+        topic = self._topic(db_conn)
+        self._store_publisher_row(db_conn, topic, "earlier-key")
+
+        entry = FeedEntry(
+            title="The Story",
+            url=self._PUBLISHER,
+            summary="s",
+            source_feed="feed",
+            published=datetime.now(UTC) - timedelta(hours=2),
+            updated=datetime.now(UTC) + timedelta(hours=6),
+        )
+        extract = AsyncMock(return_value="Body")
+        with (
+            patch(
+                "app.scraping.fetch_feeds_for_topic",
+                return_value=FeedResponse(entries=[entry], provider_name="bing_news"),
+            ),
+            patch("app.scraping.extract_article_content", extract),
+        ):
+            stored = (await fetch_new_articles_for_topic(topic, db_path=db_path)).articles
+
+        assert stored == []
+        extract.assert_not_called()
+
     async def test_a_retitled_article_is_a_different_story(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         topic = self._topic(db_conn)
         self._store_publisher_row(db_conn, topic, "earlier-key")
