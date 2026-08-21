@@ -280,6 +280,12 @@ class FeedEntry(BaseModel):
     """Pre-extracted full text, when the source already provides it (e.g. Exa search).
     ``None`` for RSS entries, whose text is fetched during content extraction. When set
     and non-empty, it short-circuits the network fetch in ``extract_article_content``."""
+    rank_at: datetime | None = None
+    """The timestamp the bounded article cap ranks this entry by (AUG-184).
+
+    Assigned by the pipeline, never by a source: it is what the entry's place in
+    the feed says about its recency, which is not the same as the date it claims.
+    ``None`` until ``assign_ranking_dates`` has run."""
 
 
 # --- Article identity ---------------------------------------------------------
@@ -320,6 +326,60 @@ def normalize_published(value: datetime | None, *, now: datetime | None = None) 
         logger.debug("Discarding impossible publication date %s", stamp.isoformat())
         return None
     return stamp
+
+
+def assign_ranking_dates(entries: list[FeedEntry], *, now: datetime | None = None) -> None:
+    """Normalize every entry's dates and settle where the article cap ranks it.
+
+    Three cases, and the earlier attempt collapsed all of them onto retrieval
+    time, which is what made AUG-184 wrong in both directions:
+
+    - A usable date ranks the entry, as it always did.
+    - A date the source named but we discarded as impossible ranks the entry
+      BELOW every dated one. Falling back to retrieval time handed the bogus
+      entry the top of the ranking a second time, so at a small cap it still
+      displaced the real stories the finding was filed about.
+    - An entry naming no date at all inherits the date of the nearest dated entry
+      of the SAME feed — the one preceding it, since feeds list newest first, and
+      otherwise the one following it. Ranking it at retrieval time instead put a
+      whole dateless archive feed above genuinely breaking news on every check;
+      ranking it at year 1 starved it forever. Taking its neighbour's date keeps
+      it where the feed put it. A feed carrying no dates at all has nothing to
+      inherit, so its entries rank below dated ones rather than above them.
+    """
+    moment = now or datetime.now(UTC)
+    for entry in entries:
+        declared = entry.published
+        entry.published = normalize_published(declared, now=moment)
+        entry.updated = normalize_published(entry.updated, now=moment)
+        if entry.published is not None:
+            entry.rank_at = entry.published
+        else:
+            entry.rank_at = _UNDATED if declared is not None else None
+
+    # Forward: the newest dated entry seen so far in this feed. Backward: the
+    # first one that follows, for entries listed above every dated entry.
+    nearest: dict[str, datetime] = {}
+    for entry in entries:
+        if entry.published is not None:
+            nearest[entry.source_feed] = entry.published
+        elif entry.rank_at is None:
+            entry.rank_at = nearest.get(entry.source_feed)
+    nearest.clear()
+    for entry in reversed(entries):
+        if entry.published is not None:
+            nearest[entry.source_feed] = entry.published
+        elif entry.rank_at is None:
+            entry.rank_at = nearest.get(entry.source_feed, _UNDATED)
+
+
+def ranking_date(entry: FeedEntry) -> datetime:
+    """The timestamp the article cap ranks one candidate by.
+
+    Falls back to the entry's own date for callers that build entries directly
+    without running them through the pipeline's normalization.
+    """
+    return entry.rank_at or as_utc(entry.published) or _UNDATED
 
 
 def _is_tracking_param(name: str) -> bool:
@@ -367,6 +427,18 @@ def _identity_digest(*parts: str) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+def body_digest(text: str | None) -> str:
+    """The comparable form of an article body, or ``""`` when there is none.
+
+    Whitespace-collapsed before hashing, so a reflowed copy of one body is that
+    body. This is what decides whether a claimed revision is a real one: the
+    source's word for it cannot be, because an ``updated`` stamp that moves on
+    every poll says the same thing as one that moved because the story changed.
+    """
+    collapsed = " ".join((text or "").split())
+    return hashlib.sha256(collapsed.encode()).hexdigest() if collapsed else ""
+
+
 def revision_marker(entry: FeedEntry) -> str:
     """What distinguishes this representation of a story from an earlier one.
 
@@ -376,14 +448,20 @@ def revision_marker(entry: FeedEntry) -> str:
     carry related-coverage lists and blurbs that churn on their own, and every
     churn would cost a content fetch, a row and an LLM analysis for an article
     nobody revised.
+
+    This marker decides only whether an entry is worth LOOKING at again. Whether
+    it is worth STORING is settled after its body arrives, by comparing that body
+    with the one the topic already holds — otherwise a source that moves the
+    stamp on every poll mints a new identity every check and the article is
+    stored, and analysed, forever.
     """
     parts: list[str] = []
     revised = as_utc(entry.updated)
     if revised is not None and revised != as_utc(entry.published):
         parts.append(revised.isoformat())
-    text = " ".join((entry.content or "").split())
+    text = body_digest(entry.content)
     if text:
-        parts.append(hashlib.sha256(text.encode()).hexdigest())
+        parts.append(text)
     return "\x1f".join(parts)
 
 
@@ -429,21 +507,26 @@ def _representation_rank(entry: FeedEntry) -> tuple[datetime, int]:
 
 
 def collapse_duplicate_entries(entries: list[FeedEntry]) -> list[FeedEntry]:
-    """One entry per canonical URL, keeping the best copy, in first-seen order.
+    """One entry per story, keeping the best copy, in first-seen order.
 
     Repeats reach the pipeline routinely — two configured feeds carrying one
     story, an aggregator listing it twice. Left in, they occupy the bounded
     article slots that unique stories needed and pay for the same content fetch
     twice (AUG-179).
 
-    Which copy survives is decided by the entries themselves — newest revision
-    first, then the one that actually carries text — never by which feed was
-    configured first, which silently threw away the corrected or richer version
-    of an article (AUG-322).
+    The merge key is ``story_identity``, the same key dedup uses, and not the URL
+    alone. A publisher republishing a correction at the story's own URL under a
+    new headline is two stories to everything downstream, so keying the merge on
+    the URL discarded one of them here — before dedup, extraction or analysis
+    could see it — and which one survived was decided by feed order (AUG-322).
+
+    Among copies that really are one story, the survivor is decided by the
+    entries themselves — newest revision first, then the one that actually
+    carries text — never by which feed was configured first.
     """
     best: dict[str, FeedEntry] = {}
     for entry in entries:
-        key = canonical_url(entry.url)
+        key = story_identity(entry)
         current = best.get(key)
         # dict keeps the first insertion's position when a value is replaced,
         # so the surviving copy stays where the story first appeared.

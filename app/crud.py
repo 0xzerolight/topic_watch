@@ -125,6 +125,38 @@ def update_topic(conn: sqlite3.Connection, topic: Topic) -> Topic:
     return topic
 
 
+def update_topic_config(conn: sqlite3.Connection, topic: Topic) -> Topic:
+    """Update only the columns the edit form owns. Does not commit.
+
+    The edit handler loads a ``Topic``, awaits DNS validation of the submitted
+    feed URLs, and only then writes. A full-row ``update_topic`` from that
+    pre-await snapshot also rewrites status, status_changed_at, error_message and
+    init_attempts — so an initialization that finished during the await was undone,
+    putting a READY topic back into RESEARCHING until stuck recovery marked it
+    ERROR, or marking an in-flight one READY and letting checks run against
+    knowledge that does not exist yet (AUG-022). Lifecycle columns are owned by the
+    init/check paths and are left alone here; ``is_active`` belongs to the
+    enable/disable command.
+    """
+    if topic.id is None:
+        raise ValueError("Cannot update a topic without an ID")
+    data = topic.to_insert_dict()
+    data["id"] = topic.id
+    conn.execute(
+        """UPDATE topics SET name=:name, description=:description,
+           feed_urls=:feed_urls, feed_mode=:feed_mode,
+           check_interval_minutes=:check_interval_minutes, tags=:tags,
+           confidence_threshold=:confidence_threshold,
+           relevance_threshold=:relevance_threshold,
+           novelty_instruction=:novelty_instruction,
+           importance_threshold=:importance_threshold
+           WHERE id=:id""",
+        data,
+    )
+    logger.info("Updated topic configuration: %s (id=%d)", topic.name, topic.id)
+    return topic
+
+
 def update_topic_init_status(
     conn: sqlite3.Connection,
     topic_id: int,
@@ -133,20 +165,34 @@ def update_topic_init_status(
     status_changed_at: datetime,
     error_message: str | None,
     init_attempts: int,
-) -> None:
+    expected_status: TopicStatus | None = None,
+    generation: str | None = None,
+) -> bool:
     """Targeted UPDATE of only the init-lifecycle columns a topic init owns.
 
     Unlike ``update_topic`` (which rewrites the whole row from a possibly-stale
     in-memory ``Topic``), this writes only status/error/init_attempts so a
     concurrent UI edit to feeds/thresholds during the long init await is not
     clobbered (OVH-100). Does not commit; the caller owns the transaction.
+
+    ``expected_status`` and ``generation`` fence the write to the claim the caller
+    still owns. Without them, an initializer that stuck recovery had already given
+    up on (RESEARCHING -> ERROR) could still land its terminal READY/ERROR minutes
+    later, making the topic's final state last-writer-wins between live work and
+    recovery (AUG-139). Returns True only when the row was actually updated.
     """
-    conn.execute(
-        """UPDATE topics
-           SET status = ?, status_changed_at = ?, error_message = ?, init_attempts = ?
-           WHERE id = ?""",
-        (status.value, status_changed_at.isoformat(), error_message, init_attempts, topic_id),
-    )
+    sql = """UPDATE topics
+             SET status = ?, status_changed_at = ?, error_message = ?, init_attempts = ?
+             WHERE id = ?"""
+    params: list = [status.value, to_db_utc(status_changed_at), error_message, init_attempts, topic_id]
+    if expected_status is not None:
+        sql += " AND status = ?"
+        params.append(expected_status.value)
+    if generation is not None:
+        sql += " AND generation = ?"
+        params.append(generation)
+    cursor = conn.execute(sql, params)
+    return cursor.rowcount == 1
 
 
 def recover_stuck_topics(conn: sqlite3.Connection) -> int:
@@ -154,11 +200,17 @@ def recover_stuck_topics(conn: sqlite3.Connection) -> int:
 
     Called at startup — any topic still in RESEARCHING status when the
     server starts is definitively stuck (the background task is dead).
+
+    ``status_changed_at`` moves with the status: it means "when the current status
+    was entered", so leaving it at the start of the abandoned research made a
+    freshly recovered topic report an ERROR age of however long it had been
+    researching (AUG-158).
     """
     cursor = conn.execute(
-        "UPDATE topics SET status = ?, error_message = ? WHERE status = ?",
+        "UPDATE topics SET status = ?, status_changed_at = ?, error_message = ? WHERE status = ?",
         (
             TopicStatus.ERROR.value,
+            to_db_utc(datetime.now(UTC)),
             "Research interrupted by server restart. Click Retry.",
             TopicStatus.RESEARCHING.value,
         ),
@@ -179,14 +231,20 @@ def recover_stuck_researching(conn: sqlite3.Connection, timeout_minutes: int = 1
     Does not commit; the caller owns the transaction (invariant #12), matching
     ``recover_stuck_topics``. The scheduler's ``_recover_stuck`` runs this inside
     a ``get_db`` block, which commits on success (OVH-087).
+
+    Stamps ``status_changed_at`` with the recovery time for the same reason
+    ``recover_stuck_topics`` does (AUG-158). The staleness predicate reads the old
+    value before the SET applies, so the window is still measured from the start
+    of the research.
     """
     cursor = conn.execute(
-        """UPDATE topics SET status = ?, error_message = ?
+        """UPDATE topics SET status = ?, status_changed_at = ?, error_message = ?
            WHERE status = ?
              AND status_changed_at IS NOT NULL
              AND datetime(status_changed_at, '+' || ? || ' minutes') <= datetime('now')""",
         (
             TopicStatus.ERROR.value,
+            to_db_utc(datetime.now(UTC)),
             "Research timed out (stuck detection). Click Retry.",
             TopicStatus.RESEARCHING.value,
             timeout_minutes,
@@ -402,6 +460,36 @@ def list_articles_for_topic(
     return [Article.from_row(row) for row in rows]
 
 
+def list_article_headers_for_topic(
+    conn: sqlite3.Connection,
+    topic_id: int,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[Article]:
+    """List articles for a topic without hydrating ``raw_content`` (AUG-038).
+
+    Topic detail renders only title/url/source/provider/timestamps, but the
+    full-row ``list_articles_for_topic`` (``SELECT *``) hydrates every capped
+    ``raw_content`` body regardless — up to ~1MB of text the page discards
+    immediately at the supported 200-row page size. This is that path's
+    metadata-only counterpart; ``list_articles_for_topic`` stays exclusively for
+    exports and the analysis pipeline, which need the body text. Returned
+    ``Article`` objects carry ``raw_content=None`` (the model's default) — never
+    render it from this path.
+    """
+    query = (
+        "SELECT id, topic_id, title, url, content_hash, source_feed, source_provider, "
+        "published_at, fetched_at, processed, analysis_attempts "
+        "FROM articles WHERE topic_id = ? ORDER BY fetched_at DESC"
+    )
+    params: list = [topic_id]
+    if limit is not None:
+        query += " LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+    rows = conn.execute(query, params).fetchall()
+    return [Article.from_row(row) for row in rows]
+
+
 def count_articles_for_topic(conn: sqlite3.Connection, topic_id: int) -> int:
     """Count total articles for a topic."""
     row = conn.execute("SELECT COUNT(*) FROM articles WHERE topic_id = ?", (topic_id,)).fetchone()
@@ -430,6 +518,29 @@ def list_article_dedup_keys(conn: sqlite3.Connection, topic_id: int) -> list[tup
         (topic_id,),
     ).fetchall()
     return [(row["content_hash"], row["url"], row["title"]) for row in rows]
+
+
+def list_article_bodies_for_urls(
+    conn: sqlite3.Connection, topic_id: int, urls: list[str]
+) -> list[tuple[str, str, str | None, str | None]]:
+    """Return ``(url, title, raw_content, source_provider)`` for a topic's rows at these URLs.
+
+    The bodies a topic already holds are what tells a genuine revision from a
+    source that merely moved its ``updated`` stamp again, so dedup reads them for
+    the handful of URLs actually under contest rather than for the whole
+    retention window. ``source_provider`` comes along because a body a source
+    handed over pre-extracted is only comparable with bodies from that same
+    source.
+    """
+    unique = list(dict.fromkeys(urls))
+    if not unique:
+        return []
+    placeholders = ",".join("?" * len(unique))
+    rows = conn.execute(
+        f"SELECT url, title, raw_content, source_provider FROM articles WHERE topic_id = ? AND url IN ({placeholders})",  # noqa: S608 - placeholders only, values are bound
+        [topic_id, *unique],
+    ).fetchall()
+    return [(row["url"], row["title"], row["raw_content"], row["source_provider"]) for row in rows]
 
 
 def topic_has_articles_from_feed(conn: sqlite3.Connection, topic_id: int, feed_url: str) -> bool:
@@ -777,6 +888,36 @@ def mark_latest_check_seen(conn: sqlite3.Connection, topic_id: int) -> None:
     )
 
 
+def mark_check_seen(conn: sqlite3.Connection, topic_id: int, check_id: int) -> None:
+    """Stamp ``seen_at`` on one specific check result (TW-AUD-024).
+
+    Companion to :func:`mark_latest_check_seen`, keyed to an explicit ``check_id``
+    instead of "whichever row is latest right now". The detail GET route no
+    longer mutates on read (a prefetch, retry, or failed render used to clear the
+    dashboard badge before the user ever saw the detail); this is called instead,
+    once the page has actually rendered, acknowledging the exact check it
+    displayed. The extra ``id =`` subquery guard means a check that lands after
+    render is never silently marked seen by a late-arriving ack for a stale page.
+    Same ``has_new_info`` / ``seen_at IS NULL`` guards as the sibling function
+    keep re-acks a no-op. The caller commits.
+    """
+    conn.execute(
+        """
+        UPDATE check_results SET seen_at = ?
+        WHERE id = ?
+          AND topic_id = ?
+          AND has_new_info = 1
+          AND seen_at IS NULL
+          AND id = (
+              SELECT id FROM check_results
+              WHERE topic_id = ?
+              ORDER BY checked_at DESC LIMIT 1
+          )
+        """,
+        (datetime.now(UTC).isoformat(), check_id, topic_id, topic_id),
+    )
+
+
 def get_check_result(conn: sqlite3.Connection, check_id: int) -> CheckResult | None:
     """Get a check result by ID, or None if not found."""
     row = conn.execute("SELECT * FROM check_results WHERE id = ?", (check_id,)).fetchone()
@@ -903,43 +1044,80 @@ def list_pending_notifications(
     return [PendingNotification.from_row(row) for row in rows]
 
 
-def claim_pending_notification(conn: sqlite3.Connection, notification_id: int, claimed_at: str) -> bool:
+def claim_pending_notification(
+    conn: sqlite3.Connection,
+    notification_id: int,
+    claimed_at: str,
+    *,
+    claim_token: str | None = None,
+) -> bool:
     """Atomically claim a pending notification for sending.
 
     Returns True only if this caller won the claim (the row was unclaimed and
     is now stamped). A concurrent drainer that lost the race gets False and
     must skip the row, preventing double-delivery across processes.
+
+    Eligibility is part of the predicate, not a separate list query: a drainer
+    working from a snapshot taken before another drainer exhausted the row could
+    otherwise claim and physically retry it past ``max_retries`` (TW-AUD-006).
+    ``claim_token`` stamps the winning owner so its apply can be fenced.
     """
     cursor = conn.execute(
-        "UPDATE pending_notifications SET claimed_at = ? WHERE id = ? AND claimed_at IS NULL",
-        (claimed_at, notification_id),
+        "UPDATE pending_notifications SET claimed_at = ?, claim_token = ? "
+        "WHERE id = ? AND claimed_at IS NULL AND retry_count < max_retries",
+        (claimed_at, claim_token, notification_id),
     )
     return cursor.rowcount == 1
 
 
-def increment_notification_retry(conn: sqlite3.Connection, notification_id: int, last_error: str | None = None) -> None:
+def increment_notification_retry(
+    conn: sqlite3.Connection,
+    notification_id: int,
+    last_error: str | None = None,
+    *,
+    claim_token: str | None = None,
+) -> bool:
     """Increment the retry count and release the claim for a pending notification.
 
     Clearing ``claimed_at`` re-arms the row so the next cycle can re-claim and
     retry it. ``last_error`` (when given) records the most recent failure reason
     so a permanently-broken channel is distinguishable from a transient blip.
+    ``claim_token`` fences the write to the owner that actually sent: a drainer
+    whose claim was released as stale and re-taken elsewhere must not consume the
+    new owner's attempt (TW-AUD-006). Returns True when a row was updated.
     """
-    if last_error is not None:
-        conn.execute(
-            "UPDATE pending_notifications "
-            "SET retry_count = retry_count + 1, claimed_at = NULL, last_error = ? WHERE id = ?",
-            (last_error, notification_id),
-        )
-    else:
-        conn.execute(
-            "UPDATE pending_notifications SET retry_count = retry_count + 1, claimed_at = NULL WHERE id = ?",
-            (notification_id,),
-        )
+    sql = (
+        "UPDATE pending_notifications "
+        "SET retry_count = retry_count + 1, claimed_at = NULL, claim_token = NULL, last_error = ? "
+        "WHERE id = ?"
+    )
+    params: list = [last_error, notification_id]
+    if claim_token is not None:
+        sql += " AND claim_token = ?"
+        params.append(claim_token)
+    cursor = conn.execute(sql, params)
+    return cursor.rowcount == 1
 
 
-def delete_pending_notification(conn: sqlite3.Connection, notification_id: int) -> None:
-    """Delete a pending notification (after successful send or max retries)."""
-    conn.execute("DELETE FROM pending_notifications WHERE id = ?", (notification_id,))
+def delete_pending_notification(
+    conn: sqlite3.Connection,
+    notification_id: int,
+    *,
+    claim_token: str | None = None,
+) -> bool:
+    """Delete a pending notification (after successful send or max retries).
+
+    ``claim_token`` fences the delete to the claim that sent it, so a late apply
+    from a superseded owner cannot drop a row another drainer is working on
+    (TW-AUD-006). Returns True when a row was deleted.
+    """
+    sql = "DELETE FROM pending_notifications WHERE id = ?"
+    params: list = [notification_id]
+    if claim_token is not None:
+        sql += " AND claim_token = ?"
+        params.append(claim_token)
+    cursor = conn.execute(sql, params)
+    return cursor.rowcount == 1
 
 
 def release_stale_notification_claims(conn: sqlite3.Connection, cutoff: str) -> int:
@@ -950,7 +1128,8 @@ def release_stale_notification_claims(conn: sqlite3.Connection, cutoff: str) -> 
     stale claims at snapshot time makes the queue self-healing.
     """
     cursor = conn.execute(
-        "UPDATE pending_notifications SET claimed_at = NULL WHERE claimed_at IS NOT NULL AND claimed_at <= ?",
+        "UPDATE pending_notifications SET claimed_at = NULL, claim_token = NULL "
+        "WHERE claimed_at IS NOT NULL AND claimed_at <= ?",
         (cutoff,),
     )
     return cursor.rowcount
@@ -1019,35 +1198,68 @@ def list_pending_webhooks(conn: sqlite3.Connection) -> list[PendingWebhook]:
     return [PendingWebhook.from_row(row) for row in rows]
 
 
-def claim_pending_webhook(conn: sqlite3.Connection, webhook_id: int, claimed_at: str) -> bool:
+def claim_pending_webhook(
+    conn: sqlite3.Connection,
+    webhook_id: int,
+    claimed_at: str,
+    *,
+    claim_token: str | None = None,
+) -> bool:
     """Atomically claim a pending webhook for sending.
 
     Returns True only if this caller won the claim (the row was unclaimed and
     is now stamped). A concurrent drainer that lost the race gets False and
-    must skip the row, preventing double-delivery across processes.
+    must skip the row, preventing double-delivery across processes. Mirrors
+    :func:`claim_pending_notification`, eligibility predicate included
+    (TW-AUD-006).
     """
     cursor = conn.execute(
-        "UPDATE pending_webhooks SET claimed_at = ? WHERE id = ? AND claimed_at IS NULL",
-        (claimed_at, webhook_id),
+        "UPDATE pending_webhooks SET claimed_at = ?, claim_token = ? "
+        "WHERE id = ? AND claimed_at IS NULL AND retry_count < max_retries",
+        (claimed_at, claim_token, webhook_id),
     )
     return cursor.rowcount == 1
 
 
-def increment_webhook_retry(conn: sqlite3.Connection, webhook_id: int) -> None:
+def increment_webhook_retry(
+    conn: sqlite3.Connection,
+    webhook_id: int,
+    *,
+    claim_token: str | None = None,
+) -> bool:
     """Increment the retry count and release the claim for a pending webhook.
 
     Clearing ``claimed_at`` re-arms the row so the next cycle can re-claim and
-    retry it.
+    retry it. Fenced by ``claim_token`` like its notification twin (TW-AUD-006).
     """
-    conn.execute(
-        "UPDATE pending_webhooks SET retry_count = retry_count + 1, claimed_at = NULL WHERE id = ?",
-        (webhook_id,),
+    sql = (
+        "UPDATE pending_webhooks SET retry_count = retry_count + 1, claimed_at = NULL, claim_token = NULL WHERE id = ?"
     )
+    params: list = [webhook_id]
+    if claim_token is not None:
+        sql += " AND claim_token = ?"
+        params.append(claim_token)
+    cursor = conn.execute(sql, params)
+    return cursor.rowcount == 1
 
 
-def delete_pending_webhook(conn: sqlite3.Connection, webhook_id: int) -> None:
-    """Delete a pending webhook (after successful send or max retries)."""
-    conn.execute("DELETE FROM pending_webhooks WHERE id = ?", (webhook_id,))
+def delete_pending_webhook(
+    conn: sqlite3.Connection,
+    webhook_id: int,
+    *,
+    claim_token: str | None = None,
+) -> bool:
+    """Delete a pending webhook (after successful send or max retries).
+
+    Fenced by ``claim_token`` like its notification twin (TW-AUD-006).
+    """
+    sql = "DELETE FROM pending_webhooks WHERE id = ?"
+    params: list = [webhook_id]
+    if claim_token is not None:
+        sql += " AND claim_token = ?"
+        params.append(claim_token)
+    cursor = conn.execute(sql, params)
+    return cursor.rowcount == 1
 
 
 def release_stale_webhook_claims(conn: sqlite3.Connection, cutoff: str) -> int:
@@ -1057,7 +1269,8 @@ def release_stale_webhook_claims(conn: sqlite3.Connection, cutoff: str) -> int:
     row then crashes before applying would otherwise strand it claimed forever.
     """
     cursor = conn.execute(
-        "UPDATE pending_webhooks SET claimed_at = NULL WHERE claimed_at IS NOT NULL AND claimed_at <= ?",
+        "UPDATE pending_webhooks SET claimed_at = NULL, claim_token = NULL "
+        "WHERE claimed_at IS NOT NULL AND claimed_at <= ?",
         (cutoff,),
     )
     return cursor.rowcount
@@ -1170,60 +1383,119 @@ def list_all_feed_health(conn: sqlite3.Connection) -> list[FeedHealth]:
 
 
 def get_new_topics(conn: sqlite3.Connection, limit: int = 1) -> list[Topic]:
-    """Get topics in NEW status, oldest first (for gradual scheduler init)."""
+    """Get topics in NEW status, oldest first (for gradual scheduler init).
+
+    Paused topics are excluded: automatic initialization fetches sources and
+    spends LLM/Exa credit, which is exactly what disabling a topic is supposed to
+    stop (AUG-140). The claim below repeats the filter to close the window between
+    this SELECT and the claim.
+    """
     rows = conn.execute(
-        "SELECT * FROM topics WHERE status = ? ORDER BY created_at ASC LIMIT ?",
+        "SELECT * FROM topics WHERE status = ? AND is_active = 1 ORDER BY created_at ASC LIMIT ?",
         (TopicStatus.NEW.value, limit),
     ).fetchall()
     return [Topic.from_row(row) for row in rows]
 
 
-def claim_new_topic_for_init(conn: sqlite3.Connection, topic_id: int) -> bool:
-    """Atomically claim a NEW topic for initialization (NEW -> RESEARCHING).
+def claim_topic_for_init(conn: sqlite3.Connection, topic_id: int, expected_status: TopicStatus) -> bool:
+    """Atomically claim a topic for initialization (expected_status -> RESEARCHING).
 
-    Returns True only if this caller won the claim (rowcount == 1). A concurrent
-    init (a same-minute web Retry click, a second scheduler tick on another
-    process, or a CLI init) that already transitioned the row out of NEW loses
-    here, so only one initializer proceeds (OVH-032). Mirrors the conditional-UPDATE
-    pattern in ``recover_stuck_researching``. Commits so the claim is durable and
-    immediately visible to concurrent WAL connections.
+    Returns True only if this caller won the claim (rowcount == 1). Every
+    initializer — scheduler tick, web Retry, CLI ``init`` — goes through this one
+    conditional UPDATE, so "read the status, then write RESEARCHING" can no longer
+    let two of them both proceed (AUG-288). ``is_active = 1`` is part of the
+    predicate: a topic paused between the caller's read and this claim is not
+    initialized (AUG-140).
+
+    Commits so the claim is durable and immediately visible to concurrent WAL
+    connections — a claim only another process can see is not a claim.
     """
-    now = datetime.now(UTC).isoformat()
     cursor = conn.execute(
         """UPDATE topics SET status = ?, status_changed_at = ?, error_message = ?
-           WHERE id = ? AND status = ?""",
-        (TopicStatus.RESEARCHING.value, now, None, topic_id, TopicStatus.NEW.value),
+           WHERE id = ? AND status = ? AND is_active = 1""",
+        (
+            TopicStatus.RESEARCHING.value,
+            to_db_utc(datetime.now(UTC)),
+            None,
+            topic_id,
+            expected_status.value,
+        ),
     )
     conn.commit()
     return cursor.rowcount == 1
 
 
-def claim_heartbeat_alert(conn: sqlite3.Connection, topic_id: int, alerted_at: datetime) -> bool:
+def claim_new_topic_for_init(conn: sqlite3.Connection, topic_id: int) -> bool:
+    """Atomically claim a NEW topic for initialization (NEW -> RESEARCHING).
+
+    The scheduler's gradual-init spelling of :func:`claim_topic_for_init`
+    (OVH-032).
+    """
+    return claim_topic_for_init(conn, topic_id, TopicStatus.NEW)
+
+
+# Fences a heartbeat latch transition to the exact topic incarnation and the exact
+# check the decision was computed from. ``topics.id`` is a recyclable rowid, so a
+# check still holding a deleted topic could otherwise latch its replacement — an
+# alert naming the deleted topic, and a replacement whose real outage is then
+# suppressed (AUG-020/TW-AUD-007). The head-check conjunct is the same idea in time:
+# a decision computed from check N must not land once check N+1 exists.
+_HEARTBEAT_GENERATION_FENCE = " AND generation = ?"
+_HEARTBEAT_HEAD_FENCE = " AND (SELECT MAX(id) FROM check_results WHERE topic_id = topics.id) = ?"
+
+
+def _heartbeat_fence(sql: str, params: list, generation: str | None, head_check_id: int | None) -> tuple[str, list]:
+    """Append the optional generation / head-check conjuncts to a latch UPDATE."""
+    if generation is not None:
+        sql += _HEARTBEAT_GENERATION_FENCE
+        params.append(generation)
+    if head_check_id is not None:
+        sql += _HEARTBEAT_HEAD_FENCE
+        params.append(head_check_id)
+    return sql, params
+
+
+def claim_heartbeat_alert(
+    conn: sqlite3.Connection,
+    topic_id: int,
+    alerted_at: datetime,
+    *,
+    generation: str | None = None,
+    head_check_id: int | None = None,
+) -> bool:
     """Atomically claim the right to announce a source outage for a topic.
 
     Returns True only for the caller that won (rowcount == 1). The guard is
     ``heartbeat_alerted_at IS NULL``, so an outage already announced — by this
     process, or by a CLI ``check-all`` running against a live server — yields
     False and no second alert. Mirrors ``claim_new_topic_for_init``; the caller
-    commits.
+    commits. ``generation`` and ``head_check_id`` add the lifecycle fences
+    described above.
     """
-    cursor = conn.execute(
-        "UPDATE topics SET heartbeat_alerted_at = ? WHERE id = ? AND heartbeat_alerted_at IS NULL",
-        (alerted_at.isoformat(), topic_id),
-    )
+    sql = "UPDATE topics SET heartbeat_alerted_at = ? WHERE id = ? AND heartbeat_alerted_at IS NULL"
+    params: list = [to_db_utc(alerted_at), topic_id]
+    sql, params = _heartbeat_fence(sql, params, generation, head_check_id)
+    cursor = conn.execute(sql, params)
     return cursor.rowcount == 1
 
 
-def clear_heartbeat_alert(conn: sqlite3.Connection, topic_id: int) -> bool:
+def clear_heartbeat_alert(
+    conn: sqlite3.Connection,
+    topic_id: int,
+    *,
+    generation: str | None = None,
+    head_check_id: int | None = None,
+) -> bool:
     """Clear an outstanding source-outage alert. True only if one was set.
 
     The ``IS NOT NULL`` guard makes the recovery notice exactly-once for the same
-    reason the claim makes the alert exactly-once. The caller commits.
+    reason the claim makes the alert exactly-once. The caller commits. Fenced by
+    the same optional lifecycle conjuncts as :func:`claim_heartbeat_alert`.
     """
-    cursor = conn.execute(
-        "UPDATE topics SET heartbeat_alerted_at = NULL WHERE id = ? AND heartbeat_alerted_at IS NOT NULL",
-        (topic_id,),
-    )
+    sql = "UPDATE topics SET heartbeat_alerted_at = NULL WHERE id = ? AND heartbeat_alerted_at IS NOT NULL"
+    params: list = [topic_id]
+    sql, params = _heartbeat_fence(sql, params, generation, head_check_id)
+    cursor = conn.execute(sql, params)
     return cursor.rowcount == 1
 
 

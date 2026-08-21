@@ -2,6 +2,7 @@
 
 import asyncio
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -70,7 +71,7 @@ class TestRunInitTimeout:
                 side_effect=_hang,
             ),
         ):
-            await _run_init(topic_id, settings, db_path)
+            await _run_init(topic_id, settings, db_path, claimed=True)
 
         conn = get_connection(db_path)
         try:
@@ -85,29 +86,22 @@ class TestRunInitTimeout:
     async def test_timeout_stamps_status_changed_at(self, db_path: Path) -> None:
         """Timeout error transition re-stamps status_changed_at for stuck-recovery timing.
 
-        ``initialize_new_topic`` stamps status_changed_at when it moves the topic
-        to RESEARCHING, so the timeout path must re-stamp it on the ERROR transition
+        The RESEARCHING stamp is written by whoever claimed the topic (here, the
+        seeded row), so the timeout path must re-stamp it on the ERROR transition
         rather than leaving the stale RESEARCHING timestamp.
         """
         settings = _make_settings()
 
+        researching_stamp = {"at": datetime.now(UTC) - timedelta(minutes=5)}
+
         conn = get_connection(db_path)
         try:
-            topic = _make_topic(conn, status_changed_at=None)
+            topic = _make_topic(conn, status_changed_at=researching_stamp["at"])
             topic_id = topic.id
         finally:
             conn.close()
 
-        # Capture the RESEARCHING-transition stamp set by initialize_new_topic
-        # right before it hangs, so we can prove the ERROR path re-stamps it.
-        researching_stamp = {}
-
         async def _hang(*args, **kwargs):
-            c = get_connection(db_path)
-            try:
-                researching_stamp["at"] = get_topic(c, topic_id).status_changed_at
-            finally:
-                c.close()
             await asyncio.sleep(9999)
 
         with (
@@ -117,7 +111,7 @@ class TestRunInitTimeout:
                 side_effect=_hang,
             ),
         ):
-            await _run_init(topic_id, settings, db_path)
+            await _run_init(topic_id, settings, db_path, claimed=True)
 
         conn = get_connection(db_path)
         try:
@@ -155,7 +149,7 @@ class TestRunInitTimeout:
             ),
             caplog.at_level(logging.ERROR, logger="app.web.routers.background"),
         ):
-            await _run_init(topic_id, settings, db_path)
+            await _run_init(topic_id, settings, db_path, claimed=True)
 
         assert any("timed out" in record.message.lower() for record in caplog.records)
 
@@ -202,7 +196,7 @@ class TestRunInitTimeout:
                 return_value=None,
             ),
         ):
-            await _run_init(topic_id, settings, db_path)
+            await _run_init(topic_id, settings, db_path, claimed=True)
 
         conn = get_connection(db_path)
         try:
@@ -251,11 +245,12 @@ class TestRunCheckAllTimeout:
         async def _hang(*args, **kwargs):
             await asyncio.sleep(9999)
 
+        owner = _checking_state.start_check_all()
         with (
             patch("app.web.routers.background._CHECK_ALL_TIMEOUT_SECONDS", 0.05),
             patch("app.web.routers.background.check_all_topics", side_effect=_hang),
         ):
-            await _run_check_all(settings, db_path)
+            await _run_check_all(settings, db_path, owner)
 
         assert not await _checking_state.is_checking_all()
 
@@ -265,12 +260,13 @@ class TestRunCheckAllTimeout:
 
         settings = _make_settings()
 
+        owner = _checking_state.start_check_all()
         with patch(
             "app.web.routers.background.check_all_topics",
             new_callable=AsyncMock,
             return_value=[],
         ):
-            await _run_check_all(settings, db_path)
+            await _run_check_all(settings, db_path, owner)
 
         assert not await _checking_state.is_checking_all()
 

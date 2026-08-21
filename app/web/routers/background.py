@@ -11,7 +11,7 @@ from pathlib import Path
 
 from app.checker import check_all_topics, check_topic
 from app.config import Settings
-from app.crud import get_topic, update_topic
+from app.crud import get_topic, update_topic_init_status
 from app.models import TopicStatus
 from app.web.state import _checking_state
 
@@ -21,19 +21,36 @@ _INIT_TIMEOUT_SECONDS = 600  # 10 minutes
 _CHECK_ALL_TIMEOUT_SECONDS = 1800  # 30 minutes
 
 
-async def _run_init(topic_id: int, settings: Settings, db_path: Path | None = None) -> None:
+async def _run_init(
+    topic_id: int,
+    settings: Settings,
+    db_path: Path | None = None,
+    owner: str | None = None,
+    *,
+    claimed: bool = False,
+) -> None:
     """Background task: fetch articles and build initial knowledge state.
 
     Creates its own database connection since the request connection
     is closed by the time this runs. Delegates to initialize_new_topic()
     for the actual init logic.
+
+    ``owner`` is the in-flight guard token the enqueueing handler already holds:
+    the Retry handler takes ownership *before* it commits RESEARCHING, so a live
+    check of the same topic makes it refuse visibly instead of leaving this task
+    to discover the busy slot and exit silently, stranding the topic in
+    RESEARCHING (AUG-137). Without a token this task takes the guard itself.
+    ``claimed`` says the caller already made the durable RESEARCHING claim.
     """
-    from app.checker import initialize_new_topic
+    from app.checker import TopicInitRefused, initialize_new_topic
     from app.database import get_db
 
-    if not await _checking_state.start_check(topic_id):
-        logger.info("Init background task: topic %d already being initialized, skipping", topic_id)
-        return
+    held = owner
+    if held is None:
+        held = await _checking_state.start_check(topic_id)
+        if held is None:
+            logger.info("Init background task: topic %d already being initialized, skipping", topic_id)
+            return
 
     try:
         with get_db(db_path) as conn:
@@ -44,23 +61,36 @@ async def _run_init(topic_id: int, settings: Settings, db_path: Path | None = No
 
         try:
             await asyncio.wait_for(
-                initialize_new_topic(topic, settings, db_path=db_path),
+                initialize_new_topic(topic, settings, db_path=db_path, claimed=claimed),
                 timeout=_INIT_TIMEOUT_SECONDS,
             )
+        except TopicInitRefused as exc:
+            logger.info("Init background task: %s", exc)
         except TimeoutError:
             logger.error(
                 "Init timed out for topic '%s' after %d seconds",
                 topic.name,
                 _INIT_TIMEOUT_SECONDS,
             )
-            topic.status = TopicStatus.ERROR
-            topic.status_changed_at = datetime.now(UTC)
-            topic.error_message = "Research timed out. Click Retry."
+            # ``wait_for`` cancelled the initializer, which hands its claim back on
+            # the way out — so the row is already ERROR here and this write only
+            # replaces the generic interruption message with the specific reason.
+            # Fencing it to ERROR is what keeps it off a topic somebody has since
+            # re-claimed (AUG-139), and a targeted write means it cannot restore
+            # name/feeds/thresholds the user edited while the init ran (AUG-022).
             with get_db(db_path) as conn:
-                update_topic(conn, topic)
+                update_topic_init_status(
+                    conn,
+                    topic_id,
+                    status=TopicStatus.ERROR,
+                    status_changed_at=datetime.now(UTC),
+                    error_message="Research timed out. Click Retry.",
+                    init_attempts=topic.init_attempts,
+                    expected_status=TopicStatus.ERROR,
+                )
                 conn.commit()
     finally:
-        await _checking_state.finish_check(topic_id)
+        await _checking_state.finish_check(topic_id, held)
 
 
 async def _run_single_check(topic_id: int, settings: Settings, db_path: Path | None = None) -> None:
@@ -75,7 +105,8 @@ async def _run_single_check(topic_id: int, settings: Settings, db_path: Path | N
     """
     from app.database import get_db
 
-    if not await _checking_state.start_check(topic_id):
+    owner = await _checking_state.start_check(topic_id)
+    if owner is None:
         logger.info("Single check: topic %d already being checked; skipping", topic_id)
         return
 
@@ -87,15 +118,16 @@ async def _run_single_check(topic_id: int, settings: Settings, db_path: Path | N
     except Exception:
         logger.error("Background check failed for topic %d", topic_id, exc_info=True)
     finally:
-        await _checking_state.finish_check(topic_id)
+        await _checking_state.finish_check(topic_id, owner)
 
 
-async def _run_check_all(settings: Settings, db_path: Path | None = None) -> None:
+async def _run_check_all(settings: Settings, db_path: Path | None = None, owner: str | None = None) -> None:
     """Background task: check all topics for new information.
 
     The web ``/check-all`` handler acquires the whole-cycle ``start_check_all``
     gate synchronously to decide whether to enqueue, so this task runs the cycle
-    with ``guard=False`` and releases the gate in ``finally`` (OVH-034).
+    with ``guard=False`` and releases the gate — with the handler's owner token —
+    in ``finally`` (OVH-034/AUG-264).
     """
     try:
         try:
@@ -105,4 +137,5 @@ async def _run_check_all(settings: Settings, db_path: Path | None = None) -> Non
     except Exception:
         logger.error("Check all background task failed", exc_info=True)
     finally:
-        await _checking_state.finish_check_all()
+        if owner is not None:
+            _checking_state.finish_check_all(owner)

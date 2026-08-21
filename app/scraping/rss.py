@@ -282,9 +282,36 @@ def _is_wrong_media_type_only(parsed: object, bozo_exc: object) -> bool:
     return bool(isinstance(bozo_exc, feedparser.NonXMLContentType) and getattr(parsed, "version", ""))
 
 
+_PUBLISHER_SUFFIX_SEPARATOR = " - "
+"""How an aggregator joins the publisher's name onto a syndicated headline."""
+
+
+def _strip_publisher_suffix(title: str, raw_entry: dict) -> str:
+    """Remove the ``" - Publisher"`` an aggregator appends to a syndicated headline.
+
+    Google News RSS declares the originating publisher in the entry's ``<source>``
+    element and repeats it on the end of the title; Bing hands over the bare
+    headline. The story key includes the title, so the same story arriving from
+    the two default providers had two identities — stored twice, fetched twice
+    and analysed twice at every provider changeover (AUG-180).
+
+    Only the exact suffix the entry itself declares is removed, so a headline that
+    merely contains a dash keeps it, and a headline that is nothing but the
+    publisher's name is left alone rather than emptied.
+    """
+    source = raw_entry.get("source")
+    publisher = source.get("title", "").strip() if isinstance(source, dict) else ""
+    if not publisher:
+        return title
+    suffix = f"{_PUBLISHER_SUFFIX_SEPARATOR}{publisher}"
+    if not title.endswith(suffix):
+        return title
+    return title[: -len(suffix)].strip() or title
+
+
 def _parse_entry(raw_entry: dict, source_feed: str) -> FeedEntry | None:
     """Convert a feedparser entry dict to a FeedEntry, or None if invalid."""
-    title = raw_entry.get("title", "").strip()
+    title = _strip_publisher_suffix(raw_entry.get("title", "").strip(), raw_entry)
     url = raw_entry.get("link", "").strip()
     if not title or not url:
         return None

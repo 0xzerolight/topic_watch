@@ -1,5 +1,6 @@
 """Tests for the CLI module: commands and error handling."""
 
+import asyncio
 import sqlite3
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -9,6 +10,7 @@ import pytest
 from app.cli import _cmd_check, _cmd_check_all, _cmd_doctor, _cmd_init, _cmd_list
 from app.config import LLMSettings, NotificationSettings, Settings
 from app.crud import (
+    claim_new_topic_for_init,
     create_topic,
     get_topic,
     get_topic_by_name,
@@ -44,6 +46,16 @@ def _real_db(tmp_path: Path) -> Path:
     db_path = tmp_path / "cli.db"
     init_db(db_path)
     return db_path
+
+
+def _monitoring_topic(conn: sqlite3.Connection, feed_urls: list[str], name: str = "Monitored") -> Topic:
+    """A topic that currently owns these feed URLs, so their health rows are live."""
+    topic = create_topic(
+        conn,
+        Topic(name=name, description="d", feed_mode=FeedMode.MANUAL, feed_urls=feed_urls),
+    )
+    conn.commit()
+    return topic
 
 
 class TestCmdDoctor:
@@ -119,14 +131,34 @@ class TestCmdDoctor:
         assert "ollama.internal" in out
 
     def test_failing_feed_url_redacted(self, capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+        url = "https://example.com/feed?key=SECRETTOKEN"
         db_path = _real_db(tmp_path)
         with get_db(db_path) as conn:
-            upsert_feed_health_failure(conn, "https://example.com/feed?key=SECRETTOKEN", "boom")
-            upsert_feed_health_failure(conn, "https://example.com/feed?key=SECRETTOKEN", "boom")
+            _monitoring_topic(conn, [url])
+            upsert_feed_health_failure(conn, url, "boom")
+            upsert_feed_health_failure(conn, url, "boom")
         out = self._run(_make_settings(db_path=str(db_path)), capsys)
         assert "SECRETTOKEN" not in out
         assert "feeds: 0 OK / 1 failing" in out
         assert "(x2)" in out
+
+    def test_feeds_no_topic_monitors_are_reported_separately(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        """AUG-148: a removed source must not read as a live failing feed.
+
+        feed_health has no topic column, so removing a manual feed or deleting the
+        last topic using it left the row behind and doctor kept reporting it as a
+        source that is failing right now.
+        """
+        db_path = _real_db(tmp_path)
+        with get_db(db_path) as conn:
+            _monitoring_topic(conn, ["https://live.example/feed"])
+            upsert_feed_health_failure(conn, "https://live.example/feed", "boom")
+            upsert_feed_health_failure(conn, "https://removed.example/feed", "boom")
+        out = self._run(_make_settings(db_path=str(db_path)), capsys)
+        assert "feeds: 0 OK / 1 failing (1 no longer monitored)" in out
+        assert "removed.example" not in out
 
     def test_malformed_notification_url_does_not_crash_doctor(self, capsys: pytest.CaptureFixture[str]) -> None:
         """AUG-328: one unparseable entry must not defeat the whole report."""
@@ -145,9 +177,11 @@ class TestCmdDoctor:
 
         db_path = _real_db(tmp_path)
         total = _MAX_LISTED_ITEMS + 5
+        urls = [f"https://example.com/feed{i}" for i in range(total)]
         with get_db(db_path) as conn:
-            for i in range(total):
-                upsert_feed_health_failure(conn, f"https://example.com/feed{i}", "boom")
+            _monitoring_topic(conn, urls)
+            for url in urls:
+                upsert_feed_health_failure(conn, url, "boom")
         out = self._run(_make_settings(db_path=str(db_path)), capsys)
         assert f"feeds: 0 OK / {total} failing" in out
         assert out.count("    failing: ") == _MAX_LISTED_ITEMS
@@ -188,6 +222,7 @@ class TestCmdDoctor:
             create_topic(conn, Topic(name="A", description="d", status=TopicStatus.READY))
             create_topic(conn, Topic(name="B", description="d", status=TopicStatus.READY))
             create_topic(conn, Topic(name="C", description="d", status=TopicStatus.ERROR))
+            _monitoring_topic(conn, ["https://ok.example/feed", "https://bad.example/feed"], name="D")
             upsert_feed_health_success(conn, "https://ok.example/feed")
             upsert_feed_health_failure(conn, "https://bad.example/feed", "boom")
         out = self._run(_make_settings(db_path=str(db_path)), capsys)
@@ -860,6 +895,91 @@ class TestCmdInitResearchingClaim:
 
         # Bailed before any fetch/LLM work was attempted.
         fetch_mock.assert_not_called()
+
+    async def test_ctrl_c_restores_the_prior_status(self, tmp_path: Path) -> None:
+        """AUG-243: cancellation hands the RESEARCHING claim back before propagating.
+
+        Ctrl-C raises ``CancelledError``, which is not an ``Exception`` and so
+        walked past every terminal handler, leaving the committed claim behind.
+        Offline there is nothing to recover it: the next CLI init would refuse the
+        topic until the server was started.
+        """
+        db_path = _real_db(tmp_path)
+        with get_db(db_path) as setup:
+            create_topic(setup, Topic(name="Interrupted", description="d", status=TopicStatus.NEW))
+
+        observed: dict[str, TopicStatus] = {}
+
+        async def _interrupt(*args, **kwargs):
+            # Prove the claim was really committed before the interrupt lands.
+            other = get_connection(db_path)
+            try:
+                observed["status"] = get_topic_by_name(other, "Interrupted").status
+            finally:
+                other.close()
+            raise asyncio.CancelledError()
+
+        with (
+            patch("app.cli.load_settings", return_value=_make_settings(db_path=str(db_path))),
+            patch("app.cli.init_db"),
+            patch("app.checker.fetch_new_articles_for_topic", new=_interrupt),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await _cmd_init("Interrupted")
+
+        assert observed["status"] == TopicStatus.RESEARCHING
+        with get_db(db_path) as check:
+            after = get_topic_by_name(check, "Interrupted")
+        assert after.status == TopicStatus.NEW
+        assert after.error_message is None
+
+    async def test_ctrl_c_during_reinit_restores_ready(self, tmp_path: Path) -> None:
+        """A cancelled re-init leaves the topic READY on its existing knowledge."""
+        db_path = _real_db(tmp_path)
+        with get_db(db_path) as setup:
+            create_topic(setup, Topic(name="ReadyInterrupted", description="d", status=TopicStatus.READY))
+
+        async def _interrupt(*args, **kwargs):
+            raise asyncio.CancelledError()
+
+        with (
+            patch("app.cli.load_settings", return_value=_make_settings(db_path=str(db_path))),
+            patch("app.cli.init_db"),
+            patch("app.checker.fetch_new_articles_for_topic", new=_interrupt),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await _cmd_init("ReadyInterrupted")
+
+        with get_db(db_path) as check:
+            after = get_topic_by_name(check, "ReadyInterrupted")
+        assert after.status == TopicStatus.READY
+
+    async def test_second_cli_init_loses_the_claim_and_exits(self, tmp_path: Path, capsys) -> None:
+        """AUG-288: the claim is a conditional UPDATE, not a read-then-write.
+
+        A CLI process that read the topic while it was still NEW, then started its
+        init after another initializer won the claim, must lose at the claim rather
+        than run a second paid initialization.
+        """
+        db_path = _real_db(tmp_path)
+        with get_db(db_path) as setup:
+            topic = create_topic(setup, Topic(name="Contended", description="d", status=TopicStatus.NEW))
+
+        # Another initializer wins the claim between this CLI's read and its own claim.
+        with get_db(db_path) as other:
+            assert claim_new_topic_for_init(other, topic.id) is True
+
+        fetch_mock = AsyncMock(return_value=FetchResult(articles=[], total_feed_entries=0))
+        with (
+            patch("app.cli.load_settings", return_value=_make_settings(db_path=str(db_path))),
+            patch("app.cli.init_db"),
+            patch("app.checker.fetch_new_articles_for_topic", fetch_mock),
+            pytest.raises(SystemExit, match="1"),
+        ):
+            await _cmd_init("Contended")
+
+        fetch_mock.assert_not_called()
+        assert "Cannot initialize" in capsys.readouterr().out
 
 
 class TestCmdLogging:

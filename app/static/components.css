@@ -267,6 +267,20 @@ a.chip:hover { background: var(--app-surface-sunken); }
   color: var(--app-bad);
 }
 
+/* Standalone source-outage callout (AUG-106): unlike .row-error (a clamped
+   table-cell fragment), this is a full block with no line-clamp, so the
+   trailing repair link can never be cut off on a narrow layout. */
+.source-warning {
+  background: var(--app-bad-tint);
+  border: 1px solid var(--app-bad);
+  border-radius: var(--app-radius);
+  padding: var(--app-3) var(--app-4);
+  margin-bottom: var(--app-4);
+}
+.source-warning p {
+  margin: var(--app-1) 0 0;
+}
+
 /* JS-free responsive collapse to cards */
 @media (max-width: 768px) {
   .data-table thead { display: none; }

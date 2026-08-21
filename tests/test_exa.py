@@ -156,9 +156,47 @@ class TestFetchExaEntries:
         assert resp.entries == []
         assert resp.feeds_total == 1 and resp.feeds_failed == 0
 
+    async def test_a_batch_with_no_usable_result_is_a_failure(self) -> None:
+        """AUG-307: rows that all fail to map are a protocol failure, not quiet news.
+
+        Recorded as success it reset the source's failure state and told the
+        silence heartbeat this was a healthy empty check, while monitoring
+        received nothing at all.
+        """
+        recorder = _Recorder()
+        transport = _exa_response([{"title": "no url"}, "not-a-dict"])
+        async with httpx.AsyncClient(transport=transport) as client:
+            resp = await fetch_exa_entries(
+                _EXA_TOPIC, _ENABLED, max_results=5, timeout=5.0, client=client, health_callback=recorder
+            )
+        assert resp.entries == []
+        assert resp.feeds_total == 1 and resp.feeds_failed == 1
+        assert [c.status for c in recorder.calls] == [FetchStatus.FAILED]
+
+    async def test_a_malformed_envelope_is_one_failed_fetch(self) -> None:
+        """AUG-174: schema drift is recorded, never raised out of a never-raises call.
+
+        ``results: null`` used to raise during iteration and take the whole check
+        down; a non-object envelope or a non-list ``results`` was accepted and
+        cleared the source's failure state with no articles to show for it.
+        """
+        for payload in ({"results": None}, ["not", "an", "object"], {"results": "rows"}, {"results": {"a": 1}}):
+            recorder = _Recorder()
+
+            def handler(request: httpx.Request, body: object = payload) -> httpx.Response:
+                return httpx.Response(200, json=body)
+
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                resp = await fetch_exa_entries(
+                    _EXA_TOPIC, _ENABLED, max_results=5, timeout=5.0, client=client, health_callback=recorder
+                )
+            assert resp.entries == [], payload
+            assert resp.feeds_failed == 1, payload
+            assert [c.status for c in recorder.calls] == [FetchStatus.FAILED], payload
+
     async def test_date_mix_flows_through_select_candidates(self) -> None:
         """Mixed publishedDate shapes all normalize so recency sort never raises (load-bearing)."""
-        from app.scraping import _select_candidates
+        from app.scraping import _prepare_entries, _select_candidates
 
         transport = _exa_response(
             [
@@ -171,13 +209,16 @@ class TestFetchExaEntries:
         async with httpx.AsyncClient(transport=transport) as client:
             resp = await fetch_exa_entries(_EXA_TOPIC, _ENABLED, max_results=10, timeout=5.0, client=client)
         assert len(resp.entries) == 4
-        new_entries = [(e, compute_article_hash(e.url, e.title)) for e in resp.entries]
+        prepared = _prepare_entries(resp.entries)
+        new_entries = [(e, compute_article_hash(e.url, e.title)) for e in prepared]
         reuse_batch, fetch_batch = _select_candidates(new_entries, [], 10)  # must not raise
         urls = [e.url for e, _ in fetch_batch]
-        # An undated entry ranks at retrieval time rather than at year 1 (AUG-184),
-        # so it leads; among dated ones the full-Z 2024 entry sorts ahead of 2023.
-        assert urls[0] == "https://x.com/3"
+        # The full-Z 2024 entry is the newest dated one, so it leads; the two
+        # undated entries take the date of the entry they follow (AUG-184), which
+        # keeps them beside it and ahead of the 2023 one.
+        assert urls[0] == "https://x.com/2"
         assert urls.index("https://x.com/2") < urls.index("https://x.com/1")
+        assert urls.index("https://x.com/3") < urls.index("https://x.com/1")
 
     async def test_not_enabled_makes_no_request(self) -> None:
         calls: list[str] = []

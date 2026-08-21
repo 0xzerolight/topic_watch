@@ -374,3 +374,98 @@ class TestSchedulerHasRecoverJob:
             assert job.trigger.interval.total_seconds() == 300  # 5 * 60
         finally:
             stop_scheduler()
+
+
+class TestRecoveryStatusMetadata:
+    """AUG-158: recovery moves status_changed_at with the status it writes."""
+
+    def test_periodic_recovery_stamps_status_changed_at(self, db_conn: sqlite3.Connection) -> None:
+        """A recovered topic reports when it entered ERROR, not when research began."""
+        created = create_topic(db_conn, _make_topic("Stale Stamp"))
+        db_conn.commit()
+        started = datetime.now(UTC) - timedelta(minutes=20)
+        _set_status_changed_at(db_conn, created.id, started)
+
+        assert recover_stuck_researching(db_conn, timeout_minutes=15) == 1
+        db_conn.commit()
+
+        refreshed = get_topic(db_conn, created.id)
+        assert refreshed.status == TopicStatus.ERROR
+        assert refreshed.status_changed_at > started
+
+    def test_startup_recovery_stamps_status_changed_at(self, db_conn: sqlite3.Connection) -> None:
+        """The startup sweep stamps the transition too (same column, same meaning)."""
+        from app.crud import recover_stuck_topics
+
+        created = create_topic(db_conn, _make_topic("Restart Stamp"))
+        db_conn.commit()
+        started = datetime.now(UTC) - timedelta(hours=3)
+        _set_status_changed_at(db_conn, created.id, started)
+
+        assert recover_stuck_topics(db_conn) == 1
+        db_conn.commit()
+
+        refreshed = get_topic(db_conn, created.id)
+        assert refreshed.status == TopicStatus.ERROR
+        assert refreshed.status_changed_at > started
+
+
+class TestRecoveryFencesLiveInitializers:
+    """AUG-139: a recovered topic cannot be re-written by the init it gave up on."""
+
+    def test_zombie_init_cannot_overwrite_recovery_error(self, db_conn: sqlite3.Connection) -> None:
+        """The abandoned initializer's terminal write matches no row once recovery wins."""
+        from app.crud import update_topic_init_status
+
+        created = create_topic(db_conn, _make_topic("Zombie"))
+        db_conn.commit()
+        _set_status_changed_at(db_conn, created.id, datetime.now(UTC) - timedelta(minutes=20))
+
+        assert recover_stuck_researching(db_conn, timeout_minutes=15) == 1
+        db_conn.commit()
+
+        # The still-running initializer finally comes back and tries to land READY.
+        won = update_topic_init_status(
+            db_conn,
+            created.id,
+            status=TopicStatus.READY,
+            status_changed_at=datetime.now(UTC),
+            error_message=None,
+            init_attempts=0,
+            expected_status=TopicStatus.RESEARCHING,
+        )
+        db_conn.commit()
+
+        assert won is False
+        refreshed = get_topic(db_conn, created.id)
+        assert refreshed.status == TopicStatus.ERROR
+        assert refreshed.error_message == "Research timed out (stuck detection). Click Retry."
+
+    def test_generation_fence_rejects_a_recycled_row_id(self, db_conn: sqlite3.Connection) -> None:
+        """A replacement topic that reused the rowid never takes the old init's write."""
+        from app.crud import delete_topic, update_topic_init_status
+
+        created = create_topic(db_conn, _make_topic("Original"))
+        db_conn.commit()
+        stale_generation = created.generation
+
+        delete_topic(db_conn, created.id)
+        db_conn.commit()
+        replacement = create_topic(db_conn, _make_topic("Replacement"))
+        db_conn.commit()
+        assert replacement.id == created.id
+        assert replacement.generation != stale_generation
+
+        won = update_topic_init_status(
+            db_conn,
+            created.id,
+            status=TopicStatus.READY,
+            status_changed_at=datetime.now(UTC),
+            error_message=None,
+            init_attempts=0,
+            generation=stale_generation,
+        )
+        db_conn.commit()
+
+        assert won is False
+        assert get_topic(db_conn, replacement.id).status == TopicStatus.RESEARCHING

@@ -12,38 +12,14 @@ from app.config import Settings
 from app.crud import list_all_feed_health, list_topics
 from app.feed_backoff import feed_backoff_until
 from app.models import FeedHealth, FeedMode, Topic
-from app.scraping.routing import router as provider_router
+from app.scraping.exa import exa_search_endpoint
+from app.scraping.routing import topic_owned_feed_urls
 from app.web.csrf import verify_csrf
 from app.web.dependencies import get_db_conn, get_settings
 from app.web.routers.templates import templates
 from app.web.state import _check_rate_limit
 
 router = APIRouter()
-
-# Mirrors app.scraping.exa's own fallback. Kept as a local literal rather than
-# importing that module's private constant — Exa's shared search endpoint is
-# what every EXA-mode topic's feed_health row is keyed on.
-_EXA_DEFAULT_BASE_URL = "https://api.exa.ai"
-
-
-def _exa_endpoint(settings: Settings) -> str:
-    """The endpoint every EXA-mode topic's health is recorded under."""
-    base = (settings.exa.base_url or _EXA_DEFAULT_BASE_URL).rstrip("/")
-    return f"{base}/search"
-
-
-def _topic_owned_urls(topic: Topic, exa_endpoint: str) -> list[str]:
-    """URLs a topic currently resolves to (mirrors topics._feed_source_context).
-
-    AUTO topics own every provider URL, not just the currently-active one, so a
-    standby provider's health still traces back to its topic. EXA topics all
-    share one endpoint. MANUAL topics own their configured list.
-    """
-    if topic.feed_mode == FeedMode.AUTO:
-        return [p.build_feed_url(topic) for p in provider_router.providers]
-    if topic.feed_mode == FeedMode.EXA:
-        return [exa_endpoint]
-    return list(topic.feed_urls)
 
 
 @dataclass
@@ -67,7 +43,7 @@ class FeedHealthRow:
 def _build_feed_health_rows(feeds: list[FeedHealth], topics: list[Topic], exa_endpoint: str) -> list[FeedHealthRow]:
     owners_by_url: dict[str, list[Topic]] = {}
     for topic in topics:
-        for url in _topic_owned_urls(topic, exa_endpoint):
+        for url in topic_owned_feed_urls(topic, exa_endpoint):
             owners_by_url.setdefault(url, []).append(topic)
 
     rows = []
@@ -76,6 +52,18 @@ def _build_feed_health_rows(feeds: list[FeedHealth], topics: list[Topic], exa_en
         is_exa = feed.feed_url == exa_endpoint or any(t.feed_mode == FeedMode.EXA for t in owners)
         rows.append(FeedHealthRow(feed=feed, is_exa=is_exa, owners=owners))
     return rows
+
+
+def _format_backoff_label(until: datetime, now: datetime) -> str:
+    """Format a retry ETA, minutes below two hours and hours thereafter (AUG-123).
+
+    The default first backoff is 15 minutes; rounding straight to hours and
+    clamping to a minimum of one made every sub-hour retry read as "~1h".
+    """
+    minutes = max(1, round((until - now).total_seconds() / 60))
+    if minutes < 120:
+        return f"next retry ~{minutes}m"
+    return f"next retry ~{round(minutes / 60)}h"
 
 
 @router.get("/feeds", response_class=HTMLResponse)
@@ -87,19 +75,26 @@ async def feed_health_page(
     """Global feed health dashboard: per-source health with owning-topic links."""
     feeds = list_all_feed_health(conn)
     topics = list_topics(conn)
-    rows = _build_feed_health_rows(feeds, topics, _exa_endpoint(settings))
+    rows = _build_feed_health_rows(feeds, topics, exa_search_endpoint(settings.exa))
+
+    # AUG-213: feed_backoff_until() is a MANUAL-feed-only formula (its own module
+    # docstring says so) — AUTO uses separate provider cooldown state and EXA is
+    # attempted without this backoff, so applying it to every row could label an
+    # AUTO/EXA source as "backing off" until a time the runtime never honors.
+    manual_urls = {url for topic in topics if topic.feed_mode == FeedMode.MANUAL for url in topic.feed_urls}
 
     now = datetime.now(UTC)
     backoff_map: dict[str, str] = {}
     for feed in feeds:
+        if feed.feed_url not in manual_urls:
+            continue
         until = feed_backoff_until(
             feed,
             base_minutes=settings.feed_backoff_base_minutes,
             cap_hours=settings.feed_backoff_cap_hours,
         )
         if until is not None and until > now:
-            hours = max(1, round((until - now).total_seconds() / 3600))
-            backoff_map[feed.feed_url] = f"next retry ~{hours}h"
+            backoff_map[feed.feed_url] = _format_backoff_label(until, now)
     return templates.TemplateResponse(
         request,
         "feed_health.html",

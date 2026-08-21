@@ -704,6 +704,21 @@ class TestKnowledgeHistoryUI:
         assert f'hx-get="/topics/{topic.id}/knowledge-diff/{revision.id}"' in response.text
         assert 'hx-trigger="toggle once from:closest details"' in response.text
 
+    async def test_timeline_ships_a_durable_retry(self, client, db_conn: sqlite3.Connection) -> None:
+        """AUG-233: ``toggle once`` is consumed the instant the request goes out,
+        win or lose (vendored HTMX 2.0.4 does not reset it on failure), so a
+        failed first load could never be retried by closing/reopening the
+        disclosure. A retry button independent of that trigger must ship."""
+        topic = _seed_topic(db_conn, "Retry Wiring Topic")
+        revision = _seed_revision(db_conn, topic.id, "Only.")
+
+        response = await client.get(f"/topics/{topic.id}")
+        assert "hx-on:htmx:response-error" in response.text
+        assert "hx-on:htmx:send-error" in response.text
+        assert f'hx-get="/topics/{topic.id}/knowledge-diff/{revision.id}"' in response.text
+        assert 'hx-target="closest .rev-body"' in response.text
+        assert "Retry" in response.text
+
     async def test_timeline_does_not_ship_summaries(self, client, db_conn: sqlite3.Connection) -> None:
         topic = _seed_topic(db_conn, "Light Topic")
         _seed_revision(db_conn, topic.id, "SECRET-SUMMARY-BODY")

@@ -190,6 +190,98 @@ class TestReinitTopic:
         assert mock_run_init is not None  # mock was set up without error
 
 
+class TestReinitOwnership:
+    """AUG-137: ownership is decided before the status changes, and refusals are visible."""
+
+    async def test_busy_topic_refuses_instead_of_losing_the_init(
+        self,
+        client: httpx.AsyncClient,
+        db_conn: sqlite3.Connection,
+    ) -> None:
+        """A live check of the same topic makes Retry refuse, not strand RESEARCHING.
+
+        The handler used to commit RESEARCHING and then queue a task that tried to
+        take the in-flight guard; the check already held it, so the task exited
+        silently and the topic sat in RESEARCHING until stuck recovery called it an
+        error.
+        """
+        from app.web.state import _checking_state
+
+        topic = _make_topic(db_conn, status=TopicStatus.ERROR, error_message="boom")
+
+        owner = await _checking_state.start_check(topic.id)
+        assert owner is not None
+        try:
+            with patch("app.web.routers.background._run_init", new_callable=AsyncMock) as mock_init:
+                response = await client.post(f"/topics/{topic.id}/init", follow_redirects=False)
+        finally:
+            await _checking_state.finish_check(topic.id, owner)
+
+        assert response.status_code == 409
+        mock_init.assert_not_called()
+        unchanged = get_topic(db_conn, topic.id)
+        assert unchanged.status == TopicStatus.ERROR
+        assert unchanged.error_message == "boom"
+
+    async def test_paused_topic_refuses(
+        self,
+        client: httpx.AsyncClient,
+        db_conn: sqlite3.Connection,
+    ) -> None:
+        """A paused topic is not re-initialized behind the user's back (AUG-140)."""
+        topic = _make_topic(db_conn, status=TopicStatus.ERROR, is_active=False)
+
+        with patch("app.web.routers.background._run_init", new_callable=AsyncMock) as mock_init:
+            response = await client.post(f"/topics/{topic.id}/init", follow_redirects=False)
+
+        assert response.status_code == 409
+        mock_init.assert_not_called()
+        assert get_topic(db_conn, topic.id).status == TopicStatus.ERROR
+
+    async def test_accepted_retry_hands_the_guard_to_the_task(
+        self,
+        client: httpx.AsyncClient,
+        db_conn: sqlite3.Connection,
+    ) -> None:
+        """The handler holds the guard across the response and passes its token on."""
+        from app.web.state import _checking_state
+
+        topic = _make_topic(db_conn, status=TopicStatus.ERROR)
+
+        with patch("app.web.routers.background._run_init", new_callable=AsyncMock) as mock_init:
+            response = await client.post(f"/topics/{topic.id}/init", follow_redirects=False)
+
+        assert response.status_code == 303
+        # BackgroundTasks ran the (mocked) task, which never released the guard —
+        # so the token the handler acquired is what it was handed.
+        args, kwargs = mock_init.call_args
+        assert args[0] == topic.id
+        assert isinstance(args[3], str) and args[3]
+        assert kwargs == {"claimed": True}
+        assert await _checking_state.is_checking(topic.id) is True
+        await _checking_state.finish_check(topic.id, args[3])
+
+    async def test_lost_claim_releases_the_guard(
+        self,
+        client: httpx.AsyncClient,
+        db_conn: sqlite3.Connection,
+    ) -> None:
+        """Losing the durable claim must not leave the in-process slot wedged."""
+        from app.web.state import _checking_state
+
+        topic = _make_topic(db_conn, status=TopicStatus.ERROR)
+
+        with (
+            patch("app.web.routers.topics.claim_topic_for_init", return_value=False),
+            patch("app.web.routers.background._run_init", new_callable=AsyncMock) as mock_init,
+        ):
+            response = await client.post(f"/topics/{topic.id}/init", follow_redirects=False)
+
+        assert response.status_code == 409
+        mock_init.assert_not_called()
+        assert await _checking_state.is_checking(topic.id) is False
+
+
 class TestRetryResearchUI:
     """Tests that the Retry Research button appears in the correct UI contexts."""
 

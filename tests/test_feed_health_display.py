@@ -147,8 +147,11 @@ class TestFeedHealthPage:
     async def test_feed_health_page_shows_backing_off(
         self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
     ) -> None:
-        """A persistently-failing feed shows a 'Backing off' note alongside its status."""
+        """A persistently-failing MANUAL feed shows a 'Backing off' note alongside its status."""
         url = "https://dead.example.com/feed.xml"
+        # AUG-213: the backoff formula only applies to URLs a MANUAL topic owns —
+        # needs an owning topic, not just a bare feed_health row.
+        _make_topic(db_conn, name="Dead Feed Owner", feed_urls=[url])
         for _ in range(10):
             upsert_feed_health_failure(db_conn, url, "boom")
         db_conn.commit()
@@ -158,6 +161,39 @@ class TestFeedHealthPage:
         assert "Backing off" in response.text
         # Status label is preserved (additive badge), not replaced.
         assert "Unhealthy" in response.text
+
+    async def test_auto_mode_feed_never_shows_backing_off(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-213: AUTO uses its own provider cooldown, not the MANUAL backoff formula."""
+        from app.scraping.routing import router as provider_router
+
+        topic = _make_topic(db_conn, name="Auto Dead", feed_mode=FeedMode.AUTO, feed_urls=[])
+        auto_url = provider_router.get_provider().build_feed_url(topic)
+        for _ in range(10):
+            upsert_feed_health_failure(db_conn, auto_url, "boom")
+        db_conn.commit()
+
+        response = await client.get("/feeds")
+        assert response.status_code == 200
+        assert "Unhealthy" in response.text
+        assert "Backing off" not in response.text
+
+    async def test_sub_hour_retry_shows_minutes_not_an_hour(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-123: the default 15-minute first backoff must not round up to '~1h'."""
+        url = "https://flaky-backoff.example.com/feed.xml"
+        _make_topic(db_conn, name="Flaky Backoff Owner", feed_urls=[url])
+        # threshold=3: exactly 3 consecutive failures triggers the base 15-minute delay.
+        for _ in range(3):
+            upsert_feed_health_failure(db_conn, url, "boom")
+        db_conn.commit()
+
+        response = await client.get("/feeds")
+        assert response.status_code == 200
+        assert "next retry ~1h" not in response.text
+        assert "next retry ~15m" in response.text
 
 
 class TestFeedHealthOwnership:

@@ -284,10 +284,24 @@ class TestCollapseDuplicateEntries:
         assert [e.url for e in collapsed] == ["https://e.example/1", "https://e.example/2"]
         assert collapsed[0].summary == "text"
 
-    def test_ties_keep_the_first_copy(self) -> None:
+    def test_ties_between_copies_of_one_story_keep_the_first(self) -> None:
+        """Only a genuine tie — same URL AND same headline — is decided by order."""
         first = self._entry("https://e.example/1", summary="one")
         second = self._entry("https://e.example/1", summary="two")
         assert collapse_duplicate_entries([first, second])[0].summary == "one"
+
+    def test_a_retitled_correction_at_one_url_is_not_a_duplicate(self) -> None:
+        """AUG-322: a URL tie between different headlines is not a tie at all.
+
+        Keying the merge on the URL alone let feed order decide which headline
+        survived, so a correction republished at the story's own URL was thrown
+        away before dedup, extraction or analysis could see it — the user never
+        heard about it.
+        """
+        claim = self._entry("https://e.example/1", title="Minister denies claim")
+        correction = self._entry("https://e.example/1", title="CORRECTION: Minister confirms claim")
+        kept = collapse_duplicate_entries([claim, correction])
+        assert [e.title for e in kept] == ["Minister denies claim", "CORRECTION: Minister confirms claim"]
 
 
 # ============================================================
@@ -396,6 +410,45 @@ class TestParseEntry:
         entry = _parse_entry(raw, "https://reddit.com/feed")
         assert entry is not None
         assert entry.updated == datetime(2025, 1, 3, 10, 0, tzinfo=UTC)
+
+    def test_the_publisher_suffix_is_stripped_from_an_aggregator_title(self) -> None:
+        """AUG-180: Google appends ' - Publisher'; Bing hands over the bare headline.
+
+        The suffix is the aggregator's annotation, not part of the headline, so
+        leaving it on gave the two default providers different story keys for one
+        story — stored, fetched and analysed twice at every changeover.
+        """
+        raw = {
+            "title": "Minister resigns - BBC News",
+            "link": "https://publisher.example/story",
+            "source": {"href": "https://www.bbc.co.uk", "title": "BBC News"},
+        }
+        entry = _parse_entry(raw, "feed")
+        assert entry is not None
+        assert entry.title == "Minister resigns"
+
+    def test_a_headline_without_the_declared_suffix_is_untouched(self) -> None:
+        raw = {
+            "title": "Minister resigns - and takes the whip with him",
+            "link": "https://publisher.example/story",
+            "source": {"title": "BBC News"},
+        }
+        entry = _parse_entry(raw, "feed")
+        assert entry is not None
+        assert entry.title == "Minister resigns - and takes the whip with him"
+
+    def test_a_headline_that_is_only_the_publisher_name_is_kept(self) -> None:
+        """Stripping must never empty a title and discard the entry."""
+        raw = {"title": "BBC News", "link": "https://publisher.example/story", "source": {"title": "BBC News"}}
+        entry = _parse_entry(raw, "feed")
+        assert entry is not None
+        assert entry.title == "BBC News"
+
+    def test_a_feed_declaring_no_source_keeps_its_title(self) -> None:
+        raw = {"title": "Minister resigns - BBC News", "link": "https://publisher.example/story"}
+        entry = _parse_entry(raw, "feed")
+        assert entry is not None
+        assert entry.title == "Minister resigns - BBC News"
 
     def test_missing_title_returns_none(self) -> None:
         raw = {"link": "https://example.com/test"}
@@ -2849,6 +2902,40 @@ class TestStoryDedup:
         assert len(stored) == 1
         assert stored[0].raw_content == "Corrected body"
 
+    async def test_a_clock_skewed_updated_stamp_is_not_a_revision(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """AUG-184/AUG-320: a fast publisher clock must not revise every entry.
+
+        ``published`` was already guarded against an impossible date while
+        ``updated`` was not, so a publisher stamping every entry a few hours ahead
+        of us had all of them read as revisions — permanently bypassing the story
+        rule and re-storing the whole feed on every check.
+        """
+        topic = self._topic(db_conn)
+        self._store_publisher_row(db_conn, topic, "earlier-key")
+
+        entry = FeedEntry(
+            title="The Story",
+            url=self._PUBLISHER,
+            summary="s",
+            source_feed="feed",
+            published=datetime.now(UTC) - timedelta(hours=2),
+            updated=datetime.now(UTC) + timedelta(hours=6),
+        )
+        extract = AsyncMock(return_value="Body")
+        with (
+            patch(
+                "app.scraping.fetch_feeds_for_topic",
+                return_value=FeedResponse(entries=[entry], provider_name="bing_news"),
+            ),
+            patch("app.scraping.extract_article_content", extract),
+        ):
+            stored = (await fetch_new_articles_for_topic(topic, db_path=db_path)).articles
+
+        assert stored == []
+        extract.assert_not_called()
+
     async def test_a_retitled_article_is_a_different_story(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         topic = self._topic(db_conn)
         self._store_publisher_row(db_conn, topic, "earlier-key")
@@ -2918,9 +3005,65 @@ class TestCandidateSelection:
         ]
         stored = await self._store(topic, db_path, entries, max_articles=2)
 
-        # Undated and impossible-dated both rank at retrieval time, in feed order;
-        # the genuinely dated story is an hour old, so it ranks below them.
-        assert sorted(a.url for a in stored) == ["https://e.example/impossible", "https://e.example/undated"]
+        # The impossible date is not evidence of anything, so it ranks below every
+        # dated story. The undated entry takes the date of the dated entry it
+        # follows in feed order, so it stays beside the story it was listed with.
+        assert sorted(a.url for a in stored) == ["https://e.example/recent", "https://e.example/undated"]
+
+    async def test_an_impossible_date_ranks_below_a_dated_story(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """AUG-184: discarding the date must also cost the entry its place.
+
+        Falling back to retrieval time put the bogus entry straight back at the
+        top of the ranking, so at a cap of one it still displaced the real story.
+        """
+        topic = self._topic(db_conn)
+        entries = [
+            FeedEntry(
+                title="Impossible",
+                url="https://e.example/impossible",
+                summary="s",
+                source_feed="feed",
+                published=datetime(2999, 1, 1, tzinfo=UTC),
+            ),
+            FeedEntry(
+                title="Dated",
+                url="https://e.example/dated",
+                summary="s",
+                source_feed="feed",
+                published=datetime.now(UTC) - timedelta(hours=1),
+            ),
+        ]
+        stored = await self._store(topic, db_path, entries, max_articles=1)
+
+        assert [a.url for a in stored] == ["https://e.example/dated"]
+
+    async def test_an_undated_feed_does_not_starve_a_dated_one(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """AUG-184: an undated archive feed must not own the cap every check.
+
+        Ranking every undated entry at retrieval time put a whole dateless feed
+        above genuinely breaking news, which is the failure the missing-date rule
+        was supposed to prevent, in the other direction.
+        """
+        topic = self._topic(db_conn)
+        entries = [
+            FeedEntry(title=f"Archive {i}", url=f"https://e.example/a{i}", summary="s", source_feed="archive")
+            for i in range(3)
+        ] + [
+            FeedEntry(
+                title="Breaking",
+                url="https://e.example/breaking",
+                summary="s",
+                source_feed="news",
+                published=datetime.now(UTC) - timedelta(minutes=5),
+            )
+        ]
+        stored = await self._store(topic, db_path, entries, max_articles=1)
+
+        assert [a.url for a in stored] == ["https://e.example/breaking"]
 
     async def test_an_impossible_date_is_not_stored(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         topic = self._topic(db_conn)

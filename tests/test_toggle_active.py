@@ -266,20 +266,23 @@ class TestToggleActive:
     async def test_toggle_htmx_row_drops_new_info_after_seen(
         self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
     ) -> None:
-        """Once the detail page has been opened (marks the latest check seen), the HTMX
-        row re-render must drop the 'new info' badge. This guards the ``from_row`` render
-        path (``_topic_row_context`` -> ``list_check_results``), distinct from the
-        dashboard's ``from_dashboard_row`` path."""
+        """Once the detail page has been opened and acknowledged, the HTMX row
+        re-render must drop the 'new info' badge. This guards the ``from_row``
+        render path (``_topic_row_context`` -> ``list_check_results``), distinct
+        from the dashboard's ``from_dashboard_row`` path."""
         topic = _make_topic(db_conn, name="Seen-Info Topic", is_active=True)
-        create_check_result(
+        check = create_check_result(
             db_conn,
             CheckResult(topic_id=topic.id, articles_found=2, has_new_info=True),
         )
         db_conn.commit()
 
-        # Open the detail page: marks the latest check seen.
+        # Opening the detail page alone no longer mutates (TW-AUD-024); the page
+        # itself fires the acknowledgement once it has rendered.
         detail = await client.get(f"/topics/{topic.id}")
         assert detail.status_code == 200
+        ack = await client.post(f"/topics/{topic.id}/checks/{check.id}/seen")
+        assert ack.status_code == 204
 
         response = await client.post(
             f"/topics/{topic.id}/toggle-active",

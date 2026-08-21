@@ -7,33 +7,52 @@ where concurrent access is possible.
 """
 
 import asyncio
+import secrets
 import time
 
 # --- In-progress check tracker ---
 
 
+def _new_owner_token() -> str:
+    """Mint an unguessable, never-repeated owner token for one acquisition."""
+    return secrets.token_hex(8)
+
+
 class CheckingState:
-    """Async-safe state tracker for in-progress topic checks."""
+    """Async-safe ownership tracker for in-progress topic checks.
+
+    Each acquisition gets its own token and a release only takes effect when it
+    presents the token that is currently held. Releases used to match on topic id
+    alone, which made ``clear_stale`` an ABA hole: a legitimate check running past
+    the callers' 600-second eviction threshold stayed live, a second owner took
+    the freed slot, and the first owner's release then evicted the *second*
+    owner's guard — letting a third check in alongside it (AUG-264). With tokens,
+    a release from an evicted owner is simply a no-op, so eviction can never hand
+    a live slot away.
+    """
 
     def __init__(self) -> None:
-        self._topics: set[int] = set()
+        self._topics: dict[int, str] = {}
         self._start_times: dict[int, float] = {}
-        self._checking_all: bool = False
+        self._checking_all: str | None = None
         self._lock = asyncio.Lock()
 
-    async def start_check(self, topic_id: int) -> bool:
-        """Mark topic as being checked. Returns False if already checking."""
+    async def start_check(self, topic_id: int) -> str | None:
+        """Claim the per-topic slot. Returns the owner token, or None if busy."""
         async with self._lock:
             if topic_id in self._topics:
-                return False
-            self._topics.add(topic_id)
+                return None
+            token = _new_owner_token()
+            self._topics[topic_id] = token
             self._start_times[topic_id] = time.monotonic()
-            return True
+            return token
 
-    async def finish_check(self, topic_id: int) -> None:
-        """Mark topic check as finished."""
+    async def finish_check(self, topic_id: int, token: str) -> None:
+        """Release the per-topic slot. No-op unless ``token`` still owns it."""
         async with self._lock:
-            self._topics.discard(topic_id)
+            if self._topics.get(topic_id) != token:
+                return
+            del self._topics[topic_id]
             self._start_times.pop(topic_id, None)
 
     async def is_checking(self, topic_id: int) -> bool:
@@ -41,31 +60,39 @@ class CheckingState:
         async with self._lock:
             return topic_id in self._topics
 
-    async def start_check_all(self) -> bool:
-        """Mark check-all as running. Returns False if already running."""
-        async with self._lock:
-            if self._checking_all:
-                return False
-            self._checking_all = True
-            return True
+    def start_check_all(self) -> str | None:
+        """Claim the whole-cycle gate. Returns the owner token, or None if busy.
 
-    async def finish_check_all(self) -> None:
-        """Mark check-all as finished."""
-        async with self._lock:
-            self._checking_all = False
+        Synchronous: this is a single test-and-set over one attribute with no
+        await in between, so the event loop cannot interleave another claim.
+        """
+        if self._checking_all is not None:
+            return None
+        token = _new_owner_token()
+        self._checking_all = token
+        return token
+
+    def finish_check_all(self, token: str) -> None:
+        """Release the whole-cycle gate. No-op unless ``token`` still owns it."""
+        if self._checking_all == token:
+            self._checking_all = None
 
     async def is_checking_all(self) -> bool:
         """Return True if a check-all is currently running."""
-        async with self._lock:
-            return self._checking_all
+        return self._checking_all is not None
 
     async def clear_stale(self, timeout_seconds: float) -> list[int]:
-        """Remove topic entries older than timeout_seconds. Returns cleared IDs."""
+        """Remove topic entries older than timeout_seconds. Returns cleared IDs.
+
+        Safe now that releases are token-checked: evicting a still-running owner
+        costs that owner nothing but its slot, and its later release cannot touch
+        whoever took the slot next.
+        """
         now = time.monotonic()
         async with self._lock:
             stale = [tid for tid, start in self._start_times.items() if now - start > timeout_seconds]
             for tid in stale:
-                self._topics.discard(tid)
+                self._topics.pop(tid, None)
                 self._start_times.pop(tid, None)
         return stale
 

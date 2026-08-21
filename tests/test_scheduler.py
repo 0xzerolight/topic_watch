@@ -449,3 +449,141 @@ class TestInitNewTopics:
             init_mock.assert_not_awaited()
         finally:
             _checking_state._topics.clear()
+
+
+class TestGradualInitRespectsPausedTopics:
+    """AUG-140: automatic initialization never spends on a paused topic."""
+
+    async def test_inactive_new_topic_is_never_initialized(self, tmp_path: Path) -> None:
+        from app.crud import create_topic, get_topic
+        from app.database import get_db, init_db
+        from app.models import Topic, TopicStatus
+        from app.scheduler import _init_new_topics
+
+        db_path = tmp_path / "paused.db"
+        init_db(db_path)
+        with get_db(db_path) as conn:
+            topic = create_topic(
+                conn,
+                Topic(name="Paused", description="d", status=TopicStatus.NEW, is_active=False),
+            )
+            conn.commit()
+
+        init_mock = AsyncMock()
+        with patch("app.scheduler.initialize_new_topic", new=init_mock):
+            await _init_new_topics(_make_settings(), db_path)
+
+        init_mock.assert_not_awaited()
+        with get_db(db_path) as conn:
+            assert get_topic(conn, topic.id).status == TopicStatus.NEW
+
+    async def test_pausing_between_selection_and_claim_stops_the_init(self, tmp_path: Path) -> None:
+        """The claim repeats the is_active filter, so the toggle race is closed too."""
+        from app.crud import claim_new_topic_for_init, create_topic, get_topic
+        from app.database import get_db, init_db
+        from app.models import Topic, TopicStatus
+        from app.scheduler import _init_new_topics
+
+        db_path = tmp_path / "paused_race.db"
+        init_db(db_path)
+        with get_db(db_path) as conn:
+            topic = create_topic(conn, Topic(name="Racy", description="d", status=TopicStatus.NEW))
+            conn.commit()
+
+        def _pause_then_claim(conn, topic_id):
+            # The user hits Disable in the window between selection and claim.
+            conn.execute("UPDATE topics SET is_active = 0 WHERE id = ?", (topic_id,))
+            conn.commit()
+            return claim_new_topic_for_init(conn, topic_id)
+
+        init_mock = AsyncMock()
+        with (
+            patch("app.scheduler.claim_new_topic_for_init", new=_pause_then_claim),
+            patch("app.scheduler.initialize_new_topic", new=init_mock),
+        ):
+            await _init_new_topics(_make_settings(), db_path)
+
+        init_mock.assert_not_awaited()
+        with get_db(db_path) as conn:
+            assert get_topic(conn, topic.id).status == TopicStatus.NEW
+
+
+class TestGradualInitIsBounded:
+    """AUG-139: a scheduler init cannot outlive the stuck-recovery window."""
+
+    async def test_hanging_init_times_out_and_lands_error(self, tmp_path: Path) -> None:
+        from app.crud import create_topic, get_topic
+        from app.database import get_db, init_db
+        from app.models import Topic, TopicStatus
+        from app.scheduler import _init_new_topics
+
+        db_path = tmp_path / "bounded.db"
+        init_db(db_path)
+        with get_db(db_path) as conn:
+            topic = create_topic(conn, Topic(name="Hangs", description="d", status=TopicStatus.NEW))
+            conn.commit()
+
+        async def _hang(*args, **kwargs):
+            import asyncio
+
+            await asyncio.sleep(9999)
+
+        with (
+            patch("app.scheduler._INIT_TIMEOUT_SECONDS", 0.05),
+            patch("app.checker.fetch_new_articles_for_topic", side_effect=_hang),
+        ):
+            await _init_new_topics(_make_settings(), db_path)
+
+        with get_db(db_path) as conn:
+            refreshed = get_topic(conn, topic.id)
+        assert refreshed.status == TopicStatus.ERROR
+        assert refreshed.error_message == "Research timed out. Click Retry."
+
+
+class TestLifespanShutdown:
+    """AUG-265: the scheduler stops however the lifespan context ends."""
+
+    async def _run_lifespan(self, monkeypatch, *, boom: bool) -> list[str]:
+        import pytest
+
+        from app.main import app, lifespan
+
+        calls: list[str] = []
+        monkeypatch.setattr("app.main.load_settings", _make_settings)
+        monkeypatch.setattr("app.main.start_scheduler", lambda *a, **k: calls.append("start"))
+        monkeypatch.setattr("app.main.stop_scheduler", lambda: calls.append("stop"))
+
+        if not boom:
+            async with lifespan(app):
+                pass
+            return calls
+
+        with pytest.raises(RuntimeError, match="serving blew up"):
+            async with lifespan(app):
+                raise RuntimeError("serving blew up")
+        return calls
+
+    async def test_clean_exit_stops_the_scheduler(self, monkeypatch) -> None:
+        assert await self._run_lifespan(monkeypatch, boom=False) == ["start", "stop"]
+
+    async def test_exceptional_exit_still_stops_the_scheduler(self, monkeypatch) -> None:
+        """The exception is thrown in at the yield; cleanup after it never ran."""
+        assert await self._run_lifespan(monkeypatch, boom=True) == ["start", "stop"]
+
+    async def test_cancelled_exit_still_stops_the_scheduler(self, monkeypatch) -> None:
+        import pytest
+
+        from app.main import app, lifespan
+
+        calls: list[str] = []
+        monkeypatch.setattr("app.main.load_settings", _make_settings)
+        monkeypatch.setattr("app.main.start_scheduler", lambda *a, **k: calls.append("start"))
+        monkeypatch.setattr("app.main.stop_scheduler", lambda: calls.append("stop"))
+
+        import asyncio
+
+        with pytest.raises(asyncio.CancelledError):
+            async with lifespan(app):
+                raise asyncio.CancelledError()
+
+        assert calls == ["start", "stop"]
