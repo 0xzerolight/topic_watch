@@ -377,6 +377,36 @@ def list_articles_for_topic(
     return [Article.from_row(row) for row in rows]
 
 
+def list_article_headers_for_topic(
+    conn: sqlite3.Connection,
+    topic_id: int,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[Article]:
+    """List articles for a topic without hydrating ``raw_content`` (AUG-038).
+
+    Topic detail renders only title/url/source/provider/timestamps, but the
+    full-row ``list_articles_for_topic`` (``SELECT *``) hydrates every capped
+    ``raw_content`` body regardless — up to ~1MB of text the page discards
+    immediately at the supported 200-row page size. This is that path's
+    metadata-only counterpart; ``list_articles_for_topic`` stays exclusively for
+    exports and the analysis pipeline, which need the body text. Returned
+    ``Article`` objects carry ``raw_content=None`` (the model's default) — never
+    render it from this path.
+    """
+    query = (
+        "SELECT id, topic_id, title, url, content_hash, source_feed, source_provider, "
+        "published_at, fetched_at, processed, analysis_attempts "
+        "FROM articles WHERE topic_id = ? ORDER BY fetched_at DESC"
+    )
+    params: list = [topic_id]
+    if limit is not None:
+        query += " LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+    rows = conn.execute(query, params).fetchall()
+    return [Article.from_row(row) for row in rows]
+
+
 def count_articles_for_topic(conn: sqlite3.Connection, topic_id: int) -> int:
     """Count total articles for a topic."""
     row = conn.execute("SELECT COUNT(*) FROM articles WHERE topic_id = ?", (topic_id,)).fetchone()

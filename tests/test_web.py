@@ -14,12 +14,15 @@ import pytest
 
 from app.config import ExaSettings, LLMSettings, NotificationSettings, Settings
 from app.crud import (
+    create_article,
     create_check_result,
     create_knowledge_state,
     create_topic,
+    list_article_headers_for_topic,
 )
 from app.main import REQUEST_ID_PATTERN, app
 from app.models import (
+    Article,
     CheckResult,
     FeedMode,
     KnowledgeState,
@@ -1303,6 +1306,53 @@ class TestTopicDetail:
         assert "Retry Research" in response.text
 
 
+class TestArticleHeadersForTopic:
+    """AUG-038: the topic-detail article list stops hydrating raw_content, which
+    the template never renders."""
+
+    def test_raw_content_is_not_hydrated(self, db_conn: sqlite3.Connection) -> None:
+        topic = create_topic(db_conn, Topic(name="Headers Only", description="d"))
+        db_conn.commit()
+        create_article(
+            db_conn,
+            Article(
+                topic_id=topic.id,
+                title="Full Article",
+                url="https://example.com/a",
+                content_hash="hash1",
+                raw_content="x" * 5000,
+                source_feed="https://example.com/feed.xml",
+            ),
+        )
+        db_conn.commit()
+
+        headers = list_article_headers_for_topic(db_conn, topic.id)
+        assert len(headers) == 1
+        assert headers[0].title == "Full Article"
+        assert headers[0].raw_content is None
+
+    async def test_detail_page_never_leaks_raw_content(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        topic = _make_topic(db_conn, name="No Leak Topic")
+        create_article(
+            db_conn,
+            Article(
+                topic_id=topic.id,
+                title="Some Article",
+                url="https://example.com/a",
+                content_hash="hash2",
+                raw_content="SECRET-BODY-TEXT-MARKER",
+                source_feed="https://example.com/feed.xml",
+            ),
+        )
+        db_conn.commit()
+
+        response = await client.get(f"/topics/{topic.id}")
+        assert response.status_code == 200
+        assert "SECRET-BODY-TEXT-MARKER" not in response.text
+
+
 # --- Topic Status (HTMX partial) ---
 
 
@@ -1831,7 +1881,7 @@ class TestCheckNow:
         with (
             patch("app.web.routers.background._run_single_check", new_callable=AsyncMock),
             patch("app.web.routers.topics.count_articles_for_topic", return_value=7) as mock_count,
-            patch("app.web.routers.topics.list_articles_for_topic") as mock_list,
+            patch("app.web.routers.topics.list_article_headers_for_topic") as mock_list,
         ):
             response = await client.post(
                 f"/topics/{topic.id}/check",

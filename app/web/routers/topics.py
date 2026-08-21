@@ -23,7 +23,7 @@ from app.crud import (
     get_previous_knowledge_revision,
     get_topic,
     get_topic_by_name,
-    list_articles_for_topic,
+    list_article_headers_for_topic,
     list_check_results,
     list_knowledge_revision_headers,
     mark_latest_check_seen,
@@ -239,7 +239,9 @@ async def topic_detail(
     revisions = list_knowledge_revision_headers(conn, topic_id, limit=settings.knowledge_revision_limit)
     checks = list_check_results(conn, topic_id, limit=per_page, offset=offset)
     total_prompt_tokens, total_completion_tokens = sum_check_tokens(conn, topic_id)
-    articles = list_articles_for_topic(conn, topic_id, limit=per_page)
+    # AUG-038: metadata only — the template never renders raw_content, so this
+    # path stops hydrating it (list_articles_for_topic stays for exports/analysis).
+    articles = list_article_headers_for_topic(conn, topic_id, limit=per_page)
     article_count = count_articles_for_topic(conn, topic_id)
 
     formatted = format_interval(topic.check_interval_minutes) if topic.check_interval_minutes else ""
