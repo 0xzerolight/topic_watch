@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -13,13 +14,17 @@ from app.checker import check_all_topics, check_topic, retry_pending_notificatio
 from app.config import LLMSettings, NotificationSettings, Settings
 from app.crud import (
     MAX_ANALYSIS_ATTEMPTS,
+    apply_notification_outcome,
+    claim_notification_intent,
     create_article,
     create_knowledge_state,
     create_pending_notification,
     create_topic,
     get_topic,
     list_articles_for_topic,
+    list_due_notification_intents,
     list_pending_notifications,
+    release_stale_notification_claims,
     update_topic,
 )
 from app.models import (
@@ -31,6 +36,7 @@ from app.models import (
     PendingNotification,
     Topic,
     TopicStatus,
+    to_db_utc,
 )
 from app.scraping import FetchResult
 from tests.helpers import conn_db_path
@@ -49,12 +55,27 @@ def _make_settings(**overrides) -> Settings:
 
 
 def _per_url_mock(*, ok: bool, error: str | None = None, url: str = "json://localhost") -> AsyncMock:
-    """AsyncMock for app.checker.send_notification_per_url returning one delivery.
+    """AsyncMock for app.checker.deliver_notification_intents returning one outcome.
 
-    check_topic delivers per-URL now (OVH-039); this mirrors the single-URL
-    default settings used across these tests.
+    Delivery is per-target (OVH-039); this mirrors the single-URL default settings
+    used across these tests. Patching at the deliver-intents seam leaves the intent
+    rows themselves untouched, which is what the pipeline tests care about.
     """
     return AsyncMock(return_value=[NotificationDelivery(url=url, ok=ok, error=error)])
+
+
+async def _ok_send(title: str, body: str, url: str, timeout_s: float) -> NotificationDelivery:
+    """Stub for app.checker.send_single_notification: every target delivers."""
+    return NotificationDelivery(url=url, ok=True)
+
+
+def _fail_send(error: str):
+    """Build a send_single_notification stub whose every target fails with ``error``."""
+
+    async def _send(title: str, body: str, url: str, timeout_s: float) -> NotificationDelivery:
+        return NotificationDelivery(url=url, ok=False, error=error)
+
+    return _send
 
 
 def _make_topic(conn: sqlite3.Connection, **overrides) -> Topic:
@@ -138,7 +159,7 @@ class TestCheckTopic:
                 new_callable=AsyncMock,
                 return_value=_make_write_result(),
             ) as mock_update,
-            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)) as mock_send,
+            patch("app.checker.deliver_notification_intents", _per_url_mock(ok=True)) as mock_send,
         ):
             result = await check_topic(topic, settings, db_path=db_path)
 
@@ -173,7 +194,7 @@ class TestCheckTopic:
                 new_callable=AsyncMock,
                 return_value=novelty,
             ),
-            patch("app.checker.send_notification_per_url") as mock_send,
+            patch("app.checker.deliver_notification_intents") as mock_send,
         ):
             result = await check_topic(topic, settings, db_path=db_path)
 
@@ -270,7 +291,7 @@ class TestCheckTopic:
             ),
             patch("app.checker.prepare_knowledge_update", new_callable=AsyncMock, return_value=_make_write_result()),
             patch(
-                "app.checker.send_notification_per_url",
+                "app.checker.deliver_notification_intents",
                 _per_url_mock(ok=False, error="SMTP error"),
             ),
         ):
@@ -285,7 +306,11 @@ class TestCheckTopic:
         assert len(pending) == 1
         assert pending[0].topic_id == topic.id
         assert "Topic Watch:" in pending[0].title
-        assert pending[0].last_error == "SMTP error"
+        # The intent was created inside the durable transition, so it is queued
+        # whatever the send did — the outcome is applied to it, not the reason it
+        # exists (TW-AUD-004).
+        assert pending[0].status == "pending"
+        assert pending[0].check_result_id == result.id
 
         # OVH-085: the article is marked processed even though the send failed.
         assert article.id is not None
@@ -322,7 +347,7 @@ class TestCheckTopic:
             ),
             patch("app.checker.prepare_knowledge_update", new_callable=AsyncMock, return_value=_make_write_result()),
             patch(
-                "app.checker.send_notification_per_url",
+                "app.checker.deliver_notification_intents",
                 _per_url_mock(ok=False, error="delivery failed"),
             ),
         ):
@@ -376,7 +401,7 @@ class TestCheckTopic:
                 return_value=novelty,
             ),
             patch("app.checker.prepare_knowledge_update", new_callable=AsyncMock, return_value=_make_write_result()),
-            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)),
+            patch("app.checker.deliver_notification_intents", _per_url_mock(ok=True)),
         ):
             result = await check_topic(topic, settings, db_path=db_path)
 
@@ -463,7 +488,7 @@ class TestCheckTopic:
                 new_callable=AsyncMock,
                 side_effect=Exception("Knowledge update crashed"),
             ),
-            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)) as mock_send,
+            patch("app.checker.deliver_notification_intents", _per_url_mock(ok=True)) as mock_send,
         ):
             result = await check_topic(topic, settings, db_path=db_path)
 
@@ -541,7 +566,7 @@ class TestCheckTopic:
                 return_value=FetchResult(articles=[article], total_feed_entries=1),
             ),
             patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=failed),
-            patch("app.checker.send_notification_per_url") as mock_send,
+            patch("app.checker.deliver_notification_intents") as mock_send,
         ):
             result = await check_topic(topic, settings, db_path=db_path)
 
@@ -573,7 +598,7 @@ class TestCheckTopic:
                 return_value=FetchResult(articles=[article], total_feed_entries=1),
             ),
             patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
-            patch("app.checker.send_notification_per_url") as mock_send,
+            patch("app.checker.deliver_notification_intents") as mock_send,
         ):
             result = await check_topic(topic, settings, db_path=db_path)
 
@@ -619,7 +644,7 @@ class TestCheckTopic:
             patch(
                 "app.checker.prepare_knowledge_update", new_callable=AsyncMock, return_value=_make_write_result()
             ) as mock_update,
-            patch("app.checker.send_notification_per_url") as mock_send,
+            patch("app.checker.deliver_notification_intents") as mock_send,
         ):
             result = await check_topic(topic, settings, db_path=db_path)
 
@@ -680,7 +705,7 @@ class TestCheckTopic:
             patch(
                 "app.checker.prepare_knowledge_update", new_callable=AsyncMock, return_value=_make_write_result()
             ) as mock_update,
-            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)) as mock_send,
+            patch("app.checker.deliver_notification_intents", _per_url_mock(ok=True)) as mock_send,
         ):
             result = await check_topic(topic, settings, db_path=db_path)
 
@@ -723,7 +748,7 @@ class TestCheckTopic:
             patch(
                 "app.checker.prepare_knowledge_update", new_callable=AsyncMock, return_value=_make_write_result()
             ) as mock_update,
-            patch("app.checker.send_notification_per_url") as mock_send,
+            patch("app.checker.deliver_notification_intents") as mock_send,
         ):
             result = await check_topic(topic, settings, db_path=db_path)
 
@@ -775,7 +800,7 @@ class TestCheckTopic:
             patch(
                 "app.checker.prepare_knowledge_update", new_callable=AsyncMock, return_value=_make_write_result()
             ) as mock_update,
-            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)) as mock_send,
+            patch("app.checker.deliver_notification_intents", _per_url_mock(ok=True)) as mock_send,
         ):
             result = await check_topic(topic, settings, db_path=db_path)
 
@@ -818,7 +843,7 @@ class TestCheckTopic:
             patch(
                 "app.checker.prepare_knowledge_update", new_callable=AsyncMock, return_value=_make_write_result()
             ) as mock_update,
-            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)) as mock_send,
+            patch("app.checker.deliver_notification_intents", _per_url_mock(ok=True)) as mock_send,
         ):
             result = await check_topic(topic, settings, db_path=db_path)
 
@@ -1020,19 +1045,19 @@ class TestInitAndRetryCarryCheckId:
         topic = _make_topic(db_conn)
         create_pending_notification(
             db_conn,
-            PendingNotification(topic_id=topic.id, title="T", body="B"),
+            PendingNotification(topic_id=topic.id, title="T", body="B", url="json://localhost"),
         )
         db_conn.commit()
         settings = _make_settings()
 
         seen: dict[str, str | None] = {}
 
-        async def _capture(*_args, **_kwargs):
+        async def _capture(title, body, url, timeout_s):  # noqa: ANN001
             seen["send"] = check_id_var.get()
-            return True
+            return NotificationDelivery(url=url, ok=True)
 
         assert check_id_var.get() is None
-        with patch("app.checker.send_notification", side_effect=_capture):
+        with patch("app.checker.send_single_notification", side_effect=_capture):
             await retry_pending_notifications(db_conn, settings)
 
         assert seen["send"] is not None
@@ -1047,14 +1072,14 @@ class TestInitAndRetryCarryCheckId:
         topic = _make_topic(db_conn)
         create_pending_notification(
             db_conn,
-            PendingNotification(topic_id=topic.id, title="T", body="B"),
+            PendingNotification(topic_id=topic.id, title="T", body="B", url="json://localhost"),
         )
         db_conn.commit()
         settings = _make_settings()
 
         token = check_id_var.set("outer-sentinel")
         try:
-            with patch("app.checker.send_notification", new_callable=AsyncMock, return_value=True):
+            with patch("app.checker.send_single_notification", side_effect=_ok_send):
                 await retry_pending_notifications(db_conn, settings)
             assert check_id_var.get() == "outer-sentinel"
         finally:
@@ -1157,7 +1182,7 @@ class TestPerTopicThresholds:
             ),
             patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
             patch("app.checker.prepare_knowledge_update", new_callable=AsyncMock, return_value=_make_write_result()),
-            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)) as mock_send,
+            patch("app.checker.deliver_notification_intents", _per_url_mock(ok=True)) as mock_send,
         ):
             result = await check_topic(topic, settings, db_path=db_path)
         return result, mock_send
@@ -1218,8 +1243,8 @@ class TestImportanceThreshold:
             patch(
                 "app.checker.prepare_knowledge_update", new_callable=AsyncMock, return_value=_make_write_result()
             ) as mock_update,
-            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)) as mock_send,
-            patch("app.checker.send_webhooks", new_callable=AsyncMock) as mock_webhooks,
+            patch("app.checker.deliver_notification_intents", _per_url_mock(ok=True)) as mock_send,
+            patch("app.checker.deliver_webhook_intents", new_callable=AsyncMock) as mock_webhooks,
         ):
             result = await check_topic(topic, settings, db_path=db_path)
         return result, mock_send, mock_update, mock_webhooks, article
@@ -1290,7 +1315,7 @@ class TestCheckResultTokens:
                 new_callable=AsyncMock,
                 return_value=_make_write_result(prompt_tokens=30, completion_tokens=10),
             ),
-            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)),
+            patch("app.checker.deliver_notification_intents", _per_url_mock(ok=True)),
         ):
             result = await check_topic(topic, settings, db_path=db_path)
 
@@ -1650,74 +1675,71 @@ class TestCheckAllTopics:
 
 
 class TestRetryPendingNotifications:
-    """Tests for the notification retry system."""
+    """The delivery-intent drain: claim, send, apply."""
 
-    async def test_successful_retry_deletes_notification(self, db_conn: sqlite3.Connection) -> None:
-        """When retry succeeds, the pending notification is removed."""
+    async def test_successful_retry_records_the_delivery(self, db_conn: sqlite3.Connection) -> None:
+        """A delivered intent becomes the ledger row, not a deleted one (AUG-153)."""
         topic = _make_topic(db_conn)
         create_pending_notification(
             db_conn,
-            PendingNotification(topic_id=topic.id, title="Retry Title", body="Retry Body"),
+            PendingNotification(topic_id=topic.id, title="Retry Title", body="Retry Body", url="json://localhost"),
         )
         db_conn.commit()
 
         settings = _make_settings()
 
-        with patch(
-            "app.checker.send_notification",
-            new_callable=AsyncMock,
-            return_value=True,
-        ):
+        with patch("app.checker.send_single_notification", side_effect=_ok_send):
             await retry_pending_notifications(db_conn, settings)
 
         assert list_pending_notifications(db_conn) == []
+        row = db_conn.execute("SELECT status, delivered_at FROM pending_notifications").fetchone()
+        assert row["status"] == "sent"
+        assert row["delivered_at"] is not None
 
-    async def test_failed_retry_increments_count(self, db_conn: sqlite3.Connection) -> None:
-        """When retry fails, the retry count is incremented."""
+    async def test_failed_retry_increments_count_and_schedules_the_next_attempt(
+        self, db_conn: sqlite3.Connection
+    ) -> None:
         topic = _make_topic(db_conn)
         create_pending_notification(
             db_conn,
-            PendingNotification(topic_id=topic.id, title="T", body="B", retry_count=0),
+            PendingNotification(topic_id=topic.id, title="T", body="B", url="json://localhost", retry_count=0),
         )
         db_conn.commit()
 
         settings = _make_settings()
 
-        with patch(
-            "app.checker.send_notification",
-            new_callable=AsyncMock,
-            return_value=False,
-        ):
+        with patch("app.checker.send_single_notification", side_effect=_fail_send("unreachable")):
             await retry_pending_notifications(db_conn, settings)
 
-        pending = list_pending_notifications(db_conn)
-        assert len(pending) == 1
-        assert pending[0].retry_count == 1
+        row = db_conn.execute("SELECT * FROM pending_notifications").fetchone()
+        assert row["retry_count"] == 1
+        assert row["status"] == "pending"
+        assert row["last_error"] == "unreachable"
+        # Backoff survives a restart because it is a stored due-time, not a timer.
+        assert row["next_attempt_at"] is not None
+        # ...and the drain honours it: this row is no longer due.
+        assert list_due_notification_intents(db_conn, to_db_utc(datetime.now(UTC)), 10) == []
 
-    async def test_exception_during_retry_increments_count(self, db_conn: sqlite3.Connection) -> None:
-        """When retry raises an exception, the retry count is incremented."""
+    async def test_unexpected_send_error_leaves_the_intent_claimed(self, db_conn: sqlite3.Connection) -> None:
+        """An exception mid-send is an unknown outcome, not a failed one."""
         topic = _make_topic(db_conn)
         create_pending_notification(
             db_conn,
-            PendingNotification(topic_id=topic.id, title="T", body="B", retry_count=0),
+            PendingNotification(topic_id=topic.id, title="T", body="B", url="json://localhost"),
         )
         db_conn.commit()
 
         settings = _make_settings()
 
-        with patch(
-            "app.checker.send_notification",
-            new_callable=AsyncMock,
-            side_effect=Exception("SMTP error"),
-        ):
+        with patch("app.checker.send_single_notification", side_effect=RuntimeError("SMTP error")):
             await retry_pending_notifications(db_conn, settings)
 
-        pending = list_pending_notifications(db_conn)
-        assert len(pending) == 1
-        assert pending[0].retry_count == 1
+        row = db_conn.execute("SELECT status, retry_count FROM pending_notifications").fetchone()
+        assert row["status"] == "sending"
+        assert row["retry_count"] == 0
 
-    async def test_expired_notifications_deleted(self, db_conn: sqlite3.Connection) -> None:
-        """Notifications that have exhausted retries are cleaned up."""
+    async def test_expired_notifications_are_abandoned(self, db_conn: sqlite3.Connection) -> None:
+        """Out-of-attempts intents become 'abandoned', keeping the record."""
         topic = _make_topic(db_conn)
         create_pending_notification(
             db_conn,
@@ -1725,6 +1747,7 @@ class TestRetryPendingNotifications:
                 topic_id=topic.id,
                 title="Expired",
                 body="B",
+                url="json://localhost",
                 retry_count=3,
                 max_retries=3,
             ),
@@ -1733,19 +1756,15 @@ class TestRetryPendingNotifications:
 
         settings = _make_settings()
 
-        with patch(
-            "app.checker.send_notification",
-            new_callable=AsyncMock,
-        ):
+        with patch("app.checker.send_single_notification", side_effect=_ok_send) as mock_send:
             await retry_pending_notifications(db_conn, settings)
 
-        # Expired notification should be gone (deleted before retry loop)
-        # and no longer retryable (retry_count >= max_retries)
-        row = db_conn.execute("SELECT COUNT(*) FROM pending_notifications").fetchone()
-        assert row[0] == 0
+        mock_send.assert_not_called()
+        row = db_conn.execute("SELECT status FROM pending_notifications").fetchone()
+        assert row["status"] == "abandoned"
 
     async def test_abandoned_notification_warns_with_ids(self, db_conn: sqlite3.Connection, caplog) -> None:  # noqa: ANN001
-        """Pruning an exhausted notification emits a WARNING naming topic/check ids (OVH-040)."""
+        """Abandoning an exhausted notification emits a WARNING naming topic/check ids (OVH-040)."""
         import logging
 
         topic = _make_topic(db_conn)
@@ -1756,6 +1775,7 @@ class TestRetryPendingNotifications:
                 check_result_id=777,
                 title="Expired",
                 body="B",
+                url="json://localhost",
                 retry_count=3,
                 max_retries=3,
             ),
@@ -1765,7 +1785,7 @@ class TestRetryPendingNotifications:
 
         with (
             caplog.at_level(logging.WARNING, logger="app.checker"),
-            patch("app.checker.send_notification", new_callable=AsyncMock),
+            patch("app.checker.send_single_notification", side_effect=_ok_send),
         ):
             await retry_pending_notifications(db_conn, settings)
 
@@ -1776,45 +1796,42 @@ class TestRetryPendingNotifications:
         assert "check_result_id=777" in msg
 
     async def test_empty_pending_is_noop(self, db_conn: sqlite3.Connection) -> None:
-        """No pending notifications means no send attempts."""
+        """No pending intents means no send attempts."""
         settings = _make_settings()
 
-        with patch(
-            "app.checker.send_notification",
-            new_callable=AsyncMock,
-        ) as mock_send:
+        with patch("app.checker.send_single_notification", side_effect=_ok_send) as mock_send:
             await retry_pending_notifications(db_conn, settings)
 
         mock_send.assert_not_called()
 
     async def test_no_connection_held_across_send(self, db_conn: sqlite3.Connection) -> None:
-        """The send must run with the snapshot connection already committed."""
+        """The send must run with the claim connection already committed."""
         topic = _make_topic(db_conn)
         create_pending_notification(
             db_conn,
-            PendingNotification(topic_id=topic.id, title="T", body="B"),
+            PendingNotification(topic_id=topic.id, title="T", body="B", url="json://localhost"),
         )
         db_conn.commit()
         settings = _make_settings()
 
         in_transaction: list[bool] = []
 
-        async def observe(title, body, s, *, url=None):  # noqa: ANN001
+        async def observe(title, body, url, timeout_s):  # noqa: ANN001
             in_transaction.append(db_conn.in_transaction)
-            return True
+            return NotificationDelivery(url=url, ok=True)
 
-        with patch("app.checker.send_notification", side_effect=observe):
+        with patch("app.checker.send_single_notification", side_effect=observe):
             await retry_pending_notifications(db_conn, settings)
 
         assert in_transaction == [False]
 
     async def test_crash_midloop_preserves_applied_results(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
-        """A crash applying item 2 must not roll back item 1's committed delete."""
+        """A crash applying item 2 must not roll back item 1's committed apply."""
         topic = _make_topic(db_conn)
         for i in range(2):
             create_pending_notification(
                 db_conn,
-                PendingNotification(topic_id=topic.id, title=f"T{i}", body="B"),
+                PendingNotification(topic_id=topic.id, title=f"T{i}", body="B", url="json://localhost"),
             )
         db_conn.commit()
         settings = _make_settings()
@@ -1823,27 +1840,193 @@ class TestRetryPendingNotifications:
         assert len(pending) == 2
         first_id = pending[0].id
 
-        from app.crud import delete_pending_notification as real_delete
+        from app.crud import apply_notification_outcome as real_apply
 
         call_count = {"n": 0}
 
-        def crashing_delete(conn, notification_id, *, claim_token=None):  # noqa: ANN001
+        def crashing_apply(conn, intent_id, claim_token, **kwargs):  # noqa: ANN001
             call_count["n"] += 1
             if call_count["n"] == 2:
                 raise RuntimeError("simulated crash applying item 2")
-            return real_delete(conn, notification_id, claim_token=claim_token)
+            return real_apply(conn, intent_id, claim_token, **kwargs)
 
         with (
-            patch("app.checker.send_notification", new_callable=AsyncMock, return_value=True),
-            patch("app.checker.delete_pending_notification", side_effect=crashing_delete),
-            pytest.raises(RuntimeError, match="simulated crash"),
+            patch("app.checker.send_single_notification", side_effect=_ok_send),
+            patch("app.checker.apply_notification_outcome", side_effect=crashing_apply),
         ):
+            # AUG-263: the drain keeps ownership until every child settles, so the
+            # sibling's crash is reported, not propagated out of a live gather.
             await retry_pending_notifications(db_conn, settings)
 
-        remaining = db_conn.execute("SELECT id FROM pending_notifications").fetchall()
-        remaining_ids = {r["id"] for r in remaining}
-        assert first_id not in remaining_ids
-        assert len(remaining_ids) == 1
+        statuses = {
+            r["id"]: r["status"] for r in db_conn.execute("SELECT id, status FROM pending_notifications").fetchall()
+        }
+        assert statuses[first_id] == "sent"
+        assert sorted(statuses.values()) == ["sending", "sent"]
+
+
+class TestDeliveryIntentDurability:
+    """The intent contract: created before the send, claimed once, fenced on apply."""
+
+    async def test_crash_after_the_transition_still_delivers_exactly_once(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """TW-AUD-004: intents survive a crash between C3 and the first send."""
+        topic = _make_topic(db_conn, name="CrashAfterC3")
+        create_knowledge_state(db_conn, KnowledgeState(topic_id=topic.id, summary_text="Old.", token_count=10))
+        db_conn.commit()
+        settings = _make_settings()
+        novelty = NoveltyResult(has_new_info=True, summary="New", confidence=0.9, relevance=0.9)
+
+        async def crash(*_args, **_kwargs):
+            raise RuntimeError("process died before any send")
+
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[_make_article(topic_id=topic.id)], total_feed_entries=1),
+            ),
+            patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
+            patch("app.checker.prepare_knowledge_update", new_callable=AsyncMock, return_value=_make_write_result()),
+            patch("app.checker.deliver_notification_intents", side_effect=crash),
+            pytest.raises(RuntimeError, match="process died"),
+        ):
+            await check_topic(topic, settings, db_path=db_path)
+
+        # The intent is durable even though no send ever ran.
+        pending = list_pending_notifications(db_conn)
+        assert len(pending) == 1
+        assert pending[0].url == "json://localhost"
+        assert pending[0].check_result_id is not None
+
+        sends: list[str] = []
+
+        async def record(title, body, url, timeout_s):  # noqa: ANN001
+            sends.append(url)
+            return NotificationDelivery(url=url, ok=True)
+
+        with patch("app.checker.send_single_notification", side_effect=record):
+            await retry_pending_notifications(db_conn, settings)
+            # A second drain must not re-deliver the ledger row.
+            await retry_pending_notifications(db_conn, settings)
+
+        assert sends == ["json://localhost"]
+
+    def test_claim_rejects_exhausted_undue_and_already_claimed_rows(self, db_conn: sqlite3.Connection) -> None:
+        """TW-AUD-006: every eligibility rule lives inside the atomic claim."""
+        topic = _make_topic(db_conn)
+        now = datetime.now(UTC)
+        now_iso = to_db_utc(now)
+
+        exhausted = create_pending_notification(
+            db_conn,
+            PendingNotification(topic_id=topic.id, title="X", body="B", url="json://a", retry_count=3, max_retries=3),
+        )
+        not_due = create_pending_notification(
+            db_conn,
+            PendingNotification(
+                topic_id=topic.id,
+                title="Y",
+                body="B",
+                url="json://b",
+                next_attempt_at=to_db_utc(now + timedelta(hours=1)),
+            ),
+        )
+        free = create_pending_notification(
+            db_conn, PendingNotification(topic_id=topic.id, title="Z", body="B", url="json://c")
+        )
+        db_conn.commit()
+
+        assert claim_notification_intent(db_conn, exhausted.id, "tok", now_iso) is False
+        assert claim_notification_intent(db_conn, not_due.id, "tok", now_iso) is False
+        assert claim_notification_intent(db_conn, free.id, "winner", now_iso) is True
+        # A second claimant loses even though its own snapshot said the row was free.
+        assert claim_notification_intent(db_conn, free.id, "loser", now_iso) is False
+
+    def test_late_apply_with_a_stale_token_is_a_noop_across_clock_jumps(self, db_conn: sqlite3.Connection) -> None:
+        """AUG-277: the fence is identity, not elapsed time.
+
+        Liveness is judged monotonically while due-times are wall clock, so the
+        fence has to hold when the clock steps forward (the stale release fires
+        early on a live claim) and when it steps back (nothing looks stale at all).
+        """
+        topic = _make_topic(db_conn)
+        for jump in (timedelta(hours=6), timedelta(hours=-6)):
+            intent = create_pending_notification(
+                db_conn, PendingNotification(topic_id=topic.id, title="T", body="B", url="json://x")
+            )
+            db_conn.commit()
+
+            assert claim_notification_intent(db_conn, intent.id, "owner-A", to_db_utc(datetime.now(UTC)))
+            # The clock jumps; the stale sweep releases A's live claim and B takes it.
+            release_stale_notification_claims(db_conn, to_db_utc(datetime.now(UTC) + jump + timedelta(hours=1)))
+            claimed_b = claim_notification_intent(db_conn, intent.id, "owner-B", to_db_utc(datetime.now(UTC) + jump))
+            db_conn.commit()
+
+            if not claimed_b:
+                # A backward jump leaves A's claim intact — also correct, and A's
+                # own apply below is the one that must win.
+                assert apply_notification_outcome(db_conn, intent.id, "owner-A", sent=True) is True
+                continue
+
+            # A finally comes back. Its apply must change nothing.
+            assert apply_notification_outcome(db_conn, intent.id, "owner-A", sent=True) is False
+            row = db_conn.execute("SELECT status FROM pending_notifications WHERE id = ?", (intent.id,)).fetchone()
+            assert row["status"] == "sending"
+            assert apply_notification_outcome(db_conn, intent.id, "owner-B", sent=True) is True
+
+    async def test_timed_out_send_stays_claimed_then_stale_release_rearms_it(self, db_conn: sqlite3.Connection) -> None:
+        """AUG-071/TW-AUD-004: an unknown outcome is recorded as unknown."""
+        topic = _make_topic(db_conn)
+        create_pending_notification(
+            db_conn, PendingNotification(topic_id=topic.id, title="T", body="B", url="json://slow")
+        )
+        db_conn.commit()
+        settings = _make_settings()
+
+        async def timeout(title, body, url, timeout_s):  # noqa: ANN001
+            return NotificationDelivery(url=url, ok=False, error="timed out", timed_out=True)
+
+        with patch("app.checker.send_single_notification", side_effect=timeout):
+            await retry_pending_notifications(db_conn, settings)
+
+        row = db_conn.execute("SELECT status, retry_count FROM pending_notifications").fetchone()
+        assert row["status"] == "sending"
+        assert row["retry_count"] == 0
+
+        released = release_stale_notification_claims(db_conn, to_db_utc(datetime.now(UTC) + timedelta(hours=1)))
+        db_conn.commit()
+        assert released == 1
+        assert len(list_pending_notifications(db_conn)) == 1
+
+    async def test_rollup_is_true_only_when_every_intent_sent(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
+        topic = _make_topic(db_conn, name="Rollup")
+        create_knowledge_state(db_conn, KnowledgeState(topic_id=topic.id, summary_text="Old.", token_count=10))
+        db_conn.commit()
+        settings = _make_settings(notifications=NotificationSettings(urls=["json://a", "json://b"]))
+        novelty = NoveltyResult(has_new_info=True, summary="New", confidence=0.9, relevance=0.9)
+
+        async def one_fails(title, body, url, timeout_s):  # noqa: ANN001
+            return NotificationDelivery(url=url, ok=url == "json://a", error=None if url == "json://a" else "down")
+
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[_make_article(topic_id=topic.id)], total_feed_entries=1),
+            ),
+            patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
+            patch("app.checker.prepare_knowledge_update", new_callable=AsyncMock, return_value=_make_write_result()),
+            patch("app.checker.send_single_notification", side_effect=one_fails),
+        ):
+            result = await check_topic(topic, settings, db_path=db_path)
+
+        assert result.notification_sent is False
+        statuses = sorted(r["status"] for r in db_conn.execute("SELECT status FROM pending_notifications"))
+        assert statuses == ["pending", "sent"]
+        # The delivered channel is never re-sent on the next drain.
+        assert [i.url for i in list_pending_notifications(db_conn)] == ["json://b"]
 
 
 class TestSourcesFailedSurfacing:
@@ -1991,7 +2174,7 @@ class TestSilenceHeartbeatPipeline:
                 new_callable=AsyncMock,
                 return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=1, feeds_failed=1),
             ),
-            patch("app.checker.send_notification_per_url", send),
+            patch("app.checker.deliver_notification_intents", send),
         ):
             return await check_topic(get_topic(db_conn, topic.id), settings, db_path=conn_db_path(db_conn))
 
@@ -2003,7 +2186,7 @@ class TestSilenceHeartbeatPipeline:
                 new_callable=AsyncMock,
                 return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=1, feeds_failed=0),
             ),
-            patch("app.checker.send_notification_per_url", send),
+            patch("app.checker.deliver_notification_intents", send),
         ):
             return await check_topic(get_topic(db_conn, topic.id), settings, db_path=conn_db_path(db_conn))
 
@@ -2017,7 +2200,7 @@ class TestSilenceHeartbeatPipeline:
 
         await self._failing_check(db_conn, topic, send)
         assert send.await_count == 1
-        assert "sources failing" in send.await_args.args[0]
+        assert "sources failing" in send.await_args.args[0][0].title
         assert get_topic(db_conn, topic.id).heartbeat_alerted_at is not None
 
         for _ in range(3):
@@ -2036,7 +2219,7 @@ class TestSilenceHeartbeatPipeline:
                     new_callable=AsyncMock,
                     side_effect=RuntimeError("boom"),
                 ),
-                patch("app.checker.send_notification_per_url", send),
+                patch("app.checker.deliver_notification_intents", send),
             ):
                 result = await check_topic(get_topic(db_conn, topic.id), settings, db_path=conn_db_path(db_conn))
         assert result.stage_error.startswith("pipeline_failed")
@@ -2057,7 +2240,7 @@ class TestSilenceHeartbeatPipeline:
                 new_callable=AsyncMock,
                 side_effect=RuntimeError("boom"),
             ),
-            patch("app.checker.send_notification_per_url", send),
+            patch("app.checker.deliver_notification_intents", send),
         ):
             await check_topic(
                 get_topic(db_conn, topic.id),
@@ -2076,7 +2259,7 @@ class TestSilenceHeartbeatPipeline:
 
         await self._healthy_empty_check(db_conn, topic, send)
         assert send.await_count == 2
-        assert "recovered" in send.await_args.args[0]
+        assert "recovered" in send.await_args.args[0][0].title
         assert get_topic(db_conn, topic.id).heartbeat_alerted_at is None
 
         await self._healthy_empty_check(db_conn, topic, send)
@@ -2099,12 +2282,12 @@ class TestSilenceHeartbeatPipeline:
                 return_value=FetchResult(articles=[_make_article()], total_feed_entries=1),
             ),
             patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
-            patch("app.checker.send_notification_per_url", send),
+            patch("app.checker.deliver_notification_intents", send),
         ):
             await check_topic(get_topic(db_conn, topic.id), settings, db_path=conn_db_path(db_conn))
 
         assert send.await_count == 2
-        assert "recovered" in send.await_args.args[0]
+        assert "recovered" in send.await_args.args[0][0].title
 
     async def test_disabled_by_zero(self, db_conn: sqlite3.Connection) -> None:
         topic = _make_topic(db_conn)
@@ -2138,20 +2321,23 @@ class TestSilenceHeartbeatPipeline:
             await self._failing_check(db_conn, topic, send)
 
         rows = db_conn.execute(
-            "SELECT title, last_error FROM pending_notifications WHERE topic_id = ?", (topic.id,)
+            "SELECT title, kind, status FROM pending_notifications WHERE topic_id = ?", (topic.id,)
         ).fetchall()
         assert len(rows) == 1
         assert "sources failing" in rows[0]["title"]
-        assert rows[0]["last_error"] == "unreachable"
+        # The intent carries its heartbeat kind, so A5's revocation can find it.
+        assert rows[0]["kind"] == "heartbeat_alert"
+        assert rows[0]["status"] == "pending"
         # The latch is claimed before the send, so a dead channel never re-alerts.
         assert get_topic(db_conn, topic.id).heartbeat_alerted_at is not None
 
-        with patch("app.checker.send_notification", new_callable=AsyncMock, return_value=True):
+        with patch("app.checker.send_single_notification", side_effect=_ok_send):
             await retry_pending_notifications(db_conn, _make_settings(silence_heartbeat_checks=3))
         remaining = db_conn.execute(
-            "SELECT COUNT(*) AS n FROM pending_notifications WHERE topic_id = ?", (topic.id,)
+            "SELECT status FROM pending_notifications WHERE topic_id = ?", (topic.id,)
         ).fetchone()
-        assert remaining["n"] == 0
+        # Retained as the delivery ledger, not deleted (AUG-153).
+        assert remaining["status"] == "sent"
 
     async def test_heartbeat_failure_does_not_break_the_check(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         topic = _make_topic(db_conn)
@@ -2181,7 +2367,7 @@ class TestSilenceHeartbeatPipeline:
         update_topic(db_conn, topic)
         db_conn.commit()
 
-        with patch("app.checker.send_notification_per_url", send):
+        with patch("app.checker.deliver_notification_intents", send):
             await check_topic(topic, _make_settings(silence_heartbeat_checks=3), db_path=conn_db_path(db_conn))
         assert send.await_count == 1
         assert get_topic(db_conn, topic.id).heartbeat_alerted_at is not None
@@ -2205,7 +2391,7 @@ class TestAnalysisFailureIsResumable:
                 return_value=FetchResult(articles=articles, total_feed_entries=len(articles)),
             ),
             patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=failed),
-            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)),
+            patch("app.checker.deliver_notification_intents", _per_url_mock(ok=True)),
         ):
             return await check_topic(get_topic(db_conn, topic.id), _make_settings(), db_path=db_path)
 
@@ -2265,7 +2451,7 @@ class TestAnalysisFailureIsResumable:
                 return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=1, feeds_failed=0),
             ),
             patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty) as mock_analyze,
-            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)),
+            patch("app.checker.deliver_notification_intents", _per_url_mock(ok=True)),
         ):
             await check_topic(get_topic(db_conn, topic.id), _make_settings(), db_path=db_path)
 
@@ -2307,8 +2493,8 @@ class TestInsufficientKnowledgeIsRecorded:
                 new_callable=AsyncMock,
                 return_value=_make_write_result(sufficient_data=False),
             ),
-            patch("app.checker.send_notification_per_url", send),
-            patch("app.checker.send_webhooks", new_callable=AsyncMock, return_value=0),
+            patch("app.checker.deliver_notification_intents", send),
+            patch("app.checker.deliver_webhook_intents", new_callable=AsyncMock, return_value=0),
         ):
             return await check_topic(get_topic(db_conn, topic.id), settings, db_path=db_path)
 
@@ -2397,7 +2583,7 @@ class TestOnlyAnalyzedArticlesAreProcessed:
                 return_value=FetchResult(articles=[kept, dropped], total_feed_entries=2),
             ),
             patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=partial),
-            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)),
+            patch("app.checker.deliver_notification_intents", _per_url_mock(ok=True)),
         ):
             await check_topic(get_topic(db_conn, topic.id), _make_settings(), db_path=db_path)
 
@@ -2418,7 +2604,7 @@ class TestOnlyAnalyzedArticlesAreProcessed:
                 return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=1),
             ),
             patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty) as mock_analyze,
-            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)),
+            patch("app.checker.deliver_notification_intents", _per_url_mock(ok=True)),
         ):
             await check_topic(get_topic(db_conn, topic.id), _make_settings(), db_path=db_path)
 
@@ -2443,7 +2629,7 @@ class TestOnlyAnalyzedArticlesAreProcessed:
                 new_callable=AsyncMock,
                 return_value=NoveltyResult(has_new_info=False, confidence=0.9),
             ),
-            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)),
+            patch("app.checker.deliver_notification_intents", _per_url_mock(ok=True)),
         ):
             await check_topic(get_topic(db_conn, topic.id), _make_settings(), db_path=db_path)
 
@@ -2527,7 +2713,7 @@ class TestOnlyAnalyzedArticlesAreProcessed:
         with (
             patch("app.checker.fetch_new_articles_for_topic", new_callable=AsyncMock, return_value=fetched),
             patch("app.analysis.llm._get_client", return_value=client),
-            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)),
+            patch("app.checker.deliver_notification_intents", _per_url_mock(ok=True)),
         ):
             await check_topic(get_topic(db_conn, topic.id), settings, db_path=db_path)
 
@@ -2552,7 +2738,7 @@ class TestOnlyAnalyzedArticlesAreProcessed:
                 new_callable=AsyncMock,
                 return_value=NoveltyResult(has_new_info=False, confidence=0.9),
             ) as mock_analyze,
-            patch("app.checker.send_notification_per_url", _per_url_mock(ok=True)),
+            patch("app.checker.deliver_notification_intents", _per_url_mock(ok=True)),
         ):
             await check_topic(get_topic(db_conn, topic.id), settings, db_path=db_path)
 

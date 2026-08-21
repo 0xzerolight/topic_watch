@@ -11,7 +11,7 @@ import secrets
 import sqlite3
 import unicodedata
 from collections.abc import Iterable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import ClassVar, Self
 
@@ -100,6 +100,34 @@ def new_generation() -> str:
     ``lower(hex(randomblob(8)))`` backfill in migration 026.
     """
     return secrets.token_hex(8)
+
+
+_RETRY_BASE_DELAY_SECONDS = 60.0
+_RETRY_MAX_DELAY_SECONDS = 3600.0
+
+
+def retry_delay_seconds(retry_count: int, *, hint_s: float | None = None) -> float:
+    """How long to wait before the next delivery attempt.
+
+    A receiver that stated its own recovery time (``Retry-After``) is believed,
+    clamped to the same ceiling as the computed backoff so a hostile or mistaken
+    header cannot park a delivery for a week. Otherwise: capped exponential
+    backoff with jitter, so a whole batch of intents failing against the same
+    down endpoint does not march back in lockstep.
+    """
+    if hint_s is not None and hint_s >= 0:
+        return float(min(hint_s, _RETRY_MAX_DELAY_SECONDS))
+    base = min(_RETRY_BASE_DELAY_SECONDS * (2.0 ** max(retry_count, 0)), _RETRY_MAX_DELAY_SECONDS)
+    # secrets rather than random: not for secrecy, but because the S-rules ban
+    # the non-cryptographic generator outright and this needs no seeding story.
+    jitter = base * (secrets.randbelow(1000) / 10000.0)
+    return base + jitter
+
+
+def next_attempt_at(retry_count: int, *, hint_s: float | None = None, now: datetime | None = None) -> str:
+    """Canonical UTC due-time for the next delivery attempt of a failed intent."""
+    moment = now or datetime.now(UTC)
+    return to_db_utc(moment + timedelta(seconds=retry_delay_seconds(retry_count, hint_s=hint_s)))
 
 
 class CorruptTimestampError(ValueError):
@@ -702,18 +730,55 @@ class DashboardStats(BaseModel):
     last_notification_at: datetime | None = None
 
 
-class PendingNotification(SQLiteModel):
-    """A notification that failed to send and should be retried.
+class DeliveryStatus(StrEnum):
+    """Lifecycle of one delivery intent.
 
-    Scoped to a single ``url`` when that target failed (OVH-039): a partial
-    batch failure queues one row per failed URL so retry never re-hits the
-    targets that already delivered. ``url`` is NULL on legacy/whole-batch rows,
-    in which case the drain falls back to every configured URL. ``last_error``
-    records the most recent failure reason for operator diagnostics.
+    ``pending`` -> ``sending`` (claimed) -> ``sent`` | ``abandoned``, or
+    ``revoked`` when the event the intent announces stopped being true before it
+    left. ``sent`` rows are kept: they are the durable delivery ledger the
+    dashboard's "last notified" reads, and retention prunes them on the daily
+    maintenance tick like any other aged row.
+    """
+
+    PENDING = "pending"
+    SENDING = "sending"
+    SENT = "sent"
+    ABANDONED = "abandoned"
+    REVOKED = "revoked"
+
+
+class NotificationKind(StrEnum):
+    """What a notification intent announces.
+
+    The kind travels with the row so the drain can tell a novelty alert from a
+    heartbeat transition, and so a superseded outage alert can be revoked by kind
+    instead of being sent after the recovery it contradicts.
+    """
+
+    NOVELTY = "novelty"
+    HEARTBEAT_ALERT = "heartbeat_alert"
+    HEARTBEAT_RECOVERY = "heartbeat_recovery"
+
+
+class PendingNotification(SQLiteModel):
+    """One durable per-target notification delivery intent.
+
+    Created inside the check's durable transaction, BEFORE any send begins
+    (TW-AUD-004): a crash between "we decided to notify" and "the message left"
+    used to be indistinguishable from "we never tried", so the alert was simply
+    lost. The intent survives that window and the next drain finishes it.
+
+    Scoped to a single ``url`` (OVH-039) so retry re-hits exactly the target that
+    owes a delivery. ``url`` is NULL on legacy whole-batch rows, in which case the
+    drain falls back to every configured URL. ``claim_token`` is the immutable
+    owner stamped by the winning claim; every result apply is fenced by it, so a
+    worker whose claim was released as stale cannot mutate the row its successor
+    now owns (AUG-277). ``next_attempt_at`` is a canonical UTC due-time, so a
+    backoff survives a restart instead of collapsing to "retry immediately".
     """
 
     _required_dt_fields = ("created_at",)
-    _insert_exclude = frozenset({"claimed_at"})
+    _insert_exclude = frozenset({"claimed_at", "claim_token", "delivered_at"})
 
     id: int | None = None
     topic_id: int
@@ -726,6 +791,13 @@ class PendingNotification(SQLiteModel):
     retry_count: int = 0
     max_retries: int = 3
     claimed_at: str | None = None
+    status: DeliveryStatus = DeliveryStatus.PENDING
+    kind: NotificationKind = NotificationKind.NOVELTY
+    claim_token: str | None = None
+    next_attempt_at: str | None = None
+    latch_value: str | None = None
+    """The heartbeat latch this intent belongs to (A5); NULL for novelty alerts."""
+    delivered_at: str | None = None
 
 
 class NotificationDelivery(BaseModel):
@@ -765,7 +837,7 @@ class PendingWebhook(SQLiteModel):
 
     _required_dt_fields = ("created_at",)
     _json_fields = {"payload": {}}  # noqa: RUF012 - declarative
-    _insert_exclude = frozenset({"claimed_at"})
+    _insert_exclude = frozenset({"claimed_at", "claim_token", "delivered_at"})
 
     id: int | None = None
     topic_id: int
@@ -776,3 +848,8 @@ class PendingWebhook(SQLiteModel):
     retry_count: int = 0
     max_retries: int = 3
     claimed_at: str | None = None
+    status: DeliveryStatus = DeliveryStatus.PENDING
+    claim_token: str | None = None
+    next_attempt_at: str | None = None
+    last_error: str | None = None
+    delivered_at: str | None = None

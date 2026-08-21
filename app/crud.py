@@ -945,155 +945,262 @@ def sum_check_tokens(conn: sqlite3.Connection, topic_id: int) -> tuple[int, int]
     return int(row[0]), int(row[1])
 
 
-# --- PendingNotification CRUD ---
+# --- Delivery intents ---
+#
+# A delivery intent is one durable row per (message, target), created INSIDE the
+# check's transaction before any send begins (TW-AUD-004). The lifecycle is
+# 'pending' -> 'sending' -> 'sent' | 'abandoned', with 'revoked' for an event that
+# stopped being true before its message left.
+#
+# Two properties hold for every intent helper below and must not be regressed
+# (TW-AUD-006 / AUG-277):
+#
+# 1. Eligibility lives INSIDE the claim predicate, never in the list query alone.
+#    A drainer working from a snapshot taken before another drainer exhausted a
+#    row must lose the claim, not physically retry past ``max_retries``.
+# 2. Every apply is fenced by the immutable ``claim_token`` the winning claim
+#    stamped. A worker whose claim was released as stale — including one released
+#    because the wall clock jumped — cannot mutate the row its successor now owns.
+#    Liveness is judged monotonically by the caller; the fence is identity-based,
+#    so it is correct across a clock jump in either direction.
+
+# How long a terminal intent is kept as the delivery ledger before the daily
+# maintenance tick prunes it. A constant, not a setting: it is the read window for
+# the dashboard's "last notified", not a preference (AUG-153).
+DELIVERY_INTENT_RETENTION_DAYS = 30
+
+_NOTIFICATION_INTENT_INSERT = """INSERT INTO pending_notifications
+    (topic_id, check_result_id, title, body, url, last_error, created_at,
+     retry_count, max_retries, status, kind, next_attempt_at, latch_value)
+    VALUES (:topic_id, :check_result_id, :title, :body, :url, :last_error,
+     :created_at, :retry_count, :max_retries, :status, :kind, :next_attempt_at,
+     :latch_value)"""
+
+# Only rows that are pending, still have attempts left, and are due. All three
+# conditions are part of the atomic claim, not a preceding SELECT.
+_NOTIFICATION_DUE = (
+    "status = 'pending' AND retry_count < max_retries AND (next_attempt_at IS NULL OR next_attempt_at <= ?)"
+)
+
+
+def create_notification_intents(conn: sqlite3.Connection, intents: list[PendingNotification]) -> list[int]:
+    """Insert delivery intents and return their ids. NO commit.
+
+    Called from inside the durable check transaction, so the intents land in the
+    same commit as the CheckResult that justifies them: either the check happened
+    and every target owes a delivery, or neither is true.
+    """
+    ids: list[int] = []
+    for intent in intents:
+        cursor = conn.execute(_NOTIFICATION_INTENT_INSERT, intent.to_insert_dict())
+        intent.id = cursor.lastrowid
+        ids.append(int(cursor.lastrowid or 0))
+    return ids
 
 
 def create_pending_notification(conn: sqlite3.Connection, notification: PendingNotification) -> PendingNotification:
-    """Store a failed notification for later retry.
-
-    ``url`` scopes the row to a single failed target so retry never re-hits the
-    targets that already delivered (OVH-039); ``last_error`` records why it
-    failed for operator diagnostics.
-    """
-    data = notification.to_insert_dict()
-    cursor = conn.execute(
-        """INSERT INTO pending_notifications (topic_id, check_result_id,
-           title, body, url, last_error, created_at, retry_count, max_retries)
-           VALUES (:topic_id, :check_result_id, :title, :body, :url, :last_error,
-           :created_at, :retry_count, :max_retries)""",
-        data,
-    )
-    notification.id = cursor.lastrowid
+    """Insert a single delivery intent, returning it with its assigned id."""
+    create_notification_intents(conn, [notification])
     return notification
 
 
 def list_pending_notifications(
     conn: sqlite3.Connection,
 ) -> list[PendingNotification]:
-    """Get pending notifications that haven't exceeded max retries.
+    """Every intent still awaiting delivery, oldest first.
 
-    Already-claimed rows (``claimed_at`` set) are excluded so a concurrent
-    drainer never re-snapshots an item another drainer is in the middle of
-    sending (see :func:`claim_pending_notification` / OVH-017).
+    Rows a drainer is currently sending ('sending') are excluded, as are the
+    terminal states — this is the queue, not the ledger.
     """
     rows = conn.execute(
         "SELECT * FROM pending_notifications "
-        "WHERE retry_count < max_retries AND claimed_at IS NULL "
-        "ORDER BY created_at ASC"
+        "WHERE status = 'pending' AND retry_count < max_retries "
+        "ORDER BY created_at ASC, id ASC"
     ).fetchall()
     return [PendingNotification.from_row(row) for row in rows]
 
 
-def claim_pending_notification(
+def list_due_notification_intents(
     conn: sqlite3.Connection,
-    notification_id: int,
-    claimed_at: str,
-    *,
-    claim_token: str | None = None,
+    now_iso: str,
+    limit: int,
+) -> list[PendingNotification]:
+    """Intents eligible to be sent right now, oldest first, at most ``limit``.
+
+    The limit is what keeps a backlog of queued messages from consuming a whole
+    scheduler cycle before any due topic is checked (AUG-027). The rows are only a
+    candidate list: eligibility is re-tested atomically by the claim.
+    """
+    rows = conn.execute(
+        f"SELECT * FROM pending_notifications WHERE {_NOTIFICATION_DUE} ORDER BY created_at ASC, id ASC LIMIT ?",
+        (now_iso, limit),
+    ).fetchall()
+    return [PendingNotification.from_row(row) for row in rows]
+
+
+def claim_notification_intent(
+    conn: sqlite3.Connection,
+    intent_id: int,
+    claim_token: str,
+    now_iso: str,
 ) -> bool:
-    """Atomically claim a pending notification for sending.
+    """Atomically take ownership of one intent. True only for the winner.
 
-    Returns True only if this caller won the claim (the row was unclaimed and
-    is now stamped). A concurrent drainer that lost the race gets False and
-    must skip the row, preventing double-delivery across processes.
-
-    Eligibility is part of the predicate, not a separate list query: a drainer
-    working from a snapshot taken before another drainer exhausted the row could
-    otherwise claim and physically retry it past ``max_retries`` (TW-AUD-006).
-    ``claim_token`` stamps the winning owner so its apply can be fenced.
+    Rejects, in one statement, every row this caller must not send: already
+    claimed or terminal, out of attempts, or not yet due.
     """
     cursor = conn.execute(
-        "UPDATE pending_notifications SET claimed_at = ?, claim_token = ? "
-        "WHERE id = ? AND claimed_at IS NULL AND retry_count < max_retries",
-        (claimed_at, claim_token, notification_id),
+        "UPDATE pending_notifications SET status = 'sending', claimed_at = ?, claim_token = ? "
+        f"WHERE id = ? AND {_NOTIFICATION_DUE}",
+        (now_iso, claim_token, intent_id, now_iso),
     )
     return cursor.rowcount == 1
 
 
-def increment_notification_retry(
+def apply_notification_outcome(
     conn: sqlite3.Connection,
-    notification_id: int,
-    last_error: str | None = None,
+    intent_id: int,
+    claim_token: str,
     *,
-    claim_token: str | None = None,
+    sent: bool,
+    error: str | None = None,
+    next_attempt_at: str | None = None,
+    delivered_at: str | None = None,
+    terminal: bool = False,
 ) -> bool:
-    """Increment the retry count and release the claim for a pending notification.
+    """Record the outcome of one send, fenced by the winning claim token.
 
-    Clearing ``claimed_at`` re-arms the row so the next cycle can re-claim and
-    retry it. ``last_error`` (when given) records the most recent failure reason
-    so a permanently-broken channel is distinguishable from a transient blip.
-    ``claim_token`` fences the write to the owner that actually sent: a drainer
-    whose claim was released as stale and re-taken elsewhere must not consume the
-    new owner's attempt (TW-AUD-006). Returns True when a row was updated.
+    ``sent`` retains the row as the delivery ledger with a ``delivered_at``
+    stamp. A failure re-arms the row at ``next_attempt_at`` unless it was the last
+    attempt or ``terminal`` says the target will never accept this payload — both
+    of which land on 'abandoned' rather than burning three identical retries.
+
+    Returns False when the fence rejected the write, which is the whole point: a
+    late apply from a superseded owner must be a no-op, not a silent mutation of
+    someone else's row (AUG-277).
     """
-    sql = (
-        "UPDATE pending_notifications "
-        "SET retry_count = retry_count + 1, claimed_at = NULL, claim_token = NULL, last_error = ? "
-        "WHERE id = ?"
+    if sent:
+        cursor = conn.execute(
+            "UPDATE pending_notifications SET status = 'sent', delivered_at = ?, last_error = NULL, "
+            "claimed_at = NULL, claim_token = NULL "
+            "WHERE id = ? AND claim_token = ? AND status = 'sending'",
+            (delivered_at or to_db_utc(datetime.now(UTC)), intent_id, claim_token),
+        )
+        return cursor.rowcount == 1
+
+    if terminal:
+        cursor = conn.execute(
+            "UPDATE pending_notifications SET status = 'abandoned', retry_count = retry_count + 1, "
+            "last_error = ?, claimed_at = NULL, claim_token = NULL "
+            "WHERE id = ? AND claim_token = ? AND status = 'sending'",
+            (error, intent_id, claim_token),
+        )
+        return cursor.rowcount == 1
+
+    cursor = conn.execute(
+        "UPDATE pending_notifications SET retry_count = retry_count + 1, last_error = ?, "
+        "next_attempt_at = ?, claimed_at = NULL, claim_token = NULL, "
+        "status = CASE WHEN retry_count + 1 >= max_retries THEN 'abandoned' ELSE 'pending' END "
+        "WHERE id = ? AND claim_token = ? AND status = 'sending'",
+        (error, next_attempt_at, intent_id, claim_token),
     )
-    params: list = [last_error, notification_id]
-    if claim_token is not None:
-        sql += " AND claim_token = ?"
-        params.append(claim_token)
-    cursor = conn.execute(sql, params)
     return cursor.rowcount == 1
 
 
-def delete_pending_notification(
-    conn: sqlite3.Connection,
-    notification_id: int,
-    *,
-    claim_token: str | None = None,
-) -> bool:
-    """Delete a pending notification (after successful send or max retries).
+def revoke_heartbeat_intents(conn: sqlite3.Connection, topic_id: int, kinds: tuple[str, ...]) -> int:
+    """Revoke a topic's undelivered heartbeat intents of the given kinds.
 
-    ``claim_token`` fences the delete to the claim that sent it, so a late apply
-    from a superseded owner cannot drop a row another drainer is working on
-    (TW-AUD-006). Returns True when a row was deleted.
+    A queued outage alert that has not left yet must not be delivered after the
+    recovery that contradicts it, and neither survives the feature being switched
+    off (AUG-019/AUG-132). Only 'pending' rows are revoked: one already claimed
+    may be mid-flight, and pretending otherwise would be a lie in the ledger.
     """
-    sql = "DELETE FROM pending_notifications WHERE id = ?"
-    params: list = [notification_id]
-    if claim_token is not None:
-        sql += " AND claim_token = ?"
-        params.append(claim_token)
-    cursor = conn.execute(sql, params)
-    return cursor.rowcount == 1
+    if not kinds:
+        return 0
+    placeholders = ",".join("?" for _ in kinds)
+    cursor = conn.execute(
+        "UPDATE pending_notifications SET status = 'revoked', claimed_at = NULL, claim_token = NULL "
+        f"WHERE topic_id = ? AND status = 'pending' AND kind IN ({placeholders})",
+        (topic_id, *kinds),
+    )
+    return cursor.rowcount
 
 
 def release_stale_notification_claims(conn: sqlite3.Connection, cutoff: str) -> int:
-    """Release notification claims stamped at or before ``cutoff`` (ISO string).
+    """Re-arm intents claimed at or before ``cutoff`` (ISO string).
 
-    A drainer that claims a row then crashes before applying its result would
-    otherwise leave the row claimed forever (and so never re-sent). Clearing
-    stale claims at snapshot time makes the queue self-healing.
+    A drainer that claims a row then dies — or whose send timed out with an
+    unknown outcome — would otherwise leave it 'sending' forever. Re-arming makes
+    the queue self-healing; the claim token makes the original owner's late apply
+    harmless if it ever comes back.
     """
     cursor = conn.execute(
-        "UPDATE pending_notifications SET claimed_at = NULL, claim_token = NULL "
-        "WHERE claimed_at IS NOT NULL AND claimed_at <= ?",
+        "UPDATE pending_notifications SET status = 'pending', claimed_at = NULL, claim_token = NULL "
+        "WHERE status = 'sending' AND claimed_at IS NOT NULL AND claimed_at <= ?",
         (cutoff,),
     )
     return cursor.rowcount
 
 
-def delete_expired_notifications(conn: sqlite3.Connection) -> list[PendingNotification]:
-    """Delete notifications that have exceeded their max retries.
+def abandon_expired_notifications(conn: sqlite3.Connection) -> list[PendingNotification]:
+    """Mark out-of-attempts intents 'abandoned', returning what was abandoned.
 
-    Returns the rows that were permanently abandoned (selected before the
-    DELETE) so the caller can log exactly what was dropped instead of only a
-    count — a silently-pruned notification is otherwise unobservable (OVH-040).
+    Rows normally reach 'abandoned' at apply time; this sweeps the ones that
+    cannot — a row that was already at its retry ceiling before intents existed
+    would otherwise sit 'pending' forever, invisible to both the drain (the claim
+    refuses it) and retention (which only prunes terminal rows). Returning the
+    rows lets the caller log exactly what was dropped (OVH-040).
     """
-    rows = conn.execute("SELECT * FROM pending_notifications WHERE retry_count >= max_retries").fetchall()
+    rows = conn.execute(
+        "SELECT * FROM pending_notifications WHERE status = 'pending' AND retry_count >= max_retries"
+    ).fetchall()
     abandoned = [PendingNotification.from_row(row) for row in rows]
-    conn.execute("DELETE FROM pending_notifications WHERE retry_count >= max_retries")
+    conn.execute(
+        "UPDATE pending_notifications SET status = 'abandoned' WHERE status = 'pending' AND retry_count >= max_retries"
+    )
     return abandoned
 
 
-# --- PendingWebhook CRUD ---
+def delete_old_delivery_intents(conn: sqlite3.Connection, days: int) -> int:
+    """Prune terminal delivery intents older than ``days``. Returns rows removed.
+
+    Only terminal rows are eligible: anything still 'pending' or 'sending' owes a
+    delivery no matter how old it is.
+    """
+    cutoff = to_db_utc(datetime.now(UTC) - timedelta(days=days))
+    removed = conn.execute(
+        "DELETE FROM pending_notifications WHERE status IN ('sent', 'abandoned', 'revoked') AND created_at < ?",
+        (cutoff,),
+    ).rowcount
+    removed += conn.execute(
+        "DELETE FROM pending_webhooks WHERE status IN ('sent', 'abandoned', 'revoked') AND created_at < ?",
+        (cutoff,),
+    ).rowcount
+    return removed
+
+
+# --- Webhook delivery intents ---
 #
-# The webhook retry queue mirrors pending_notifications. Rows map to the
-# PendingWebhook model (see app/models.py); the payload is stored as a JSON TEXT
-# column. list_pending_webhooks returns PendingWebhook models, symmetric with
-# list_pending_notifications (OVH-152).
+# An exact mirror of the notification intent helpers above, over pending_webhooks.
+# Same two invariants: eligibility inside the claim, apply fenced by claim_token.
+
+_WEBHOOK_INTENT_INSERT = """INSERT INTO pending_webhooks
+    (topic_id, check_result_id, url, payload, created_at, retry_count,
+     max_retries, status, next_attempt_at, last_error)
+    VALUES (:topic_id, :check_result_id, :url, :payload, :created_at,
+     :retry_count, :max_retries, :status, :next_attempt_at, :last_error)"""
+
+_WEBHOOK_DUE = "status = 'pending' AND retry_count < max_retries AND (next_attempt_at IS NULL OR next_attempt_at <= ?)"
+
+
+def create_webhook_intents(conn: sqlite3.Connection, intents: list[PendingWebhook]) -> list[int]:
+    """Insert webhook delivery intents and return their ids. NO commit."""
+    ids: list[int] = []
+    for intent in intents:
+        cursor = conn.execute(_WEBHOOK_INTENT_INSERT, intent.to_insert_dict())
+        intent.id = cursor.lastrowid
+        ids.append(int(cursor.lastrowid or 0))
+    return ids
 
 
 def create_pending_webhook(
@@ -1104,129 +1211,122 @@ def create_pending_webhook(
     check_result_id: int | None = None,
     max_retries: int = 3,
 ) -> int:
-    """Store a failed webhook delivery for later retry. Returns the new row id."""
-    webhook = PendingWebhook(
+    """Insert a single webhook delivery intent. Returns the new row id."""
+    intent = PendingWebhook(
         topic_id=topic_id,
         check_result_id=check_result_id,
         url=url,
         payload=payload,
         max_retries=max_retries,
     )
-    data = webhook.to_insert_dict()
-    cursor = conn.execute(
-        """INSERT INTO pending_webhooks (topic_id, check_result_id, url, payload,
-           created_at, retry_count, max_retries)
-           VALUES (:topic_id, :check_result_id, :url, :payload,
-           :created_at, :retry_count, :max_retries)""",
-        data,
-    )
-    return int(cursor.lastrowid or 0)
+    return create_webhook_intents(conn, [intent])[0]
 
 
 def list_pending_webhooks(conn: sqlite3.Connection) -> list[PendingWebhook]:
-    """Get pending webhooks that haven't exceeded max retries.
-
-    Returns ``PendingWebhook`` models (payload decoded from JSON), symmetric with
-    :func:`list_pending_notifications` (OVH-152). Already-claimed rows
-    (``claimed_at`` set) are excluded so a concurrent drainer never re-snapshots
-    an item another drainer is sending (see :func:`claim_pending_webhook` /
-    OVH-017).
-    """
+    """Every webhook intent still awaiting delivery, oldest first."""
     rows = conn.execute(
-        "SELECT * FROM pending_webhooks WHERE retry_count < max_retries AND claimed_at IS NULL ORDER BY created_at ASC"
+        "SELECT * FROM pending_webhooks "
+        "WHERE status = 'pending' AND retry_count < max_retries "
+        "ORDER BY created_at ASC, id ASC"
     ).fetchall()
     return [PendingWebhook.from_row(row) for row in rows]
 
 
-def claim_pending_webhook(
+def list_due_webhook_intents(
     conn: sqlite3.Connection,
-    webhook_id: int,
-    claimed_at: str,
-    *,
-    claim_token: str | None = None,
-) -> bool:
-    """Atomically claim a pending webhook for sending.
+    now_iso: str,
+    limit: int,
+) -> list[PendingWebhook]:
+    """Webhook intents eligible to be sent right now, oldest first."""
+    rows = conn.execute(
+        f"SELECT * FROM pending_webhooks WHERE {_WEBHOOK_DUE} ORDER BY created_at ASC, id ASC LIMIT ?",
+        (now_iso, limit),
+    ).fetchall()
+    return [PendingWebhook.from_row(row) for row in rows]
 
-    Returns True only if this caller won the claim (the row was unclaimed and
-    is now stamped). A concurrent drainer that lost the race gets False and
-    must skip the row, preventing double-delivery across processes. Mirrors
-    :func:`claim_pending_notification`, eligibility predicate included
-    (TW-AUD-006).
-    """
+
+def claim_webhook_intent(
+    conn: sqlite3.Connection,
+    intent_id: int,
+    claim_token: str,
+    now_iso: str,
+) -> bool:
+    """Atomically take ownership of one webhook intent. True only for the winner."""
     cursor = conn.execute(
-        "UPDATE pending_webhooks SET claimed_at = ?, claim_token = ? "
-        "WHERE id = ? AND claimed_at IS NULL AND retry_count < max_retries",
-        (claimed_at, claim_token, webhook_id),
+        "UPDATE pending_webhooks SET status = 'sending', claimed_at = ?, claim_token = ? "
+        f"WHERE id = ? AND {_WEBHOOK_DUE}",
+        (now_iso, claim_token, intent_id, now_iso),
     )
     return cursor.rowcount == 1
 
 
-def increment_webhook_retry(
+def apply_webhook_outcome(
     conn: sqlite3.Connection,
-    webhook_id: int,
+    intent_id: int,
+    claim_token: str,
     *,
-    claim_token: str | None = None,
+    sent: bool,
+    error: str | None = None,
+    next_attempt_at: str | None = None,
+    delivered_at: str | None = None,
+    terminal: bool = False,
 ) -> bool:
-    """Increment the retry count and release the claim for a pending webhook.
+    """Record one webhook send's outcome, fenced by the winning claim token.
 
-    Clearing ``claimed_at`` re-arms the row so the next cycle can re-claim and
-    retry it. Fenced by ``claim_token`` like its notification twin (TW-AUD-006).
+    ``terminal`` is what makes a permanent rejection cheap: a 400 or a 422 will
+    still be a 400 on the third identical POST, so the intent is abandoned on the
+    spot instead of consuming the whole retry budget (AUG-324).
     """
-    sql = (
-        "UPDATE pending_webhooks SET retry_count = retry_count + 1, claimed_at = NULL, claim_token = NULL WHERE id = ?"
+    if sent:
+        cursor = conn.execute(
+            "UPDATE pending_webhooks SET status = 'sent', delivered_at = ?, last_error = NULL, "
+            "claimed_at = NULL, claim_token = NULL "
+            "WHERE id = ? AND claim_token = ? AND status = 'sending'",
+            (delivered_at or to_db_utc(datetime.now(UTC)), intent_id, claim_token),
+        )
+        return cursor.rowcount == 1
+
+    if terminal:
+        cursor = conn.execute(
+            "UPDATE pending_webhooks SET status = 'abandoned', retry_count = retry_count + 1, "
+            "last_error = ?, claimed_at = NULL, claim_token = NULL "
+            "WHERE id = ? AND claim_token = ? AND status = 'sending'",
+            (error, intent_id, claim_token),
+        )
+        return cursor.rowcount == 1
+
+    cursor = conn.execute(
+        "UPDATE pending_webhooks SET retry_count = retry_count + 1, last_error = ?, "
+        "next_attempt_at = ?, claimed_at = NULL, claim_token = NULL, "
+        "status = CASE WHEN retry_count + 1 >= max_retries THEN 'abandoned' ELSE 'pending' END "
+        "WHERE id = ? AND claim_token = ? AND status = 'sending'",
+        (error, next_attempt_at, intent_id, claim_token),
     )
-    params: list = [webhook_id]
-    if claim_token is not None:
-        sql += " AND claim_token = ?"
-        params.append(claim_token)
-    cursor = conn.execute(sql, params)
-    return cursor.rowcount == 1
-
-
-def delete_pending_webhook(
-    conn: sqlite3.Connection,
-    webhook_id: int,
-    *,
-    claim_token: str | None = None,
-) -> bool:
-    """Delete a pending webhook (after successful send or max retries).
-
-    Fenced by ``claim_token`` like its notification twin (TW-AUD-006).
-    """
-    sql = "DELETE FROM pending_webhooks WHERE id = ?"
-    params: list = [webhook_id]
-    if claim_token is not None:
-        sql += " AND claim_token = ?"
-        params.append(claim_token)
-    cursor = conn.execute(sql, params)
     return cursor.rowcount == 1
 
 
 def release_stale_webhook_claims(conn: sqlite3.Connection, cutoff: str) -> int:
-    """Release webhook claims stamped at or before ``cutoff`` (ISO string).
-
-    Mirrors :func:`release_stale_notification_claims`: a drainer that claims a
-    row then crashes before applying would otherwise strand it claimed forever.
-    """
+    """Re-arm webhook intents claimed at or before ``cutoff`` (ISO string)."""
     cursor = conn.execute(
-        "UPDATE pending_webhooks SET claimed_at = NULL, claim_token = NULL "
-        "WHERE claimed_at IS NOT NULL AND claimed_at <= ?",
+        "UPDATE pending_webhooks SET status = 'pending', claimed_at = NULL, claim_token = NULL "
+        "WHERE status = 'sending' AND claimed_at IS NOT NULL AND claimed_at <= ?",
         (cutoff,),
     )
     return cursor.rowcount
 
 
-def delete_expired_webhooks(conn: sqlite3.Connection) -> list[PendingWebhook]:
-    """Delete webhooks that have exceeded their max retries.
+def abandon_expired_webhooks(conn: sqlite3.Connection) -> list[PendingWebhook]:
+    """Mark out-of-attempts webhook intents 'abandoned', returning what was abandoned.
 
-    Returns the rows that were permanently abandoned (selected before the
-    DELETE) so the caller can log exactly what was dropped — including the
-    topic_id/check_result_id for traceability — instead of only a count
-    (OVH-040). The URL is redacted by the caller before it reaches a log.
+    The URL is redacted by the caller before it reaches a log.
     """
-    rows = conn.execute("SELECT * FROM pending_webhooks WHERE retry_count >= max_retries").fetchall()
+    rows = conn.execute(
+        "SELECT * FROM pending_webhooks WHERE status = 'pending' AND retry_count >= max_retries"
+    ).fetchall()
     abandoned = [PendingWebhook.from_row(row) for row in rows]
-    conn.execute("DELETE FROM pending_webhooks WHERE retry_count >= max_retries")
+    conn.execute(
+        "UPDATE pending_webhooks SET status = 'abandoned' WHERE status = 'pending' AND retry_count >= max_retries"
+    )
     return abandoned
 
 
@@ -1467,7 +1567,17 @@ def get_dashboard_stats(conn: sqlite3.Connection) -> DashboardStats:
             (SELECT COUNT(*) FROM check_results
              WHERE has_new_info = 1 AND datetime(checked_at) >= datetime('now', '-1 day')) AS new_info_24h,
             (SELECT COUNT(*) FROM check_results WHERE has_new_info = 1) AS new_info_total,
-            (SELECT MAX(checked_at) FROM check_results WHERE notification_sent = 1) AS last_notification_at
+            -- "Last notified" means the most recent alert of ANY kind that actually
+            -- left. The delivery ledger is the truthful source: heartbeat outage and
+            -- recovery messages create no check_results row at all, so deriving this
+            -- from notification_sent alone showed an older timestamp (or 'never')
+            -- right after a heartbeat alert (AUG-153). The check_results half is kept
+            -- so history predating the ledger still reads correctly.
+            (SELECT MAX(stamp) FROM (
+                SELECT MAX(checked_at) AS stamp FROM check_results WHERE notification_sent = 1
+                UNION ALL
+                SELECT MAX(delivered_at) FROM pending_notifications WHERE status = 'sent'
+            )) AS last_notification_at
         """
     ).fetchone()
     assert row is not None

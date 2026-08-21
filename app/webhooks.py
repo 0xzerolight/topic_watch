@@ -1,14 +1,21 @@
 """Custom webhook delivery for Topic Watch.
 
-Sends structured JSON payloads to arbitrary HTTP endpoints when
-new information is found, complementing the Apprise notifications.
+Sends structured JSON payloads to arbitrary HTTP endpoints when new information
+is found, complementing the Apprise notifications.
+
+Delivery is intent-based: a per-target row is committed inside the check's
+durable transaction before any POST is attempted, and the send is a separate
+claim -> POST -> apply cycle that the live path and the retry drain share
+(TW-AUD-004). Nothing here holds a SQLite connection across a network await.
 """
 
 import asyncio
 import logging
 import secrets
 import sqlite3
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -17,17 +24,15 @@ import httpx
 from app.analysis.llm import NoveltyResult
 from app.config import Settings
 from app.crud import (
-    claim_pending_webhook,
-    create_pending_webhook,
-    delete_expired_webhooks,
-    delete_pending_webhook,
-    increment_webhook_retry,
-    list_pending_webhooks,
+    abandon_expired_webhooks,
+    apply_webhook_outcome,
+    claim_webhook_intent,
+    list_due_webhook_intents,
     release_stale_webhook_claims,
 )
 from app.database import short_conn
 from app.log_redaction import redact_url
-from app.models import PendingWebhook
+from app.models import PendingWebhook, next_attempt_at, to_db_utc
 from app.url_validation import is_private_url
 
 logger = logging.getLogger(__name__)
@@ -35,22 +40,75 @@ logger = logging.getLogger(__name__)
 _WEBHOOK_TIMEOUT = 10.0
 
 # OVH-139: bound how many queued deliveries the retry drain sends at once.
-# The live path (send_webhooks) already fans out with asyncio.gather; the retry
-# drain previously ran strictly one-at-a-time, so a backlog of K failures cost
-# K x up-to-timeout seconds at the start of every cycle, delaying due checks.
-# A small cap mirrors the live path while staying gentle on endpoints.
+# The live path already fans out with asyncio.gather; the retry drain previously
+# ran strictly one-at-a-time, so a backlog of K failures cost K x up-to-timeout
+# seconds at the start of every cycle, delaying due checks. A small cap mirrors
+# the live path while staying gentle on endpoints.
 _RETRY_DRAIN_CONCURRENCY = 5
+
+# AUG-027: rows per drain. Bounds how long queued deliveries can hold a scheduler
+# cycle before due-topic work starts; the rest wait for the next tick.
+_RETRY_DRAIN_LIMIT = 20
 
 # Single-flight guard: serializes webhook drains within this process so two
 # overlapping drains (scheduler tick vs. a UI/CLI check-all) cannot both walk
 # the queue at once. The cross-process case is covered by the atomic per-row
-# claim (claimed_at) below. (OVH-017)
+# claim below. (OVH-017)
 _retry_lock = asyncio.Lock()
 
-# Claims older than this are treated as stale (a drainer crashed mid-send) and
-# released so the row can be re-claimed. Comfortably exceeds the per-item send
-# timeout so an in-flight send is never stolen.
-_CLAIM_STALE_AFTER = timedelta(minutes=10)
+# Claims older than this are treated as stale (a drainer crashed mid-send, or its
+# POST timed out with an unknown outcome) and re-armed. Comfortably exceeds the
+# per-item send timeout so an in-flight send is never stolen. Measured against
+# the stored wall-clock claim stamp; a clock jump can therefore re-arm a live
+# claim early, which is harmless because the apply is fenced by claim_token
+# rather than by elapsed time (AUG-277).
+_CLAIM_STALE_AFTER_SECONDS = 600.0
+
+# HTTP statuses that will not change on a retry: the payload or the address is
+# wrong, so three more identical POSTs only add noise (AUG-324).
+_TERMINAL_STATUSES = frozenset({400, 401, 403, 404, 410, 413, 422})
+
+# Ceiling on a Retry-After the receiver asked for. A header is a hint, not a
+# lease: without a bound, one bad value parks a delivery indefinitely.
+_MAX_RETRY_AFTER_SECONDS = 3600.0
+
+
+@dataclass(frozen=True)
+class WebhookOutcome:
+    """What one webhook POST actually did.
+
+    A bare bool erased everything the retry scheduler needs: a permanent 400 was
+    indistinguishable from a transient 503, and a receiver's stated recovery time
+    was discarded, so a 429 could burn its whole retry budget before the endpoint
+    was ready to answer (AUG-324).
+    """
+
+    ok: bool
+    status: int | None = None
+    retryable: bool = True
+    retry_after_s: float | None = None
+    error: str | None = None
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parse a ``Retry-After`` header: delta-seconds or HTTP-date."""
+    if not value:
+        return None
+    raw = value.strip()
+    try:
+        return max(0.0, min(float(int(raw)), _MAX_RETRY_AFTER_SECONDS))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    delta = (when - datetime.now(UTC)).total_seconds()
+    return max(0.0, min(delta, _MAX_RETRY_AFTER_SECONDS))
 
 
 def _build_webhook_payload(topic_name: str, novelty_result: NoveltyResult) -> dict:
@@ -68,23 +126,21 @@ def _build_webhook_payload(topic_name: str, novelty_result: NoveltyResult) -> di
     }
 
 
-async def send_webhook(url: str, payload: dict, timeout: float = _WEBHOOK_TIMEOUT) -> bool:
-    """POST a JSON payload to a webhook URL.
-
-    Returns True on success (2xx response), False on failure.
-    Never raises — all errors are caught and logged.
+async def send_webhook(url: str, payload: dict, timeout: float = _WEBHOOK_TIMEOUT) -> WebhookOutcome:
+    """POST a JSON payload to a webhook URL. Never raises.
 
     SSRF note: is_private_url performs blocking DNS resolution, so it is
     offloaded to a worker thread to avoid stalling the event loop. A
     DNS-rebinding TOCTOU window between this check and the POST is a
     pre-existing, architectural limitation shared by all outbound fetches.
+
+    A blocked URL is terminal, not a failure to retry: a private address or a
+    non-http(s) scheme will still be one on the next attempt.
     """
     # Validate the URL BEFORE the POST. A malformed URL (e.g. an unbracketed or
     # otherwise broken IPv6 literal) makes urlparse / is_private_url raise
-    # ValueError, which would violate the documented "Never raises" contract —
-    # both callers rely on it (send_webhooks' gather and retry_pending_webhooks'
-    # try/except), so a leaked exception silently re-queues an unparseable URL
-    # with no specific log. Treat any validation error as "blocked" (OVH-131).
+    # ValueError, which would violate the documented "Never raises" contract, so
+    # any validation error counts as blocked (OVH-131).
     try:
         # Scheme allowlist BEFORE the POST (OVH-141). is_private_url() returns
         # False for schemes with no netloc (file://, gopher://, ftp://), so
@@ -93,14 +149,14 @@ async def send_webhook(url: str, payload: dict, timeout: float = _WEBHOOK_TIMEOU
         # redirect checks.
         if urlparse(url).scheme not in ("http", "https"):
             logger.warning("Blocked webhook to non-http(s) URL: %s", redact_url(url))
-            return False
+            return WebhookOutcome(ok=False, retryable=False, error="non-http(s) URL")
 
         if await asyncio.to_thread(is_private_url, url):
             logger.warning("Blocked webhook to private/reserved URL: %s", redact_url(url))
-            return False
+            return WebhookOutcome(ok=False, retryable=False, error="private/reserved URL")
     except Exception:
         logger.warning("Blocked webhook to malformed URL: %s", redact_url(url), exc_info=True)
-        return False
+        return WebhookOutcome(ok=False, retryable=False, error="malformed URL")
 
     try:
         # follow_redirects=False (httpx default, made explicit) so a 3xx to a
@@ -109,91 +165,144 @@ async def send_webhook(url: str, payload: dict, timeout: float = _WEBHOOK_TIMEOU
             response = await client.post(url, json=payload)
             response.raise_for_status()
             logger.info("Webhook delivered to %s (status %d)", redact_url(url), response.status_code)
-            return True
+            return WebhookOutcome(ok=True, status=response.status_code)
     except httpx.TimeoutException:
         logger.warning("Webhook timeout for %s", redact_url(url))
-        return False
+        return WebhookOutcome(ok=False, error="timeout")
     except httpx.HTTPStatusError as exc:
-        logger.warning("Webhook HTTP %d for %s", exc.response.status_code, redact_url(url))
-        return False
-    except Exception:
+        status = exc.response.status_code
+        retryable = status not in _TERMINAL_STATUSES
+        retry_after = _parse_retry_after(exc.response.headers.get("Retry-After")) if retryable else None
+        logger.warning(
+            "Webhook HTTP %d for %s (%s)",
+            status,
+            redact_url(url),
+            "retryable" if retryable else "permanent",
+        )
+        return WebhookOutcome(
+            ok=False,
+            status=status,
+            retryable=retryable,
+            retry_after_s=retry_after,
+            error=f"HTTP {status}",
+        )
+    except Exception as exc:
         logger.warning("Webhook error for %s", redact_url(url), exc_info=True)
-        return False
+        return WebhookOutcome(ok=False, error=type(exc).__name__)
 
 
-async def send_webhooks(
+def build_webhook_intents(
     topic_name: str,
     novelty_result: NoveltyResult,
     settings: Settings,
-    conn: sqlite3.Connection | None = None,
-    topic_id: int | None = None,
+    topic_id: int,
     check_result_id: int | None = None,
-    *,
-    db_path: Path | None = None,
-) -> int:
-    """Send webhook notifications to all configured webhook URLs.
+) -> list[PendingWebhook]:
+    """One unsaved delivery intent per configured webhook target. Pure.
 
-    Args:
-        topic_name: The topic name.
-        novelty_result: The novelty analysis result.
-        settings: Application settings.
-        conn: Optional DB connection. When given together with topic_id,
-            failed deliveries are enqueued to pending_webhooks for retry.
-        topic_id: Topic id used when enqueuing failed deliveries.
-        check_result_id: Optional originating check result id (for traceability).
-        db_path: Path used to open a short-lived connection for the enqueue when
-            no ``conn`` is supplied. The pipeline passes this rather than its own
-            connection, so no caller's handle is held across the POSTs above.
-
-    Returns:
-        Number of successfully delivered webhooks.
+    Pure so the caller can build the intents with nothing open and hand them to
+    the durable transaction, which inserts them alongside the CheckResult that
+    justifies them.
     """
-    webhook_urls = settings.notifications.webhook_urls
-    if not webhook_urls:
+    payload = _build_webhook_payload(topic_name, novelty_result)
+    return [
+        PendingWebhook(topic_id=topic_id, check_result_id=check_result_id, url=url, payload=payload)
+        for url in settings.notifications.webhook_urls
+    ]
+
+
+async def _deliver_one_intent(
+    intent: PendingWebhook,
+    db_path: Path | None,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Claim, POST, apply — for one intent. Returns True when it was delivered.
+
+    Each database interaction is its own short connection with its own commit, so
+    a sibling's failure can never roll back what this one already applied, and no
+    connection is open across the POST.
+    """
+    intent_id = intent.id
+    if intent_id is None:
+        return False
+
+    claim_token = secrets.token_hex(8)
+    now_iso = to_db_utc(datetime.now(UTC))
+    with short_conn(conn, db_path) as claim_conn:
+        won = claim_webhook_intent(claim_conn, intent_id, claim_token, now_iso)
+        claim_conn.commit()
+    if not won:
+        logger.debug("Webhook intent id=%d not claimable (claimed, exhausted or not due); skipping", intent_id)
+        return False
+
+    outcome = await send_webhook(intent.url, intent.payload)
+
+    due = (
+        None
+        if outcome.ok or not outcome.retryable
+        else next_attempt_at(intent.retry_count, hint_s=outcome.retry_after_s)
+    )
+    with short_conn(conn, db_path) as apply_conn:
+        applied = apply_webhook_outcome(
+            apply_conn,
+            intent_id,
+            claim_token,
+            sent=outcome.ok,
+            error=outcome.error,
+            next_attempt_at=due,
+            terminal=not outcome.retryable,
+        )
+        apply_conn.commit()
+    if not applied:
+        logger.warning("Late apply for webhook intent id=%d ignored: the claim is no longer ours", intent_id)
+    elif not outcome.ok and not outcome.retryable:
+        logger.warning(
+            "Abandoning webhook intent id=%d without retry (topic_id=%s url=%s reason=%s)",
+            intent_id,
+            intent.topic_id,
+            redact_url(intent.url),
+            outcome.error,
+        )
+    return outcome.ok
+
+
+async def deliver_webhook_intents(
+    intents: list[PendingWebhook],
+    settings: Settings,
+    db_path: Path | None,
+    conn: sqlite3.Connection | None = None,
+) -> int:
+    """Deliver a batch of already-persisted webhook intents. Returns the count sent.
+
+    ``return_exceptions=True`` and every result inspected (AUG-263): the default
+    fail-fast gather propagated the first claim/apply error while its siblings kept
+    running, unwinding the drain's lock and the scheduler's job around still-live
+    children. Ownership is held until every child has settled.
+    """
+    if not intents:
         return 0
 
-    payload = _build_webhook_payload(topic_name, novelty_result)
+    semaphore = asyncio.Semaphore(_RETRY_DRAIN_CONCURRENCY)
 
-    tasks = [send_webhook(url, payload) for url in webhook_urls]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    async def _process(intent: PendingWebhook) -> bool:
+        async with semaphore:
+            return await _deliver_one_intent(intent, db_path, conn)
 
-    success_count = 0
-    can_queue = topic_id is not None and (conn is not None or db_path is not None)
-    failed_urls: list[str] = []
-    for url, result in zip(webhook_urls, results, strict=True):
-        if isinstance(result, bool) and result:
-            success_count += 1
-        elif can_queue:
-            failed_urls.append(url)
+    results = await asyncio.gather(*(_process(intent) for intent in intents), return_exceptions=True)
 
-    if failed_urls:
-        # Persist the failed deliveries so a later cycle can retry them instead
-        # of dropping them (fire-and-forget loses failures). One short
-        # transaction, opened after every POST has returned.
-        assert topic_id is not None
-        with short_conn(conn, db_path) as queue_conn:
-            for url in failed_urls:
-                try:
-                    create_pending_webhook(queue_conn, topic_id, url, payload, check_result_id)
-                except Exception:
-                    logger.warning("Failed to enqueue webhook for retry (url=%s)", redact_url(url), exc_info=True)
-            queue_conn.commit()
+    delivered = 0
+    for intent, result in zip(intents, results, strict=True):
+        if isinstance(result, BaseException):
+            logger.warning("Webhook intent id=%s failed unexpectedly", intent.id, exc_info=(type(result), result, None))
+            continue
+        if result:
+            delivered += 1
 
-    if success_count < len(webhook_urls):
-        logger.warning(
-            "Webhooks: %d/%d delivered for topic '%s'",
-            success_count,
-            len(webhook_urls),
-            topic_name,
-        )
+    if delivered < len(intents):
+        logger.warning("Webhooks: %d/%d delivered", delivered, len(intents))
     else:
-        logger.info(
-            "Webhooks: all %d delivered for topic '%s'",
-            success_count,
-            topic_name,
-        )
-
-    return success_count
+        logger.info("Webhooks: all %d delivered", delivered)
+    return delivered
 
 
 async def retry_pending_webhooks(
@@ -202,23 +311,15 @@ async def retry_pending_webhooks(
     *,
     db_path: Path | None = None,
 ) -> None:
-    """Retry any pending webhook deliveries from previous check cycles.
+    """Drain the webhook delivery queue: due intents get one more attempt.
 
-    Mirrors retry_pending_notifications: successful deliveries are deleted,
-    failures get their retry count incremented, and deliveries exceeding
-    max_retries are dropped.
-
-    Connection handling: no sqlite connection is held across the network
-    sends. The pending rows are snapshotted under a short connection, the
-    POSTs run with no open connection, and results are applied with a commit
-    *per item* so a mid-loop crash never rolls back already-applied
-    delete/increment operations (which would let a permanently-failing URL be
-    retried unbounded across restarts).
+    Same claim/send/apply cycle as the live path — a queued intent and a
+    just-created one are the same kind of thing, so they take the same code path.
 
     Args:
         conn: Optional existing connection (back-compat; callers that already
-            own a connection may pass it). When given, it is reused but still
-            committed per item and never held across a send.
+            own a connection may pass it). Reused but still committed per item
+            and never held across a send.
         settings: Application settings (required).
         db_path: Database path used to open short-lived connections when no
             ``conn`` is provided.
@@ -233,22 +334,22 @@ async def retry_pending_webhooks(
         return
 
     async with _retry_lock:
-        await _drain_pending_webhooks(conn, db_path)
+        await _drain_webhook_intents(conn, settings, db_path)
 
 
-async def _drain_pending_webhooks(
+async def _drain_webhook_intents(
     conn: sqlite3.Connection | None,
+    settings: Settings,
     db_path: Path | None,
 ) -> None:
-    """Drain the webhook retry queue once (caller holds ``_retry_lock``)."""
-    # --- Phase 1: snapshot pending rows under a short-lived connection. ---
-    stale_cutoff = (datetime.now(UTC) - _CLAIM_STALE_AFTER).isoformat()
+    """Drain the webhook queue once (caller holds ``_retry_lock``)."""
+    now = datetime.now(UTC)
+    stale_cutoff = to_db_utc(now - timedelta(seconds=_CLAIM_STALE_AFTER_SECONDS))
     with short_conn(conn, db_path) as snapshot:
         released = release_stale_webhook_claims(snapshot, stale_cutoff)
         if released:
-            logger.warning("Released %d stale webhook claim(s)", released)
-        abandoned = delete_expired_webhooks(snapshot)
-        for item in abandoned:
+            logger.warning("Re-armed %d stale webhook claim(s)", released)
+        for item in abandon_expired_webhooks(snapshot):
             # One WARNING per permanently-dropped delivery so an abandoned
             # webhook is observable: identify it by topic/check ids and the
             # redacted destination (never the secret-bearing full URL) (OVH-040).
@@ -259,67 +360,11 @@ async def _drain_pending_webhooks(
                 redact_url(item.url),
                 item.created_at.isoformat(),
             )
-        if abandoned:
-            logger.warning("Deleted %d expired pending webhook(s)", len(abandoned))
         snapshot.commit()
-        pending = list_pending_webhooks(snapshot)
+        pending = list_due_webhook_intents(snapshot, to_db_utc(now), _RETRY_DRAIN_LIMIT)
 
     if not pending:
         return
 
     logger.info("Retrying %d pending webhook(s)", len(pending))
-
-    # --- Phase 2: claim, send with NO connection held, then apply per item. ---
-    # OVH-139: process items with bounded concurrency (mirrors the live path's
-    # bounded gather) instead of strict K x timeout serialization. The 1.6
-    # invariants are preserved: each row is still claimed atomically exactly
-    # once (only the winning drainer sends, no double-delivery), and each item
-    # is applied + committed on its own short connection. The claim and apply
-    # blocks contain no await points, so on a shared ``conn`` they never
-    # interleave mid-transaction.
-    semaphore = asyncio.Semaphore(_RETRY_DRAIN_CONCURRENCY)
-
-    async def _process(webhook: PendingWebhook) -> None:
-        webhook_id = webhook.id
-        assert webhook_id is not None
-        async with semaphore:
-            # Atomically claim this row. A concurrent (cross-process) drainer
-            # that already claimed it returns rowcount 0 here, so we skip — only
-            # the winner sends, preventing double-delivery (OVH-017).
-            claimed_at = datetime.now(UTC).isoformat()
-            # Owner token + eligibility inside the claim, mirroring the
-            # notification drain: no retry past max_retries and no late apply from
-            # a superseded owner (TW-AUD-006).
-            claim_token = secrets.token_hex(8)
-            with short_conn(conn, db_path) as claim_conn:
-                won = claim_pending_webhook(claim_conn, webhook_id, claimed_at, claim_token=claim_token)
-                claim_conn.commit()
-            if not won:
-                logger.debug("Webhook id=%d already claimed by another drain; skipping", webhook_id)
-                return
-
-            try:
-                sent = await send_webhook(webhook.url, webhook.payload)
-            except Exception:
-                sent = False
-                logger.warning("Retry error for webhook id=%d", webhook_id, exc_info=True)
-
-            # Apply this single result and commit immediately so another item's
-            # failure can't roll back what was already applied. On failure,
-            # increment_webhook_retry also clears the claim so the next cycle can
-            # re-claim and retry.
-            with short_conn(conn, db_path) as apply_conn:
-                if sent:
-                    applied = delete_pending_webhook(apply_conn, webhook_id, claim_token=claim_token)
-                    logger.info("Retry succeeded for webhook id=%d", webhook_id)
-                else:
-                    applied = increment_webhook_retry(apply_conn, webhook_id, claim_token=claim_token)
-                    logger.warning("Retry failed for webhook id=%d", webhook_id)
-                apply_conn.commit()
-            if not applied:
-                logger.warning(
-                    "Late apply for webhook id=%d ignored: the claim is no longer ours",
-                    webhook_id,
-                )
-
-    await asyncio.gather(*(_process(webhook) for webhook in pending))
+    await deliver_webhook_intents(pending, settings, db_path, conn)

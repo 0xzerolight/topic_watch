@@ -25,20 +25,20 @@ from app.check_context import check_id_var, generate_check_id
 from app.config import Settings
 from app.crud import (
     MAX_ANALYSIS_ATTEMPTS,
+    abandon_expired_notifications,
+    apply_notification_outcome,
     claim_heartbeat_alert,
-    claim_pending_notification,
+    claim_notification_intent,
     claim_topic_for_init,
     clear_heartbeat_alert,
     create_check_result,
-    create_pending_notification,
-    delete_expired_notifications,
-    delete_pending_notification,
+    create_notification_intents,
+    create_webhook_intents,
     get_knowledge_state,
     get_topic,
     get_topics_due_for_check,
-    increment_notification_retry,
     list_articles_for_topic,
-    list_pending_notifications,
+    list_due_notification_intents,
     mark_articles_processed,
     record_article_analysis_failure,
     release_stale_notification_claims,
@@ -53,27 +53,47 @@ from app.models import (
     CheckResult,
     KnowledgeRevisionSource,
     NotificationDelivery,
+    NotificationKind,
     NotifyDisposition,
     PendingNotification,
+    PendingWebhook,
     Topic,
     TopicStatus,
+    next_attempt_at,
+    to_db_utc,
 )
-from app.notifications import format_notification, redact_url, send_notification, send_notification_per_url
+from app.notifications import format_notification, redact_url, send_single_notification
 from app.scraping import FetchResult, all_sources_failed, fetch_new_articles_for_topic
 from app.web.state import _checking_state
-from app.webhooks import retry_pending_webhooks, send_webhooks
+from app.webhooks import build_webhook_intents, deliver_webhook_intents, retry_pending_webhooks
 
 logger = logging.getLogger(__name__)
 
 # Single-flight guard: serializes notification drains within this process so
 # two overlapping drains (scheduler tick vs. a UI/CLI check-all) cannot both
 # walk the queue at once. The cross-process case is covered by the atomic
-# per-row claim (claimed_at) below. (OVH-017)
+# per-row claim below. (OVH-017)
 _notification_retry_lock = asyncio.Lock()
 
-# Claims older than this are treated as stale (a drainer crashed mid-send) and
-# released so the row can be re-claimed.
+# Claims older than this are treated as stale — a drainer crashed mid-send, or a
+# send timed out with an unknown outcome — and the intent is re-armed. Measured
+# against the stored wall-clock claim stamp, so a clock jump can re-arm a live
+# claim early; that is harmless because the apply is fenced by the immutable
+# claim token rather than by elapsed time (AUG-277).
 _CLAIM_STALE_AFTER = timedelta(minutes=10)
+
+# Per-batch send fan-out. Matches the webhook drain's bound: enough to stop a
+# backlog serializing at one timeout each, gentle enough not to hammer a channel.
+_DELIVERY_CONCURRENCY = 5
+
+# AUG-027: intents per drain. Bounds how long a queued backlog can hold a
+# scheduler cycle before due-topic work starts; the rest wait for the next tick.
+_RETRY_DRAIN_LIMIT = 20
+
+# Delivery failures that will not change on a retry: the target is an unedited
+# example URL or one Apprise cannot even parse. Three more attempts only delay
+# the abandonment (AUG-245).
+_TERMINAL_DELIVERY_ERRORS = frozenset({"placeholder notification URL", "invalid notification URL"})
 
 
 def _summarize_exc(exc: BaseException, *, limit: int = 200) -> str:
@@ -143,6 +163,11 @@ class CheckOutcome:
     attempt, so the next cycle re-analyzes them and a hopeless one is eventually
     abandoned (see ``crud.record_article_analysis_failure``)."""
     notify_disposition: str | None = None
+    intents: list[PendingNotification] = field(default_factory=list)
+    """Per-target notification delivery intents, inserted in the same commit as the
+    CheckResult that justifies them and stamped with its id (TW-AUD-004)."""
+    webhook_intents: list[PendingWebhook] = field(default_factory=list)
+    """The webhook half of the same thing."""
 
 
 def _snapshot_topic(conn: sqlite3.Connection, topic_id: int) -> TopicSnapshot | None:
@@ -273,6 +298,17 @@ def _commit_check_transition(
         )
     outcome.result.notify_disposition = outcome.notify_disposition
     created = create_check_result(conn, outcome.result)
+
+    # The delivery intents ride the same commit. Stamped with the CheckResult id
+    # only now that it exists, so an abandoned delivery is always attributable to
+    # the check that wanted it (OVH-040).
+    for intent in outcome.intents:
+        intent.check_result_id = created.id
+    for webhook_intent in outcome.webhook_intents:
+        webhook_intent.check_result_id = created.id
+    create_notification_intents(conn, outcome.intents)
+    create_webhook_intents(conn, outcome.webhook_intents)
+
     conn.commit()
     return created
 
@@ -587,6 +623,19 @@ async def _check_topic_inner(
     # version, and completed BEFORE any irreversible send — so a failure here
     # leaves nothing behind and the next cycle re-runs cleanly (OVH-066), while a
     # crash after it leaves a complete, self-consistent record.
+    #
+    # The delivery intents go in with it: one durable row per target, created
+    # BEFORE any send begins. A crash between "this check decided to notify" and
+    # "the message left" used to be indistinguishable from "no notification was
+    # ever intended", so the alert was simply lost; now the next drain finishes
+    # it, exactly once, because each intent is claimed atomically (TW-AUD-004).
+    intents: list[PendingNotification] = []
+    webhook_intents: list[PendingWebhook] = []
+    if should_notify and notification is not None:
+        title, body = notification
+        intents = build_notification_intents(title, body, settings, topic_id)
+        webhook_intents = build_webhook_intents(topic.name, novelty, settings, topic_id)
+
     outcome = CheckOutcome(
         result=result,
         knowledge_plan=knowledge_plan,
@@ -595,6 +644,8 @@ async def _check_topic_inner(
         article_ids=article_ids,
         failed_article_ids=failed_article_ids,
         notify_disposition=disposition,
+        intents=intents,
+        webhook_intents=webhook_intents,
     )
     try:
         with get_db(db_path) as conn:
@@ -605,40 +656,21 @@ async def _check_topic_inner(
         return result
 
     # --- P4: irreversible network sends, now that durable state is committed and
-    # no connection is open.
-    if should_notify and notification is not None:
-        title, body = notification
-        # Deliver per-URL so a partial failure (one channel down) re-queues only
-        # the failed targets — the channels that already delivered are never
-        # re-sent on retry (OVH-039). send_notification_per_url never raises.
-        deliveries = await send_notification_per_url(title, body, settings)
+    # no connection is open. Same claim/send/apply cycle the retry drain uses, so
+    # a message delivered here and one delivered three cycles later go through
+    # exactly one code path.
+    if intents or webhook_intents:
+        deliveries = await deliver_notification_intents(intents, settings, db_path)
+        # True only when every target this check owed actually delivered. A
+        # timed-out target is not a success: its outcome is unknown.
         result.notification_sent = bool(deliveries) and all(d.ok for d in deliveries)
         failed = [d for d in deliveries if not d.ok]
         if failed:
-            # Surface the first/aggregated reason without leaking a raw URL.
+            # Surface the aggregated reason without leaking a raw URL.
             result.notification_error = _summarize_delivery_failures(failed)
-            # TW-AUD-005: commit the retry intents on their own short connection
-            # BEFORE the webhook I/O below. Staging them on a connection that then
-            # awaited webhook delivery held the WAL writer across that await, and a
-            # cancellation rolled the intents back — losing the record that these
-            # channels still owe a delivery. Correlated to this check (OVH-040).
-            with get_db(db_path) as conn:
-                _queue_failed_notifications(conn, topic_id, title, body, deliveries, check_result_id=result.id)
-                conn.commit()
 
-        # Send webhooks (independent of Apprise success/failure). Pass db_path +
-        # topic_id + check_result_id so failed deliveries are enqueued to
-        # pending_webhooks (correlated to this check) for retry instead of being
-        # dropped — on a short connection of their own, never this caller's.
         try:
-            await send_webhooks(
-                topic.name,
-                novelty,
-                settings,
-                topic_id=topic_id,
-                check_result_id=result.id,
-                db_path=db_path,
-            )
+            await deliver_webhook_intents(webhook_intents, settings, db_path)
         except Exception:
             logger.warning(
                 "Webhook delivery failed for topic '%s'",
@@ -757,9 +789,25 @@ async def _run_heartbeat(
                 # opened.
                 conn.rollback()
                 return
+
+            # The heartbeat's messages are delivery intents like any other, and
+            # they carry their kind so a superseded outage alert can be revoked
+            # rather than delivered after the recovery it contradicts (AUG-019).
+            # A5 moves this insert into the same commit as the latch transition;
+            # today it still commits after it.
+            kind = NotificationKind.HEARTBEAT_ALERT if action.kind == "alert" else NotificationKind.HEARTBEAT_RECOVERY
+            intents = build_notification_intents(
+                action.title,
+                action.body,
+                settings,
+                topic.id,
+                kind=kind,
+                check_result_id=check_result_id,
+            )
+            create_notification_intents(conn, intents)
             conn.commit()
 
-        deliveries = await send_notification_per_url(action.title, action.body, settings)
+        deliveries = await deliver_notification_intents(intents, settings, db_path)
         failed = [d for d in deliveries if not d.ok]
         if failed:
             logger.warning(
@@ -767,16 +815,6 @@ async def _run_heartbeat(
                 topic.name,
                 _summarize_delivery_failures(failed),
             )
-            with get_db(db_path) as conn:
-                _queue_failed_notifications(
-                    conn,
-                    topic.id,
-                    action.title,
-                    action.body,
-                    deliveries,
-                    check_result_id=check_result_id,
-                )
-                conn.commit()
     except Exception:
         logger.warning("Silence Heartbeat failed for topic '%s'", topic.name, exc_info=True)
 
@@ -791,45 +829,156 @@ def _summarize_delivery_failures(failed: list[NotificationDelivery]) -> str:
     return "; ".join(parts)
 
 
-def _queue_failed_notifications(
-    conn: sqlite3.Connection,
-    topic_id: int,
+def build_notification_intents(
     title: str,
     body: str,
-    deliveries: list[NotificationDelivery],
+    settings: Settings,
+    topic_id: int,
+    *,
+    kind: NotificationKind = NotificationKind.NOVELTY,
+    latch_value: str | None = None,
     check_result_id: int | None = None,
-) -> None:
-    """Queue one pending row per FAILED URL for retry.
+) -> list[PendingNotification]:
+    """One unsaved delivery intent per configured Apprise target. Pure.
 
-    Only the targets that failed are queued, each scoped to its own URL, so the
-    retry drain re-hits exactly those channels and never re-delivers to the ones
-    that already succeeded (OVH-039). The per-URL failure reason is stored as
-    ``last_error`` for diagnostics, and ``check_result_id`` correlates each queued
-    row to its originating check (OVH-040), so an abandoned-after-max-retries
-    notification can be attributed to a specific check.
+    Pure so the intents can be built with no connection open and handed to the
+    transaction that commits them alongside the state change they announce.
+    ``kind`` and ``latch_value`` are what let a heartbeat transition revoke a
+    superseded message instead of sending it after the event it contradicts.
     """
-    for d in deliveries:
-        if d.ok:
+    return [
+        PendingNotification(
+            topic_id=topic_id,
+            check_result_id=check_result_id,
+            title=title,
+            body=body,
+            url=url,
+            kind=kind,
+            latch_value=latch_value,
+        )
+        for url in settings.notifications.urls
+    ]
+
+
+async def _deliver_one_notification_intent(
+    intent: PendingNotification,
+    settings: Settings,
+    db_path: Path | None,
+    conn: sqlite3.Connection | None = None,
+) -> NotificationDelivery | None:
+    """Claim, send, apply — for one intent. ``None`` when the claim was lost.
+
+    Three short connections, three commits, no connection open across the send.
+    """
+    intent_id = intent.id
+    if intent_id is None:
+        return None
+
+    claim_token = secrets.token_hex(8)
+    now_iso = to_db_utc(datetime.now(UTC))
+    with short_conn(conn, db_path) as claim_conn:
+        won = claim_notification_intent(claim_conn, intent_id, claim_token, now_iso)
+        claim_conn.commit()
+    if not won:
+        logger.debug("Notification intent id=%d not claimable (claimed, exhausted or not due); skipping", intent_id)
+        return None
+
+    if intent.url is None:
+        # A pre-per-target row names no destination. Re-sending it to every
+        # configured URL would re-hit channels that already delivered, so it is
+        # abandoned rather than duplicated.
+        with short_conn(conn, db_path) as apply_conn:
+            apply_notification_outcome(
+                apply_conn,
+                intent_id,
+                claim_token,
+                sent=False,
+                error="intent has no target URL",
+                terminal=True,
+            )
+            apply_conn.commit()
+        return None
+
+    delivery = await send_single_notification(intent.title, intent.body, intent.url, settings.apprise_timeout_seconds)
+    delivery = delivery.model_copy(update={"intent_id": intent_id})
+
+    if delivery.timed_out:
+        # Unknown, not failed: the Apprise thread cannot be cancelled and may
+        # still be delivering. Leaving the intent 'sending' is the honest record
+        # (TW-AUD-004); the stale-claim release re-arms it once enough time has
+        # passed that the send cannot still be in flight (AUG-071).
+        logger.warning(
+            "Notification intent id=%d left in flight after its deadline; outcome unknown",
+            intent_id,
+        )
+        return delivery
+
+    terminal = (delivery.error or "") in _TERMINAL_DELIVERY_ERRORS
+    due = None if delivery.ok or terminal else next_attempt_at(intent.retry_count)
+    with short_conn(conn, db_path) as apply_conn:
+        applied = apply_notification_outcome(
+            apply_conn,
+            intent_id,
+            claim_token,
+            sent=delivery.ok,
+            error=delivery.error,
+            next_attempt_at=due,
+            terminal=terminal,
+        )
+        apply_conn.commit()
+    if not applied:
+        logger.warning("Late apply for notification intent id=%d ignored: the claim is no longer ours", intent_id)
+    elif delivery.ok:
+        logger.info("Notification intent id=%d delivered to %s", intent_id, redact_url(intent.url))
+    elif terminal:
+        logger.warning(
+            "Abandoning notification intent id=%d without retry (url=%s reason=%s)",
+            intent_id,
+            redact_url(intent.url),
+            delivery.error,
+        )
+    return delivery
+
+
+async def deliver_notification_intents(
+    intents: list[PendingNotification],
+    settings: Settings,
+    db_path: Path | None,
+    conn: sqlite3.Connection | None = None,
+) -> list[NotificationDelivery]:
+    """Deliver a batch of already-persisted intents. One outcome per intent sent.
+
+    Shared by the live path and the retry drain: a message delivered seconds after
+    its check and one delivered three cycles later take the same code path, so
+    there is only one place where a claim, a send and an apply can disagree.
+
+    Intents whose claim was lost (another drainer owns them, they are exhausted,
+    or they are not due yet) contribute no outcome. ``return_exceptions=True`` with
+    every result inspected keeps ownership until every child has settled (AUG-263).
+    """
+    if not intents:
+        return []
+
+    semaphore = asyncio.Semaphore(_DELIVERY_CONCURRENCY)
+
+    async def _process(intent: PendingNotification) -> NotificationDelivery | None:
+        async with semaphore:
+            return await _deliver_one_notification_intent(intent, settings, db_path, conn)
+
+    results = await asyncio.gather(*(_process(intent) for intent in intents), return_exceptions=True)
+
+    deliveries: list[NotificationDelivery] = []
+    for intent, result in zip(intents, results, strict=True):
+        if isinstance(result, BaseException):
+            logger.warning(
+                "Notification intent id=%s failed unexpectedly",
+                intent.id,
+                exc_info=(type(result), result, None),
+            )
             continue
-        try:
-            create_pending_notification(
-                conn,
-                PendingNotification(
-                    topic_id=topic_id,
-                    check_result_id=check_result_id,
-                    title=title,
-                    body=body,
-                    url=d.url,
-                    last_error=d.error,
-                ),
-            )
-            logger.info(
-                "Queued notification for retry (topic_id=%d, url=%s)",
-                topic_id,
-                redact_url(d.url),
-            )
-        except Exception:
-            logger.warning("Failed to queue notification for retry", exc_info=True)
+        if result is not None:
+            deliveries.append(result)
+    return deliveries
 
 
 async def retry_pending_notifications(
@@ -838,16 +987,7 @@ async def retry_pending_notifications(
     *,
     db_path: Path | None = None,
 ) -> None:
-    """Retry any pending notifications from previous check cycles.
-
-    Successful notifications are deleted. Failed ones get their retry
-    count incremented. Notifications exceeding max_retries are deleted.
-
-    Connection handling mirrors retry_pending_webhooks: no sqlite connection
-    is held across the (potentially slow) notification sends. Pending rows are
-    snapshotted under a short connection, sends run with no open connection,
-    and each result is applied with a commit *per item* so a mid-loop crash
-    can't roll back already-applied delete/increment operations.
+    """Drain the notification delivery queue: due intents get one more attempt.
 
     Args:
         conn: Optional existing connection (back-compat). Reused if given but
@@ -871,25 +1011,24 @@ async def retry_pending_notifications(
     async with _notification_retry_lock:
         token = check_id_var.set(generate_check_id())
         try:
-            await _drain_pending_notifications(conn, settings, db_path)
+            await _drain_notification_intents(conn, settings, db_path)
         finally:
             check_id_var.reset(token)
 
 
-async def _drain_pending_notifications(
+async def _drain_notification_intents(
     conn: sqlite3.Connection | None,
     settings: Settings,
     db_path: Path | None,
 ) -> None:
-    """Drain the notification retry queue once (caller holds the retry lock)."""
-    # --- Phase 1: snapshot pending rows under a short-lived connection. ---
-    stale_cutoff = (datetime.now(UTC) - _CLAIM_STALE_AFTER).isoformat()
+    """Drain the notification queue once (caller holds the retry lock)."""
+    now = datetime.now(UTC)
+    stale_cutoff = to_db_utc(now - _CLAIM_STALE_AFTER)
     with short_conn(conn, db_path) as snapshot:
         released = release_stale_notification_claims(snapshot, stale_cutoff)
         if released:
-            logger.warning("Released %d stale notification claim(s)", released)
-        abandoned = delete_expired_notifications(snapshot)
-        for item in abandoned:
+            logger.warning("Re-armed %d stale notification claim(s)", released)
+        for item in abandon_expired_notifications(snapshot):
             # One WARNING per permanently-dropped delivery so an abandoned
             # notification is observable: identify it by topic/check ids (the
             # body is not logged — it may carry the notified content) (OVH-040).
@@ -900,65 +1039,14 @@ async def _drain_pending_notifications(
                 item.title,
                 item.created_at.isoformat(),
             )
-        if abandoned:
-            logger.warning("Deleted %d expired pending notification(s)", len(abandoned))
         snapshot.commit()
-        pending = list_pending_notifications(snapshot)
+        pending = list_due_notification_intents(snapshot, to_db_utc(now), _RETRY_DRAIN_LIMIT)
 
     if not pending:
         return
 
     logger.info("Retrying %d pending notification(s)", len(pending))
-
-    # --- Phase 2: claim, send with NO connection held, then apply per item. ---
-    for notification in pending:
-        assert notification.id is not None
-
-        # Atomically claim this row. A concurrent (cross-process) drainer that
-        # already claimed it returns rowcount 0 here, so we skip — only the
-        # winner sends, preventing double-delivery (OVH-017).
-        claimed_at = datetime.now(UTC).isoformat()
-        # The claim carries an owner token and rechecks eligibility, so a drainer
-        # working from a stale snapshot cannot retry a row another drainer has
-        # since exhausted, and this drainer's apply below cannot land after a
-        # stale-claim release handed the row to someone else (TW-AUD-006).
-        claim_token = secrets.token_hex(8)
-        with short_conn(conn, db_path) as claim_conn:
-            won = claim_pending_notification(claim_conn, notification.id, claimed_at, claim_token=claim_token)
-            claim_conn.commit()
-        if not won:
-            logger.debug("Notification id=%d already claimed by another drain; skipping", notification.id)
-            continue
-
-        # Retry only the URL this row is scoped to (OVH-039) so a partial-batch
-        # failure never re-delivers to channels that already succeeded. Legacy
-        # rows with url=None fall back to all configured URLs.
-        last_error: str | None = None
-        try:
-            sent = await send_notification(notification.title, notification.body, settings, url=notification.url)
-            if not sent:
-                last_error = "delivery failed"
-        except Exception:
-            sent = False
-            last_error = "retry error"
-            logger.warning("Retry error for notification id=%d", notification.id, exc_info=True)
-
-        # Apply this single result and commit immediately. On failure,
-        # increment_notification_retry also clears the claim so the next cycle
-        # can re-claim and retry.
-        with short_conn(conn, db_path) as apply_conn:
-            if sent:
-                applied = delete_pending_notification(apply_conn, notification.id, claim_token=claim_token)
-                logger.info("Retry succeeded for notification id=%d", notification.id)
-            else:
-                applied = increment_notification_retry(apply_conn, notification.id, last_error, claim_token=claim_token)
-                logger.warning("Retry failed for notification id=%d", notification.id)
-            apply_conn.commit()
-        if not applied:
-            logger.warning(
-                "Late apply for notification id=%d ignored: the claim is no longer ours",
-                notification.id,
-            )
+    await deliver_notification_intents(pending, settings, db_path, conn)
 
 
 async def check_all_topics(

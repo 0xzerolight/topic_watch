@@ -379,7 +379,7 @@ def _enqueue_notifications(db_path, count: int) -> list[int]:  # noqa: ANN001
         for i in range(count):
             n = create_pending_notification(
                 conn,
-                PendingNotification(topic_id=topic.id, title=f"T{i}", body=f"B{i}"),
+                PendingNotification(topic_id=topic.id, title=f"T{i}", body=f"B{i}", url=f"json://t{i}"),
             )
             ids.append(n.id)
         conn.commit()
@@ -402,13 +402,13 @@ class TestNotificationDrainSingleFlight:
         first_send_started = asyncio.Event()
         release = asyncio.Event()
 
-        async def slow_send(title: str, body: str, _settings, *, url=None) -> bool:  # noqa: ANN001
+        async def slow_send(title: str, body: str, url: str, timeout_s: float) -> NotificationDelivery:
             first_send_started.set()
             await release.wait()
             sent_counts[title] += 1
-            return True
+            return NotificationDelivery(url=url, ok=True)
 
-        with patch("app.checker.send_notification", side_effect=slow_send):
+        with patch("app.checker.send_single_notification", side_effect=slow_send):
             drain1 = asyncio.create_task(retry_pending_notifications(settings=settings, db_path=db_path))
             await first_send_started.wait()
             drain2 = asyncio.create_task(retry_pending_notifications(settings=settings, db_path=db_path))
@@ -426,7 +426,7 @@ class TestNotificationDrainSingleFlight:
 
     async def test_claimed_row_skipped_by_second_drainer(self, tmp_path) -> None:  # noqa: ANN001
         """A row another process already claimed is skipped, not re-sent."""
-        from app.crud import claim_pending_notification
+        from app.crud import claim_notification_intent
 
         db_path = tmp_path / "test.db"
         init_db(db_path)
@@ -434,18 +434,18 @@ class TestNotificationDrainSingleFlight:
 
         claimer = get_connection(db_path)
         try:
-            assert claim_pending_notification(claimer, ids[0], "2999-01-01T00:00:00+00:00") is True
+            assert claim_notification_intent(claimer, ids[0], "other-owner", "2999-01-01T00:00:00+00:00") is True
             claimer.commit()
         finally:
             claimer.close()
 
         send_calls: list[str] = []
 
-        async def record_send(title: str, body: str, _settings, *, url=None) -> bool:  # noqa: ANN001
+        async def record_send(title: str, body: str, url: str, timeout_s: float) -> NotificationDelivery:
             send_calls.append(title)
-            return True
+            return NotificationDelivery(url=url, ok=True)
 
-        with patch("app.checker.send_notification", side_effect=record_send):
+        with patch("app.checker.send_single_notification", side_effect=record_send):
             await retry_pending_notifications(settings=_make_settings(), db_path=db_path)
 
         assert send_calls == []
@@ -596,24 +596,33 @@ class TestSendNotificationStillNonRaising:
 class TestRetryOnlyResendsFailedUrls:
     """A partial failure queues only the failed URL; retry never re-hits the rest."""
 
-    async def test_partial_failure_requeues_only_failed_url(self, tmp_path) -> None:  # noqa: ANN001
-        """check_topic-style queueing: a 3-URL send with one failure queues 1 row for that URL."""
-        from app.checker import _queue_failed_notifications
-        from app.models import NotificationDelivery
+    async def test_partial_failure_leaves_only_the_failed_url_queued(self, tmp_path) -> None:  # noqa: ANN001
+        """A 3-target send with one failure leaves exactly that target owing a delivery."""
+        from app.checker import build_notification_intents, deliver_notification_intents
+        from app.crud import create_notification_intents
 
         db_path = tmp_path / "test.db"
         init_db(db_path)
+        settings = _make_settings(notifications=NotificationSettings(urls=["json://a", "json://b", "json://c"]))
         conn = get_connection(db_path)
         try:
             topic = create_topic(conn, Topic(name="Notif", description="d", status=TopicStatus.READY))
             conn.commit()
-            deliveries = [
-                NotificationDelivery(url="json://a", ok=True),
-                NotificationDelivery(url="json://b", ok=False, error="HTTP 500"),
-                NotificationDelivery(url="json://c", ok=True),
-            ]
-            _queue_failed_notifications(conn, topic.id, "T", "B", deliveries)
+            intents = build_notification_intents("T", "B", settings, topic.id)
+            create_notification_intents(conn, intents)
             conn.commit()
+        finally:
+            conn.close()
+
+        async def one_fails(title: str, body: str, url: str, timeout_s: float) -> NotificationDelivery:
+            ok = url != "json://b"
+            return NotificationDelivery(url=url, ok=ok, error=None if ok else "HTTP 500")
+
+        with patch("app.checker.send_single_notification", side_effect=one_fails):
+            await deliver_notification_intents(intents, settings, db_path)
+
+        conn = get_connection(db_path)
+        try:
             pending = list_pending_notifications(conn)
         finally:
             conn.close()
@@ -638,14 +647,14 @@ class TestRetryOnlyResendsFailedUrls:
         finally:
             conn.close()
 
-        # The retry drain must call send_notification scoped to the queued URL only.
+        # The retry drain must send scoped to the queued URL only.
         sent_urls: list[str | None] = []
 
-        async def record_send(title: str, body: str, _settings, *, url=None) -> bool:  # noqa: ANN001
+        async def record_send(title: str, body: str, url: str, timeout_s: float) -> NotificationDelivery:
             sent_urls.append(url)
-            return True
+            return NotificationDelivery(url=url, ok=True)
 
-        with patch("app.checker.send_notification", side_effect=record_send):
+        with patch("app.checker.send_single_notification", side_effect=record_send):
             await retry_pending_notifications(settings=_make_settings(), db_path=db_path)
 
         assert sent_urls == ["json://b"]

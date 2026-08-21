@@ -6,14 +6,15 @@ from datetime import UTC, datetime, timedelta, timezone
 import pytest
 
 from app.crud import (
+    abandon_expired_notifications,
+    apply_notification_outcome,
     article_hash_exists,
+    claim_notification_intent,
     create_article,
     create_check_result,
     create_knowledge_state,
     create_pending_notification,
     create_topic,
-    delete_expired_notifications,
-    delete_pending_notification,
     delete_topic,
     get_article,
     get_check_result,
@@ -21,7 +22,6 @@ from app.crud import (
     get_knowledge_state,
     get_topic,
     get_topic_by_name,
-    increment_notification_retry,
     list_articles_for_topic,
     list_check_results,
     list_pending_notifications,
@@ -1744,11 +1744,13 @@ class TestPendingNotificationCRUD:
         )
         db_conn.commit()
 
-        increment_notification_retry(db_conn, notif.id)
+        assert claim_notification_intent(db_conn, notif.id, "tok", "2999-01-01T00:00:00+00:00") is True
+        apply_notification_outcome(db_conn, notif.id, "tok", sent=False, error="down")
         db_conn.commit()
 
         pending = list_pending_notifications(db_conn)
         assert pending[0].retry_count == 1
+        assert pending[0].last_error == "down"
 
     def test_delete(self, db_conn: sqlite3.Connection) -> None:
         topic, _ = self._make_topic_and_check(db_conn)
@@ -1758,13 +1760,17 @@ class TestPendingNotificationCRUD:
         )
         db_conn.commit()
 
-        delete_pending_notification(db_conn, notif.id)
+        assert claim_notification_intent(db_conn, notif.id, "tok", "2999-01-01T00:00:00+00:00") is True
+        apply_notification_outcome(db_conn, notif.id, "tok", sent=True)
         db_conn.commit()
 
+        # Delivered intents leave the queue but stay as the delivery ledger.
         assert list_pending_notifications(db_conn) == []
+        row = db_conn.execute("SELECT status FROM pending_notifications WHERE id = ?", (notif.id,)).fetchone()
+        assert row["status"] == "sent"
 
-    def test_delete_expired(self, db_conn: sqlite3.Connection) -> None:
-        """delete_expired_notifications removes only maxed-out entries."""
+    def test_abandon_expired(self, db_conn: sqlite3.Connection) -> None:
+        """abandon_expired_notifications retires only maxed-out entries."""
         topic, _ = self._make_topic_and_check(db_conn)
         create_pending_notification(
             db_conn,
@@ -1782,13 +1788,13 @@ class TestPendingNotificationCRUD:
         )
         db_conn.commit()
 
-        deleted = delete_expired_notifications(db_conn)
+        abandoned = abandon_expired_notifications(db_conn)
         db_conn.commit()
-        # Returns the abandoned rows (not just a count) so the prune site can
-        # log what was permanently dropped (OVH-040).
-        assert len(deleted) == 1
-        assert deleted[0].title == "Expired"
-        assert deleted[0].topic_id == topic.id
+        # Returns the abandoned rows (not just a count) so the caller can log
+        # what was permanently dropped (OVH-040).
+        assert len(abandoned) == 1
+        assert abandoned[0].title == "Expired"
+        assert abandoned[0].topic_id == topic.id
 
         # Only the active one remains
         remaining = list_pending_notifications(db_conn)
