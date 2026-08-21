@@ -1164,6 +1164,43 @@ async def _check_all_topics_inner(
     return results
 
 
+def _init_corpus(
+    db_path: Path | None,
+    topic_id: int,
+    fetched: list[Article],
+    max_articles: int,
+) -> list[Article]:
+    """The articles a baseline is built from: this fetch plus what is already stored.
+
+    ``fetch_new_articles_for_topic`` returns only entries the topic has never seen
+    — that is what makes a routine check cheap. Initialization is not a routine
+    check. A Retry after the LLM failed re-fetches feeds that have not moved,
+    gets nothing back, and reports the same error again while the batch it failed
+    on sits unprocessed in the database; a Re-initialize on a mature topic
+    rebuilds its whole understanding from whatever handful of entries appeared
+    since the last check and records that as the new baseline (AUG-252).
+
+    Stored rows are appended newest-first behind the fresh ones and the whole
+    batch is capped at ``max_articles``, so an over-budget prompt is fitted by
+    dropping the oldest stored articles, never the new ones. Marking already-
+    processed rows processed again is a no-op.
+    """
+    seen = {article.id for article in fetched if article.id is not None}
+    corpus = list(fetched)
+    if len(corpus) >= max_articles:
+        return corpus[:max_articles]
+
+    with get_db(db_path) as conn:
+        stored = list_articles_for_topic(conn, topic_id, limit=max_articles)
+    for article in stored:
+        if len(corpus) >= max_articles:
+            break
+        if article.id is None or article.id in seen:
+            continue
+        corpus.append(article)
+    return corpus
+
+
 def _commit_init_transition(
     conn: sqlite3.Connection,
     snapshot: TopicSnapshot,
@@ -1334,7 +1371,7 @@ async def initialize_new_topic(
             feed_backoff_cap_hours=settings.feed_backoff_cap_hours,
             exa_settings=settings.exa,
         )
-        articles = fetch_result.articles
+        articles = _init_corpus(db_path, topic_id, fetch_result.articles, settings.max_articles_per_check)
 
         if not articles:
             # OVH-001: during a NEW-topic re-init (init_attempts>0) every prior

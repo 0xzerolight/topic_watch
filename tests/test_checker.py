@@ -1089,6 +1089,115 @@ class TestInitAndRetryCarryCheckId:
 # --- initialize_new_topic ---
 
 
+class TestInitializeRebuildsFromStoredArticles:
+    """AUG-252: initialization is not a routine check and must not depend on the
+    feed having moved since the last one."""
+
+    async def test_retry_after_llm_failure_reuses_the_stored_batch(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """The batch a failed init stored is invisible to the next fetch — same-topic
+        dedup rejects every stored hash — so a Retry used to find nothing and
+        report the same error, permanently."""
+        from app.checker import initialize_new_topic
+        from app.crud import create_article
+
+        topic = _make_topic(db_conn, status=TopicStatus.ERROR)
+        create_article(db_conn, _make_article(id=None, topic_id=topic.id, content_hash="stored-1"))
+        db_conn.commit()
+
+        prepare = AsyncMock(return_value=_make_write_result())
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[], total_feed_entries=0),
+            ),
+            patch("app.checker.prepare_initial_knowledge", new=prepare),
+        ):
+            await initialize_new_topic(topic, _make_settings(), db_path=db_path)
+
+        from app.crud import get_topic
+
+        assert get_topic(db_conn, topic.id).status == TopicStatus.READY
+        passed = prepare.await_args.args[1]
+        assert [a.content_hash for a in passed] == ["stored-1"]
+
+    async def test_reinitialize_rebuilds_from_the_whole_corpus(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """A READY re-init used to replace a mature baseline with one built from
+        whatever handful of entries had appeared since the last check."""
+        from app.checker import initialize_new_topic
+        from app.crud import create_article
+
+        topic = _make_topic(db_conn, status=TopicStatus.READY)
+        for i in range(3):
+            stored = _make_article(id=None, topic_id=topic.id, content_hash=f"old-{i}")
+            stored.processed = True
+            create_article(db_conn, stored)
+        db_conn.commit()
+        fresh = [_make_article(id=None, topic_id=topic.id, content_hash="fresh-1")]
+
+        prepare = AsyncMock(return_value=_make_write_result())
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=fresh, total_feed_entries=1),
+            ),
+            patch("app.checker.prepare_initial_knowledge", new=prepare),
+        ):
+            await initialize_new_topic(topic, _make_settings(), db_path=db_path)
+
+        passed = prepare.await_args.args[1]
+        assert [a.content_hash for a in passed][0] == "fresh-1", "fresh entries lead the prompt"
+        assert {a.content_hash for a in passed} == {"fresh-1", "old-0", "old-1", "old-2"}
+
+    async def test_corpus_is_capped_and_fresh_articles_win(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
+        """An over-budget prompt drops trailing articles, so the stored ones go last."""
+        from app.checker import initialize_new_topic
+        from app.crud import create_article
+
+        topic = _make_topic(db_conn, status=TopicStatus.READY)
+        for i in range(5):
+            create_article(db_conn, _make_article(id=None, topic_id=topic.id, content_hash=f"old-{i}"))
+        db_conn.commit()
+        fresh = [_make_article(id=None, topic_id=topic.id, content_hash="fresh-1")]
+
+        prepare = AsyncMock(return_value=_make_write_result())
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=fresh, total_feed_entries=1),
+            ),
+            patch("app.checker.prepare_initial_knowledge", new=prepare),
+        ):
+            await initialize_new_topic(topic, _make_settings(max_articles_per_check=3), db_path=db_path)
+
+        passed = prepare.await_args.args[1]
+        assert len(passed) == 3
+        assert passed[0].content_hash == "fresh-1"
+
+    async def test_a_topic_with_no_articles_at_all_still_errors(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """Nothing stored and nothing fetched is still a genuine failure."""
+        from app.checker import initialize_new_topic
+        from app.crud import get_topic
+
+        topic = _make_topic(db_conn, status=TopicStatus.NEW)
+        with patch(
+            "app.checker.fetch_new_articles_for_topic",
+            new_callable=AsyncMock,
+            return_value=FetchResult(articles=[], total_feed_entries=0),
+        ):
+            await initialize_new_topic(topic, _make_settings(), db_path=db_path)
+
+        assert get_topic(db_conn, topic.id).status == TopicStatus.ERROR
+
+
 class TestInitializeNewTopicStatusChangedAt:
     """status_changed_at must be refreshed on every status transition."""
 
