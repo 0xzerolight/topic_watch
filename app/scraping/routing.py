@@ -6,8 +6,8 @@ table (which tracks individual feed URLs for the UI dashboard).
 """
 
 import logging
+import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
 
 from app.scraping.providers import BingNewsProvider, GoogleNewsProvider, NewsProvider
 
@@ -17,17 +17,34 @@ logger = logging.getLogger(__name__)
 # Google second (best coverage but fragile).
 DEFAULT_PROVIDERS: list[NewsProvider] = [BingNewsProvider(), GoogleNewsProvider()]
 
-_UNHEALTHY_COOLDOWN = timedelta(minutes=30)
+_UNHEALTHY_COOLDOWN_SECONDS = 30 * 60.0
 _FAILURE_THRESHOLD = 3
+_PROBE_LEASE_SECONDS = 120.0
+"""How long one half-open probe holds the right to test a recovering provider.
+
+The lease exists only so a check that is cancelled, hangs or dies between taking
+the probe and reporting its outcome cannot wedge recovery forever. The normal
+release is the outcome itself.
+"""
 
 
 @dataclass
 class _ProviderHealth:
+    """One provider's local health record. Created on first failure, never deleted.
+
+    Deleting it on success also destroyed ``epoch``, so the next failure recreated
+    the counter at zero and an older success carrying that recycled value passed
+    the equality check and wiped a newer cooldown (TW-AUD-021). The record now
+    outlives any number of recoveries and ``epoch`` only ever counts up.
+    """
+
     consecutive_failures: int = 0
-    last_failure: datetime | None = None
-    # Monotonic counter bumped on every failure. Lets a success that started
-    # before a concurrent failure detect it is stale and skip the reset.
+    failed_at: float | None = None
+    """Monotonic reading of the last failure. Liveness is measured monotonically —
+    a wall-clock step must not expire or extend a cooldown (wave-A clock policy)."""
     epoch: int = 0
+    probe_until: float | None = None
+    """Monotonic deadline of an outstanding half-open probe, if one is out."""
 
 
 @dataclass
@@ -43,21 +60,42 @@ class ProviderRouter:
     _health: dict[str, _ProviderHealth] = field(default_factory=dict)
 
     def get_provider(self) -> NewsProvider:
-        """Return the first healthy provider."""
+        """The provider a topic would currently be served by — a display answer.
+
+        Always names one, because "which provider is this AUTO topic on" has an
+        answer even mid-outage. Callers about to make a request want
+        :meth:`admit_provider` instead, which can refuse.
+        """
         for provider in self.providers:
             if self._is_healthy(provider.name):
                 return provider
-        # All unhealthy — return first (best effort, cooldown will expire)
         return self.providers[0]
 
-    def get_next_provider(self, after: NewsProvider) -> NewsProvider | None:
-        """Return the next provider after the given one, or None.
+    def admit_provider(self) -> NewsProvider | None:
+        """The provider a fetch may use, or ``None`` when none may be used.
 
-        Prefers a healthy provider after ``after``. When every provider is
-        unhealthy, falls back to the first OTHER provider (mirroring
-        :meth:`get_provider`'s all-unhealthy best-effort behaviour) so the
-        within-cycle retry still attempts the second provider during the
-        shared 30-minute cooldown instead of silently returning nothing.
+        ``None`` is the cooldown actually taking effect. Handing back an unhealthy
+        provider "as best effort" meant every due topic attempted both providers
+        during the shared 30-minute window and every failure pushed both deadlines
+        forward again, so the cooldown suppressed no requests at all and kept a
+        throttling upstream throttled (AUG-306).
+
+        Once a cooldown has elapsed the provider is not simply reopened either:
+        one caller takes a half-open probe and the rest still get ``None``, so a
+        recovering provider meets one request rather than every due topic at once.
+        """
+        for provider in self.providers:
+            if self._is_healthy(provider.name):
+                return provider
+        return self._take_probe()
+
+    def get_next_provider(self, after: NewsProvider) -> NewsProvider | None:
+        """Return the next healthy provider after the given one, or None.
+
+        Only a healthy successor is offered. Falling back to a provider that is
+        itself in cooldown was the other half of AUG-306: the within-cycle retry
+        then made a second throttled request and refreshed that provider's
+        deadline too.
         """
         found = False
         for provider in self.providers:
@@ -65,13 +103,6 @@ class ProviderRouter:
                 return provider
             if provider.name == after.name:
                 found = True
-        # No healthy successor. If ALL providers are unhealthy, fall back to
-        # the first provider that isn't ``after`` (best effort, same as
-        # get_provider's all-unhealthy path).
-        if not any(self._is_healthy(p.name) for p in self.providers):
-            for provider in self.providers:
-                if provider.name != after.name:
-                    return provider
         return None
 
     def health_epoch(self, provider_name: str) -> int:
@@ -96,7 +127,8 @@ class ProviderRouter:
         was_below_threshold = health.consecutive_failures < _FAILURE_THRESHOLD
         health.consecutive_failures += 1
         health.epoch += 1
-        health.last_failure = datetime.now(UTC)
+        health.failed_at = time.monotonic()
+        health.probe_until = None  # the probe, if this was one, has reported
         logger.debug(
             "Provider %s: failure %d/%d",
             provider_name,
@@ -129,15 +161,40 @@ class ProviderRouter:
             )
             return False
         recovered = health.consecutive_failures > 0
-        del self._health[provider_name]
+        health.consecutive_failures = 0
+        health.failed_at = None
+        health.probe_until = None
         return recovered
 
+    def _take_probe(self) -> NewsProvider | None:
+        """Claim the single half-open probe among the recovering providers.
+
+        The candidate is the one whose cooldown elapsed earliest — the provider
+        that has been waiting longest is the one worth re-testing first.
+        """
+        now = time.monotonic()
+        candidates = [p for p in self.providers if self._is_recovering(p.name, now)]
+        if not candidates:
+            return None
+        candidate = min(candidates, key=lambda p: self._health[p.name].failed_at or 0.0)
+        health = self._health[candidate.name]
+        if health.probe_until is not None and health.probe_until > now:
+            return None  # a probe is already out; this check waits for its verdict
+        health.probe_until = now + _PROBE_LEASE_SECONDS
+        logger.info("Provider %s: cooldown elapsed, taking a half-open probe", candidate.name)
+        return candidate
+
     def _is_healthy(self, provider_name: str) -> bool:
+        """True while the provider has not crossed the consecutive-failure threshold."""
+        health = self._health.get(provider_name)
+        return not health or health.consecutive_failures < _FAILURE_THRESHOLD
+
+    def _is_recovering(self, provider_name: str, now: float) -> bool:
+        """True for an unhealthy provider whose cooldown has run out."""
         health = self._health.get(provider_name)
         if not health or health.consecutive_failures < _FAILURE_THRESHOLD:
-            return True
-        # Cooldown expired — give it another chance
-        return bool(health.last_failure and datetime.now(UTC) - health.last_failure > _UNHEALTHY_COOLDOWN)
+            return False
+        return health.failed_at is not None and (now - health.failed_at) > _UNHEALTHY_COOLDOWN_SECONDS
 
 
 # Module-level singleton — all callers import this.

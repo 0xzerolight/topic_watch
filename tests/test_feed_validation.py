@@ -105,7 +105,10 @@ async def test_validate_valid_url(client: httpx.AsyncClient):
         FeedEntry(title="Entry 2", url="https://example.com/2", source_feed="https://example.com/feed.xml"),
     ]
 
-    with patch("app.scraping.rss.fetch_feed", new=AsyncMock(return_value=fake_entries)):
+    from app.scraping.source import FeedFetchResult, FetchStatus
+
+    ok = AsyncMock(return_value=FeedFetchResult(entries=fake_entries, status=FetchStatus.OK))
+    with patch("app.scraping.rss.fetch_feed_outcome", new=ok):
         response = await client.post(
             "/feeds/validate",
             data={"feed_urls": "https://example.com/feed.xml"},
@@ -117,8 +120,20 @@ async def test_validate_valid_url(client: httpx.AsyncClient):
 
 
 async def test_validate_invalid_url(client: httpx.AsyncClient):
-    """A URL that raises during fetch returns an error message."""
-    with patch("app.scraping.rss.fetch_feed", new=AsyncMock(side_effect=Exception("Connection refused"))):
+    """A network failure is reported with its reason, not as an empty valid feed.
+
+    The fetch layer is fail-safe and swallows the exception this test used to
+    mock, so the failure has to arrive as a failed outcome (AUG-175).
+    """
+    from app.scraping.source import FeedFetchResult, FeedHealthOutcome, FetchStatus
+
+    async def refused(url, client=None, **kwargs):
+        callback = kwargs.get("health_callback")
+        if callback:
+            callback(FeedHealthOutcome(url, FetchStatus.FAILED, "Network error: ConnectError: Connection refused"))
+        return FeedFetchResult(status=FetchStatus.FAILED)
+
+    with patch("app.scraping.rss.fetch_feed_outcome", new=refused):
         response = await client.post(
             "/feeds/validate",
             data={"feed_urls": "https://bad.example.com/feed.xml"},
@@ -157,3 +172,45 @@ async def test_validate_rate_limit_exceeded(client: httpx.AsyncClient):
 
     assert response.status_code == 429
     assert "Rate limit exceeded" in response.text
+
+
+async def test_validate_reports_a_failed_fetch_as_invalid(client: httpx.AsyncClient):
+    """AUG-175: a feed that failed to fetch must not validate as an empty-but-valid one."""
+    from app.scraping.source import FeedFetchResult, FeedHealthOutcome, FetchStatus
+
+    _rate_limit_store.pop("127.0.0.1", None)
+
+    async def failed_fetch(url, client=None, **kwargs):
+        callback = kwargs.get("health_callback")
+        if callback:
+            callback(FeedHealthOutcome(url, FetchStatus.FAILED, "HTTP 404"))
+        return FeedFetchResult(status=FetchStatus.FAILED)
+
+    with patch("app.scraping.rss.fetch_feed_outcome", new=failed_fetch):
+        response = await client.post(
+            "/feeds/validate",
+            data={"feed_urls": "https://gone.example.com/feed.xml"},
+        )
+
+    assert response.status_code == 200
+    assert "Valid RSS feed" not in response.text
+    assert "HTTP 404" in response.text
+    assert "&#10008;" in response.text  # cross mark
+
+
+async def test_validate_accepts_a_genuinely_empty_feed(client: httpx.AsyncClient):
+    """A feed that fetched fine with no items is still a usable feed."""
+    from app.scraping.source import FeedFetchResult, FetchStatus
+
+    _rate_limit_store.pop("127.0.0.1", None)
+
+    async def empty_fetch(url, client=None, **kwargs):
+        return FeedFetchResult(status=FetchStatus.EMPTY)
+
+    with patch("app.scraping.rss.fetch_feed_outcome", new=empty_fetch):
+        response = await client.post(
+            "/feeds/validate",
+            data={"feed_urls": "https://quiet.example.com/feed.xml"},
+        )
+
+    assert "Valid RSS feed with 0 entries" in response.text

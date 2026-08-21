@@ -50,6 +50,7 @@ from app.database import get_connection
 from app.models import Article, KnowledgeState, NotificationDelivery, NotifyDisposition, Topic, TopicStatus
 from app.scraping import FetchResult
 from app.scraping.rss import FeedEntry, FeedResponse
+from app.scraping.source import FeedHealthOutcome, FetchStatus
 
 
 def _conn_db_path(conn: sqlite3.Connection) -> Path:
@@ -362,7 +363,7 @@ class TestNoWriteLockAcrossExtractionAwait:
             # across the later extraction gather.
             callback = kwargs.get("health_callback")
             if callback is not None:
-                callback("https://example.com/feed.xml", True, None)
+                callback(FeedHealthOutcome("https://example.com/feed.xml", FetchStatus.OK))
             return FeedResponse(entries=[entry])
 
         async def _extract_with_concurrent_write(*_args, **_kwargs) -> str:
@@ -618,7 +619,7 @@ class TestInitNoConnectionAcrossAwaits:
         async def _fetch_feeds_with_health_write(*_args, **kwargs) -> FeedResponse:
             callback = kwargs.get("health_callback")
             if callback is not None:
-                callback("https://example.com/feed.xml", True, None)
+                callback(FeedHealthOutcome("https://example.com/feed.xml", FetchStatus.OK))
             return FeedResponse(entries=[entry])
 
         async def _extract_with_concurrent_write(*_args, **_kwargs) -> str:
@@ -827,8 +828,8 @@ class TestFeedHealthSurvivesPartialFailure:
 
         async def _fetch_feeds_then_fail(*_args, **kwargs):
             callback = kwargs["health_callback"]
-            callback("https://ok.example/feed", True, None, 'W/"e1"', "LM1")
-            callback("https://bad.example/feed", False, "boom", None, None)
+            callback(FeedHealthOutcome("https://ok.example/feed", FetchStatus.OK, None, 'W/"e1"', "LM1"))
+            callback(FeedHealthOutcome("https://bad.example/feed", FetchStatus.FAILED, "boom"))
             raise RuntimeError("provider exploded after two feeds")
 
         with (

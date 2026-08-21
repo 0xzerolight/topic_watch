@@ -23,10 +23,13 @@ from app.feed_backoff import feed_backoff_until
 from app.log_redaction import redact_url
 from app.models import FeedMode, Topic
 from app.scraping.google_news import GOOGLE_NEWS_HOST
-from app.scraping.providers import provider_identity
+from app.scraping.providers import NewsProvider, provider_identity
 from app.scraping.source import (
     DEADLINE_ERROR,
     Deadline,
+    FeedFetchResult,
+    FeedHealthOutcome,
+    FetchStatus,
     SourceDeadlineExceeded,
     SourceRequest,
     bounded,
@@ -44,6 +47,7 @@ from app.url_validation import is_private_url, safe_get
 
 if TYPE_CHECKING:
     from app.models import FeedHealth
+    from app.scraping.routing import ProviderRouter
 
 logger = logging.getLogger(__name__)
 
@@ -321,11 +325,46 @@ def _parse_entry(raw_entry: dict, source_feed: str) -> FeedEntry | None:
     )
 
 
+def _classify_parsed_feed(feed_url: str, raw_count: int, entries: list[FeedEntry]) -> FetchStatus:
+    """Decide what a well-formed 200 body actually told us.
+
+    A feed that published entries and had every one of them rejected — missing
+    title or link, a ``javascript:`` scheme, a per-entry parse error — is not a
+    quiet feed. It is a source that has changed shape and is now delivering
+    nothing, and calling it healthy-empty is what let a publisher's schema
+    regression stop all monitoring while Feed Health stayed green and the silence
+    heartbeat read the result as normal quiet (AUG-178).
+
+    A body carrying no entries at all is still the healthy-empty case: nothing was
+    thrown away, the feed simply has nothing today.
+    """
+    if entries:
+        if raw_count > len(entries):
+            logger.info("Feed %s: %d of %d entries rejected", feed_url, raw_count - len(entries), raw_count)
+        return FetchStatus.OK
+    if raw_count:
+        logger.warning("Feed %s published %d entries but none were usable", feed_url, raw_count)
+        return FetchStatus.FAILED
+    return FetchStatus.EMPTY
+
+
+def _report(
+    health_callback: FeedHealthCallback | None,
+    feed_url: str,
+    status: FetchStatus,
+    error_msg: str | None = None,
+    etag: str | None = None,
+    last_modified: str | None = None,
+) -> None:
+    """Hand one fetch's verdict to the health side-channel, when there is one."""
+    if health_callback:
+        health_callback(FeedHealthOutcome(feed_url, status, error_msg, etag, last_modified))
+
+
 def _record_out_of_budget(feed_url: str, health_callback: FeedHealthCallback | None, reason: str) -> None:
     """Record the typed timeout outcome for a feed that ran out of budget."""
     logger.warning("Feed fetch out of budget: %s — %s", feed_url, reason)
-    if health_callback:
-        health_callback(feed_url, False, reason, None, None)
+    _report(health_callback, feed_url, FetchStatus.ABORTED, reason)
 
 
 async def _retry_pause(budget: Deadline) -> bool:
@@ -351,7 +390,7 @@ async def fetch_feed(
     deadline: Deadline | None = None,
 ) -> list[FeedEntry]:
     """Fetch and parse a single RSS/Atom feed. Returns [] on any error."""
-    entries, _ = await fetch_feed_with_status(
+    result = await fetch_feed_outcome(
         feed_url,
         client,
         timeout=timeout,
@@ -361,10 +400,10 @@ async def fetch_feed(
         last_modified=last_modified,
         deadline=deadline,
     )
-    return entries
+    return result.entries
 
 
-async def fetch_feed_with_status(
+async def fetch_feed_outcome(
     feed_url: str,
     client: httpx.AsyncClient | None = None,
     timeout: float = _FEED_FETCH_TIMEOUT,
@@ -373,33 +412,40 @@ async def fetch_feed_with_status(
     etag: str | None = None,
     last_modified: str | None = None,
     deadline: Deadline | None = None,
-) -> tuple[list[FeedEntry], bool]:
-    """Fetch and parse a single feed, also reporting whether the fetch succeeded.
+) -> FeedFetchResult:
+    """Fetch and parse a single feed, reporting entries and a typed outcome.
 
-    Returns ``(entries, fetch_ok)``. ``fetch_ok`` is True when the feed was
-    fetched and parsed successfully — even if it legitimately contained zero
-    entries — and False on any error (blocked URL, timeout, HTTP error, etc.).
-    This lets callers distinguish "fetched OK but empty" from "fetch failed" so
-    an empty-but-valid feed does not get treated as a provider failure.
+    The status says which of four different things happened — the feed had news
+    (``OK``), the server said our copy is current (``NOT_MODIFIED``), the feed is
+    genuinely quiet (``EMPTY``), or it failed us (``FAILED``/``ABORTED``) —
+    because provider health, the AUTO cascade and the check's coverage counters
+    each want a different one of those distinctions, and none of them can be
+    recovered from ``len(entries)``.
 
     ``etag`` / ``last_modified`` are the feed's stored conditional-GET validators;
-    when present they are sent as ``If-None-Match`` / ``If-Modified-Since`` and a
-    304 returns ``([], True)`` (the empty-but-OK bucket) without re-parsing.
+    when present they are sent as ``If-None-Match`` / ``If-Modified-Since``.
 
     ``deadline`` bounds this feed's whole share of the attempt — the DNS check,
     every retry and the sleeps between them — rather than each transport wait
-    separately (TW-AUD-018). Running out is a typed outcome: the feed is recorded
-    as failed with ``DEADLINE_ERROR`` and no further attempt is made.
+    separately (TW-AUD-018). Running out is ``ABORTED``, which is charged to the
+    check but not to the feed's failure streak.
     """
     budget = deadline if deadline is not None else Deadline.after()
     if budget.expired():
         _record_out_of_budget(feed_url, health_callback, f"{DEADLINE_ERROR} before the feed fetch")
-        return [], False
+        return FeedFetchResult(status=FetchStatus.ABORTED)
     # The SSRF check resolves DNS, which is why it runs once per feed rather than
     # once per attempt; it carries its own hard resolve cap (OVH-148).
     if await asyncio.to_thread(is_private_url, feed_url):
+        # A feed that is blocked, unresolvable or whose resolver timed out failed
+        # this fetch as surely as a 404 did. Returning before the callback left it
+        # with no health row and no failure streak, so it was retried on every
+        # single check, never entered backoff, and showed the dashboard whatever
+        # it last showed (AUG-177). The message stays generic — the reason is a
+        # DNS fact about a URL the health row already names.
         logger.warning("Blocked fetch to private URL: %s", redact_url(feed_url))
-        return [], False
+        _report(health_callback, feed_url, FetchStatus.FAILED, "Blocked: private, reserved or unresolvable host")
+        return FeedFetchResult(status=FetchStatus.FAILED)
     owns_client = client is None
     if owns_client:
         client = httpx.AsyncClient(
@@ -419,14 +465,21 @@ async def fetch_feed_with_status(
                 response = await bounded(
                     budget, "the feed request", safe_get(client, feed_url, headers=cond_headers or None)
                 )
-                # 304 Not Modified: validators still valid. Treat as an empty-but-
-                # successful fetch — the existing "([], True)" bucket that
-                # _fetch_auto/_fetch_manual already handle. Pass (None, None) so the
-                # stored validators are preserved (COALESCE), not wiped.
+                # 304 Not Modified: our copy is current. Its own outcome, not the
+                # empty-feed one — the source answered and told us we are up to
+                # date, so there is nothing for a fallback provider to add
+                # (AUG-172). A 304 may still carry a refreshed ETag, which is
+                # forwarded; absent validators are preserved, not cleared.
                 if response.status_code == 304:
-                    if health_callback:
-                        health_callback(feed_url, True, None, None, None)
-                    return [], True
+                    _report(
+                        health_callback,
+                        feed_url,
+                        FetchStatus.NOT_MODIFIED,
+                        None,
+                        response.headers.get("etag"),
+                        response.headers.get("last-modified"),
+                    )
+                    return FeedFetchResult(status=FetchStatus.NOT_MODIFIED)
                 response.raise_for_status()
                 parsed = feedparser.parse(response.content, response_headers=_parser_headers(response))
                 entries = []
@@ -449,32 +502,42 @@ async def fetch_feed_with_status(
                     bozo_exc = getattr(parsed, "bozo_exception", None)
                     if not entries and not _is_wrong_media_type_only(parsed, bozo_exc):
                         logger.warning("Feed parse error (bozo) with no entries: %s — %s", feed_url, bozo_exc)
-                        if health_callback:
-                            health_callback(feed_url, False, f"Feed parse error: {bozo_exc}", None, None)
-                        return [], False
+                        _report(health_callback, feed_url, FetchStatus.FAILED, f"Feed parse error: {bozo_exc}")
+                        return FeedFetchResult(status=FetchStatus.FAILED)
                     logger.debug(
                         "Feed flagged bozo but %d entries recovered: %s — %s", len(entries), feed_url, bozo_exc
                     )
-                if health_callback:
-                    health_callback(
+                status = _classify_parsed_feed(feed_url, len(parsed.entries), entries)
+                if status.is_source_failure:
+                    _report(
+                        health_callback,
                         feed_url,
-                        True,
-                        None,
-                        response.headers.get("etag"),
-                        response.headers.get("last-modified"),
+                        status,
+                        f"Feed published {len(parsed.entries)} entries, none usable",
                     )
-                return entries, True
+                    return FeedFetchResult(status=status)
+                # A 200 is the authoritative statement of which validators this
+                # feed issues now, so absent headers CLEAR the stored ones. Only a
+                # 304's silence means "unchanged" (AUG-152).
+                _report(
+                    health_callback,
+                    feed_url,
+                    status,
+                    None,
+                    response.headers.get("etag"),
+                    response.headers.get("last-modified"),
+                )
+                return FeedFetchResult(entries=entries, status=status)
             except SourceDeadlineExceeded as exc:
                 _record_out_of_budget(feed_url, health_callback, str(exc))
-                return [], False
+                return FeedFetchResult(status=FetchStatus.ABORTED)
             except httpx.TimeoutException as exc:
                 if attempt < max_attempts - 1 and await _retry_pause(budget):
                     logger.debug("Timeout fetching feed (attempt %d): %s", attempt + 1, feed_url)
                     continue
                 logger.warning("Timeout fetching feed after %d attempts: %s", max_attempts, feed_url)
-                if health_callback:
-                    health_callback(feed_url, False, f"Timeout after {max_attempts} attempts: {exc}", None, None)
-                return [], False
+                _report(health_callback, feed_url, FetchStatus.FAILED, f"Timeout after {max_attempts} attempts: {exc}")
+                return FeedFetchResult(status=FetchStatus.FAILED)
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code >= 500 and attempt < max_attempts - 1 and await _retry_pause(budget):
                     logger.debug(
@@ -482,9 +545,8 @@ async def fetch_feed_with_status(
                     )
                     continue
                 logger.warning("HTTP %d fetching feed: %s", exc.response.status_code, feed_url)
-                if health_callback:
-                    health_callback(feed_url, False, f"HTTP {exc.response.status_code}", None, None)
-                return [], False
+                _report(health_callback, feed_url, FetchStatus.FAILED, f"HTTP {exc.response.status_code}")
+                return FeedFetchResult(status=FetchStatus.FAILED)
             except httpx.NetworkError as exc:
                 if attempt < max_attempts - 1 and await _retry_pause(budget):
                     logger.debug(
@@ -500,134 +562,172 @@ async def fetch_feed_with_status(
                     feed_url,
                     type(exc).__name__,
                 )
-                if health_callback:
-                    health_callback(feed_url, False, f"Network error: {type(exc).__name__}: {exc}", None, None)
-                return [], False
+                _report(health_callback, feed_url, FetchStatus.FAILED, f"Network error: {type(exc).__name__}: {exc}")
+                return FeedFetchResult(status=FetchStatus.FAILED)
             except Exception as exc:
                 logger.warning("Error fetching feed: %s", feed_url, exc_info=True)
-                if health_callback:
-                    health_callback(feed_url, False, f"{type(exc).__name__}: {exc}", None, None)
-                return [], False
-        return [], False  # pragma: no cover
+                _report(health_callback, feed_url, FetchStatus.FAILED, f"{type(exc).__name__}: {exc}")
+                return FeedFetchResult(status=FetchStatus.FAILED)
+        return FeedFetchResult(status=FetchStatus.FAILED)  # pragma: no cover
     finally:
         if owns_client:
             await client.aclose()
 
 
+_STATUS_REASON = {
+    FetchStatus.NOT_MODIFIED: "reported no change (304)",
+    FetchStatus.EMPTY: "returned no entries (empty result)",
+    FetchStatus.FAILED: "fetch failed",
+    FetchStatus.ABORTED: "ran out of budget",
+}
+
+
+def _conditional_validators(
+    request: SourceRequest, feed_url: str, state: FeedHealth | None
+) -> tuple[str | None, str | None]:
+    """The validators to send for this feed — or none, when a 304 would strand us.
+
+    ``feed_health`` is keyed by feed URL while articles are owned per topic, so a
+    feed another topic already polls hands this one validators for a
+    representation it has never received. The server then answers 304, this topic
+    stores nothing, and it stays empty until the feed changes (TW-AUD-020).
+    Sending no validator when the topic holds nothing from the feed makes the
+    conditional request replay-safe: the full body is fetched once, and every
+    later check is conditional again as normal.
+    """
+    if request.topic_holds_feed_articles is not None and not request.topic_holds_feed_articles(feed_url):
+        logger.debug("Skipping conditional validators for %s: topic holds no articles from it", feed_url)
+        return None, None
+    return _validators(state)
+
+
+async def _fetch_one_provider(
+    topic: Topic,
+    provider: NewsProvider,
+    request: SourceRequest,
+    client: httpx.AsyncClient,
+    router: ProviderRouter,
+) -> FeedFetchResult:
+    """Fetch one provider's feed and apply its outcome to the router's health.
+
+    Every outcome the provider is answerable for updates the streak: a success of
+    any kind (entries, 304, or a genuinely empty feed) resets it, because all
+    three prove the provider is reachable and behaving. Inferring the reset from
+    "did it return entries" left a quiet-but-healthy provider's failure count
+    armed, so failure-failure-empty-failure crossed a threshold documented as
+    *consecutive* (AUG-173). An aborted fetch updates nothing — the budget ran
+    out on us, which says nothing about the provider.
+    """
+    feed_url = provider.build_feed_url(topic)
+    # Capture the health epoch before the fetch await so a success that races
+    # with a concurrent failure is recognised as stale (OVH-127).
+    epoch = router.health_epoch(provider.name)
+    state = request.feed_state_loader(feed_url) if request.feed_state_loader else None
+    etag, last_modified = _conditional_validators(request, feed_url, state)
+    result = await fetch_feed_outcome(
+        feed_url,
+        client,
+        timeout=request.timeout,
+        max_attempts=request.max_attempts,
+        health_callback=request.health_callback,
+        etag=etag,
+        last_modified=last_modified,
+        deadline=request.deadline,
+    )
+    if result.status.succeeded:
+        if router.mark_healthy(provider.name, observed_epoch=epoch):
+            logger.info("Provider %s recovered (back to healthy)", provider.name)
+    elif result.status.is_source_failure and router.mark_unhealthy(provider.name):
+        logger.warning("Provider %s marked unhealthy (failure threshold reached)", provider.name)
+    return result
+
+
 async def _fetch_auto(topic: Topic, request: SourceRequest) -> FeedResponse:
     """AUTO mode: try provider, fallback to next on empty/error."""
-    timeout = request.timeout
-    max_attempts = request.max_attempts
-    health_callback = request.health_callback
-    feed_state_loader = request.feed_state_loader
-    deadline = request.deadline
     router = request.router
     if router is None:
         from app.scraping.routing import router as default_router
 
         router = default_router
 
-    provider = router.get_provider()
+    provider = router.admit_provider()
+    if provider is None:
+        # Every provider is inside its cooldown and the one half-open probe is
+        # already out. Counted as a failed source rather than an empty one: no
+        # source was consulted, so reporting healthy silence would tell the
+        # silence heartbeat this topic simply had no news (AUG-306).
+        logger.warning("Topic '%s': every news provider is in cooldown; no fetch attempted", topic.name)
+        return FeedResponse(feeds_total=1, feeds_failed=1)
 
     async with httpx.AsyncClient(
         headers={"User-Agent": _USER_AGENT},
-        timeout=timeout,
+        timeout=request.timeout,
         follow_redirects=False,
     ) as client:
-        feed_url = provider.build_feed_url(topic)
-        # Capture the health epoch before the fetch await so a success that races
-        # with a concurrent failure is recognised as stale (OVH-127).
-        provider_epoch = router.health_epoch(provider.name)
-        p_etag, p_last_modified = _validators(feed_state_loader(feed_url) if feed_state_loader else None)
-        entries, fetch_ok = await fetch_feed_with_status(
-            feed_url,
-            client,
-            timeout=timeout,
-            max_attempts=max_attempts,
-            health_callback=health_callback,
-            etag=p_etag,
-            last_modified=p_last_modified,
-            deadline=deadline,
-        )
+        result = await _fetch_one_provider(topic, provider, request, client, router)
+        first_failed = 1 if result.status.counts_as_failed_fetch else 0
 
-        if entries:
-            if router.mark_healthy(provider.name, observed_epoch=provider_epoch):
-                logger.info("Provider %s recovered (back to healthy)", provider.name)
+        if result.entries:
             return FeedResponse.from_source(
                 provider_identity(provider),
-                entries=entries,
+                entries=result.entries,
                 feeds_total=1,
                 feeds_failed=0,
             )
 
-        # No entries. Only a real fetch error marks the provider unhealthy —
-        # a legitimately-empty-but-successful feed must not trigger cascade/cooldown.
-        # Distinguish those two cases in the log so a silently-failing provider is
-        # not indistinguishable from a genuinely-empty one (OVH-133).
-        if not fetch_ok and router.mark_unhealthy(provider.name):
-            logger.warning("Provider %s marked unhealthy (failure threshold reached)", provider.name)
-        reason = "fetch failed" if not fetch_ok else "returned no entries (empty result)"
-        next_provider = router.get_next_provider(provider)
+        reason = _STATUS_REASON[result.status]
+        next_provider = router.get_next_provider(provider) if result.status.should_cascade else None
         if next_provider is None:
-            logger.warning("Provider %s %s; no fallback provider available", provider.name, reason)
+            # Either there is no other provider, or there is nothing for it to
+            # add: a 304 means this provider has already given us everything it
+            # has, so cascading would fetch a second aggregator's coverage for a
+            # topic that is not missing any (AUG-172).
+            logger.log(
+                logging.INFO if result.status.succeeded else logging.WARNING,
+                "Provider %s %s; no fallback fetched",
+                provider.name,
+                reason,
+            )
             return FeedResponse.from_source(
                 provider_identity(provider),
                 feeds_total=1,
-                feeds_failed=1 if not fetch_ok else 0,
+                feeds_failed=first_failed,
                 needs_url_resolution=False,
             )
 
-        if deadline.expired():
+        if request.deadline.expired():
             # The cascade is a second full fetch; starting one with no budget left
             # only pushes the topic further past its slot.
             logger.warning("Provider %s %s; no budget left to cascade to %s", provider.name, reason, next_provider.name)
             return FeedResponse.from_source(
                 provider_identity(provider),
                 feeds_total=1,
-                feeds_failed=1 if not fetch_ok else 0,
+                feeds_failed=first_failed,
                 needs_url_resolution=False,
             )
 
         logger.info("Provider %s %s, cascading to %s", provider.name, reason, next_provider.name)
-        feed_url = next_provider.build_feed_url(topic)
-        next_epoch = router.health_epoch(next_provider.name)
-        f_etag, f_last_modified = _validators(feed_state_loader(feed_url) if feed_state_loader else None)
-        entries, next_fetch_ok = await fetch_feed_with_status(
-            feed_url,
-            client,
-            timeout=timeout,
-            max_attempts=max_attempts,
-            health_callback=health_callback,
-            etag=f_etag,
-            last_modified=f_last_modified,
-            deadline=deadline,
-        )
-        first_failed = 1 if not fetch_ok else 0
+        next_result = await _fetch_one_provider(topic, next_provider, request, client, router)
 
-        if entries:
-            if router.mark_healthy(next_provider.name, observed_epoch=next_epoch):
-                logger.info("Provider %s recovered (back to healthy)", next_provider.name)
+        if next_result.entries:
             return FeedResponse.from_source(
                 provider_identity(next_provider),
-                entries=entries,
+                entries=next_result.entries,
                 feeds_total=2,
                 feeds_failed=first_failed,
             )
 
-        if not next_fetch_ok and router.mark_unhealthy(next_provider.name):
-            logger.warning("Provider %s marked unhealthy (failure threshold reached)", next_provider.name)
-        next_reason = "fetch failed" if not next_fetch_ok else "returned no entries (empty result)"
         logger.warning(
             "Provider cascade exhausted: %s %s, fallback %s %s",
             provider.name,
             reason,
             next_provider.name,
-            next_reason,
+            _STATUS_REASON[next_result.status],
         )
         return FeedResponse.from_source(
             provider_identity(next_provider),
             feeds_total=2,
-            feeds_failed=first_failed + (1 if not next_fetch_ok else 0),
+            feeds_failed=first_failed + (1 if next_result.status.counts_as_failed_fetch else 0),
             needs_url_resolution=False,
         )
 
@@ -657,7 +757,7 @@ async def _fetch_manual(topic: Topic, request: SourceRequest) -> FeedResponse:
             feeds_skipped += 1
             logger.debug("Skipping backed-off feed %s (next retry %s)", url, until.isoformat())
             continue
-        etag, last_modified = _validators(state)
+        etag, last_modified = _conditional_validators(request, url, state)
         attempted.append((url, etag, last_modified))
 
     # Build the client only when something is actually attempted (the all-skipped
@@ -670,11 +770,11 @@ async def _fetch_manual(topic: Topic, request: SourceRequest) -> FeedResponse:
         timeout=timeout,
         follow_redirects=False,
     ) as client:
-        # fetch_feed_with_status reports per-feed success so a partial failure
+        # fetch_feed_outcome reports per-feed success so a partial failure
         # (some of N feeds down) is countable, not just absorbed into a smaller
         # entry list (OVH-130).
         tasks = [
-            fetch_feed_with_status(
+            fetch_feed_outcome(
                 url,
                 client,
                 timeout=timeout,
@@ -696,10 +796,9 @@ async def _fetch_manual(topic: Topic, request: SourceRequest) -> FeedResponse:
             logger.warning("Feed fetch failed: %s", result)
             feeds_failed += 1
             continue
-        feed_entries, fetch_ok = result
-        if not fetch_ok:
+        if result.status.counts_as_failed_fetch:
             feeds_failed += 1
-        entries.extend(feed_entries)
+        entries.extend(result.entries)
 
     # Two configured feeds carrying one story merge on the entries themselves —
     # newest revision, then the copy with text — rather than on which feed the

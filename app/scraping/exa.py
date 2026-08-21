@@ -24,7 +24,9 @@ from app.scraping.source import (
     Deadline,
     FeedEntry,
     FeedHealthCallback,
+    FeedHealthOutcome,
     FeedResponse,
+    FetchStatus,
     SourceDeadlineExceeded,
     SourceIdentity,
     SourceRequest,
@@ -44,6 +46,28 @@ _EXA_TEXT_MAX_CHARS = 5000
 
 EXA_SOURCE = SourceIdentity(name="exa")
 """Exa returns publisher URLs directly, so no async URL resolution is needed."""
+
+
+def _report(
+    health_callback: FeedHealthCallback | None,
+    endpoint: str,
+    status: FetchStatus,
+    error_msg: str | None = None,
+) -> None:
+    """Record this attempt's verdict. Exa has no conditional-GET validators."""
+    if health_callback:
+        health_callback(FeedHealthOutcome(endpoint, status, error_msg))
+
+
+def _failed(
+    endpoint: str,
+    health_callback: FeedHealthCallback | None,
+    error_msg: str,
+    status: FetchStatus = FetchStatus.FAILED,
+) -> FeedResponse:
+    """One failed Exa attempt, recorded and counted."""
+    _report(health_callback, endpoint, status, error_msg)
+    return FeedResponse.from_source(EXA_SOURCE, feeds_total=1, feeds_failed=1)
 
 
 def _map_exa_result(raw: dict[str, Any]) -> FeedEntry | None:
@@ -91,6 +115,40 @@ def _map_exa_result(raw: dict[str, Any]) -> FeedEntry | None:
     )
 
 
+def _exa_results(data: object) -> list[Any]:
+    """The result rows of an Exa envelope, or ``ValueError`` if it is not one.
+
+    Exa's contract is a JSON object with a list-valued ``results``. Anything else
+    — a top level that is not an object, ``results: null``, a string or a dict —
+    is schema drift, and accepting it produced either a raised ``TypeError`` or a
+    silent zero-entry "success" that cleared the source's failure state (AUG-174).
+    """
+    if not isinstance(data, dict):
+        raise ValueError(f"Exa response was {type(data).__name__}, expected a JSON object")
+    results = data.get("results", [])
+    if not isinstance(results, list):
+        raise ValueError(f"Exa 'results' was {type(results).__name__}, expected a list")
+    return results
+
+
+def _map_exa_results(results: list[Any], topic_name: str) -> list[FeedEntry]:
+    """Map the usable rows of a result list, isolating each one.
+
+    Per-result isolation mirrors RSS (OVH-024): one bad row never zeroes a batch
+    that also carried good ones.
+    """
+    entries: list[FeedEntry] = []
+    for raw in results:
+        try:
+            entry = _map_exa_result(raw)
+        except Exception:
+            logger.warning("Skipping malformed Exa result for topic '%s'", topic_name, exc_info=True)
+            continue
+        if entry is not None:
+            entries.append(entry)
+    return entries
+
+
 async def fetch_exa_entries(
     topic: Topic,
     exa_settings: ExaSettings,
@@ -128,19 +186,13 @@ async def fetch_exa_entries(
     try:
         if urlparse(endpoint).scheme not in ("http", "https"):
             logger.warning("Blocked Exa request to non-http(s) endpoint: %s", redact_url(endpoint))
-            if health_callback:
-                health_callback(endpoint, False, "Non-http(s) endpoint", None, None)
-            return FeedResponse.from_source(EXA_SOURCE, feeds_total=1, feeds_failed=1)
+            return _failed(endpoint, health_callback, "Non-http(s) endpoint")
         if await asyncio.to_thread(is_private_url, endpoint):
             logger.warning("Blocked Exa request to private/reserved endpoint: %s", redact_url(endpoint))
-            if health_callback:
-                health_callback(endpoint, False, "Private/reserved endpoint", None, None)
-            return FeedResponse.from_source(EXA_SOURCE, feeds_total=1, feeds_failed=1)
+            return _failed(endpoint, health_callback, "Private/reserved endpoint")
     except Exception:
         logger.warning("Blocked Exa request to malformed endpoint: %s", redact_url(endpoint), exc_info=True)
-        if health_callback:
-            health_callback(endpoint, False, "Malformed endpoint", None, None)
-        return FeedResponse.from_source(EXA_SOURCE, feeds_total=1, feeds_failed=1)
+        return _failed(endpoint, health_callback, "Malformed endpoint")
 
     query = f"{topic.name} {topic.description}".strip()
     body: dict[str, Any] = {
@@ -160,45 +212,39 @@ async def fetch_exa_entries(
         response = await bounded(budget, "the Exa search", client.post(endpoint, json=body, headers=headers))
         response.raise_for_status()
         data = response.json()
+        # Envelope handling belongs INSIDE this boundary. Reading `results` after it
+        # meant a 200 whose `results` was null raised straight out of a function
+        # whose whole contract is that it never raises, taking the check down
+        # instead of recording one failed source (AUG-174).
+        results = _exa_results(data)
+        entries = _map_exa_results(results, topic.name)
     except SourceDeadlineExceeded as exc:
         logger.warning("Exa request out of budget for topic '%s': %s", topic.name, exc)
-        if health_callback:
-            health_callback(endpoint, False, str(exc), None, None)
-        return FeedResponse.from_source(EXA_SOURCE, feeds_total=1, feeds_failed=1)
+        return _failed(endpoint, health_callback, str(exc), FetchStatus.ABORTED)
     except httpx.TimeoutException:
         logger.warning("Exa request timed out for topic '%s'", topic.name)
-        if health_callback:
-            health_callback(endpoint, False, "Request timed out", None, None)
-        return FeedResponse.from_source(EXA_SOURCE, feeds_total=1, feeds_failed=1)
+        return _failed(endpoint, health_callback, "Request timed out")
     except httpx.HTTPStatusError as exc:
         logger.warning("Exa returned HTTP %d for topic '%s'", exc.response.status_code, topic.name)
-        if health_callback:
-            health_callback(endpoint, False, f"HTTP {exc.response.status_code}", None, None)
-        return FeedResponse.from_source(EXA_SOURCE, feeds_total=1, feeds_failed=1)
+        return _failed(endpoint, health_callback, f"HTTP {exc.response.status_code}")
     except Exception as exc:
-        # NetworkError, JSON-decode (ValueError), and any other failure: never raise.
+        # NetworkError, JSON-decode (ValueError), malformed envelope, and any other
+        # failure: never raise.
         logger.warning("Exa request failed for topic '%s'", topic.name, exc_info=True)
-        if health_callback:
-            health_callback(endpoint, False, f"{type(exc).__name__}: {exc}", None, None)
-        return FeedResponse.from_source(EXA_SOURCE, feeds_total=1, feeds_failed=1)
+        return _failed(endpoint, health_callback, f"{type(exc).__name__}: {exc}")
     finally:
         if owns_client:
             await client.aclose()
 
-    entries: list[FeedEntry] = []
-    results = data.get("results", []) if isinstance(data, dict) else []
-    for raw in results:
-        # Per-result isolation (mirrors RSS OVH-024): one bad result never zeroes the batch.
-        try:
-            entry = _map_exa_result(raw)
-        except Exception:
-            logger.warning("Skipping malformed Exa result for topic '%s'", topic.name, exc_info=True)
-            continue
-        if entry is not None:
-            entries.append(entry)
+    if results and not entries:
+        # Exa answered with rows and not one of them was usable. That is a protocol
+        # failure wearing the shape of quiet news: recorded as success it reset feed
+        # health and fed the silence heartbeat a healthy-empty check while
+        # monitoring received nothing (AUG-307). A genuinely empty list stays healthy.
+        logger.warning("Exa returned %d results for topic '%s', none usable", len(results), topic.name)
+        return _failed(endpoint, health_callback, f"Exa returned {len(results)} results, none usable")
 
-    if health_callback:
-        health_callback(endpoint, True, None, None, None)
+    _report(health_callback, endpoint, FetchStatus.OK if entries else FetchStatus.EMPTY)
     return FeedResponse.from_source(EXA_SOURCE, entries=entries, feeds_total=1, feeds_failed=0)
 
 

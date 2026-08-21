@@ -19,6 +19,8 @@ from app.crud import (
     find_article_by_hash,
     get_feed_health,
     list_article_dedup_keys,
+    topic_has_articles_from_feed,
+    upsert_feed_health_aborted,
     upsert_feed_health_failure,
     upsert_feed_health_success,
 )
@@ -30,6 +32,8 @@ from app.scraping.google_news import is_google_news_url, resolve_google_news_url
 from app.scraping.rss import FeedEntry, fetch_feeds_for_topic
 from app.scraping.rss import FeedResponse as FeedResponse
 from app.scraping.source import Deadline as Deadline
+from app.scraping.source import FeedHealthOutcome as FeedHealthOutcome
+from app.scraping.source import FetchStatus as FetchStatus
 from app.scraping.source import (
     article_identity,
     as_utc,
@@ -99,43 +103,31 @@ def _insert_or_count_dup(
         return False
 
 
-@dataclass
-class FeedHealthOutcome:
-    """One feed fetch's health verdict, captured in memory during source I/O.
-
-    The fetch layer reports per-feed outcomes through a callback that fires while
-    other feeds are still in flight. Writing them to SQLite from inside that
-    callback opened a WAL write transaction that stayed open across every
-    remaining feed await — in MANUAL mode a fast feed could own the single writer
-    while ``gather`` waited on a slow one, and in AUTO mode the primary's outcome
-    could own it across the fallback fetch. Past the 5-second busy timeout that
-    fails concurrent UI and scheduler writes outright, and a cancellation
-    discarded health outcomes that had already been observed (AUG-171).
-
-    Collecting them as plain values and applying the batch afterwards, in one
-    short no-await phase, removes both failure modes.
-    """
-
-    feed_url: str
-    success: bool
-    error_msg: str | None = None
-    etag: str | None = None
-    last_modified: str | None = None
-
-
 def apply_feed_health(conn: sqlite3.Connection, outcomes: list[FeedHealthOutcome]) -> None:
     """Persist collected feed-health outcomes. Contains no awaits; caller commits.
 
     A swallowed write is surfaced at WARNING because feed_health is the ONLY
     persisted record of per-feed failures, so silently losing it would leave the
-    dashboard showing stale health while feeds break (OVH-132). On success the
-    response's conditional-GET validators are stored too; a 304 carries ``None``
-    for both, which ``upsert_feed_health_success`` preserves via COALESCE.
+    dashboard showing stale health while feeds break (OVH-132).
+
+    The outcome's status decides which of the three writes applies. A 200 is the
+    feed's current statement of which validators it issues, so its headers replace
+    the stored pair exactly, clearing one the feed has stopped sending; only a
+    304's silence means "unchanged" and preserves them (AUG-152). An aborted fetch
+    is recorded for diagnostics without touching the failure streak.
     """
     for outcome in outcomes:
         try:
-            if outcome.success:
-                upsert_feed_health_success(conn, outcome.feed_url, outcome.etag, outcome.last_modified)
+            if outcome.status is FetchStatus.ABORTED:
+                upsert_feed_health_aborted(conn, outcome.feed_url, outcome.error_msg or "Unknown error")
+            elif outcome.status.succeeded:
+                upsert_feed_health_success(
+                    conn,
+                    outcome.feed_url,
+                    outcome.etag,
+                    outcome.last_modified,
+                    replace_validators=outcome.status is not FetchStatus.NOT_MODIFIED,
+                )
             else:
                 upsert_feed_health_failure(conn, outcome.feed_url, outcome.error_msg or "Unknown error")
         except Exception:
@@ -156,24 +148,31 @@ def _commit_feed_health(db_path: Path | None, outcomes: list[FeedHealthOutcome])
 def _make_health_collector(outcomes: list[FeedHealthOutcome]):
     """Build the per-feed health callback that appends to ``outcomes`` in memory."""
 
-    def callback(
-        feed_url: str,
-        success: bool,
-        error_msg: str | None,
-        etag: str | None = None,
-        last_modified: str | None = None,
-    ) -> None:
-        outcomes.append(
-            FeedHealthOutcome(
-                feed_url=feed_url,
-                success=success,
-                error_msg=error_msg,
-                etag=etag,
-                last_modified=last_modified,
-            )
-        )
+    def callback(outcome: FeedHealthOutcome) -> None:
+        outcomes.append(outcome)
 
     return callback
+
+
+def _make_feed_article_check(db_path: Path | None, topic_id: int):
+    """Build the "does this topic already hold articles from this feed" probe.
+
+    Answers the one question conditional requests need before they are safe to
+    send: ``feed_health`` stores validators per feed URL, but articles belong to a
+    topic, so a topic that has never received this feed's representation would get
+    a 304 for articles it does not have (TW-AUD-020). Opens and closes its own
+    connection per call for the same reason ``_make_feed_state_loader`` does — it
+    is called from inside the fetch coroutine, between network awaits.
+    """
+
+    def check(feed_url: str) -> bool:
+        conn = get_connection(db_path)
+        try:
+            return topic_has_articles_from_feed(conn, topic_id, feed_url)
+        finally:
+            conn.close()
+
+    return check
 
 
 def _make_feed_state_loader(db_path: Path | None):
@@ -556,6 +555,7 @@ async def fetch_new_articles_for_topic(
             max_attempts=feed_max_retries,
             health_callback=_make_health_collector(health_outcomes),
             feed_state_loader=_make_feed_state_loader(db_path),
+            topic_holds_feed_articles=_make_feed_article_check(db_path, topic.id),
             backoff_base_minutes=feed_backoff_base_minutes,
             backoff_cap_hours=feed_backoff_cap_hours,
             exa_settings=exa_settings,

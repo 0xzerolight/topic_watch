@@ -1,11 +1,11 @@
 """Tests for provider routing with health-based cascade."""
 
-from datetime import UTC, datetime, timedelta
+import time
 
 from app.scraping.providers import BingNewsProvider, GoogleNewsProvider
 from app.scraping.routing import (
     _FAILURE_THRESHOLD,
-    _UNHEALTHY_COOLDOWN,
+    _UNHEALTHY_COOLDOWN_SECONDS,
     ProviderRouter,
 )
 
@@ -30,13 +30,70 @@ class TestGetProvider:
         assert provider.name == "google_news"
 
     def test_returns_first_when_all_unhealthy(self) -> None:
-        """When all providers are unhealthy, return first as best effort."""
+        """The display answer still names a provider even mid-outage."""
         router = _make_router()
         for _ in range(_FAILURE_THRESHOLD):
             router.mark_unhealthy("bing_news")
             router.mark_unhealthy("google_news")
         provider = router.get_provider()
         assert provider.name == "bing_news"
+
+
+class TestAdmitProvider:
+    """AUG-306: a cooldown only means something if it can refuse a fetch."""
+
+    def test_admits_the_first_healthy_provider(self) -> None:
+        router = _make_router()
+        admitted = router.admit_provider()
+        assert admitted is not None and admitted.name == "bing_news"
+
+    def test_refuses_while_every_provider_is_in_cooldown(self) -> None:
+        router = _make_router()
+        for _ in range(_FAILURE_THRESHOLD):
+            router.mark_unhealthy("bing_news")
+            router.mark_unhealthy("google_news")
+        assert router.admit_provider() is None
+        # And it keeps refusing, so concurrent checks cannot slide both deadlines.
+        assert router.admit_provider() is None
+
+    def test_one_probe_is_admitted_once_a_cooldown_elapses(self) -> None:
+        router = _make_router()
+        for _ in range(_FAILURE_THRESHOLD):
+            router.mark_unhealthy("bing_news")
+            router.mark_unhealthy("google_news")
+        for name in ("bing_news", "google_news"):
+            router._health[name].failed_at = time.monotonic() - _UNHEALTHY_COOLDOWN_SECONDS - 1
+
+        first = router.admit_provider()
+        assert first is not None and first.name == "bing_news"
+        # The other due topics wait for that probe's verdict instead of piling on.
+        assert router.admit_provider() is None
+
+    def test_a_failed_probe_puts_the_provider_back_in_cooldown(self) -> None:
+        router = _make_router()
+        for _ in range(_FAILURE_THRESHOLD):
+            router.mark_unhealthy("bing_news")
+            router.mark_unhealthy("google_news")
+        router._health["bing_news"].failed_at = time.monotonic() - _UNHEALTHY_COOLDOWN_SECONDS - 1
+
+        probe = router.admit_provider()
+        assert probe is not None and probe.name == "bing_news"
+        router.mark_unhealthy("bing_news")  # the probe failed
+        assert router.admit_provider() is None
+
+    def test_a_successful_probe_reopens_the_provider(self) -> None:
+        router = _make_router()
+        for _ in range(_FAILURE_THRESHOLD):
+            router.mark_unhealthy("bing_news")
+            router.mark_unhealthy("google_news")
+        router._health["bing_news"].failed_at = time.monotonic() - _UNHEALTHY_COOLDOWN_SECONDS - 1
+
+        probe = router.admit_provider()
+        assert probe is not None and probe.name == "bing_news"
+        router.mark_healthy("bing_news")
+
+        admitted = router.admit_provider()
+        assert admitted is not None and admitted.name == "bing_news"
 
 
 class TestGetNextProvider:
@@ -60,17 +117,14 @@ class TestGetNextProvider:
             router.mark_unhealthy("google_news")
         assert router.get_next_provider(bing) is None
 
-    def test_falls_back_when_all_unhealthy(self) -> None:
-        """When BOTH providers are unhealthy, get_next_provider still returns
-        the other provider (best effort), matching get_provider's behaviour."""
+    def test_no_fallback_when_all_unhealthy(self) -> None:
+        """AUG-306: the within-cycle retry must not spend a provider's cooldown either."""
         router = _make_router()
         bing = router.providers[0]
         for _ in range(_FAILURE_THRESHOLD):
             router.mark_unhealthy("bing_news")
             router.mark_unhealthy("google_news")
-        next_provider = router.get_next_provider(bing)
-        assert next_provider is not None
-        assert next_provider.name == "google_news"
+        assert router.get_next_provider(bing) is None
 
 
 class TestMarkUnhealthy:
@@ -92,7 +146,7 @@ class TestMarkUnhealthy:
         router = _make_router()
         router.mark_unhealthy("bing_news")
         health = router._health["bing_news"]
-        assert health.last_failure is not None
+        assert health.failed_at is not None
         assert health.consecutive_failures == 1
 
 
@@ -102,7 +156,23 @@ class TestMarkHealthy:
         router.mark_unhealthy("bing_news")
         router.mark_unhealthy("bing_news")
         router.mark_healthy("bing_news")
-        assert "bing_news" not in router._health
+        assert router._health["bing_news"].consecutive_failures == 0
+        assert router._health["bing_news"].failed_at is None
+
+    def test_recovery_keeps_the_epoch(self) -> None:
+        """TW-AUD-021: an epoch that can be recycled lets an old success win."""
+        router = _make_router()
+        router.mark_unhealthy("bing_news")
+        router.mark_healthy("bing_news")
+        # A check that started before this recovery captured epoch 0.
+        stale_epoch = 0
+        for _ in range(_FAILURE_THRESHOLD):
+            router.mark_unhealthy("bing_news")
+
+        router.mark_healthy("bing_news", observed_epoch=stale_epoch)
+
+        assert router._health["bing_news"].consecutive_failures >= _FAILURE_THRESHOLD
+        assert router.admit_provider().name == "google_news"
 
     def test_noop_for_unknown_provider(self) -> None:
         router = _make_router()
@@ -133,11 +203,11 @@ class TestMonotonicHealthAccounting:
         # Meanwhile, a concurrent check fails three times and trips cooldown.
         for _ in range(_FAILURE_THRESHOLD):
             router.mark_unhealthy("bing_news")
-        assert router.get_provider().name == "google_news"  # cooldown engaged
+        assert router.admit_provider().name == "google_news"  # cooldown engaged
         # The earlier (now stale) check finally returns success and marks healthy
         # using its captured epoch — it must NOT clobber the fresh cooldown.
         router.mark_healthy("bing_news", observed_epoch=observed)
-        assert router.get_provider().name == "google_news"
+        assert router.admit_provider().name == "google_news"
         assert router._health["bing_news"].consecutive_failures >= _FAILURE_THRESHOLD
 
     def test_fresh_mark_healthy_still_resets(self) -> None:
@@ -147,14 +217,14 @@ class TestMonotonicHealthAccounting:
         # Success observed after those failures (current epoch) resets normally.
         observed = router.health_epoch("bing_news")
         router.mark_healthy("bing_news", observed_epoch=observed)
-        assert "bing_news" not in router._health
+        assert router._health["bing_news"].consecutive_failures == 0
 
     def test_mark_healthy_without_epoch_resets_unconditionally(self) -> None:
         """Back-compat: callers that don't pass an epoch keep the old reset."""
         router = _make_router()
         router.mark_unhealthy("bing_news")
         router.mark_healthy("bing_news")
-        assert "bing_news" not in router._health
+        assert router._health["bing_news"].consecutive_failures == 0
 
     def test_epoch_unknown_provider_is_zero(self) -> None:
         router = _make_router()
@@ -168,13 +238,16 @@ class TestCooldownExpiry:
         for _ in range(_FAILURE_THRESHOLD):
             router.mark_unhealthy("bing_news")
 
-        # Simulate cooldown expiry by setting last_failure in the past
+        # The fallback is unhealthy too, so nothing else can be preferred.
+        for _ in range(_FAILURE_THRESHOLD):
+            router.mark_unhealthy("google_news")
+        # Simulate cooldown expiry by moving the failure into the past
         health = router._health["bing_news"]
-        health.last_failure = datetime.now(UTC) - _UNHEALTHY_COOLDOWN - timedelta(seconds=1)
+        health.failed_at = time.monotonic() - _UNHEALTHY_COOLDOWN_SECONDS - 1
 
-        # Should be healthy again
-        provider = router.get_provider()
-        assert provider.name == "bing_news"
+        # Should be probed again
+        provider = router.admit_provider()
+        assert provider is not None and provider.name == "bing_news"
 
     def test_provider_stays_unhealthy_before_cooldown(self) -> None:
         router = _make_router()
@@ -183,7 +256,7 @@ class TestCooldownExpiry:
 
         # Set last failure to just recently
         health = router._health["bing_news"]
-        health.last_failure = datetime.now(UTC) - timedelta(seconds=10)
+        health.failed_at = time.monotonic() - 10
 
-        provider = router.get_provider()
-        assert provider.name == "google_news"
+        provider = router.admit_provider()
+        assert provider is not None and provider.name == "google_news"

@@ -14,6 +14,7 @@ from app.models import FeedMode, Topic
 from app.scraping import fetch_new_articles_for_topic
 from app.scraping.exa import _map_exa_result, fetch_exa_entries
 from app.scraping.rss import compute_article_hash, fetch_feeds_for_topic
+from app.scraping.source import FeedHealthOutcome, FetchStatus
 
 _EXA_TOPIC = Topic(name="AI safety", description="news about AI safety", feed_mode=FeedMode.EXA, feed_urls=[])
 _ENABLED = ExaSettings(enabled=True, api_key="test-exa-key")
@@ -21,20 +22,13 @@ _EXA_ENDPOINT = "https://api.exa.ai/search"  # default effective endpoint (base_
 
 
 class _Recorder:
-    """Records feed-health callback invocations (all 5 positional args)."""
+    """Records the typed feed-health outcomes a fetch reports."""
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, bool, str | None, str | None, str | None]] = []
+        self.calls: list[FeedHealthOutcome] = []
 
-    def __call__(
-        self,
-        feed_url: str,
-        success: bool,
-        error_msg: str | None,
-        etag: str | None,
-        last_modified: str | None,
-    ) -> None:
-        self.calls.append((feed_url, success, error_msg, etag, last_modified))
+    def __call__(self, outcome: FeedHealthOutcome) -> None:
+        self.calls.append(outcome)
 
 
 def _exa_response(results: list[object]) -> httpx.MockTransport:
@@ -240,7 +234,7 @@ class TestFetchExaEntries:
         assert resp.feeds_total == 1 and resp.feeds_failed == 1
         assert resp.entries == []
         assert calls == []
-        assert DEADLINE_ERROR in callback.call_args[0][2]
+        assert DEADLINE_ERROR in callback.call_args[0][0].error_msg
 
     async def test_http_4xx_fails_safe(self) -> None:
         transport = httpx.MockTransport(lambda r: httpx.Response(401, json={"error": "bad key"}))
@@ -300,7 +294,7 @@ class TestFetchExaEntries:
 
 
 class TestExaHealthCallback:
-    """Feed-health recording: every attempted fetch records one 5-arg callback."""
+    """Feed-health recording: every attempted fetch records one typed outcome."""
 
     async def test_success_records_healthy(self) -> None:
         rec = _Recorder()
@@ -308,7 +302,7 @@ class TestExaHealthCallback:
             await fetch_exa_entries(
                 _EXA_TOPIC, _ENABLED, max_results=5, timeout=5.0, client=client, health_callback=rec
             )
-        assert rec.calls == [(_EXA_ENDPOINT, True, None, None, None)]
+        assert rec.calls == [FeedHealthOutcome(_EXA_ENDPOINT, FetchStatus.EMPTY)]
 
     async def test_http_error_records_failure(self) -> None:
         rec = _Recorder()
@@ -318,11 +312,11 @@ class TestExaHealthCallback:
                 _EXA_TOPIC, _ENABLED, max_results=5, timeout=5.0, client=client, health_callback=rec
             )
         assert len(rec.calls) == 1
-        url, success, reason, etag, last_modified = rec.calls[0]
-        assert url == _EXA_ENDPOINT
-        assert success is False
-        assert reason  # non-empty reason
-        assert etag is None and last_modified is None
+        outcome = rec.calls[0]
+        assert outcome.feed_url == _EXA_ENDPOINT
+        assert outcome.status is FetchStatus.FAILED
+        assert outcome.error_msg  # non-empty reason
+        assert outcome.etag is None and outcome.last_modified is None
 
     async def test_timeout_records_failure(self) -> None:
         rec = _Recorder()
@@ -335,9 +329,9 @@ class TestExaHealthCallback:
                 _EXA_TOPIC, _ENABLED, max_results=5, timeout=5.0, client=client, health_callback=rec
             )
         assert len(rec.calls) == 1
-        assert rec.calls[0][0] == _EXA_ENDPOINT
-        assert rec.calls[0][1] is False
-        assert rec.calls[0][2]
+        assert rec.calls[0].feed_url == _EXA_ENDPOINT
+        assert rec.calls[0].status is FetchStatus.FAILED
+        assert rec.calls[0].error_msg
 
     async def test_generic_error_records_failure(self) -> None:
         """Invalid JSON hits the generic except path and records a failure."""
@@ -348,8 +342,8 @@ class TestExaHealthCallback:
                 _EXA_TOPIC, _ENABLED, max_results=5, timeout=5.0, client=client, health_callback=rec
             )
         assert len(rec.calls) == 1
-        assert rec.calls[0][1] is False
-        assert rec.calls[0][2]
+        assert rec.calls[0].status is FetchStatus.FAILED
+        assert rec.calls[0].error_msg
 
     async def test_non_http_endpoint_records_failure(self) -> None:
         rec = _Recorder()
@@ -359,8 +353,9 @@ class TestExaHealthCallback:
                 _EXA_TOPIC, settings, max_results=5, timeout=5.0, client=client, health_callback=rec
             )
         assert len(rec.calls) == 1
-        assert rec.calls[0] == ("ftp://host/search", False, rec.calls[0][2], None, None)
-        assert rec.calls[0][2]
+        assert rec.calls[0].feed_url == "ftp://host/search"
+        assert rec.calls[0].status is FetchStatus.FAILED
+        assert rec.calls[0].error_msg
 
     async def test_private_endpoint_records_failure(self) -> None:
         rec = _Recorder()
@@ -371,9 +366,9 @@ class TestExaHealthCallback:
                     _EXA_TOPIC, settings, max_results=5, timeout=5.0, client=client, health_callback=rec
                 )
         assert len(rec.calls) == 1
-        assert rec.calls[0][0] == "http://internal.local/search"
-        assert rec.calls[0][1] is False
-        assert rec.calls[0][2]
+        assert rec.calls[0].feed_url == "http://internal.local/search"
+        assert rec.calls[0].status is FetchStatus.FAILED
+        assert rec.calls[0].error_msg
 
     async def test_malformed_endpoint_records_failure(self) -> None:
         """The SSRF-check except path (no prior test) records a failure."""
@@ -384,9 +379,9 @@ class TestExaHealthCallback:
                     _EXA_TOPIC, _ENABLED, max_results=5, timeout=5.0, client=client, health_callback=rec
                 )
         assert len(rec.calls) == 1
-        assert rec.calls[0][0] == _EXA_ENDPOINT
-        assert rec.calls[0][1] is False
-        assert rec.calls[0][2]
+        assert rec.calls[0].feed_url == _EXA_ENDPOINT
+        assert rec.calls[0].status is FetchStatus.FAILED
+        assert rec.calls[0].error_msg
 
     async def test_disabled_records_nothing(self) -> None:
         rec = _Recorder()
