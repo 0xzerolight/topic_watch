@@ -96,13 +96,14 @@ _DELIVERY_CONCURRENCY = 5
 _RETRY_DRAIN_LIMIT = 20
 
 # Delivery failures that will not change on a retry: the target is an unedited
-# example URL, one Apprise cannot even parse, or one the SSRF gate refuses.
-# Three more attempts only delay the abandonment (AUG-245).
+# example URL, or one Apprise cannot even parse. Three more attempts only delay
+# the abandonment (AUG-245). A target the SSRF gate refuses is NOT in here: that
+# gate fails closed, so its verdict is also what an unresolvable host looks like,
+# and a resolver blip must not destroy the alert on its first attempt.
 _TERMINAL_DELIVERY_ERRORS = frozenset(
     {
         "placeholder notification URL",
         "invalid notification URL",
-        "blocked notification target",
     }
 )
 
@@ -1007,45 +1008,75 @@ async def _deliver_one_notification_intent(
             apply_conn.commit()
         return None
 
-    delivery = await send_single_notification(intent.title, intent.body, intent.url, settings.apprise_timeout_seconds)
-    delivery = delivery.model_copy(update={"intent_id": intent_id})
-
-    if delivery.timed_out:
-        # Unknown, not failed: the Apprise thread cannot be cancelled and may
-        # still be delivering. Leaving the intent 'sending' is the honest record
-        # (TW-AUD-004); the stale-claim release re-arms it once enough time has
-        # passed that the send cannot still be in flight (AUG-071).
-        logger.warning(
-            "Notification intent id=%d left in flight after its deadline; outcome unknown",
-            intent_id,
+    delivery: NotificationDelivery | None = None
+    try:
+        delivery = await send_single_notification(
+            intent.title, intent.body, intent.url, settings.apprise_timeout_seconds
         )
+        delivery = delivery.model_copy(update={"intent_id": intent_id})
+
+        if delivery.timed_out:
+            # Unknown, not failed: the Apprise thread cannot be cancelled and may
+            # still be delivering. Leaving the intent 'sending' is the honest record
+            # (TW-AUD-004); the stale-claim release re-arms it once enough time has
+            # passed that the send cannot still be in flight (AUG-071).
+            logger.warning(
+                "Notification intent id=%d left in flight after its deadline; outcome unknown",
+                intent_id,
+            )
+            return delivery
+
+        terminal = (delivery.error or "") in _TERMINAL_DELIVERY_ERRORS
+        due = None if delivery.ok or terminal else next_attempt_at(intent.retry_count)
+        with short_conn(conn, db_path) as apply_conn:
+            applied = apply_notification_outcome(
+                apply_conn,
+                intent_id,
+                claim_token,
+                sent=delivery.ok,
+                error=delivery.error,
+                next_attempt_at=due,
+                terminal=terminal,
+            )
+            apply_conn.commit()
+        if not applied:
+            logger.warning("Late apply for notification intent id=%d ignored: the claim is no longer ours", intent_id)
+        elif delivery.ok:
+            logger.info("Notification intent id=%d delivered to %s", intent_id, redact_url(intent.url))
+        elif terminal:
+            logger.warning(
+                "Abandoning notification intent id=%d without retry (url=%s reason=%s)",
+                intent_id,
+                redact_url(intent.url),
+                delivery.error,
+            )
         return delivery
-
-    terminal = (delivery.error or "") in _TERMINAL_DELIVERY_ERRORS
-    due = None if delivery.ok or terminal else next_attempt_at(intent.retry_count)
-    with short_conn(conn, db_path) as apply_conn:
-        applied = apply_notification_outcome(
-            apply_conn,
-            intent_id,
-            claim_token,
-            sent=delivery.ok,
-            error=delivery.error,
-            next_attempt_at=due,
-            terminal=terminal,
-        )
-        apply_conn.commit()
-    if not applied:
-        logger.warning("Late apply for notification intent id=%d ignored: the claim is no longer ours", intent_id)
-    elif delivery.ok:
-        logger.info("Notification intent id=%d delivered to %s", intent_id, redact_url(intent.url))
-    elif terminal:
-        logger.warning(
-            "Abandoning notification intent id=%d without retry (url=%s reason=%s)",
-            intent_id,
-            redact_url(intent.url),
-            delivery.error,
-        )
-    return delivery
+    except Exception as exc:
+        # An escaping exception must still land an outcome. Without this the row
+        # stays 'sending' for good: retry_count never moves so it is never
+        # abandoned, retention prunes only terminal rows, the UI queue hides it,
+        # and every later drain sends it again. ``sent`` carries whatever the send
+        # already told us, so a delivered message whose apply hit a locked
+        # database is recorded as delivered instead of being sent twice; the claim
+        # fence makes it a no-op if that first apply landed after all.
+        logger.warning("Notification intent id=%d raised during delivery", intent_id, exc_info=True)
+        sent = delivery is not None and delivery.ok
+        try:
+            with short_conn(conn, db_path) as apply_conn:
+                apply_notification_outcome(
+                    apply_conn,
+                    intent_id,
+                    claim_token,
+                    sent=sent,
+                    error=type(exc).__name__,
+                    next_attempt_at=None if sent else next_attempt_at(intent.retry_count),
+                )
+                apply_conn.commit()
+        except Exception:
+            # The database is what failed; leave the claim to the stale release
+            # rather than raising into the gather, which records nothing at all.
+            logger.warning("Could not record the outcome for notification intent id=%d", intent_id, exc_info=True)
+        return delivery or NotificationDelivery(url=intent.url, ok=False, error=type(exc).__name__, intent_id=intent_id)
 
 
 async def deliver_notification_intents(

@@ -1,5 +1,6 @@
 """Tests for the webhook delivery module."""
 
+import socket
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
@@ -10,8 +11,14 @@ import pytest
 
 from app.analysis.llm import NoveltyResult
 from app.config import LLMSettings, NotificationSettings, Settings
-from app.crud import create_topic, create_webhook_intents, list_pending_webhooks
-from app.models import Topic, TopicStatus
+from app.crud import (
+    apply_webhook_outcome,
+    create_topic,
+    create_webhook_intents,
+    list_pending_webhooks,
+    release_stale_webhook_claims,
+)
+from app.models import Topic, TopicStatus, to_db_utc
 from app.webhooks import (
     WebhookOutcome,
     _build_webhook_payload,
@@ -374,12 +381,25 @@ class TestWebhookOutcomeClassification:
         assert outcome.retryable is False
         assert outcome.retry_after_s is None
 
-    async def test_blocked_targets_are_terminal_not_transient(self) -> None:
-        """A private address or a bad scheme will not become valid on a retry."""
-        for url in ("http://127.0.0.1:8080/hook", "file:///etc/passwd", "http://[::1"):
+    async def test_unusable_urls_are_terminal_not_transient(self) -> None:
+        """A bad scheme or a URL that will not parse cannot become valid on a retry."""
+        for url in ("file:///etc/passwd", "http://[::1"):
             outcome = await send_webhook(url, {})
             assert outcome.ok is False, url
             assert outcome.retryable is False, url
+
+    async def test_a_blocked_host_is_retried_not_abandoned(self) -> None:
+        """The SSRF gate fails closed on resolution failure, so its verdict is not final.
+
+        The same "blocked" answer covers a genuinely private address and a host
+        the resolver could not answer for at all — a resolver restart, a
+        container that started before its DNS, a lookup that hit the resolve
+        timeout. Spending the retry budget on it is the honest reading; only
+        url_validation can tell the two apart.
+        """
+        outcome = await send_webhook("http://127.0.0.1:8080/hook", {})
+        assert outcome.ok is False
+        assert outcome.retryable is True
 
 
 class TestWebhookIntents:
@@ -597,6 +617,92 @@ class TestWebhookRetryQueue:
             await retry_pending_webhooks(db_conn, settings)
         mock_send.assert_awaited_once()
 
+    async def test_a_transient_resolution_failure_keeps_the_intent_queued(self, db_conn: sqlite3.Connection) -> None:
+        """One EAI_AGAIN must not destroy the delivery on its first attempt."""
+        topic = _make_topic(db_conn)
+        settings = _make_settings(
+            notifications=NotificationSettings(urls=[], webhook_urls=["https://hooks.example.com/abc"])
+        )
+
+        def unresolvable(*_args, **_kwargs):
+            raise socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
+
+        with patch("socket.getaddrinfo", side_effect=unresolvable):
+            await _deliver(db_conn, topic.id, settings)
+
+        row = db_conn.execute("SELECT status, retry_count, next_attempt_at FROM pending_webhooks").fetchone()
+        assert row["status"] == "pending"
+        assert row["retry_count"] == 1
+        assert row["next_attempt_at"] is not None
+
+        # DNS recovers before the next attempt is due.
+        db_conn.execute("UPDATE pending_webhooks SET next_attempt_at = NULL")
+        db_conn.commit()
+        with patch("app.webhooks.send_webhook", new_callable=AsyncMock, return_value=_ok()) as mock_send:
+            await retry_pending_webhooks(db_conn, settings)
+
+        mock_send.assert_awaited_once()
+        row = db_conn.execute("SELECT status FROM pending_webhooks").fetchone()
+        assert row["status"] == "sent"
+
+    async def test_an_escaping_error_still_records_a_retryable_failure(self, db_conn: sqlite3.Connection) -> None:
+        """An exception must land an outcome, or the row is stuck 'sending' for good.
+
+        Nothing else frees it: retry_count never moves so it is never abandoned,
+        retention prunes only terminal rows, and the queue view hides 'sending'.
+        """
+        topic = _make_topic(db_conn)
+        settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=["https://a.com/hook"]))
+
+        async def boom(url: str, payload: dict, timeout: float = 10.0) -> WebhookOutcome:
+            raise RuntimeError("unexpected")
+
+        with patch("app.webhooks.send_webhook", side_effect=boom):
+            delivered = await _deliver(db_conn, topic.id, settings)
+
+        assert delivered == 0
+        row = db_conn.execute("SELECT * FROM pending_webhooks").fetchone()
+        assert row["status"] == "pending"
+        assert row["retry_count"] == 1
+        assert row["last_error"] == "RuntimeError"
+        assert row["next_attempt_at"] is not None
+
+    async def test_a_failed_apply_after_a_delivered_post_is_not_re_sent(self, db_conn: sqlite3.Connection) -> None:
+        """Exactly-once holds when the apply write fails, not just when the POST does.
+
+        A locked database after a POST the endpoint accepted must not re-arm the
+        row: the receiver would get the payload twice.
+        """
+        topic = _make_topic(db_conn)
+        settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=["https://a.com/hook"]))
+        posts: list[str] = []
+
+        async def record(url: str, payload: dict, timeout: float = 10.0) -> WebhookOutcome:
+            posts.append(url)
+            return _ok()
+
+        applies = {"n": 0}
+
+        def flaky_apply(*args, **kwargs):  # noqa: ANN002, ANN003
+            applies["n"] += 1
+            if applies["n"] == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return apply_webhook_outcome(*args, **kwargs)
+
+        with (
+            patch("app.webhooks.send_webhook", side_effect=record),
+            patch("app.webhooks.apply_webhook_outcome", side_effect=flaky_apply),
+        ):
+            await _deliver(db_conn, topic.id, settings)
+            # The stale-claim window elapses; a re-armed row would POST again.
+            release_stale_webhook_claims(db_conn, to_db_utc(datetime.now(UTC) + timedelta(hours=1)))
+            db_conn.commit()
+            await retry_pending_webhooks(db_conn, settings)
+
+        assert posts == ["https://a.com/hook"]
+        row = db_conn.execute("SELECT status FROM pending_webhooks").fetchone()
+        assert row["status"] == "sent"
+
 
 class TestAbandonedWebhookLogging:
     """A permanently-dropped webhook must be observable (OVH-040)."""
@@ -667,16 +773,14 @@ class TestWebhookRetryCrashSafety:
         db_conn.commit()
         pending = list_pending_webhooks(db_conn)
         assert len(pending) == 2
-        first_id = pending[0].id
+        first_id, second_id = pending[0].id, pending[1].id
 
-        # Retry: both sends "succeed", but applying the SECOND result crashes.
+        # Retry: both sends "succeed", but every apply for the SECOND crashes —
+        # the recovery apply included, as a genuinely unwritable database would.
         from app.crud import apply_webhook_outcome as real_apply
 
-        call_count = {"n": 0}
-
         def crashing_apply(conn, intent_id, claim_token, **kwargs):  # noqa: ANN001
-            call_count["n"] += 1
-            if call_count["n"] == 2:
+            if intent_id == second_id:
                 raise RuntimeError("simulated crash applying item 2")
             return real_apply(conn, intent_id, claim_token, **kwargs)
 

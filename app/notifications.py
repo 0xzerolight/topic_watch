@@ -255,14 +255,19 @@ def _deliver_one(title: str, body: str, url: str) -> NotificationDelivery:
             logger.warning("Blocked notification to %s: %s", redact_url(url), exc)
             return NotificationDelivery(url=url, ok=False, error="blocked notification target")
 
-    ap = apprise.Apprise()
-    if not ap.add(url):
-        # OVH-027: a typo'd/unsupported URL is dropped by Apprise at add() time.
-        # Surface it instead of silently succeeding on the other channels.
-        logger.warning("Skipping invalid notification URL: %s", redact_url(url))
-        return NotificationDelivery(url=url, ok=False, error="invalid notification URL")
-
     try:
+        # add() parses the URL, so it RAISES on inputs Apprise cannot make sense
+        # of — an ordinary password containing '[' reads as a broken IPv6 literal.
+        # It belongs inside the guard: the delivery state machine leans on the
+        # "Never raises" contract, and an escaping exception leaves the intent
+        # claimed with no outcome ever recorded (TW-AUD-004).
+        ap = apprise.Apprise()
+        if not ap.add(url):
+            # OVH-027: a typo'd/unsupported URL is dropped by Apprise at add() time.
+            # Surface it instead of silently succeeding on the other channels.
+            logger.warning("Skipping invalid notification URL: %s", redact_url(url))
+            return NotificationDelivery(url=url, ok=False, error="invalid notification URL")
+
         ok = bool(ap.notify(title=title, body=body))
         if ok:
             logger.info("Notification sent to %s: %s", redact_url(url), title)

@@ -19,6 +19,7 @@ from app.models import NotificationDelivery, PendingNotification, Topic, TopicSt
 from app.notifications import (
     NOTIFICATION_BODY_CHAR_LIMIT,
     NOTIFICATION_TITLE_CHAR_LIMIT,
+    _deliver_one,
     _is_placeholder_url,
     format_notification,
     redact_url,
@@ -619,6 +620,33 @@ class TestSendNotificationStillNonRaising:
 
         result = await send_notification("T", "B", settings)
         assert result is False
+
+    @patch("app.notifications.apprise.Apprise")
+    def test_an_add_that_raises_is_a_failed_delivery(self, mock_apprise: MagicMock) -> None:
+        """add() parses the URL and can raise, so it belongs inside the guard.
+
+        The delivery state machine leans on the "Never raises" contract: an
+        escaping exception leaves the intent claimed with no outcome recorded.
+        """
+        inst = MagicMock()
+        inst.add.side_effect = ValueError("Invalid IPv6 URL")
+        mock_apprise.return_value = inst
+
+        result = _deliver_one("T", "B", "ntfy://token@ntfy.example.com/alerts")
+
+        assert result.ok is False
+        assert result.error
+
+    def test_a_bracket_in_a_password_is_a_failed_delivery(self) -> None:
+        """The live trigger: apprise raises on ordinary credentials containing '['.
+
+        No config validation stops such a URL, so one character in an SMTP
+        password used to strand every notification intent it produced.
+        """
+        result = _deliver_one("T", "B", "mailtos://alice:secret[1]@smtp.example.com")
+
+        assert result.ok is False
+        assert result.error
 
 
 # --- retry does not re-send already-succeeded URLs (OVH-039) ---
