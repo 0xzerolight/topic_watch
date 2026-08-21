@@ -120,6 +120,71 @@ class TestM025Backfill:
         finally:
             conn.close()
 
+    def test_real_v24_database_upgrades_to_head(self, tmp_path, monkeypatch) -> None:
+        """AUG-157: the registered v24 -> head route, not a hand-invoked ``up()``.
+
+        The other tests here call ``m025_up`` directly on a database that is
+        already at HEAD, so the one thing this stateful backfill exists for — an
+        existing install crossing version 24 — was never exercised: not the
+        registry ordering, not the ledger advancing, and not the actual pre-m025
+        schema that migrations m001-m024 produce.
+        """
+        import app.migrations as migrations_mod
+        from app.database import get_schema_version
+
+        real = list(migrations_mod.MIGRATIONS)
+        db_path = tmp_path / "v24.db"
+
+        monkeypatch.setattr(migrations_mod, "MIGRATIONS", [m for m in real if m[0] <= 24])
+        init_db(db_path)
+
+        conn = get_connection(db_path)
+        try:
+            assert get_schema_version(conn) == 24
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            assert "knowledge_revisions" not in tables, "precondition: v24 predates the history table"
+            conn.execute(
+                "INSERT INTO topics (name, description, feed_urls, feed_mode, created_at, status)"
+                " VALUES ('Upgrader', 'd', '[]', 'manual', ?, 'ready')",
+                (datetime.now(UTC).isoformat(),),
+            )
+            topic_id = conn.execute("SELECT id FROM topics WHERE name='Upgrader'").fetchone()[0]
+            conn.execute(
+                "INSERT INTO knowledge_states (topic_id, summary_text, token_count, updated_at)"
+                " VALUES (?, 'Known before the upgrade.', 77, ?)",
+                (topic_id, "2026-01-02T03:04:05+00:00"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        monkeypatch.setattr(migrations_mod, "MIGRATIONS", real)
+        init_db(db_path)
+
+        conn = get_connection(db_path)
+        try:
+            assert get_schema_version(conn) == max(v for v, _, _ in real)
+            rows = conn.execute(
+                "SELECT summary_text, token_count, source, change_note, created_at"
+                " FROM knowledge_revisions WHERE topic_id = ?",
+                (topic_id,),
+            ).fetchall()
+            assert len(rows) == 1, "the upgrade must backfill one baseline revision"
+            assert tuple(rows[0]) == ("Known before the upgrade.", 77, "init", None, "2026-01-02T03:04:05+00:00")
+            upgraded_columns = {r[1] for r in conn.execute("PRAGMA table_info(knowledge_revisions)").fetchall()}
+        finally:
+            conn.close()
+
+        # The upgraded schema must match what a fresh install gets.
+        fresh_path = tmp_path / "fresh.db"
+        init_db(fresh_path)
+        fresh = get_connection(fresh_path)
+        try:
+            fresh_columns = {r[1] for r in fresh.execute("PRAGMA table_info(knowledge_revisions)").fetchall()}
+        finally:
+            fresh.close()
+        assert upgraded_columns == fresh_columns
+
     def test_rerun_does_not_duplicate(self, tmp_path) -> None:
         from app.migrations.m025_knowledge_revisions import up as m025_up
 
