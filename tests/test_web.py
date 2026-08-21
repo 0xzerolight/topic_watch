@@ -283,6 +283,22 @@ class TestDashboard:
         assert "tag: detailTarget.id" in response.text
         assert 'tag: "topic-watch"' not in response.text
 
+    async def test_dashboard_shows_msg_banner(self, client: httpx.AsyncClient) -> None:
+        """AUG-197: a successful/partial OPML import summary (redirected to
+        /?msg=...) must actually render — the dashboard used to accept and
+        render only ?error=, discarding every non-error import outcome."""
+        response = await client.get("/?msg=Imported+3+topic(s).")
+        assert response.status_code == 200
+        assert "Imported 3 topic(s)." in response.text
+
+    async def test_search_trigger_reacts_to_paste(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        """AUG-226: the search box listens for `input` (fires on a context-menu
+        paste), not just `keyup`/`search`, which paste does not trigger."""
+        _make_topic(db_conn)
+
+        response = await client.get("/")
+        assert "input changed delay:300ms, search" in response.text
+
     async def test_dashboard_opml_file_input_has_accessible_name(self, client: httpx.AsyncClient) -> None:
         """AUG-238: the OPML file picker has a programmatically associated label."""
         response = await client.get("/")
