@@ -40,9 +40,9 @@ from app.scraping.source import (
     body_digest,
     bounded,
     collapse_duplicate_entries,
-    compute_article_hash,
     ranking_date,
     revision_marker,
+    stored_story_keys,
     story_identity,
 )
 
@@ -256,17 +256,29 @@ class _StoredArticles:
     Read once per check rather than queried per entry, because the story key is
     derived from a stored row's URL and title and so cannot be looked up directly
     without an index this schema does not have.
+
+    ``urls_by_story`` carries the URL strings actually written to the rows, which
+    is the only way to read a story's stored bodies back: identity is canonical
+    (tracking parameters stripped) while the column holds whatever the feed served,
+    so a feed rotating a campaign parameter names a URL that is the same story and
+    matches no row by string.
     """
 
     identities: frozenset[str]
     stories: frozenset[str]
+    urls_by_story: dict[str, list[str]]
 
     @classmethod
     def load(cls, conn: sqlite3.Connection, topic_id: int) -> "_StoredArticles":
         rows = list_article_dedup_keys(conn, topic_id)
+        urls_by_story: dict[str, list[str]] = {}
+        for _, url, title in rows:
+            for key in stored_story_keys(url, title):
+                urls_by_story.setdefault(key, []).append(url)
         return cls(
             identities=frozenset(content_hash for content_hash, _, _ in rows),
-            stories=frozenset(compute_article_hash(url, title) for _, url, title in rows),
+            stories=frozenset(urls_by_story),
+            urls_by_story=urls_by_story,
         )
 
     def holds(self, entry: FeedEntry) -> bool:
@@ -491,11 +503,21 @@ def _drop_unchanged_representations(
     that disagreement as a revision is what left the story rule dead for Exa and
     re-stored a topic's whole history on a mode switch.
 
-    When there is nothing comparable, the two cases differ because the evidence
-    does: prefetched text on its own is not a claim, so the entry is held; an
-    ``updated`` stamp IS the source's explicit claim, and one that cannot be
-    refuted is honoured. That costs at most one row, since the row it stores then
-    becomes the body every later poll is compared against.
+    When the same source produced nothing comparable, a body from ANOTHER provider
+    stands in: the two extractors disagree about boilerplate, so the entry is
+    stored, and that row is the baseline every later poll from this source is
+    compared against. Holding the entry instead looked cheaper and was permanent —
+    a drop stores nothing, so the source's bucket for that story stayed empty and
+    every later body it produced, corrections included, was dropped the same way.
+    The stand-in costs one row per story the first time a provider meets a story
+    another one already carried, then goes quiet.
+
+    An entry that arrived with no body at all is a third case, and the one that
+    reinstated the unbounded ingest this function exists to stop: an empty body
+    has no digest, so it matched nothing and every check stored another row for a
+    page we can never read — a paywall, a 403, a transient extraction failure —
+    and handed novelty analysis an empty article each time. No body is no
+    evidence, so the revision claim goes unrefuted and the entry is held.
     """
     contested = [(index, row) for index, row in enumerate(pending) if story_identity(row[0]) in stored.stories]
     if not contested:
@@ -503,25 +525,26 @@ def _drop_unchanged_representations(
 
     by_story: dict[str, set[str]] = {}
     by_source: dict[tuple[str, str | None], set[str]] = {}
-    for url, title, raw_content, source_provider in list_article_bodies_for_urls(
-        conn, topic_id, [row[0].url for _, row in contested]
-    ):
+    stored_urls = [url for _, row in contested for url in stored.urls_by_story.get(story_identity(row[0]), ())]
+    for url, title, raw_content, source_provider in list_article_bodies_for_urls(conn, topic_id, stored_urls):
         digest = body_digest(raw_content)
         if not digest:
             continue
-        story = compute_article_hash(url, title)
-        by_story.setdefault(story, set()).add(digest)
-        by_source.setdefault((story, source_provider), set()).add(digest)
+        for story in stored_story_keys(url, title):
+            by_story.setdefault(story, set()).add(digest)
+            by_source.setdefault((story, source_provider), set()).add(digest)
 
     unchanged: set[int] = set()
     for index, (entry, _, content, origin_provider) in contested:
         story = story_identity(entry)
         offered = body_digest(content)
-        if _is_prefetched(entry):
+        if not offered:
+            settled = True
+        elif _is_prefetched(entry):
             known = by_source.get((story, origin_provider if origin_provider is not None else provider_name), set())
-            settled = not known or offered in known
+            settled = offered in (known or by_story.get(story, set()))
         else:
-            settled = bool(by_story.get(story)) and offered in by_story[story]
+            settled = offered in by_story.get(story, set())
         if settled:
             logger.info("Story unchanged since it was stored; not re-storing: %s", entry.url)
             unchanged.add(index)
