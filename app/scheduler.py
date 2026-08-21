@@ -7,6 +7,7 @@ loop in Session 5.
 
 import asyncio
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -19,6 +20,7 @@ from app.crud import (
     delete_old_articles,
     get_new_topics,
     recover_stuck_researching,
+    update_topic_init_status,
 )
 from app.database import get_db
 from app.models import TopicStatus
@@ -34,6 +36,11 @@ _scheduler: AsyncIOScheduler | None = None
 # Cron maintenance (VACUUM, article cleanup) tolerates running hours late so a
 # slept/woken host still catches up missed runs instead of skipping them (OVH-029).
 _MAINTENANCE_MISFIRE_GRACE_SECONDS = 6 * 60 * 60
+
+# End-to-end bound on one gradual-init tick, matching the web background task's
+# own bound (``app.web.routers.background._INIT_TIMEOUT_SECONDS``). Without it a
+# scheduler init could outlive the 15-minute stuck-recovery window (AUG-139).
+_INIT_TIMEOUT_SECONDS = 600
 
 
 def _resolve_settings(app: "FastAPI | None", fallback: Settings) -> Settings:
@@ -145,7 +152,36 @@ async def _init_new_topics(settings: Settings, db_path: Path | None = None) -> N
             topic.status = TopicStatus.RESEARCHING
             # No connection is held across the init's fetch + LLM awaits: it opens
             # its own short-lived one per phase (AUG-136).
-            await initialize_new_topic(topic, settings, db_path=db_path)
+            #
+            # Bounded like the web path (AUG-139): an unbounded init could still be
+            # running when stuck recovery declares it timed out at 15 minutes, which
+            # is how a live initializer and recovery ended up racing for the terminal
+            # status. The claim itself is fenced too, so the loser writes nothing.
+            try:
+                await asyncio.wait_for(
+                    initialize_new_topic(topic, settings, db_path=db_path, claimed=True),
+                    timeout=_INIT_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                logger.error(
+                    "NEW topic init timed out for '%s' after %d seconds",
+                    topic.name,
+                    _INIT_TIMEOUT_SECONDS,
+                )
+                # The cancelled initializer already handed its claim back (ERROR);
+                # this only names the reason, fenced so it cannot land on a topic
+                # somebody re-claimed in between.
+                with get_db(db_path) as conn:
+                    update_topic_init_status(
+                        conn,
+                        topic_id,
+                        status=TopicStatus.ERROR,
+                        status_changed_at=datetime.now(UTC),
+                        error_message="Research timed out. Click Retry.",
+                        init_attempts=topic.init_attempts,
+                        expected_status=TopicStatus.ERROR,
+                    )
+                    conn.commit()
         finally:
             await _checking_state.finish_check(topic_id, owner)
     except Exception:

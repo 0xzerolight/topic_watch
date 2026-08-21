@@ -131,20 +131,34 @@ def update_topic_init_status(
     status_changed_at: datetime,
     error_message: str | None,
     init_attempts: int,
-) -> None:
+    expected_status: TopicStatus | None = None,
+    generation: str | None = None,
+) -> bool:
     """Targeted UPDATE of only the init-lifecycle columns a topic init owns.
 
     Unlike ``update_topic`` (which rewrites the whole row from a possibly-stale
     in-memory ``Topic``), this writes only status/error/init_attempts so a
     concurrent UI edit to feeds/thresholds during the long init await is not
     clobbered (OVH-100). Does not commit; the caller owns the transaction.
+
+    ``expected_status`` and ``generation`` fence the write to the claim the caller
+    still owns. Without them, an initializer that stuck recovery had already given
+    up on (RESEARCHING -> ERROR) could still land its terminal READY/ERROR minutes
+    later, making the topic's final state last-writer-wins between live work and
+    recovery (AUG-139). Returns True only when the row was actually updated.
     """
-    conn.execute(
-        """UPDATE topics
-           SET status = ?, status_changed_at = ?, error_message = ?, init_attempts = ?
-           WHERE id = ?""",
-        (status.value, status_changed_at.isoformat(), error_message, init_attempts, topic_id),
-    )
+    sql = """UPDATE topics
+             SET status = ?, status_changed_at = ?, error_message = ?, init_attempts = ?
+             WHERE id = ?"""
+    params: list = [status.value, to_db_utc(status_changed_at), error_message, init_attempts, topic_id]
+    if expected_status is not None:
+        sql += " AND status = ?"
+        params.append(expected_status.value)
+    if generation is not None:
+        sql += " AND generation = ?"
+        params.append(generation)
+    cursor = conn.execute(sql, params)
+    return cursor.rowcount == 1
 
 
 def recover_stuck_topics(conn: sqlite3.Connection) -> int:
@@ -152,11 +166,17 @@ def recover_stuck_topics(conn: sqlite3.Connection) -> int:
 
     Called at startup — any topic still in RESEARCHING status when the
     server starts is definitively stuck (the background task is dead).
+
+    ``status_changed_at`` moves with the status: it means "when the current status
+    was entered", so leaving it at the start of the abandoned research made a
+    freshly recovered topic report an ERROR age of however long it had been
+    researching (AUG-158).
     """
     cursor = conn.execute(
-        "UPDATE topics SET status = ?, error_message = ? WHERE status = ?",
+        "UPDATE topics SET status = ?, status_changed_at = ?, error_message = ? WHERE status = ?",
         (
             TopicStatus.ERROR.value,
+            to_db_utc(datetime.now(UTC)),
             "Research interrupted by server restart. Click Retry.",
             TopicStatus.RESEARCHING.value,
         ),
@@ -177,14 +197,20 @@ def recover_stuck_researching(conn: sqlite3.Connection, timeout_minutes: int = 1
     Does not commit; the caller owns the transaction (invariant #12), matching
     ``recover_stuck_topics``. The scheduler's ``_recover_stuck`` runs this inside
     a ``get_db`` block, which commits on success (OVH-087).
+
+    Stamps ``status_changed_at`` with the recovery time for the same reason
+    ``recover_stuck_topics`` does (AUG-158). The staleness predicate reads the old
+    value before the SET applies, so the window is still measured from the start
+    of the research.
     """
     cursor = conn.execute(
-        """UPDATE topics SET status = ?, error_message = ?
+        """UPDATE topics SET status = ?, status_changed_at = ?, error_message = ?
            WHERE status = ?
              AND status_changed_at IS NOT NULL
              AND datetime(status_changed_at, '+' || ? || ' minutes') <= datetime('now')""",
         (
             TopicStatus.ERROR.value,
+            to_db_utc(datetime.now(UTC)),
             "Research timed out (stuck detection). Click Retry.",
             TopicStatus.RESEARCHING.value,
             timeout_minutes,
@@ -1114,32 +1140,55 @@ def list_all_feed_health(conn: sqlite3.Connection) -> list[FeedHealth]:
 
 
 def get_new_topics(conn: sqlite3.Connection, limit: int = 1) -> list[Topic]:
-    """Get topics in NEW status, oldest first (for gradual scheduler init)."""
+    """Get topics in NEW status, oldest first (for gradual scheduler init).
+
+    Paused topics are excluded: automatic initialization fetches sources and
+    spends LLM/Exa credit, which is exactly what disabling a topic is supposed to
+    stop (AUG-140). The claim below repeats the filter to close the window between
+    this SELECT and the claim.
+    """
     rows = conn.execute(
-        "SELECT * FROM topics WHERE status = ? ORDER BY created_at ASC LIMIT ?",
+        "SELECT * FROM topics WHERE status = ? AND is_active = 1 ORDER BY created_at ASC LIMIT ?",
         (TopicStatus.NEW.value, limit),
     ).fetchall()
     return [Topic.from_row(row) for row in rows]
 
 
-def claim_new_topic_for_init(conn: sqlite3.Connection, topic_id: int) -> bool:
-    """Atomically claim a NEW topic for initialization (NEW -> RESEARCHING).
+def claim_topic_for_init(conn: sqlite3.Connection, topic_id: int, expected_status: TopicStatus) -> bool:
+    """Atomically claim a topic for initialization (expected_status -> RESEARCHING).
 
-    Returns True only if this caller won the claim (rowcount == 1). A concurrent
-    init (a same-minute web Retry click, a second scheduler tick on another
-    process, or a CLI init) that already transitioned the row out of NEW loses
-    here, so only one initializer proceeds (OVH-032). Mirrors the conditional-UPDATE
-    pattern in ``recover_stuck_researching``. Commits so the claim is durable and
-    immediately visible to concurrent WAL connections.
+    Returns True only if this caller won the claim (rowcount == 1). Every
+    initializer — scheduler tick, web Retry, CLI ``init`` — goes through this one
+    conditional UPDATE, so "read the status, then write RESEARCHING" can no longer
+    let two of them both proceed (AUG-288). ``is_active = 1`` is part of the
+    predicate: a topic paused between the caller's read and this claim is not
+    initialized (AUG-140).
+
+    Commits so the claim is durable and immediately visible to concurrent WAL
+    connections — a claim only another process can see is not a claim.
     """
-    now = datetime.now(UTC).isoformat()
     cursor = conn.execute(
         """UPDATE topics SET status = ?, status_changed_at = ?, error_message = ?
-           WHERE id = ? AND status = ?""",
-        (TopicStatus.RESEARCHING.value, now, None, topic_id, TopicStatus.NEW.value),
+           WHERE id = ? AND status = ? AND is_active = 1""",
+        (
+            TopicStatus.RESEARCHING.value,
+            to_db_utc(datetime.now(UTC)),
+            None,
+            topic_id,
+            expected_status.value,
+        ),
     )
     conn.commit()
     return cursor.rowcount == 1
+
+
+def claim_new_topic_for_init(conn: sqlite3.Connection, topic_id: int) -> bool:
+    """Atomically claim a NEW topic for initialization (NEW -> RESEARCHING).
+
+    The scheduler's gradual-init spelling of :func:`claim_topic_for_init`
+    (OVH-032).
+    """
+    return claim_topic_for_init(conn, topic_id, TopicStatus.NEW)
 
 
 def claim_heartbeat_alert(conn: sqlite3.Connection, topic_id: int, alerted_at: datetime) -> bool:

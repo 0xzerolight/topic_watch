@@ -26,6 +26,7 @@ from app.crud import (
     MAX_ANALYSIS_ATTEMPTS,
     claim_heartbeat_alert,
     claim_pending_notification,
+    claim_topic_for_init,
     clear_heartbeat_alert,
     create_check_result,
     create_pending_notification,
@@ -78,6 +79,16 @@ def _summarize_exc(exc: BaseException, *, limit: int = 200) -> str:
     """One-line, length-bounded exception summary for the stored stage_error."""
     summary = f"{type(exc).__name__}: {exc}".replace("\n", " ").strip()
     return summary[:limit]
+
+
+class TopicInitRefused(Exception):
+    """Initialization never started because this caller does not own the topic.
+
+    Raised instead of silently returning so every entry point (CLI exit code, web
+    response, scheduler log) can say what happened: the topic was already being
+    initialized by someone else, is paused, or disappeared. A refusal writes
+    nothing — in particular it never takes a RESEARCHING claim it cannot release.
+    """
 
 
 class CheckTransitionAborted(Exception):
@@ -1067,14 +1078,21 @@ def _commit_init_transition(
         )
 
     mark_articles_processed(conn, article_ids)
-    update_topic_init_status(
+    if not update_topic_init_status(
         conn,
         topic_id,
         status=TopicStatus.READY,
         status_changed_at=datetime.now(UTC),
         error_message=None,
         init_attempts=0,
-    )
+        expected_status=TopicStatus.RESEARCHING,
+    ):
+        # Stuck recovery gave up on this initialization and moved the row to ERROR
+        # while the LLM phase was running, so a Retry may already be under way. The
+        # claim is gone; landing READY here would make the terminal status
+        # last-writer-wins between recovery and abandoned work (AUG-139). Abort the
+        # whole transition instead — nothing is written and the next attempt is clean.
+        raise CheckTransitionAborted(f"topic_id={topic_id} left RESEARCHING during initialization")
     conn.commit()
 
 
@@ -1083,11 +1101,22 @@ async def initialize_new_topic(
     settings: Settings,
     *,
     db_path: Path | None = None,
+    claimed: bool = False,
 ) -> None:
     """Initialize a topic's knowledge state from its first batch of articles.
 
-    Transitions: NEW/RESEARCHING → RESEARCHING → READY (or ERROR on failure).
-    Called by both the web layer (background task) and the scheduler (gradual init).
+    Transitions: NEW/READY/ERROR → RESEARCHING → READY (or ERROR on failure).
+    Called by the web layer (background task), the scheduler (gradual init) and
+    the CLI.
+
+    Ownership: the RESEARCHING transition is a conditional claim, not an
+    unconditional write (AUG-288). Callers that already won the claim durably —
+    the scheduler's ``claim_new_topic_for_init``, the web Retry handler, the
+    just-INSERTed row of a topic creation — pass ``claimed=True``; everyone else
+    lets this function claim, and gets :class:`TopicInitRefused` when the topic is
+    already being initialized, is paused, or is gone. Every terminal write is
+    fenced back to that claim, so an initializer stuck recovery has already
+    written off cannot overwrite the recovered state (AUG-139).
 
     Connection invariant (AUG-136): no connection is open across the fetch or LLM
     awaits. Status writes each take a short connection of their own, the fetch and
@@ -1112,24 +1141,54 @@ async def initialize_new_topic(
     # never clobbered by a stale in-memory snapshot (OVH-100).
 
     def _set_init_status(status: TopicStatus, *, error_message: str | None, init_attempts: int) -> None:
+        """Write a terminal status, but only while this initializer still owns the claim."""
         now = datetime.now(UTC)
         with get_db(db_path) as conn:
-            update_topic_init_status(
+            won = update_topic_init_status(
                 conn,
                 topic_id,
                 status=status,
                 status_changed_at=now,
                 error_message=error_message,
                 init_attempts=init_attempts,
+                expected_status=TopicStatus.RESEARCHING,
             )
             conn.commit()
+        if not won:
+            logger.warning(
+                "Topic id=%d left RESEARCHING during initialization; not writing %s",
+                topic_id,
+                status.value,
+            )
+            return
         topic.status = status
         topic.status_changed_at = now
         topic.error_message = error_message
         topic.init_attempts = init_attempts
 
-    # Immediately mark as RESEARCHING (concurrency guard: UI shows spinner, prevents re-trigger).
-    _set_init_status(TopicStatus.RESEARCHING, error_message=None, init_attempts=topic.init_attempts)
+    # The status this call took the claim from, so a cancellation can hand it back
+    # (AUG-243). ``None`` when the caller claimed on our behalf and we never saw it.
+    prior_status: TopicStatus | None = None
+
+    if not claimed:
+        # One conditional UPDATE decides who initializes. Reading the status and
+        # then writing RESEARCHING let two initializers both pass (AUG-288).
+        with get_db(db_path) as conn:
+            live = get_topic(conn, topic_id)
+            if live is None:
+                check_id_var.reset(token)
+                raise TopicInitRefused(f"Topic id={topic_id} no longer exists")
+            if live.status == TopicStatus.RESEARCHING:
+                check_id_var.reset(token)
+                raise TopicInitRefused(f"Topic '{live.name}' is already being initialized")
+            if not live.is_active:
+                check_id_var.reset(token)
+                raise TopicInitRefused(f"Topic '{live.name}' is paused; enable it before initializing")
+            if not claim_topic_for_init(conn, topic_id, live.status):
+                check_id_var.reset(token)
+                raise TopicInitRefused(f"Topic '{live.name}' was claimed by another initializer")
+            prior_status = live.status
+        topic.status = TopicStatus.RESEARCHING
 
     with get_db(db_path) as conn:
         snapshot = _snapshot_topic(conn, topic_id)
@@ -1204,6 +1263,25 @@ async def initialize_new_topic(
                 topic.name,
             )
 
+    except asyncio.CancelledError:
+        # Ctrl-C on the CLI — and task cancellation generally — is not an
+        # ``Exception``, so it walked straight past the handler below and left the
+        # committed RESEARCHING claim behind. Offline, nothing ever recovers that:
+        # every later CLI init refuses the topic until the server is started
+        # (AUG-243). Hand the claim back before re-raising. All of this is
+        # synchronous on purpose; an await here would be cancelled again.
+        restored = prior_status if prior_status is not None else TopicStatus.ERROR
+        logger.warning(
+            "Initialization of topic '%s' was cancelled; restoring status %s",
+            topic.name,
+            restored.value,
+        )
+        _set_init_status(
+            restored,
+            error_message=("Initialization interrupted. Click Retry." if restored is TopicStatus.ERROR else None),
+            init_attempts=topic.init_attempts,
+        )
+        raise
     except Exception as exc:
         logger.error("Knowledge init failed for topic '%s'", topic.name, exc_info=True)
         _set_init_status(TopicStatus.ERROR, error_message=str(exc), init_attempts=topic.init_attempts)

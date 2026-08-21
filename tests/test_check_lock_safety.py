@@ -13,9 +13,11 @@ from app.crud import (
     claim_new_topic_for_init,
     claim_pending_notification,
     claim_pending_webhook,
+    claim_topic_for_init,
     create_pending_notification,
     create_pending_webhook,
     create_topic,
+    get_new_topics,
     get_topic,
     release_stale_notification_claims,
     release_stale_webhook_claims,
@@ -476,6 +478,68 @@ def test_claim_new_topic_for_init_noop_when_not_new(db_conn: sqlite3.Connection)
     topic = create_topic(db_conn, Topic(name="Ready", description="d", status=TopicStatus.READY))
     db_conn.commit()
     assert claim_new_topic_for_init(db_conn, topic.id) is False
+
+
+def test_claim_new_topic_for_init_refuses_paused_topic(db_conn: sqlite3.Connection) -> None:
+    """A paused NEW topic is never claimed for automatic initialization (AUG-140)."""
+    topic = create_topic(db_conn, Topic(name="Paused", description="d", status=TopicStatus.NEW, is_active=False))
+    db_conn.commit()
+
+    assert claim_new_topic_for_init(db_conn, topic.id) is False
+    assert get_topic(db_conn, topic.id).status == TopicStatus.NEW
+
+
+def test_get_new_topics_excludes_paused_topics(db_conn: sqlite3.Connection) -> None:
+    """The gradual-init selection skips paused topics, so no LLM/Exa spend (AUG-140)."""
+    create_topic(db_conn, Topic(name="Off", description="d", status=TopicStatus.NEW, is_active=False))
+    active = create_topic(db_conn, Topic(name="On", description="d", status=TopicStatus.NEW))
+    db_conn.commit()
+
+    selected = get_new_topics(db_conn, limit=10)
+    assert [t.id for t in selected] == [active.id]
+
+
+def test_claim_topic_for_init_requires_the_expected_status(db_conn: sqlite3.Connection) -> None:
+    """The claim is a compare-and-set: a stale expectation loses (AUG-288)."""
+    topic = create_topic(db_conn, Topic(name="Stale", description="d", status=TopicStatus.ERROR))
+    db_conn.commit()
+
+    # A caller that read READY before the row became ERROR must not claim it.
+    assert claim_topic_for_init(db_conn, topic.id, TopicStatus.READY) is False
+    assert get_topic(db_conn, topic.id).status == TopicStatus.ERROR
+    # The caller that read the live status wins.
+    assert claim_topic_for_init(db_conn, topic.id, TopicStatus.ERROR) is True
+    assert get_topic(db_conn, topic.id).status == TopicStatus.RESEARCHING
+
+
+def test_claim_topic_for_init_refuses_paused_topic(db_conn: sqlite3.Connection) -> None:
+    """Pausing a topic between the read and the claim stops the init (AUG-140)."""
+    topic = create_topic(db_conn, Topic(name="PausedError", description="d", status=TopicStatus.ERROR))
+    db_conn.commit()
+    db_conn.execute("UPDATE topics SET is_active = 0 WHERE id = ?", (topic.id,))
+    db_conn.commit()
+
+    assert claim_topic_for_init(db_conn, topic.id, TopicStatus.ERROR) is False
+    assert get_topic(db_conn, topic.id).status == TopicStatus.ERROR
+
+
+async def test_concurrent_reinit_claim_only_one_wins(tmp_path) -> None:
+    """Two processes re-initializing the same READY topic: exactly one claims it."""
+    from app.database import get_db, init_db
+
+    db_path = tmp_path / "reinit.db"
+    init_db(db_path)
+    with get_db(db_path) as seed:
+        topic = create_topic(seed, Topic(name="Reinit", description="d", status=TopicStatus.READY))
+        seed.commit()
+
+    def _claim() -> bool:
+        with get_db(db_path) as conn:
+            return claim_topic_for_init(conn, topic.id, TopicStatus.READY)
+
+    results = await asyncio.gather(asyncio.to_thread(_claim), asyncio.to_thread(_claim))
+    assert results.count(True) == 1
+    assert results.count(False) == 1
 
 
 async def test_concurrent_init_claim_only_one_wins(tmp_path) -> None:
