@@ -146,6 +146,76 @@ class TestStartStopScheduler:
         finally:
             stop_scheduler()
 
+    async def test_start_does_not_capture_caller_request_id(self, monkeypatch) -> None:
+        """AUG-272: AsyncIOScheduler.start() schedules its first wakeup via the
+        event loop, which copies whatever contextvars.Context is active at that
+        call -- so calling start_scheduler() synchronously from the first-run
+        setup POST leaked that request's id into every later scheduler tick.
+        Spy on the real AsyncIOScheduler.start() to see exactly what
+        request_id_var reads at the moment APScheduler captures its context.
+        """
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+        from app.check_context import request_id_var
+
+        captured: dict[str, str | None] = {}
+        real_start = AsyncIOScheduler.start
+
+        def spy_start(self, *args, **kwargs):
+            captured["request_id"] = request_id_var.get()
+            return real_start(self, *args, **kwargs)
+
+        monkeypatch.setattr(AsyncIOScheduler, "start", spy_start)
+
+        token = request_id_var.set("setup-request-123")
+        try:
+            settings = _make_settings()
+            start_scheduler(settings)
+        finally:
+            stop_scheduler()
+            request_id_var.reset(token)
+
+        assert captured["request_id"] is None
+
+    async def test_start_does_not_capture_caller_check_id(self, monkeypatch) -> None:
+        """Same as above for check_id_var (AUG-272)."""
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+        from app.check_context import check_id_var
+
+        captured: dict[str, str | None] = {}
+        real_start = AsyncIOScheduler.start
+
+        def spy_start(self, *args, **kwargs):
+            captured["check_id"] = check_id_var.get()
+            return real_start(self, *args, **kwargs)
+
+        monkeypatch.setattr(AsyncIOScheduler, "start", spy_start)
+
+        token = check_id_var.set("leftover-check-456")
+        try:
+            settings = _make_settings()
+            start_scheduler(settings)
+        finally:
+            stop_scheduler()
+            check_id_var.reset(token)
+
+        assert captured["check_id"] is None
+
+    async def test_start_restores_callers_request_id_after_returning(self) -> None:
+        """The clear is scoped to scheduler.start() only -- the caller's own
+        context must be intact once start_scheduler() returns."""
+        from app.check_context import request_id_var
+
+        token = request_id_var.set("caller-context-789")
+        try:
+            settings = _make_settings()
+            start_scheduler(settings)
+            assert request_id_var.get() == "caller-context-789"
+        finally:
+            stop_scheduler()
+            request_id_var.reset(token)
+
     async def test_check_job_reads_live_settings_from_app(self) -> None:
         """OVH-015/036: when wired to an app, the tick reads settings from app.state."""
         from types import SimpleNamespace
