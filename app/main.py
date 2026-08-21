@@ -32,6 +32,17 @@ from app.web.routers import router
 from app.web.routers.templates import templates
 from app.web.setup_middleware import SetupRedirectMiddleware
 
+# Configured at import time, not from lifespan(): Uvicorn logs "Started server
+# process [pid]" and "Waiting for application startup" through its own text
+# handler BEFORE it ever awaits the ASGI lifespan startup event, so calling
+# setup_logging() from inside lifespan() left both lines — and anything logged
+# by an eagerly-imported dependency such as LiteLLM (imported transitively via
+# app.scheduler above) — outside the configured JSON stream (AUG-249). Module
+# import happens strictly before that point (uvicorn imports the app via
+# ``config.load()`` before logging anything), and litellm is already imported
+# above by the time this runs, so its logger exists to retarget.
+setup_logging()
+
 logger = logging.getLogger(__name__)
 
 REQUEST_ID_HEADER = "X-Request-ID"
@@ -70,7 +81,6 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan: init DB, start scheduler on startup; stop on shutdown."""
-    setup_logging()
     settings = load_settings()
     db_path = resolve_db_path(settings)
     init_db(db_path)
