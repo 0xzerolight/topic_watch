@@ -4,7 +4,10 @@
     {%- if topic.status.value == "error" %}{% set _ = row_classes.append("row-problem") %}{% endif -%}
     {% if row_classes %} class="{{ row_classes | join(' ') }}"{% endif %}
     data-topic-name="{{ topic.name }}"
-    {% if last_check and last_check.has_new_info and not last_check.seen_at %}data-new-info="true"{% endif %}
+    {#- The browser-notification gate (dashboard.html reads data-new-info). It
+        requires the check to have intended a send, so a finding the importance
+        gate muted never pops a desktop alert announcing it (AUG-129). -#}
+    {% if last_check and last_check.has_new_info and last_check.notification_intended and not last_check.seen_at %}data-new-info="true"{% endif %}
     {% if just_checked %}data-just-checked="true"{% endif %}
     {#- Self-terminating status poll: only new/researching rows carry the attrs, and
         the re-rendered ready/error row emits none, so polling stops itself. The

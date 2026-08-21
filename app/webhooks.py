@@ -34,6 +34,7 @@ from app.database import short_conn
 from app.log_redaction import redact_url
 from app.models import PendingWebhook, next_attempt_at, to_db_utc
 from app.url_validation import is_private_url
+from app.web.state import live_claim, live_claim_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -266,6 +267,21 @@ async def _deliver_one_intent(
         logger.debug("Webhook intent id=%d not claimable (claimed, exhausted or not due); skipping", intent_id)
         return False
 
+    # Registered while the POST is in flight so the wall-clock stale release
+    # cannot re-arm a live claim after a forward clock step and deliver the same
+    # payload twice (AUG-277).
+    with live_claim(claim_token):
+        return await _send_claimed_webhook_intent(intent, intent_id, claim_token, db_path, conn)
+
+
+async def _send_claimed_webhook_intent(
+    intent: PendingWebhook,
+    intent_id: int,
+    claim_token: str,
+    db_path: Path | None,
+    conn: sqlite3.Connection | None,
+) -> bool:
+    """POST an already-claimed intent and apply its outcome (caller holds the live claim)."""
     outcome: WebhookOutcome | None = None
     try:
         outcome = await send_webhook(intent.url, intent.payload)
@@ -405,7 +421,7 @@ async def _drain_webhook_intents(
     now = datetime.now(UTC)
     stale_cutoff = to_db_utc(now - timedelta(seconds=_CLAIM_STALE_AFTER_SECONDS))
     with short_conn(conn, db_path) as snapshot:
-        released = release_stale_webhook_claims(snapshot, stale_cutoff)
+        released = release_stale_webhook_claims(snapshot, stale_cutoff, live_claim_tokens())
         if released:
             logger.warning("Re-armed %d stale webhook claim(s)", released)
         for item in abandon_expired_webhooks(snapshot):

@@ -69,7 +69,7 @@ from app.models import (
 )
 from app.notifications import format_notification, redact_url, send_single_notification
 from app.scraping import FetchResult, all_sources_failed, fetch_new_articles_for_topic
-from app.web.state import _checking_state
+from app.web.state import _checking_state, live_claim, live_claim_tokens
 from app.webhooks import build_webhook_intents, deliver_webhook_intents, retry_pending_webhooks
 
 logger = logging.getLogger(__name__)
@@ -86,6 +86,16 @@ _notification_retry_lock = asyncio.Lock()
 # claim early; that is harmless because the apply is fenced by the immutable
 # claim token rather than by elapsed time (AUG-277).
 _CLAIM_STALE_AFTER = timedelta(minutes=10)
+
+# End-to-end bound on ONE topic check, wherever it is driven from: the web
+# background task, the CLI, or a check-all cycle. Deliberately under the
+# 600-second staleness threshold the check handlers pass to ``clear_stale``,
+# because eviction frees the per-topic slot for a second checker — so an entry
+# old enough to be evicted must already have been released by its owner
+# (AUG-264). 540, not 600: ``clear_stale`` compares ``>``, so a bound equal to
+# the threshold leaves a window where the timing-out owner has not yet released
+# when its entry becomes evictable.
+CHECK_TIMEOUT_SECONDS = 540
 
 # Per-batch send fan-out. Matches the webhook drain's bound: enough to stop a
 # backlog serializing at one timeout each, gentle enough not to hammer a channel.
@@ -1008,11 +1018,28 @@ async def _deliver_one_notification_intent(
             apply_conn.commit()
         return None
 
+    # Registered for as long as this send is in flight, so a forward clock step
+    # cannot make a live claim look stale and let a second drainer send the same
+    # message again (AUG-277).
+    with live_claim(claim_token):
+        return await _send_claimed_notification_intent(
+            intent, intent_id, claim_token, intent.url, settings, db_path, conn
+        )
+
+
+async def _send_claimed_notification_intent(
+    intent: PendingNotification,
+    intent_id: int,
+    claim_token: str,
+    url: str,
+    settings: Settings,
+    db_path: Path | None,
+    conn: sqlite3.Connection | None,
+) -> NotificationDelivery | None:
+    """Send an already-claimed intent and apply its outcome (caller holds the live claim)."""
     delivery: NotificationDelivery | None = None
     try:
-        delivery = await send_single_notification(
-            intent.title, intent.body, intent.url, settings.apprise_timeout_seconds
-        )
+        delivery = await send_single_notification(intent.title, intent.body, url, settings.apprise_timeout_seconds)
         delivery = delivery.model_copy(update={"intent_id": intent_id})
 
         if delivery.timed_out:
@@ -1042,12 +1069,12 @@ async def _deliver_one_notification_intent(
         if not applied:
             logger.warning("Late apply for notification intent id=%d ignored: the claim is no longer ours", intent_id)
         elif delivery.ok:
-            logger.info("Notification intent id=%d delivered to %s", intent_id, redact_url(intent.url))
+            logger.info("Notification intent id=%d delivered to %s", intent_id, redact_url(url))
         elif terminal:
             logger.warning(
                 "Abandoning notification intent id=%d without retry (url=%s reason=%s)",
                 intent_id,
-                redact_url(intent.url),
+                redact_url(url),
                 delivery.error,
             )
         return delivery
@@ -1076,7 +1103,7 @@ async def _deliver_one_notification_intent(
             # The database is what failed; leave the claim to the stale release
             # rather than raising into the gather, which records nothing at all.
             logger.warning("Could not record the outcome for notification intent id=%d", intent_id, exc_info=True)
-        return delivery or NotificationDelivery(url=intent.url, ok=False, error=type(exc).__name__, intent_id=intent_id)
+        return delivery or NotificationDelivery(url=url, ok=False, error=type(exc).__name__, intent_id=intent_id)
 
 
 async def deliver_notification_intents(
@@ -1164,7 +1191,7 @@ async def _drain_notification_intents(
     now = datetime.now(UTC)
     stale_cutoff = to_db_utc(now - _CLAIM_STALE_AFTER)
     with short_conn(conn, db_path) as snapshot:
-        released = release_stale_notification_claims(snapshot, stale_cutoff)
+        released = release_stale_notification_claims(snapshot, stale_cutoff, live_claim_tokens())
         if released:
             logger.warning("Re-armed %d stale notification claim(s)", released)
         for item in abandon_expired_notifications(snapshot):
@@ -1299,7 +1326,25 @@ async def _run_check_cycle(
                 # short-lived per-phase connections (AUG-136). Wrapping this call
                 # in one held the handle — and, via the feed-health callback, the
                 # WAL writer — across every fetch/LLM/send await in the pipeline.
-                return await check_topic(topic, settings, db_path=db_path)
+                #
+                # Bounded per topic, not just per cycle: check_topic takes the
+                # per-topic guard, and ``clear_stale`` evicts a slot whose holder
+                # has outlived the callers' threshold — handing the slot to a
+                # second checker of the SAME topic, which then commits and
+                # delivers the same finding twice. Every slot holder must be
+                # bounded below that threshold; the 1800-second whole-cycle bound
+                # is not that bound (AUG-264 residual).
+                return await asyncio.wait_for(
+                    check_topic(topic, settings, db_path=db_path),
+                    timeout=CHECK_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                logger.error(
+                    "Check timed out for topic '%s' after %d seconds",
+                    topic.name,
+                    CHECK_TIMEOUT_SECONDS,
+                )
+                return None
             except Exception:
                 logger.error(
                     "Unexpected error checking topic '%s'",

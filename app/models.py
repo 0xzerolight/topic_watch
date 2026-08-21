@@ -279,7 +279,13 @@ class SQLiteModel(BaseModel):
                 d[field] = int(d[field])
         for field in (*self._required_dt_fields, *self._optional_dt_fields):
             if d.get(field) is not None:
-                d[field] = d[field].isoformat()
+                # ``to_db_utc``, never bare ``isoformat()``: the latter emits
+                # whatever offset the value happens to carry, and SQLite compares
+                # these columns as TEXT — so a restored or programmatically
+                # supplied ``12:00+02:00`` sorted ABOVE an ``11:00+00:00``
+                # sibling that is genuinely later, picking the wrong latest check
+                # and shifting cadence and retention (AUG-280).
+                d[field] = to_db_utc(d[field])
         for field, value in list(d.items()):
             if isinstance(value, StrEnum):
                 d[field] = value.value
@@ -604,6 +610,18 @@ class NotifyDisposition(StrEnum):
     ANALYSIS_FAILED = "analysis_failed"
 
 
+_SUPPRESSED_DISPOSITIONS: frozenset[str] = frozenset(
+    {
+        NotifyDisposition.NO_NEW_INFO,
+        NotifyDisposition.BELOW_CONFIDENCE,
+        NotifyDisposition.BELOW_RELEVANCE,
+        NotifyDisposition.SUPPRESSED_IMPORTANCE,
+        NotifyDisposition.ANALYSIS_FAILED,
+    }
+)
+"""The dispositions that mean no send was ever intended for this check."""
+
+
 class CheckResult(SQLiteModel):
     """Record of a single check cycle for a topic."""
 
@@ -733,12 +751,28 @@ class CheckResult(SQLiteModel):
             # Paired with the ``cr.seen_at AS cr_seen_at`` alias in _DASHBOARD_SELECT;
             # one without the other 500s the dashboard.
             seen_at=_coerce_dt(row["cr_seen_at"], "seen_at"),
+            # Paired with ``cr.notify_disposition AS cr_notify_disposition``; the
+            # dashboard row gates its browser notification on it (AUG-129).
+            notify_disposition=row["cr_notify_disposition"],
         )
 
     @property
     def sources_failing(self) -> bool:
         """True when this check saw no usable source (fetch failed, or none attempted)."""
         return is_source_failure(self.stage_error)
+
+    @property
+    def notification_intended(self) -> bool:
+        """True when this check decided to notify — sent, queued, or still retrying.
+
+        The dashboard's browser notification is gated on this as well as on
+        ``has_new_info``: a finding the importance gate deliberately muted must
+        not pop a desktop alert saying it was found (AUG-129). Both ``pending``
+        states count as a send that was intended (A2's contract), and a row from
+        before the column existed (NULL) keeps its pre-upgrade behaviour rather
+        than going quiet.
+        """
+        return self.notify_disposition not in _SUPPRESSED_DISPOSITIONS
 
 
 class FeedHealth(SQLiteModel):

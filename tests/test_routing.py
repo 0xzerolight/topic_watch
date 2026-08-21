@@ -260,3 +260,29 @@ class TestCooldownExpiry:
 
         provider = router.admit_provider()
         assert provider is not None and provider.name == "google_news"
+
+
+class TestCooldownIsElapsedTime:
+    """AUG-282 — the 30-minute cooldown measures elapsed time, not wall time."""
+
+    def test_only_elapsed_time_reopens_a_cooldown(self, monkeypatch) -> None:
+        """Nothing here reads the wall clock, so a clock step cannot move the deadline."""
+        from app import clock
+        from app.scraping import routing
+
+        assert "datetime" not in routing.__dict__, "provider health must not read wall time"
+
+        router = _make_router()
+        monkeypatch.setattr(clock, "monotonic_now", lambda: 5_000.0)
+        for _ in range(_FAILURE_THRESHOLD):
+            router.mark_unhealthy("bing_news")
+            router.mark_unhealthy("google_news")
+        assert router.admit_provider() is None
+
+        # One second short of the cooldown, however much wall time has "passed".
+        monkeypatch.setattr(clock, "monotonic_now", lambda: 5_000.0 + _UNHEALTHY_COOLDOWN_SECONDS - 1)
+        assert router.admit_provider() is None
+
+        monkeypatch.setattr(clock, "monotonic_now", lambda: 5_000.0 + _UNHEALTHY_COOLDOWN_SECONDS + 1)
+        probed = router.admit_provider()
+        assert probed is not None and probed.name == "bing_news"

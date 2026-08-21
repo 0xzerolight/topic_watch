@@ -6,25 +6,53 @@ database connection. State is tracked via the shared ``_checking_state``.
 
 import asyncio
 import logging
+import math
 from datetime import UTC, datetime
 from pathlib import Path
 
-from app.checker import check_all_topics, check_topic
+from app.checker import CHECK_TIMEOUT_SECONDS, check_all_topics, check_topic
 from app.config import Settings
-from app.crud import get_topic, update_topic_init_status
+from app.crud import get_topic, get_topics_due_for_check, update_topic_init_status
 from app.models import TopicStatus
 from app.web.state import _checking_state
 
 logger = logging.getLogger(__name__)
 
 _INIT_TIMEOUT_SECONDS = 600  # 10 minutes
+
+# Fixed overhead of a cycle, on top of what the backlog itself needs: the due
+# query and both retry drains.
 _CHECK_ALL_TIMEOUT_SECONDS = 1800  # 30 minutes
-# Bounds one single-topic check. Deliberately under the 600-second staleness
-# threshold the check handlers pass to ``clear_stale``: eviction frees the slot
-# for a second checker, so an entry old enough to be evicted must already have
-# been released by its owner. Unbounded, this task outlived its own guard and one
-# finding was committed and delivered twice (AUG-264).
-_CHECK_TIMEOUT_SECONDS = 540  # 9 minutes
+
+
+def _check_all_deadline_seconds(due_count: int, concurrency: int) -> float:
+    """The bound for one check-all: overhead plus what the backlog can legitimately take.
+
+    One fixed 1800-second deadline was count-blind, so a perfectly healthy large
+    backlog was cancelled partway through — at the default concurrency of 3, 500
+    topics need only ~11 seconds each to exceed it — and cancellation propagates
+    through the gather to topics that had not started (AUG-211). Each topic is
+    itself bounded now (``CHECK_TIMEOUT_SECONDS``), so the worst legitimate cycle
+    is one bounded wave per batch of ``concurrency`` topics; the deadline is that
+    plus the fixed overhead, and stays a safety net for a wedged cycle rather
+    than a cap on how much work is allowed.
+    """
+    waves = math.ceil(max(due_count, 0) / max(concurrency, 1))
+    return _CHECK_ALL_TIMEOUT_SECONDS + waves * CHECK_TIMEOUT_SECONDS
+
+
+def _due_topic_count(settings: Settings, db_path: Path | None) -> int:
+    """How many topics this cycle has to get through, for the deadline above."""
+    try:
+        from app.database import get_db
+
+        with get_db(db_path) as conn:
+            return len(get_topics_due_for_check(conn, settings.check_interval_minutes))
+    except Exception:
+        # The cycle itself will report the real problem; fall back to the
+        # overhead-only bound rather than refusing to run.
+        logger.warning("Could not size the check-all backlog; using the base deadline", exc_info=True)
+        return 0
 
 
 async def _run_init(
@@ -135,13 +163,13 @@ async def _run_single_check(topic_id: int, settings: Settings, db_path: Path | N
         if topic:
             await asyncio.wait_for(
                 check_topic(topic, settings, db_path=db_path, guard=False),
-                timeout=_CHECK_TIMEOUT_SECONDS,
+                timeout=CHECK_TIMEOUT_SECONDS,
             )
     except TimeoutError:
         logger.error(
             "Check timed out for topic %d after %d seconds",
             topic_id,
-            _CHECK_TIMEOUT_SECONDS,
+            CHECK_TIMEOUT_SECONDS,
         )
     except Exception:
         logger.error("Background check failed for topic %d", topic_id, exc_info=True)
@@ -158,10 +186,11 @@ async def _run_check_all(settings: Settings, db_path: Path | None = None, owner:
     in ``finally`` (OVH-034/AUG-264).
     """
     try:
+        deadline = _check_all_deadline_seconds(_due_topic_count(settings, db_path), settings.topic_check_concurrency)
         try:
-            await asyncio.wait_for(check_all_topics(settings, db_path, guard=False), timeout=_CHECK_ALL_TIMEOUT_SECONDS)
+            await asyncio.wait_for(check_all_topics(settings, db_path, guard=False), timeout=deadline)
         except TimeoutError:
-            logger.error("Check all timed out after %d seconds", _CHECK_ALL_TIMEOUT_SECONDS)
+            logger.error("Check all timed out after %d seconds", deadline)
     except Exception:
         logger.error("Check all background task failed", exc_info=True)
     finally:

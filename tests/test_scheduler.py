@@ -896,3 +896,187 @@ class TestRetryDrainDoesNotStarveDueTopics:
         ):
             assert await check_all_topics(_make_settings(), db_path) == []
         drain.assert_awaited_once()
+
+
+class TestLiveSchedulerSettings:
+    """AUG-023: jitter and misfire grace are job properties; live edits must reach them."""
+
+    async def test_tick_applies_edited_jitter_and_misfire(self) -> None:
+        from types import SimpleNamespace
+
+        from app.scheduler import _tick_check
+
+        initial = _make_settings(scheduler_jitter_seconds=30, scheduler_misfire_grace_time=60)
+        app = SimpleNamespace(state=SimpleNamespace(settings=initial, db_path=None))
+        scheduler = start_scheduler(initial, app=app)
+        try:
+            assert scheduler is not None
+            edited = _make_settings(scheduler_jitter_seconds=5, scheduler_misfire_grace_time=120)
+            app.state.settings = edited
+
+            with patch("app.scheduler._scheduled_check", new_callable=AsyncMock):
+                await _tick_check(initial, None, app)
+
+            check = scheduler.get_job("check_all_topics")
+            recover = scheduler.get_job("recover_stuck_researching")
+            assert check is not None and recover is not None
+            assert check.trigger.jitter == 5
+            assert check.trigger.interval.total_seconds() == 60
+            assert check.misfire_grace_time == 120
+            assert recover.misfire_grace_time == 120
+        finally:
+            stop_scheduler()
+
+    async def test_maintenance_grace_is_not_overwritten(self) -> None:
+        from types import SimpleNamespace
+
+        from app.scheduler import _MAINTENANCE_MISFIRE_GRACE_SECONDS, reconfigure_scheduler
+
+        settings = _make_settings(scheduler_misfire_grace_time=60)
+        app = SimpleNamespace(state=SimpleNamespace(settings=settings, db_path=None))
+        scheduler = start_scheduler(settings, app=app)
+        try:
+            assert scheduler is not None
+            reconfigure_scheduler(_make_settings(scheduler_misfire_grace_time=120))
+            vacuum = scheduler.get_job("vacuum_db")
+            assert vacuum is not None
+            assert vacuum.misfire_grace_time == _MAINTENANCE_MISFIRE_GRACE_SECONDS
+        finally:
+            stop_scheduler()
+
+    async def test_unchanged_settings_do_not_reschedule(self) -> None:
+        settings = _make_settings()
+        from app.scheduler import reconfigure_scheduler
+
+        scheduler = start_scheduler(settings)
+        try:
+            assert scheduler is not None
+            assert reconfigure_scheduler(settings) is False
+        finally:
+            stop_scheduler()
+
+
+class TestSchedulerLease:
+    """AUG-024: one process owns the scheduler, so extra workers cannot compress cadence."""
+
+    async def test_second_process_gets_no_scheduler(self, tmp_path: Path) -> None:
+        import fcntl
+
+        db_path = tmp_path / "topic_watch.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Stand in for the worker that started first.
+        holder = (tmp_path / "scheduler.lock").open("a+b")
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            assert start_scheduler(_make_settings(), db_path=db_path) is None
+        finally:
+            holder.close()
+            stop_scheduler()
+
+    async def test_lease_is_released_on_stop(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "topic_watch.db"
+        first = start_scheduler(_make_settings(), db_path=db_path)
+        assert first is not None
+        stop_scheduler()
+
+        second = start_scheduler(_make_settings(), db_path=db_path)
+        try:
+            assert second is not None
+        finally:
+            stop_scheduler()
+
+
+class TestSchedulerHealthSurface:
+    """TW-AUD-008: the last cycle's outcome and freshness are reported, not swallowed."""
+
+    async def test_reports_stopped_without_a_scheduler(self) -> None:
+        from app.scheduler import scheduler_health
+
+        stop_scheduler()
+        health = scheduler_health()
+        assert health["running"] is False
+        assert health["monitoring"] == "stopped"
+
+    async def test_a_failing_cycle_is_visible(self, tmp_path: Path) -> None:
+        from app.scheduler import scheduler_health
+
+        scheduler = start_scheduler(_make_settings())
+        try:
+            assert scheduler is not None
+            with (
+                patch("app.scheduler._run_check_cycle", side_effect=RuntimeError("provider down")),
+                patch("app.scheduler._init_new_topics", new_callable=AsyncMock),
+            ):
+                await _scheduled_check(_make_settings(), tmp_path / "x.db")
+
+            health = scheduler_health()
+            assert health["monitoring"] == "failing"
+            assert health["jobs"]["check_all_topics"]["consecutive_failures"] == 1
+            assert "provider down" in health["jobs"]["check_all_topics"]["last_error"]
+            assert health["last_cycle_at"] is None
+        finally:
+            stop_scheduler()
+
+    async def test_a_successful_cycle_reads_ok_then_goes_stale(self, tmp_path: Path, monkeypatch) -> None:
+        from app import clock
+        from app.scheduler import _CYCLE_STALE_AFTER_SECONDS, scheduler_health
+
+        scheduler = start_scheduler(_make_settings())
+        try:
+            assert scheduler is not None
+            monkeypatch.setattr(clock, "monotonic_now", lambda: 100.0)
+            with (
+                patch("app.scheduler._run_check_cycle", new_callable=AsyncMock),
+                patch("app.scheduler._init_new_topics", new_callable=AsyncMock),
+            ):
+                await _scheduled_check(_make_settings(), tmp_path / "x.db")
+
+            assert scheduler_health()["monitoring"] == "ok"
+            assert scheduler_health()["last_cycle_at"] is not None
+
+            # Elapsed time, not wall time, is what makes monitoring stale.
+            monkeypatch.setattr(clock, "monotonic_now", lambda: 100.0 + _CYCLE_STALE_AFTER_SECONDS + 1)
+            assert scheduler_health()["monitoring"] == "stale"
+        finally:
+            stop_scheduler()
+
+    async def test_missed_runs_are_counted(self) -> None:
+        from types import SimpleNamespace
+
+        from app.scheduler import _record_missed_run, scheduler_health
+
+        scheduler = start_scheduler(_make_settings())
+        try:
+            assert scheduler is not None
+            _record_missed_run(SimpleNamespace(job_id="check_all_topics"))
+            assert scheduler_health()["jobs"]["check_all_topics"]["missed_runs"] == 1
+        finally:
+            stop_scheduler()
+
+    async def test_health_endpoint_carries_the_scheduler_block(self, tmp_path: Path) -> None:
+        import httpx
+
+        from app.main import app as fastapi_app
+        from app.web.dependencies import get_db_conn
+        from tests.conftest import get_connection, init_db
+
+        db_path = tmp_path / "health.db"
+        init_db(db_path)
+        conn = get_connection(db_path)
+
+        def override_db():
+            yield conn
+
+        fastapi_app.dependency_overrides[get_db_conn] = override_db
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=fastapi_app), base_url="http://test"
+            ) as client:
+                response = await client.get("/health")
+            assert response.status_code == 200
+            payload = response.json()
+            assert payload["status"] == "ok"
+            assert payload["scheduler"]["monitoring"] in {"stopped", "starting", "ok", "stale", "failing"}
+        finally:
+            fastapi_app.dependency_overrides.clear()
+            conn.close()

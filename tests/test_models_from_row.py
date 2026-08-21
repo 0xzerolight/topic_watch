@@ -798,6 +798,7 @@ class TestCheckResultFromDashboardRow:
             "cr_notification_error": None,
             "cr_stage_error": None,
             "cr_seen_at": None,
+            "cr_notify_disposition": None,
         }
         row.update(overrides)
         return row

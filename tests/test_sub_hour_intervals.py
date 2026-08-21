@@ -4,6 +4,7 @@ import sqlite3
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -32,6 +33,21 @@ def _make_settings(**overrides) -> Settings:
 
 
 CSRF_TEST_TOKEN = "test-csrf-token-for-tests"
+
+
+@pytest.fixture(autouse=True)
+def _no_background_research(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep POST /topics from running a real initialization.
+
+    Creating a topic enqueues ``_run_init``, which fetches the provider feeds for
+    real. With no network in the sandbox that is two providers x two attempts of
+    connect timeouts — a minute of wall time in a form-validation test, and a
+    live outbound request in every other environment. The suite's rule is that no
+    test performs live I/O; these tests are about interval parsing, so the
+    research task is stubbed for the whole module (the pattern test_web.py uses
+    per test).
+    """
+    monkeypatch.setattr("app.web.routers.background._run_init", AsyncMock())
 
 
 @pytest.fixture

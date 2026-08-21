@@ -294,3 +294,55 @@ class TestToggleActive:
         # Badge gated off; has_new_info untouched but seen_at now set.
         assert "data-new-info" not in response.text
         assert "badge--signal" not in response.text
+
+
+class TestBrowserNotificationGate:
+    """AUG-129: the row's browser-notification marker follows the recorded disposition."""
+
+    async def test_suppressed_check_carries_no_new_info_marker(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        topic = _make_topic(db_conn, name="Muted Topic", is_active=True)
+        create_check_result(
+            db_conn,
+            CheckResult(
+                topic_id=topic.id,
+                articles_found=2,
+                has_new_info=True,
+                notify_disposition="suppressed_importance",
+            ),
+        )
+        db_conn.commit()
+
+        response = await client.post(
+            f"/topics/{topic.id}/toggle-active",
+            data={"active": "false"},
+            headers={"HX-Request": "true"},
+            follow_redirects=False,
+        )
+        assert response.status_code == 200
+        assert "data-new-info" not in response.text
+
+    async def test_pending_check_still_carries_the_marker(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        topic = _make_topic(db_conn, name="Notifying Topic", is_active=True)
+        create_check_result(
+            db_conn,
+            CheckResult(
+                topic_id=topic.id,
+                articles_found=2,
+                has_new_info=True,
+                notify_disposition="pending",
+            ),
+        )
+        db_conn.commit()
+
+        response = await client.post(
+            f"/topics/{topic.id}/toggle-active",
+            data={"active": "false"},
+            headers={"HX-Request": "true"},
+            follow_redirects=False,
+        )
+        assert response.status_code == 200
+        assert 'data-new-info="true"' in response.text

@@ -8,7 +8,10 @@ where concurrent access is possible.
 
 import asyncio
 import secrets
-import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+
+from app import clock
 
 # --- In-progress check tracker ---
 
@@ -44,7 +47,7 @@ class CheckingState:
                 return None
             token = _new_owner_token()
             self._topics[topic_id] = token
-            self._start_times[topic_id] = time.monotonic()
+            self._start_times[topic_id] = clock.monotonic_now()
             return token
 
     async def finish_check(self, topic_id: int, token: str) -> None:
@@ -92,7 +95,7 @@ class CheckingState:
         that every task holding a slot is bounded below the thresholds callers
         pass here (``app.web.routers.background``).
         """
-        now = time.monotonic()
+        now = clock.monotonic_now()
         async with self._lock:
             stale = [tid for tid, start in self._start_times.items() if now - start > timeout_seconds]
             for tid in stale:
@@ -102,6 +105,43 @@ class CheckingState:
 
 
 _checking_state = CheckingState()
+
+
+# --- Delivery claims this process is actively sending ---
+
+_live_claim_tokens: set[str] = set()
+
+
+@contextmanager
+def live_claim(token: str) -> Iterator[None]:
+    """Mark a delivery claim as held by a live sender in THIS process.
+
+    The stale-claim release is a wall-clock rule — a claim stamped more than ten
+    minutes ago is assumed abandoned — because it must also recover claims left
+    by a process that died, and a monotonic reading means nothing across
+    processes. That rule alone re-armed live claims whenever the host clock
+    stepped forward past the cutoff, and the second drainer then sent the same
+    notification again: the token fence makes the first sender's apply a no-op,
+    but nothing un-sends the duplicate message (AUG-277).
+
+    Liveness of an owner in this process is therefore not inferred from the
+    clock at all: while a send is in flight its token is here, and the release
+    skips it however old its stamp looks. A crashed process leaves nothing
+    behind — the set dies with it, and the wall-clock rule recovers the row as
+    it always did. A send that returns with an unknown outcome (the Apprise
+    timeout, deliberately left ``sending``) leaves the set on the way out, so
+    the release can re-arm it exactly as before.
+    """
+    _live_claim_tokens.add(token)
+    try:
+        yield
+    finally:
+        _live_claim_tokens.discard(token)
+
+
+def live_claim_tokens() -> tuple[str, ...]:
+    """The claim tokens whose sends are still in flight in this process."""
+    return tuple(_live_claim_tokens)
 
 
 # --- Feed-validation rate limiter ---
@@ -117,8 +157,15 @@ def _check_rate_limit(ip: str) -> bool:
 
     Evicts entries whose timestamps have all fallen outside the window so the
     store cannot grow without bound (one entry per IP would otherwise leak).
+
+    Recorded and aged monotonically (AUG-283): the window means "the last 60
+    seconds of elapsed time". Differencing wall-clock readings made it mean "the
+    last 60 seconds of what the host clock currently says", so a backward
+    correction kept spent requests alive until the clock caught up — a 429 at a
+    moment the user did nothing to earn one — and a forward one handed back the
+    whole quota.
     """
-    now = time.time()
+    now = clock.monotonic_now()
     timestamps = _rate_limit_store.get(ip, [])
     active = [t for t in timestamps if now - t < _RATE_LIMIT_WINDOW]
     if len(active) >= _RATE_LIMIT_MAX:
