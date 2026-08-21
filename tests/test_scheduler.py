@@ -614,10 +614,11 @@ class TestDeliveryLedgerRetention:
             DELIVERY_INTENT_RETENTION_DAYS,
             create_pending_notification,
             create_topic,
+            create_webhook_intents,
             delete_old_delivery_intents,
         )
         from app.database import get_connection, init_db
-        from app.models import PendingNotification, Topic, TopicStatus
+        from app.models import PendingNotification, PendingWebhook, Topic, TopicStatus
 
         db_path = tmp_path / "ledger.db"
         init_db(db_path)
@@ -625,26 +626,42 @@ class TestDeliveryLedgerRetention:
         try:
             topic = create_topic(conn, Topic(name="T", description="d", status=TopicStatus.READY))
             old = datetime.now(UTC) - timedelta(days=DELIVERY_INTENT_RETENTION_DAYS + 1)
-            for title, status, created in (
+            rows = (
                 ("old-sent", "sent", old),
                 ("old-abandoned", "abandoned", old),
                 ("old-pending", "pending", old),
                 ("fresh-sent", "sent", datetime.now(UTC)),
-            ):
+            )
+            for title, status, created in rows:
                 intent = create_pending_notification(
                     conn,
                     PendingNotification(topic_id=topic.id, title=title, body="B", url="json://x", created_at=created),
                 )
                 conn.execute("UPDATE pending_notifications SET status = ? WHERE id = ?", (status, intent.id))
+                # Both halves of the ledger are pruned by the same call.
+                (hook_id,) = create_webhook_intents(
+                    conn,
+                    [
+                        PendingWebhook(
+                            topic_id=topic.id,
+                            url=f"https://hooks.example.com/{title}",
+                            payload={"t": title},
+                            created_at=created,
+                        )
+                    ],
+                )
+                conn.execute("UPDATE pending_webhooks SET status = ? WHERE id = ?", (status, hook_id))
             conn.commit()
 
             removed = delete_old_delivery_intents(conn, DELIVERY_INTENT_RETENTION_DAYS)
             conn.commit()
 
-            assert removed == 2
+            assert removed == 4
             titles = {r["title"] for r in conn.execute("SELECT title FROM pending_notifications")}
             # An undelivered intent still owes a delivery, however old it is.
             assert titles == {"old-pending", "fresh-sent"}
+            hooks = {r["url"].rsplit("/", 1)[-1] for r in conn.execute("SELECT url FROM pending_webhooks")}
+            assert hooks == {"old-pending", "fresh-sent"}
         finally:
             conn.close()
 
