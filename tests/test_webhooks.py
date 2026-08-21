@@ -2,6 +2,7 @@
 
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -299,6 +300,86 @@ class TestSendWebhook:
 
 
 # --- send_webhooks ---
+
+
+class TestWebhookOutcomeClassification:
+    """AUG-324: the outcome has to say what happened, not just whether it worked."""
+
+    @staticmethod
+    def _client_returning(status: int, headers: dict | None = None) -> AsyncMock:
+        response = MagicMock()
+        response.status_code = status
+        response.headers = headers or {}
+        response.raise_for_status = MagicMock(
+            side_effect=httpx.HTTPStatusError("err", request=MagicMock(), response=response)
+        )
+        client = AsyncMock()
+        client.post = AsyncMock(return_value=response)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=None)
+        return client
+
+    @pytest.mark.parametrize("status", [400, 401, 403, 404, 410, 413, 422])
+    async def test_permanent_statuses_are_not_retryable(self, status: int) -> None:
+        with patch("app.webhooks.httpx.AsyncClient", return_value=self._client_returning(status)):
+            outcome = await send_webhook("https://example.com/hook", {})
+        assert outcome.ok is False
+        assert outcome.status == status
+        assert outcome.retryable is False
+        assert outcome.error == f"HTTP {status}"
+
+    @pytest.mark.parametrize("status", [408, 425, 429, 500, 503])
+    async def test_transient_statuses_stay_retryable(self, status: int) -> None:
+        with patch("app.webhooks.httpx.AsyncClient", return_value=self._client_returning(status)):
+            outcome = await send_webhook("https://example.com/hook", {})
+        assert outcome.retryable is True
+
+    async def test_retry_after_delta_seconds_is_parsed(self) -> None:
+        client = self._client_returning(429, {"Retry-After": "120"})
+        with patch("app.webhooks.httpx.AsyncClient", return_value=client):
+            outcome = await send_webhook("https://example.com/hook", {})
+        assert outcome.retry_after_s == pytest.approx(120.0)
+
+    async def test_retry_after_http_date_is_parsed(self) -> None:
+        when = datetime.now(UTC) + timedelta(seconds=300)
+        client = self._client_returning(503, {"Retry-After": format_datetime(when, usegmt=True)})
+        with patch("app.webhooks.httpx.AsyncClient", return_value=client):
+            outcome = await send_webhook("https://example.com/hook", {})
+        assert outcome.retry_after_s is not None
+        assert 250 < outcome.retry_after_s <= 300
+
+    async def test_retry_after_is_clamped_and_never_negative(self) -> None:
+        client = self._client_returning(429, {"Retry-After": "999999"})
+        with patch("app.webhooks.httpx.AsyncClient", return_value=client):
+            outcome = await send_webhook("https://example.com/hook", {})
+        assert outcome.retry_after_s == pytest.approx(3600.0)
+
+        past = datetime.now(UTC) - timedelta(hours=1)
+        client = self._client_returning(429, {"Retry-After": format_datetime(past, usegmt=True)})
+        with patch("app.webhooks.httpx.AsyncClient", return_value=client):
+            outcome = await send_webhook("https://example.com/hook", {})
+        assert outcome.retry_after_s == pytest.approx(0.0)
+
+    async def test_unparseable_retry_after_is_ignored(self) -> None:
+        client = self._client_returning(429, {"Retry-After": "next tuesday"})
+        with patch("app.webhooks.httpx.AsyncClient", return_value=client):
+            outcome = await send_webhook("https://example.com/hook", {})
+        assert outcome.retry_after_s is None
+        assert outcome.retryable is True
+
+    async def test_permanent_status_ignores_retry_after(self) -> None:
+        client = self._client_returning(422, {"Retry-After": "60"})
+        with patch("app.webhooks.httpx.AsyncClient", return_value=client):
+            outcome = await send_webhook("https://example.com/hook", {})
+        assert outcome.retryable is False
+        assert outcome.retry_after_s is None
+
+    async def test_blocked_targets_are_terminal_not_transient(self) -> None:
+        """A private address or a bad scheme will not become valid on a retry."""
+        for url in ("http://127.0.0.1:8080/hook", "file:///etc/passwd", "http://[::1"):
+            outcome = await send_webhook(url, {})
+            assert outcome.ok is False, url
+            assert outcome.retryable is False, url
 
 
 class TestWebhookIntents:
