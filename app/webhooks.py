@@ -74,11 +74,28 @@ async def send_webhook(url: str, payload: dict, timeout: float = _WEBHOOK_TIMEOU
     Returns True on success (2xx response), False on failure.
     Never raises — all errors are caught and logged.
 
+    ``timeout`` is a TOTAL wall-clock deadline covering validation and the whole
+    POST, not just each individual network operation (AUG-247). httpx's timeout
+    is per-operation inactivity, so an endpoint trickling sub-timeout chunks kept
+    the send — and the gather and check cycle around it — alive indefinitely,
+    long enough for the ten-minute stale-claim window to expire and permit a
+    duplicate send. The granular httpx phase timeouts are kept underneath it.
+
     SSRF note: is_private_url performs blocking DNS resolution, so it is
     offloaded to a worker thread to avoid stalling the event loop. A
     DNS-rebinding TOCTOU window between this check and the POST is a
     pre-existing, architectural limitation shared by all outbound fetches.
     """
+    try:
+        async with asyncio.timeout(timeout):
+            return await _send_webhook_within_deadline(url, payload, timeout)
+    except TimeoutError:
+        logger.warning("Webhook exceeded its %.1fs deadline for %s", timeout, redact_url(url))
+        return False
+
+
+async def _send_webhook_within_deadline(url: str, payload: dict, timeout: float) -> bool:
+    """Validate and POST one webhook. Caller owns the total deadline."""
     # Validate the URL BEFORE the POST. A malformed URL (e.g. an unbracketed or
     # otherwise broken IPv6 literal) makes urlparse / is_private_url raise
     # ValueError, which would violate the documented "Never raises" contract —
@@ -104,8 +121,12 @@ async def send_webhook(url: str, payload: dict, timeout: float = _WEBHOOK_TIMEOU
 
     try:
         # follow_redirects=False (httpx default, made explicit) so a 3xx to a
-        # private address can't bypass the is_private_url check above.
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+        # private address can't bypass the is_private_url check above. The
+        # per-phase timeouts stay under the caller's total deadline; connect gets
+        # a tighter share so a black-holed host fails fast rather than spending
+        # the whole budget before a single byte moves.
+        phase_timeout = httpx.Timeout(timeout, connect=min(timeout, 5.0))
+        async with httpx.AsyncClient(timeout=phase_timeout, follow_redirects=False) as client:
             response = await client.post(url, json=payload)
             response.raise_for_status()
             logger.info("Webhook delivered to %s (status %d)", redact_url(url), response.status_code)

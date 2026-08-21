@@ -2890,3 +2890,74 @@ class TestPromptOutputRules:
         # Compression must not invent values, so the value rule is deliberately absent.
         system = build_knowledge_compress_messages("cur", _make_topic(), 500)[0]["content"]
         assert "STATE THE VALUE" not in system
+
+
+class TestLlmEndpointPolicy:
+    """The configured base_url is gated before any secret leaves (AUG-333/AUG-334)."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_endpoint_cache(self):
+        from app.analysis import llm as llm_mod
+
+        llm_mod._validated_base_urls.clear()
+        yield
+        llm_mod._validated_base_urls.clear()
+
+    async def test_public_cleartext_base_url_is_refused(self) -> None:
+        mock_client, mock_create = _mock_instructor_client(NoveltyResult(has_new_info=False, confidence=0.5))
+        settings = _make_settings(
+            llm=LLMSettings(model="openai/glm-5.2", api_key="k", base_url="http://gateway.example.com/v1")
+        )
+
+        with patch("app.analysis.llm._get_client", return_value=mock_client):
+            result = await analyze_articles([_make_article()], "Known facts.", _make_topic(), settings)
+
+        mock_create.assert_not_called()
+        assert result.has_new_info is False
+        assert result.error
+
+    async def test_non_http_base_url_is_refused(self) -> None:
+        mock_client, mock_create = _mock_instructor_client(NoveltyResult(has_new_info=False, confidence=0.5))
+        settings = _make_settings(
+            llm=LLMSettings(model="openai/glm-5.2", api_key="k", base_url="ftp://gateway.example.com/v1")
+        )
+
+        with patch("app.analysis.llm._get_client", return_value=mock_client):
+            result = await analyze_articles([_make_article()], "Known facts.", _make_topic(), settings)
+
+        mock_create.assert_not_called()
+        assert result.has_new_info is False
+
+    async def test_local_ollama_base_url_is_allowed(self) -> None:
+        """The documented local path stays working: http://localhost:11434."""
+        expected = NoveltyResult(has_new_info=False, confidence=0.5)
+        mock_client, mock_create = _mock_instructor_client(expected)
+        settings = _make_settings(
+            llm=LLMSettings(model="openai/gpt-4o-mini", api_key="k", base_url="http://localhost:11434")
+        )
+
+        with patch("app.analysis.llm._get_client", return_value=mock_client):
+            await analyze_articles([_make_article()], "Known facts.", _make_topic(), settings)
+
+        mock_create.assert_called_once()
+
+    async def test_public_https_base_url_is_allowed(self) -> None:
+        expected = NoveltyResult(has_new_info=False, confidence=0.5)
+        mock_client, mock_create = _mock_instructor_client(expected)
+        settings = _make_settings(
+            llm=LLMSettings(model="openai/glm-5.2", api_key="k", base_url="https://opencode.ai/zen/go/v1")
+        )
+
+        with patch("app.analysis.llm._get_client", return_value=mock_client):
+            await analyze_articles([_make_article()], "Known facts.", _make_topic(), settings)
+
+        mock_create.assert_called_once()
+
+    def test_litellm_session_does_not_follow_redirects(self) -> None:
+        """A 307/308 must not carry x-api-key and the prompt to another origin."""
+        import litellm
+
+        import app.analysis.llm  # noqa: F401 -- import installs the session
+
+        assert litellm.aclient_session is not None
+        assert litellm.aclient_session.follow_redirects is False

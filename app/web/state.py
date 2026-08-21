@@ -127,4 +127,13 @@ def _check_rate_limit(ip: str) -> bool:
         stale = [k for k, v in _rate_limit_store.items() if not v or now - v[-1] >= _RATE_LIMIT_WINDOW]
         for k in stale:
             del _rate_limit_store[k]
+        # Staleness alone could not enforce the cap: under a distributed burst
+        # every tracked key is inside the window, nothing is evicted, and the
+        # store keeps growing past its documented bound (AUG-216). Fall back to
+        # dropping the least-recently-seen keys, which are the ones closest to
+        # expiring anyway. The key just recorded holds the newest timestamp, so
+        # it is never the one evicted.
+        while len(_rate_limit_store) > _RATE_LIMIT_MAX_IPS:
+            oldest = min(_rate_limit_store, key=lambda k: _rate_limit_store[k][-1])
+            del _rate_limit_store[oldest]
     return True

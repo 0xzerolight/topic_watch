@@ -397,7 +397,7 @@ class TestBlockedUrlHealth:
         from app.scraping.rss import fetch_feed_outcome
 
         callback = MagicMock()
-        with patch("app.scraping.rss.is_private_url", return_value=True):
+        with patch("app.url_validation.is_private_url", return_value=True):
             result = await fetch_feed_outcome("https://internal.local/feed.xml", health_callback=callback)
 
         assert result.status is FetchStatus.FAILED

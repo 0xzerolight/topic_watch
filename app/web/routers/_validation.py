@@ -55,7 +55,11 @@ async def validate_topic_form(
         errors.append(f"Invalid feed mode: {feed_mode!r}")
     # AUTO and EXA carry no manual feed URLs; only MANUAL validates them.
     if mode == FeedMode.MANUAL:
-        urls = [u.strip() for u in feed_urls.strip().splitlines() if u.strip()]
+        # Ordered dedup before anything touches the network: every distinct URL
+        # costs one blocking resolution here and one fetch on every later check,
+        # and the same line pasted twice bought both twice (AUG-193). The count
+        # cap lives in validate_feed_urls, which is also where OPML gets it.
+        urls = list(dict.fromkeys(u.strip() for u in feed_urls.strip().splitlines() if u.strip()))
         if urls:
             errors.extend(await asyncio.to_thread(validate_feed_urls, urls))
         else:

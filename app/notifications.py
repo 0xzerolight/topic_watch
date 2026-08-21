@@ -6,6 +6,7 @@ come from the application settings (Apprise URL format).
 
 import asyncio
 import logging
+from urllib.parse import urlparse, urlunparse
 
 import apprise
 
@@ -19,8 +20,44 @@ from app.config import Settings
 # ``from app.notifications import redact_url`` call sites keep working.
 from app.log_redaction import redact_url as redact_url
 from app.models import NotificationDelivery
+from app.url_validation import validate_outbound_url
 
 logger = logging.getLogger(__name__)
+
+# Apprise schemes that are a *generic* HTTP request rather than a named service:
+# the URL alone picks the host, method, headers and payload, which is the same
+# capability ``notifications.webhook_urls`` offers — and that one has always run
+# through the SSRF gate. Left ungated, ``json://127.0.0.1:9000/`` was a way to
+# aim an attacker-shaped POST at an internal service (AUG-004).
+#
+# Deliberately scheme-based, not host-based: many Apprise plugins repurpose the
+# URL's host field as a token (``discord://<webhook_id>/<token>`` parses to
+# ``host="<webhook_id>"``), so resolving every plugin's ``.host`` would fail
+# closed on services that have no host at all. Named self-hosted services
+# (ntfy, Gotify, Matrix, SMTP) keep working on a LAN address unchanged.
+_GENERIC_HTTP_SCHEMES: dict[str, str] = {
+    "json": "http",
+    "jsons": "https",
+    "form": "http",
+    "forms": "https",
+    "xml": "http",
+    "xmls": "https",
+}
+
+
+def _generic_http_target(url: str) -> str | None:
+    """The plain http(s) URL a generic Apprise notifier would POST to, or ``None``."""
+    try:
+        parsed = urlparse(url)
+        scheme = _GENERIC_HTTP_SCHEMES.get(parsed.scheme.lower())
+        if scheme is None:
+            return None
+        return urlunparse(parsed._replace(scheme=scheme))
+    except Exception:
+        # An unparseable URL is not a generic-HTTP target we can validate; Apprise
+        # rejects it at add() time and it is reported as an invalid URL there.
+        return None
+
 
 # Literal placeholder tokens that appear ONLY in documentation/example URLs
 # (config.example.yml, README, the setup UI). A real notification URL carries
@@ -102,6 +139,14 @@ def _deliver_one(title: str, body: str, url: str) -> NotificationDelivery:
         # deliver to a real public target. Drop it rather than leak (OVH guard).
         logger.warning("Skipping placeholder/example notification URL: %s", redact_url(url))
         return NotificationDelivery(url=url, ok=False, error="placeholder notification URL")
+
+    target = _generic_http_target(url)
+    if target is not None:
+        try:
+            validate_outbound_url(target, purpose="Notification target")
+        except ValueError as exc:
+            logger.warning("Blocked notification to %s: %s", redact_url(url), exc)
+            return NotificationDelivery(url=url, ok=False, error="blocked notification target")
 
     ap = apprise.Apprise()
     if not ap.add(url):

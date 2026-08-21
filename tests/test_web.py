@@ -3078,3 +3078,37 @@ class TestExaFeedModeWeb:
         assert response.status_code == 200
         assert "Exa AI semantic search" in response.text
         assert "No feed URLs configured" not in response.text
+
+
+class TestOpmlUploadSizeGate:
+    """The 1 MiB limit is enforced before anything parses the multipart body (AUG-014)."""
+
+    async def test_oversize_upload_rejected_without_parsing(self, client: httpx.AsyncClient) -> None:
+        """The multipart parser — which spools file parts to temp storage — never runs."""
+        from starlette.formparsers import MultiPartParser
+
+        oversize = b"<opml>" + b"A" * (3 * 1024 * 1024) + b"</opml>"
+        with patch.object(MultiPartParser, "parse", autospec=True) as spool:
+            response = await client.post(
+                "/import/opml",
+                files={"opml_file": ("big.opml", oversize, "text/xml")},
+                follow_redirects=False,
+            )
+
+        assert response.status_code == 413
+        spool.assert_not_called()
+
+    async def test_normal_upload_still_imports(self, client: httpx.AsyncClient) -> None:
+        from app.opml import OPMLResult
+
+        parsed = OPMLResult()
+        parsed.topics.append({"name": "Imported", "feed_urls": ["https://feeds.example.com/ok"], "tags": []})
+
+        with patch("app.opml.parse_opml", return_value=parsed):
+            response = await client.post(
+                "/import/opml",
+                files={"opml_file": ("feeds.opml", b'<?xml version="1.0"?><opml><body/></opml>', "text/xml")},
+                follow_redirects=False,
+            )
+
+        assert response.status_code == 303

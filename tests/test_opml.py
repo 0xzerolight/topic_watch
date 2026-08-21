@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pytest
 
 from app.opml import MAX_IMPORT_TOPICS, export_opml, parse_opml
+from app.url_validation import validate_feed_url as _real_validate_feed_url
 
 
 @pytest.fixture(autouse=True)
@@ -431,4 +432,68 @@ class TestParseOPMLResolverTimeout:
         assert elapsed < 2.0  # bounded — did not wait for the 5s resolver
         # Fail-closed: unverifiable host is skipped, never imported.
         assert result.topics == []
+        assert result.skipped_invalid == 1
+
+
+class TestImportUrlBudget:
+    """DNS work is capped BEFORE per-topic processing, not after (AUG-012)."""
+
+    def _opml(self, n: int) -> str:
+        outlines = "".join(f'<outline text="Feed {i}" xmlUrl="https://e{i}.example.com/feed" />' for i in range(n))
+        return f'<?xml version="1.0"?><opml version="2.0"><body>{outlines}</body></opml>'
+
+    def test_validation_stops_at_the_url_budget(self):
+        from app.opml import MAX_IMPORT_FEED_URLS
+
+        seen: list[str] = []
+
+        def _fake(url: str) -> None:
+            seen.append(url)
+            return None
+
+        with patch("app.opml.validate_feed_url", side_effect=_fake):
+            result = parse_opml(self._opml(MAX_IMPORT_FEED_URLS + 25), set())
+
+        assert len(seen) == MAX_IMPORT_FEED_URLS
+        assert any(str(MAX_IMPORT_FEED_URLS) in w for w in result.warnings)
+
+
+class TestEntityExpansion:
+    """A DTD/entity declaration is refused before the tree is built (AUG-015)."""
+
+    def test_internal_entity_document_is_rejected(self):
+        opml = (
+            '<?xml version="1.0"?>'
+            '<!DOCTYPE opml [<!ENTITY a "AAAAAAAAAA">'
+            '<!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;">'
+            '<!ENTITY c "&b;&b;&b;&b;&b;&b;&b;&b;&b;&b;">]>'
+            '<opml version="2.0"><body>'
+            '<outline text="&c;" xmlUrl="https://a.example.com/feed" />'
+            "</body></opml>"
+        )
+        result = parse_opml(opml, set())
+
+        assert result.topics == []
+        assert any("entit" in w.lower() or "doctype" in w.lower() for w in result.warnings)
+
+    def test_plain_opml_still_parses(self):
+        result = parse_opml(VALID_OPML, set())
+        assert len(result.topics) == 2
+
+
+class TestMalformedUrlIsolation:
+    """One malformed outline skips that entry, not the whole import (AUG-205)."""
+
+    def test_malformed_url_skips_only_that_entry(self):
+        opml = (
+            '<?xml version="1.0"?><opml version="2.0"><body>'
+            '<outline text="Broken" xmlUrl="http://[::1" />'
+            '<outline text="Good" xmlUrl="https://good.example.com/feed" />'
+            "</body></opml>"
+        )
+        # Real validation (no stub): the malformed URL must not propagate.
+        with patch("app.opml.validate_feed_url", new=_real_validate_feed_url):
+            result = parse_opml(opml, set())
+
+        assert [t["name"] for t in result.topics] == ["Good"]
         assert result.skipped_invalid == 1

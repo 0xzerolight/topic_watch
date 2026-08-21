@@ -1069,10 +1069,7 @@ class TestBingStubRegression:
         # the apiclick URL carries it percent-encoded (%2f), so before the fix the
         # fetch would hit apiclick, miss the mock, and fall back to the short summary.
         transport = _mock_transport({"publisher.example/bing-real-article": (200, _SAMPLE_HTML)})
-        with (
-            patch("app.scraping.content.is_private_url", return_value=False),
-            patch("app.url_validation.is_private_url", return_value=False),
-        ):
+        with patch("app.url_validation.is_private_url", return_value=False):
             async with httpx.AsyncClient(transport=transport) as client:
                 content = await extract_article_content(entry.url, fallback_summary=entry.summary, client=client)
         assert len(content) >= _STUB_CONTENT_MIN_CHARS
@@ -2684,7 +2681,7 @@ class TestSafeSendRedirectEdgeCases:
 
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
-            seen.append((request.method, url, request.content, request.headers.get("content-type")))
+            seen.append((request.method, url, request.content, request.headers.get("content-length")))
             if "final.example.org" in url:
                 return httpx.Response(200, text="done")
             return httpx.Response(303, headers={"location": "https://final.example.org/result"})
@@ -2703,12 +2700,12 @@ class TestSafeSendRedirectEdgeCases:
         # First hop: original POST with body.
         assert seen[0][0] == "POST"
         assert seen[0][2] == b"payload=1"
-        # Second hop: downgraded to GET, body stripped, content-type removed.
-        method, url, body, content_type = seen[1]
+        # Second hop: downgraded to GET, body stripped, framing headers removed.
+        method, url, body, content_length = seen[1]
         assert method == "GET"
         assert "final.example.org" in url
         assert body == b""
-        assert content_type is None
+        assert content_length is None
 
     async def test_redirect_to_non_http_scheme_is_rejected(self) -> None:
         """A redirect to a file:// (or other non-http) scheme is blocked and the

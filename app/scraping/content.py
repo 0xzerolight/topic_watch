@@ -12,7 +12,7 @@ import httpx
 import trafilatura
 
 from app.log_redaction import redact_url
-from app.url_validation import is_private_url, safe_get
+from app.url_validation import PrivateRedirectError, safe_get
 
 logger = logging.getLogger(__name__)
 
@@ -38,9 +38,10 @@ async def _fetch_html(
     timeout: float = _ARTICLE_FETCH_TIMEOUT,
 ) -> str | None:
     """Fetch a URL and return HTML text, or None on error."""
-    if await asyncio.to_thread(is_private_url, url):
-        logger.warning("Blocked article fetch to private/reserved URL: %s", redact_url(url))
-        return None
+    # No is_private_url() preflight: safe_get() applies the same check to the
+    # initial URL before its first send (OVH-140), so preflighting resolved every
+    # article's hostname twice (AUG-035). A blocked target arrives below as
+    # PrivateRedirectError.
     owns_client = client is None
     if owns_client:
         client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
@@ -60,6 +61,11 @@ async def _fetch_html(
                     await asyncio.sleep(2)
                     continue
                 logger.warning("Failed to fetch article: %s", url, exc_info=True)
+                return None
+            except PrivateRedirectError:
+                # Deterministic, so never retried. Logged with the redacted URL
+                # rather than the exception text, which carries the full one.
+                logger.warning("Blocked article fetch to private/reserved URL: %s", redact_url(url))
                 return None
             except Exception:
                 logger.warning("Failed to fetch article: %s", url, exc_info=True)

@@ -14,6 +14,8 @@ llm:
 
   # Optional: Base URL for a self-hosted (Ollama) or OpenAI-compatible gateway endpoint.
   # Honored for any provider; leave unset to use the provider's default endpoint.
+  # A local or LAN endpoint may use plain http, as the Ollama examples below do;
+  # a public one must use https, since the request carries your API key.
   #
   # Ollama (self-hosted). In Docker use host.docker.internal instead of localhost:
   # base_url: "http://host.docker.internal:11434"   # or http://localhost:11434 outside Docker
@@ -30,6 +32,8 @@ exa:
   enabled: false
   api_key: ""
   # Optional advanced/proxy override; defaults to https://api.exa.ai when unset.
+  # Must be https: the request carries your Exa API key, so a plain-http
+  # endpoint is refused rather than sent in cleartext.
   # base_url: "https://api.exa.ai"
 
 # Notification settings
