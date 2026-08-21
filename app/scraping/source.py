@@ -427,6 +427,18 @@ def _identity_digest(*parts: str) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+def body_digest(text: str | None) -> str:
+    """The comparable form of an article body, or ``""`` when there is none.
+
+    Whitespace-collapsed before hashing, so a reflowed copy of one body is that
+    body. This is what decides whether a claimed revision is a real one: the
+    source's word for it cannot be, because an ``updated`` stamp that moves on
+    every poll says the same thing as one that moved because the story changed.
+    """
+    collapsed = " ".join((text or "").split())
+    return hashlib.sha256(collapsed.encode()).hexdigest() if collapsed else ""
+
+
 def revision_marker(entry: FeedEntry) -> str:
     """What distinguishes this representation of a story from an earlier one.
 
@@ -436,14 +448,20 @@ def revision_marker(entry: FeedEntry) -> str:
     carry related-coverage lists and blurbs that churn on their own, and every
     churn would cost a content fetch, a row and an LLM analysis for an article
     nobody revised.
+
+    This marker decides only whether an entry is worth LOOKING at again. Whether
+    it is worth STORING is settled after its body arrives, by comparing that body
+    with the one the topic already holds — otherwise a source that moves the
+    stamp on every poll mints a new identity every check and the article is
+    stored, and analysed, forever.
     """
     parts: list[str] = []
     revised = as_utc(entry.updated)
     if revised is not None and revised != as_utc(entry.published):
         parts.append(revised.isoformat())
-    text = " ".join((entry.content or "").split())
+    text = body_digest(entry.content)
     if text:
-        parts.append(hashlib.sha256(text.encode()).hexdigest())
+        parts.append(text)
     return "\x1f".join(parts)
 
 
