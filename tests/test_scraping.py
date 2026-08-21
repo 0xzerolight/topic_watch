@@ -284,10 +284,24 @@ class TestCollapseDuplicateEntries:
         assert [e.url for e in collapsed] == ["https://e.example/1", "https://e.example/2"]
         assert collapsed[0].summary == "text"
 
-    def test_ties_keep_the_first_copy(self) -> None:
+    def test_ties_between_copies_of_one_story_keep_the_first(self) -> None:
+        """Only a genuine tie — same URL AND same headline — is decided by order."""
         first = self._entry("https://e.example/1", summary="one")
         second = self._entry("https://e.example/1", summary="two")
         assert collapse_duplicate_entries([first, second])[0].summary == "one"
+
+    def test_a_retitled_correction_at_one_url_is_not_a_duplicate(self) -> None:
+        """AUG-322: a URL tie between different headlines is not a tie at all.
+
+        Keying the merge on the URL alone let feed order decide which headline
+        survived, so a correction republished at the story's own URL was thrown
+        away before dedup, extraction or analysis could see it — the user never
+        heard about it.
+        """
+        claim = self._entry("https://e.example/1", title="Minister denies claim")
+        correction = self._entry("https://e.example/1", title="CORRECTION: Minister confirms claim")
+        kept = collapse_duplicate_entries([claim, correction])
+        assert [e.title for e in kept] == ["Minister denies claim", "CORRECTION: Minister confirms claim"]
 
 
 # ============================================================

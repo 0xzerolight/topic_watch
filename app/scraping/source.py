@@ -429,21 +429,26 @@ def _representation_rank(entry: FeedEntry) -> tuple[datetime, int]:
 
 
 def collapse_duplicate_entries(entries: list[FeedEntry]) -> list[FeedEntry]:
-    """One entry per canonical URL, keeping the best copy, in first-seen order.
+    """One entry per story, keeping the best copy, in first-seen order.
 
     Repeats reach the pipeline routinely — two configured feeds carrying one
     story, an aggregator listing it twice. Left in, they occupy the bounded
     article slots that unique stories needed and pay for the same content fetch
     twice (AUG-179).
 
-    Which copy survives is decided by the entries themselves — newest revision
-    first, then the one that actually carries text — never by which feed was
-    configured first, which silently threw away the corrected or richer version
-    of an article (AUG-322).
+    The merge key is ``story_identity``, the same key dedup uses, and not the URL
+    alone. A publisher republishing a correction at the story's own URL under a
+    new headline is two stories to everything downstream, so keying the merge on
+    the URL discarded one of them here — before dedup, extraction or analysis
+    could see it — and which one survived was decided by feed order (AUG-322).
+
+    Among copies that really are one story, the survivor is decided by the
+    entries themselves — newest revision first, then the one that actually
+    carries text — never by which feed was configured first.
     """
     best: dict[str, FeedEntry] = {}
     for entry in entries:
-        key = canonical_url(entry.url)
+        key = story_identity(entry)
         current = best.get(key)
         # dict keeps the first insertion's position when a value is replaced,
         # so the surviving copy stays where the story first appeared.
