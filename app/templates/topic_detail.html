@@ -308,10 +308,18 @@ document.body.addEventListener("htmx:afterSwap", function (event) {
                     Sent
                 {% elif check.notification_error %}
                     Failed: {{ check.notification_error }}
-                {% elif check.has_new_info and topic.importance_threshold is not none
-                        and check_importance is not none and check_importance < topic.importance_threshold %}
+                {% elif check.notify_disposition == 'suppressed_importance' %}
                     {# Below the importance gate: knowledge absorbed it, the send was
-                       suppressed. Without this, the row is identical to a silent failure. #}
+                       suppressed. Without this, the row is identical to a silent failure.
+                       Read from what the check RECORDED, not recomputed from the topic's
+                       current threshold — that is mutable, so raising it relabelled
+                       history that had in fact notified, and lowering it hid history that
+                       had not (AUG-129). #}
+                    <span title="Importance {{ check_importance }}/5 was below this topic's threshold when it ran">Suppressed</span>
+                {% elif check.notify_disposition is none and check.has_new_info and topic.importance_threshold is not none
+                        and check_importance is not none and check_importance < topic.importance_threshold %}
+                    {# Rows written before the disposition column exists have nothing
+                       recorded; the recompute is the only signal they carry. #}
                     <span title="Importance {{ check_importance }}/5 is below this topic's threshold of {{ topic.importance_threshold }}/5">Suppressed</span>
                 {% else %}
                     -

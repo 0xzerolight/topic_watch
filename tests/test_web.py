@@ -1541,6 +1541,48 @@ class TestTopicDetail:
         assert response.status_code == 200
         assert "Suppressed" not in response.text
 
+    async def test_detail_label_follows_the_recorded_disposition(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-129: raising the threshold must not relabel history that did notify."""
+        topic = _make_topic(db_conn, name="Relabel Topic", importance_threshold=4)
+        create_check_result(
+            db_conn,
+            CheckResult(
+                topic_id=topic.id,
+                has_new_info=True,
+                notification_sent=False,
+                notify_disposition="pending",
+                llm_response=json.dumps({"has_new_info": True, "confidence": 0.9, "importance": 2}),
+            ),
+        )
+        db_conn.commit()
+
+        response = await client.get(f"/topics/{topic.id}")
+        assert response.status_code == 200
+        assert "Suppressed" not in response.text
+
+    async def test_detail_labels_a_recorded_suppression_at_any_threshold(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """The converse: a recorded suppression stays labelled after the gate is lowered."""
+        topic = _make_topic(db_conn, name="Lowered Topic", importance_threshold=1)
+        create_check_result(
+            db_conn,
+            CheckResult(
+                topic_id=topic.id,
+                has_new_info=True,
+                notification_sent=False,
+                notify_disposition="suppressed_importance",
+                llm_response=json.dumps({"has_new_info": True, "confidence": 0.9, "importance": 2}),
+            ),
+        )
+        db_conn.commit()
+
+        response = await client.get(f"/topics/{topic.id}")
+        assert response.status_code == 200
+        assert "Suppressed" in response.text
+
     async def test_detail_shows_auto_feed_url(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
         """Detail page for auto mode shows the generated Google News URL."""
         topic = _make_topic(db_conn, name="Auto Detail", feed_mode=FeedMode.AUTO, feed_urls=[])

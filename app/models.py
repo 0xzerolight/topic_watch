@@ -610,6 +610,18 @@ class NotifyDisposition(StrEnum):
     ANALYSIS_FAILED = "analysis_failed"
 
 
+_SUPPRESSED_DISPOSITIONS: frozenset[str] = frozenset(
+    {
+        NotifyDisposition.NO_NEW_INFO,
+        NotifyDisposition.BELOW_CONFIDENCE,
+        NotifyDisposition.BELOW_RELEVANCE,
+        NotifyDisposition.SUPPRESSED_IMPORTANCE,
+        NotifyDisposition.ANALYSIS_FAILED,
+    }
+)
+"""The dispositions that mean no send was ever intended for this check."""
+
+
 class CheckResult(SQLiteModel):
     """Record of a single check cycle for a topic."""
 
@@ -748,6 +760,19 @@ class CheckResult(SQLiteModel):
     def sources_failing(self) -> bool:
         """True when this check saw no usable source (fetch failed, or none attempted)."""
         return is_source_failure(self.stage_error)
+
+    @property
+    def notification_intended(self) -> bool:
+        """True when this check decided to notify — sent, queued, or still retrying.
+
+        The dashboard's browser notification is gated on this as well as on
+        ``has_new_info``: a finding the importance gate deliberately muted must
+        not pop a desktop alert saying it was found (AUG-129). Both ``pending``
+        states count as a send that was intended (A2's contract), and a row from
+        before the column existed (NULL) keeps its pre-upgrade behaviour rather
+        than going quiet.
+        """
+        return self.notify_disposition not in _SUPPRESSED_DISPOSITIONS
 
 
 class FeedHealth(SQLiteModel):
