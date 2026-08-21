@@ -315,6 +315,12 @@ class PrivateRedirectError(httpx.HTTPError):
     Subclasses ``httpx.HTTPError`` so existing call sites that catch
     ``httpx.HTTPError`` (e.g. google_news) treat a blocked redirect as a
     fetch failure rather than crashing.
+
+    The message carries the blocked target through :func:`redact_url`, never
+    the raw URL: a caller logging this exception with ``exc_info=True`` (a
+    traceback renders the exception's own ``str()``) must not reproduce
+    userinfo or a signed query token that redaction elsewhere already strips
+    from the warning logged alongside the raise (AUG-312).
     """
 
 
@@ -403,11 +409,11 @@ async def safe_send(
     initial_url = str(request.url)
     if urlparse(initial_url).scheme not in ("http", "https"):
         logger.warning("Blocked request to non-http(s) URL: %s", redact_url(initial_url))
-        raise PrivateRedirectError(f"Non-http(s) scheme blocked: {initial_url}")
+        raise PrivateRedirectError(f"Non-http(s) scheme blocked: {redact_url(initial_url)}")
     # is_private_url does blocking DNS; offload so the event loop is not stalled.
     if await asyncio.to_thread(is_private_url, initial_url):
         logger.warning("Blocked request to private/reserved URL: %s", redact_url(initial_url))
-        raise PrivateRedirectError(f"Request to private/reserved address blocked: {initial_url}")
+        raise PrivateRedirectError(f"Request to private/reserved address blocked: {redact_url(initial_url)}")
 
     sent = request
     response = await client.send(sent, stream=True)
@@ -423,11 +429,11 @@ async def safe_send(
         if urlparse(next_url).scheme not in ("http", "https"):
             await response.aclose()
             logger.warning("Blocked redirect to non-http(s) URL: %s", redact_url(next_url))
-            raise PrivateRedirectError(f"Redirect to non-http(s) scheme blocked: {next_url}")
+            raise PrivateRedirectError(f"Redirect to non-http(s) scheme blocked: {redact_url(next_url)}")
         if await asyncio.to_thread(is_private_url, next_url):
             await response.aclose()
             logger.warning("Blocked redirect to private/reserved URL: %s", redact_url(next_url))
-            raise PrivateRedirectError(f"Redirect to private/reserved address blocked: {next_url}")
+            raise PrivateRedirectError(f"Redirect to private/reserved address blocked: {redact_url(next_url)}")
         redirects += 1
         if redirects > max_redirects:
             await response.aclose()

@@ -26,7 +26,14 @@ from collections import Counter
 from pathlib import Path
 from urllib.parse import urlparse
 
-from app.config import Settings, is_api_key_env_sourced, is_exa_key_env_sourced, load_settings, resolve_db_path
+from app.config import (
+    DEFAULT_CONFIG_PATH,
+    Settings,
+    is_api_key_env_sourced,
+    is_exa_key_env_sourced,
+    load_settings,
+    resolve_db_path,
+)
 from app.crud import (
     get_knowledge_state,
     get_topic,
@@ -299,6 +306,22 @@ def _in_docker() -> bool:
     return os.path.exists("/.dockerenv")
 
 
+def _config_error_location(exc: BaseException) -> str | None:
+    """Line/column of a YAML syntax error, or ``None`` when unavailable.
+
+    Reads only a ``MarkedYAMLError``'s ``problem_mark.line``/``.column`` — never
+    the mark itself (``str(mark)``/``.get_snippet()`` render the offending
+    source line) and never ``problem``/``context`` (free text that can quote a
+    bad value verbatim). Safe to print.
+    """
+    mark = getattr(exc, "problem_mark", None)
+    line = getattr(mark, "line", None)
+    column = getattr(mark, "column", None)
+    if not isinstance(line, int) or not isinstance(column, int):
+        return None
+    return f"line {line + 1}, column {column + 1}"
+
+
 # Config keys that carry secrets (or are rendered specially); never dumped raw.
 _SECRET_CONFIG_KEYS = frozenset({"api_key", "base_url", "urls", "webhook_urls"})
 
@@ -470,7 +493,17 @@ def _cmd_doctor() -> None:
     try:
         settings = load_settings()
     except Exception as exc:  # noqa: BLE001 - diagnostics must never crash
-        print(f"configuration: unavailable ({exc})")
+        # str(exc) is unsafe here: PyYAML embeds a snippet of the offending
+        # source line and Pydantic's ValidationError echoes each failing
+        # field's raw input value — either can reproduce an api_key or
+        # notification/webhook URL straight from a malformed config line into
+        # what README tells users to paste into bug reports (AUG-009). Only
+        # the exception type, config path, and a YAML mark's line/column
+        # (never its snippet or the surrounding free text) are safe to print.
+        print(f"configuration: unavailable ({type(exc).__name__}, {DEFAULT_CONFIG_PATH})")
+        location = _config_error_location(exc)
+        if location:
+            print(f"  at: {location}")
         return
 
     print("configuration:")

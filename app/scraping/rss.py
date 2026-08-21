@@ -337,7 +337,7 @@ def _parse_entry(raw_entry: dict, source_feed: str) -> FeedEntry | None:
     # pass a scheme test yet have no fetchable host, so they were stored, failed
     # extraction on every check, and notified with a dead link (AUG-182).
     if not is_absolute_http_url(url):
-        logger.warning("Dropping feed entry with a non-absolute http(s) link: %s", url)
+        logger.warning("Dropping feed entry with a non-absolute http(s) link: %s", redact_url(url))
         return None
 
     return FeedEntry(
@@ -365,10 +365,10 @@ def _classify_parsed_feed(feed_url: str, raw_count: int, entries: list[FeedEntry
     """
     if entries:
         if raw_count > len(entries):
-            logger.info("Feed %s: %d of %d entries rejected", feed_url, raw_count - len(entries), raw_count)
+            logger.info("Feed %s: %d of %d entries rejected", redact_url(feed_url), raw_count - len(entries), raw_count)
         return FetchStatus.OK
     if raw_count:
-        logger.warning("Feed %s published %d entries but none were usable", feed_url, raw_count)
+        logger.warning("Feed %s published %d entries but none were usable", redact_url(feed_url), raw_count)
         return FetchStatus.FAILED
     return FetchStatus.EMPTY
 
@@ -388,7 +388,7 @@ def _report(
 
 def _record_out_of_budget(feed_url: str, health_callback: FeedHealthCallback | None, reason: str) -> None:
     """Record the typed timeout outcome for a feed that ran out of budget."""
-    logger.warning("Feed fetch out of budget: %s — %s", feed_url, reason)
+    logger.warning("Feed fetch out of budget: %s — %s", redact_url(feed_url), reason)
     _report(health_callback, feed_url, FetchStatus.ABORTED, reason)
 
 
@@ -507,7 +507,7 @@ async def fetch_feed_outcome(
                     try:
                         entry = _parse_entry(raw, feed_url)
                     except Exception:
-                        logger.warning("Skipping malformed feed entry in %s", feed_url, exc_info=True)
+                        logger.warning("Skipping malformed feed entry in %s", redact_url(feed_url), exc_info=True)
                         continue
                     if entry:
                         entries.append(entry)
@@ -518,11 +518,16 @@ async def fetch_feed_outcome(
                 if getattr(parsed, "bozo", 0):
                     bozo_exc = getattr(parsed, "bozo_exception", None)
                     if not entries and not _is_wrong_media_type_only(parsed, bozo_exc):
-                        logger.warning("Feed parse error (bozo) with no entries: %s — %s", feed_url, bozo_exc)
+                        logger.warning(
+                            "Feed parse error (bozo) with no entries: %s — %s", redact_url(feed_url), bozo_exc
+                        )
                         _report(health_callback, feed_url, FetchStatus.FAILED, f"Feed parse error: {bozo_exc}")
                         return FeedFetchResult(status=FetchStatus.FAILED)
                     logger.debug(
-                        "Feed flagged bozo but %d entries recovered: %s — %s", len(entries), feed_url, bozo_exc
+                        "Feed flagged bozo but %d entries recovered: %s — %s",
+                        len(entries),
+                        redact_url(feed_url),
+                        bozo_exc,
                     )
                 status = _classify_parsed_feed(feed_url, len(parsed.entries), entries)
                 if status.is_source_failure:
@@ -550,18 +555,21 @@ async def fetch_feed_outcome(
                 return FeedFetchResult(status=FetchStatus.ABORTED)
             except httpx.TimeoutException as exc:
                 if attempt < max_attempts - 1 and await _retry_pause(budget):
-                    logger.debug("Timeout fetching feed (attempt %d): %s", attempt + 1, feed_url)
+                    logger.debug("Timeout fetching feed (attempt %d): %s", attempt + 1, redact_url(feed_url))
                     continue
-                logger.warning("Timeout fetching feed after %d attempts: %s", max_attempts, feed_url)
+                logger.warning("Timeout fetching feed after %d attempts: %s", max_attempts, redact_url(feed_url))
                 _report(health_callback, feed_url, FetchStatus.FAILED, f"Timeout after {max_attempts} attempts: {exc}")
                 return FeedFetchResult(status=FetchStatus.FAILED)
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code >= 500 and attempt < max_attempts - 1 and await _retry_pause(budget):
                     logger.debug(
-                        "HTTP %d fetching feed (attempt %d): %s", exc.response.status_code, attempt + 1, feed_url
+                        "HTTP %d fetching feed (attempt %d): %s",
+                        exc.response.status_code,
+                        attempt + 1,
+                        redact_url(feed_url),
                     )
                     continue
-                logger.warning("HTTP %d fetching feed: %s", exc.response.status_code, feed_url)
+                logger.warning("HTTP %d fetching feed: %s", exc.response.status_code, redact_url(feed_url))
                 _report(health_callback, feed_url, FetchStatus.FAILED, f"HTTP {exc.response.status_code}")
                 return FeedFetchResult(status=FetchStatus.FAILED)
             except httpx.NetworkError as exc:
@@ -569,14 +577,14 @@ async def fetch_feed_outcome(
                     logger.debug(
                         "Network error fetching feed (attempt %d): %s — %s",
                         attempt + 1,
-                        feed_url,
+                        redact_url(feed_url),
                         type(exc).__name__,
                     )
                     continue
                 logger.warning(
                     "Network error fetching feed after %d attempts: %s — %s",
                     max_attempts,
-                    feed_url,
+                    redact_url(feed_url),
                     type(exc).__name__,
                 )
                 _report(health_callback, feed_url, FetchStatus.FAILED, f"Network error: {type(exc).__name__}: {exc}")
@@ -596,7 +604,7 @@ async def fetch_feed_outcome(
                 )
                 return FeedFetchResult(status=FetchStatus.FAILED)
             except Exception as exc:
-                logger.warning("Error fetching feed: %s", feed_url, exc_info=True)
+                logger.warning("Error fetching feed: %s", redact_url(feed_url), exc_info=True)
                 _report(health_callback, feed_url, FetchStatus.FAILED, f"{type(exc).__name__}: {exc}")
                 return FeedFetchResult(status=FetchStatus.FAILED)
         return FeedFetchResult(status=FetchStatus.FAILED)  # pragma: no cover
@@ -627,7 +635,7 @@ def _conditional_validators(
     later check is conditional again as normal.
     """
     if request.topic_holds_feed_articles is not None and not request.topic_holds_feed_articles(feed_url):
-        logger.debug("Skipping conditional validators for %s: topic holds no articles from it", feed_url)
+        logger.debug("Skipping conditional validators for %s: topic holds no articles from it", redact_url(feed_url))
         return None, None
     return _validators(state)
 
@@ -786,7 +794,7 @@ async def _fetch_manual(topic: Topic, request: SourceRequest) -> FeedResponse:
         until = feed_backoff_until(state, base_minutes=backoff_base_minutes, cap_hours=backoff_cap_hours)
         if until is not None and until > now:
             feeds_skipped += 1
-            logger.debug("Skipping backed-off feed %s (next retry %s)", url, until.isoformat())
+            logger.debug("Skipping backed-off feed %s (next retry %s)", redact_url(url), until.isoformat())
             continue
         etag, last_modified = _conditional_validators(request, url, state)
         attempted.append((url, etag, last_modified))

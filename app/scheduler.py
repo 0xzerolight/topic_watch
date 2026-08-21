@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from app.check_context import check_id_var, request_id_var
 from app.checker import initialize_new_topic
 from app.config import Settings
 from app.crud import (
@@ -338,7 +339,20 @@ def start_scheduler(
         max_instances=1,
         misfire_grace_time=_MAINTENANCE_MISFIRE_GRACE_SECONDS,
     )
-    scheduler.start()
+    # AsyncIOScheduler.start() schedules its wakeup via the event loop, which
+    # copies whatever contextvars.Context is active right now — and every later
+    # timer/job it chains from that wakeup keeps copying forward from there.
+    # Called synchronously from the first-run setup POST, that context still
+    # carries the request's request_id_var, so every scheduler/maintenance log
+    # line was falsely attributed to that one setup request until the next
+    # restart (AUG-272). Clear both correlation vars for just this call.
+    check_token = check_id_var.set(None)
+    request_token = request_id_var.set(None)
+    try:
+        scheduler.start()
+    finally:
+        check_id_var.reset(check_token)
+        request_id_var.reset(request_token)
     _scheduler = scheduler
 
     logger.info(
