@@ -1,0 +1,31 @@
+{# Novelty findings for one check, lazy-loaded by HTMX on first expand (AUG-110).
+   Renders exactly what analysis stored and notifications already send: summary,
+   key facts, filtered source links, and the three scores. ``reasoning`` (the
+   model's raw chain-of-thought) is deliberately never rendered here. #}
+{% if not novelty %}
+<p><small class="quiet">No findings recorded for this check.</small></p>
+{% else %}
+{% if novelty.summary %}
+<p>{{ novelty.summary }}</p>
+{% endif %}
+{% if novelty.key_facts %}
+<ul>
+    {% for fact in novelty.key_facts %}
+    <li>{{ fact }}</li>
+    {% endfor %}
+</ul>
+{% endif %}
+{% if novelty.source_urls %}
+<p class="cell-stack">
+    <small class="quiet">Sources:</small>
+    {% for url in novelty.source_urls %}
+    <a href="{{ url|safe_href }}" target="_blank" rel="noopener" class="chip">{{ url|feed_source_name }}</a>
+    {% endfor %}
+</p>
+{% endif %}
+<p><small class="quiet">
+    Confidence {{ "%.2f"|format(novelty.confidence) }} ·
+    Relevance {{ "%.2f"|format(novelty.relevance) }} ·
+    Importance {{ novelty.importance }}/5
+</small></p>
+{% endif %}

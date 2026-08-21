@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
+from app.analysis.llm import NoveltyResult
 from app.config import ExaSettings, LLMSettings, NotificationSettings, Settings
 from app.crud import (
     create_article,
@@ -668,6 +669,100 @@ class TestNewInfoSeenBadge:
         assert detail.status_code == 200
         assert "Notify" in detail.text
         assert ">Yes<" in detail.text
+
+
+# --- Check detail (novelty findings disclosure, AUG-110) ---
+
+
+class TestCheckDetail:
+    """GET /topics/{topic_id}/checks/{check_id}/detail.
+
+    A lazy HTMX panel exposing the novelty findings a check already stored —
+    summary, key facts, source links, and the three scores. No new LLM call;
+    this is a read path over ``llm_response``. ``reasoning`` (the model's raw
+    chain-of-thought) must never render.
+    """
+
+    async def test_renders_stored_findings(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn, name="Findings Topic")
+        novelty = NoveltyResult(
+            has_new_info=True,
+            summary="A new development happened.",
+            key_facts=["Fact one", "Fact two"],
+            source_urls=["https://example.com/a"],
+            confidence=0.87,
+            relevance=0.91,
+            importance=4,
+            reasoning="secret chain of thought",
+        )
+        check = create_check_result(
+            db_conn,
+            CheckResult(topic_id=topic.id, has_new_info=True, llm_response=novelty.model_dump_json()),
+        )
+        db_conn.commit()
+
+        response = await client.get(f"/topics/{topic.id}/checks/{check.id}/detail")
+        assert response.status_code == 200
+        assert "A new development happened." in response.text
+        assert "Fact one" in response.text
+        assert "Fact two" in response.text
+        assert "https://example.com/a" in response.text
+        assert "0.87" in response.text
+        assert "4/5" in response.text
+        assert "secret chain of thought" not in response.text
+
+    async def test_wrong_topic_returns_404(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        topic_a = _make_topic(db_conn, name="Owner A")
+        topic_b = _make_topic(db_conn, name="Owner B")
+        check = create_check_result(
+            db_conn,
+            CheckResult(
+                topic_id=topic_b.id,
+                has_new_info=True,
+                llm_response=NoveltyResult(has_new_info=True, confidence=0.5).model_dump_json(),
+            ),
+        )
+        db_conn.commit()
+
+        response = await client.get(f"/topics/{topic_a.id}/checks/{check.id}/detail")
+        assert response.status_code == 404
+
+    async def test_missing_check_returns_404(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn)
+        response = await client.get(f"/topics/{topic.id}/checks/999999/detail")
+        assert response.status_code == 404
+
+    async def test_check_without_llm_response_renders_no_findings(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        topic = _make_topic(db_conn)
+        check = create_check_result(
+            db_conn,
+            CheckResult(topic_id=topic.id, has_new_info=False, llm_response=None),
+        )
+        db_conn.commit()
+
+        response = await client.get(f"/topics/{topic.id}/checks/{check.id}/detail")
+        assert response.status_code == 200
+        assert "No findings" in response.text
+
+    async def test_detail_page_wires_lazy_disclosure_for_new_info_row(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        topic = _make_topic(db_conn, name="Disclosure Topic")
+        check = create_check_result(
+            db_conn,
+            CheckResult(
+                topic_id=topic.id,
+                has_new_info=True,
+                llm_response=NoveltyResult(has_new_info=True, summary="x", confidence=0.5).model_dump_json(),
+            ),
+        )
+        db_conn.commit()
+
+        page = await client.get(f"/topics/{topic.id}")
+        assert f'hx-get="/topics/{topic.id}/checks/{check.id}/detail"' in page.text
+        assert "toggle once from:closest details" in page.text
 
 
 # --- Add Topic ---
