@@ -267,6 +267,77 @@ async def test_dashboard_tag_filter_no_match(client, db_conn):
     assert "AI News" not in response.text
 
 
+async def test_dashboard_tag_filter_normalizes_whitespace(client, db_conn):
+    """C6 leftover / pairs with AUG-120: a hand-typed ?tag= with odd spacing
+    must still match the stored (already-normalized) tag."""
+    _make_topic(db_conn, "AI News", tags=["ai"])
+
+    response = await client.get("/?tag=%20%20ai%20%20")  # "  ai  "
+    assert response.status_code == 200
+    assert "AI News" in response.text
+
+
+async def test_dashboard_tag_filter_no_match_shows_tag_specific_empty_state(client, db_conn):
+    """AUG-227: a tag with zero matching topics shows the tag-named empty state
+    (with its Clear-filter link), not the generic no-topics-yet copy — the
+    branch previously unreachable because active_tag alone satisfied the
+    outer "has content" condition even with an empty filtered list."""
+    _make_topic(db_conn, "AI News", tags=["ai"])
+
+    response = await client.get("/?tag=nonexistent")
+    assert response.status_code == 200
+    assert "No topics found with tag" in response.text
+    assert "nonexistent" in response.text
+    assert "Add your first topic" not in response.text
+
+
+async def test_dashboard_tag_active_labels_stats_as_global(client, db_conn):
+    """AUG-120: the stat cards stay global while the table is tag-scoped; label
+    them so the two different scopes aren't read as one contradictory number."""
+    _make_topic(db_conn, "AI News", tags=["ai"])
+    _make_topic(db_conn, "Security Watch", tags=["security"])
+
+    response = await client.get("/?tag=ai")
+    assert response.status_code == 200
+    assert "Totals above are for all topics" in response.text
+
+    unfiltered = await client.get("/")
+    assert "Totals above are for all topics" not in unfiltered.text
+
+
+async def test_tag_chip_links_are_query_encoded(client, db_conn):
+    """AUG-119: a tag containing URL-significant characters must be
+    percent-encoded in its filter link, not interpolated raw — otherwise the
+    browser parses & as another query parameter."""
+    _make_topic(db_conn, "RD Topic", tags=["R&D"])
+
+    response = await client.get("/")
+    assert "/?tag=R%26D" in response.text
+    assert '/?tag=R&D"' not in response.text
+
+
+async def test_dashboard_search_controls_carry_active_tag(client, db_conn):
+    """AUG-220: the search/status HTMX controls must submit the active tag
+    alongside q/status, so a filtered search stays scoped to the tag chip."""
+    _make_topic(db_conn, "AI News", tags=["ai"])
+
+    response = await client.get("/?tag=ai")
+    assert response.status_code == 200
+    assert "[name='tag']" in response.text
+
+
+async def test_search_route_scoped_to_active_tag(client, db_conn):
+    """AUG-220: /topics/search applies a carried tag param instead of
+    searching globally and ignoring the currently active filter."""
+    _make_topic(db_conn, "AI News", tags=["ai"])
+    _make_topic(db_conn, "AI Security", tags=["security"])
+
+    response = await client.get("/topics/search?q=AI&tag=ai")
+    assert response.status_code == 200
+    assert "AI News" in response.text
+    assert "AI Security" not in response.text
+
+
 async def test_create_topic_with_tags_via_form(client, db_conn):
     response = await client.post(
         "/topics",

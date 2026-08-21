@@ -15,6 +15,15 @@
     hx-get="/topics/{{ topic.id }}/row?since={{ topic.status.value }}"
     hx-trigger="every {{ '3s' if topic.status.value == 'researching' else '30s' }}"
     hx-swap="outerHTML"
+    {% elif checking %}
+    {#- A just-queued manual check (AUG-217): status stays "ready" throughout,
+        so completion is detected by a newer check_results row, not a status
+        transition. Same self-terminating shape as the researching/new poll
+        above — the re-rendered row carries no ``checking`` context, so this
+        block is absent and the poll stops itself. -#}
+    hx-get="/topics/{{ topic.id }}/row?since_check_id={{ baseline_check_id or 0 }}"
+    hx-trigger="every 2s"
+    hx-swap="outerHTML"
     {% endif %}>
     <td data-label="">
         <input type="checkbox" name="topic_ids" value="{{ topic.id }}"
@@ -59,7 +68,7 @@
     <td data-label="Articles" class="num">{{ article_count }}</td>
     <td data-label="">
         <div class="action-row">
-        {% if topic.is_active and topic.status.value == "ready" %}
+        {% if topic.is_active and topic.status.value == "ready" and not checking %}
         <button
             hx-post="/topics/{{ topic.id }}/check"
             hx-target="#topic-{{ topic.id }}"
@@ -68,6 +77,10 @@
             class="btn-sm"
         >
             Check Now <span class="htmx-indicator spinner"></span>
+        </button>
+        {% elif checking %}
+        <button class="btn-sm" disabled>
+            Checking&hellip; <span class="spinner" style="display:inline-block"></span>
         </button>
         {% endif %}
         {# The desired state travels with the request, so replaying the POST after

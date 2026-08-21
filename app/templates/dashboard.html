@@ -4,6 +4,9 @@
 {% if error %}
 <article class="error-banner" role="alert">{{ error }}</article>
 {% endif %}
+{% if msg %}
+<div class="alert alert-success" role="status">{{ msg }}</div>
+{% endif %}
 <div class="page-header masthead">
     <h1>Topics</h1>
     <div class="action-row">
@@ -48,6 +51,9 @@
         <span class="stat-sub">most recent alert</span>
     </div>
 </div>
+{% if active_tag %}
+<p><small class="quiet">Totals above are for all topics, not just <kbd>{{ active_tag }}</kbd>.</small></p>
+{% endif %}
 {% endif %}
 
 {% if topic_data or active_tag %}
@@ -63,7 +69,7 @@
 <div class="toolbar tag-filter">
     <span class="card-kicker">Filter by tag</span>
     {% for t in all_tags %}
-    <a href="/?tag={{ t }}" class="chip{% if active_tag == t %} chip--active{% endif %}">{{ t }}</a>
+    <a href="/?tag={{ t | urlencode }}" class="chip{% if active_tag == t %} chip--active{% endif %}">{{ t }}</a>
     {% endfor %}
     {% if active_tag %}
     <a href="/" class="chip">&#x2715; Clear</a>
@@ -71,19 +77,21 @@
 </div>
 {% endif %}
 
+{% if topic_data %}
 <div class="toolbar search-row">
+    <input type="hidden" name="tag" value="{{ active_tag or '' }}">
     <input type="search" name="q" placeholder="Search topics..." class="toolbar-grow"
            aria-label="Search topics by name or description"
            hx-get="/topics/search"
-           hx-trigger="keyup changed delay:300ms, search"
+           hx-trigger="input changed delay:300ms, search"
            hx-target="#topic-list"
-           hx-include="[name='status']">
+           hx-include="[name='status'],[name='tag']">
     <select name="status"
             aria-label="Filter topics by status"
             hx-get="/topics/search"
             hx-trigger="change"
             hx-target="#topic-list"
-            hx-include="[name='q']">
+            hx-include="[name='q'],[name='tag']">
         <option value="all">All Statuses</option>
         <option value="new">New</option>
         <option value="ready">Ready</option>
@@ -121,18 +129,17 @@
         {% include "_topic_list.html" %}
     </tbody>
 </table>
-{% else %}
-{% if active_tag %}
+{% elif active_tag %}
 <div class="empty-state">
     <p class="empty-title">No topics found with tag <kbd>{{ active_tag }}</kbd>.</p>
     <p class="empty-state-hint"><a href="/">Clear filter</a> to see all topics.</p>
 </div>
+{% endif %}
 {% else %}
 <div class="empty-state">
     <p class="empty-title">No topics yet</p>
     <p class="empty-state-hint"><a href="/topics/new">Add your first topic</a> to start watching.</p>
 </div>
-{% endif %}
 {% endif %}
 
 <script>

@@ -10,10 +10,15 @@ from app.crud import (
     get_dashboard_stats,
     search_dashboard_data,
 )
+from app.models import normalize_tag
 from app.web.dependencies import get_db_conn
 from app.web.routers.templates import templates
 
 router = APIRouter()
+
+# OPML import banners (AUG-197) are bounded so a pathological message can't
+# visually flood the dashboard.
+_MAX_DASHBOARD_MSG_LEN = 300
 
 
 @router.get("/health")
@@ -29,6 +34,7 @@ async def dashboard(
     conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
     tag: str | None = None,
     error: str | None = None,
+    msg: str | None = None,
 ):
     """Dashboard showing all topics with status and last check time."""
     topic_data = get_dashboard_data(conn)
@@ -43,8 +49,11 @@ async def dashboard(
                 seen.add(t)
     all_tags.sort()
 
-    # Filter topic_data by tag if requested
+    # Filter topic_data by tag if requested. Stored tags are already
+    # canonicalized (AUG-338); normalizing the incoming param too means a
+    # hand-typed ?tag= with odd spacing or Unicode form still matches.
     if tag:
+        tag = normalize_tag(tag)
         topic_data = [item for item in topic_data if tag in item["topic"].tags]
 
     status_counts = {"ready": 0, "researching": 0, "error": 0, "new": 0}
@@ -66,6 +75,7 @@ async def dashboard(
             "active_tag": tag,
             "stats": stats,
             "error": error,
+            "msg": msg[:_MAX_DASHBOARD_MSG_LEN] if msg else None,
         },
     )
 
@@ -76,13 +86,22 @@ async def search_topics(
     conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
     q: str = "",
     status: str = "all",
+    tag: str = "",
 ):
-    """HTMX partial: filtered topic list for search/filter."""
+    """HTMX partial: filtered topic list for search/filter.
+
+    ``tag`` carries the dashboard's active tag chip (AUG-220): without it, a
+    search or status change replaced the list with globally-scoped results
+    while the chip and tag-scoped counts stayed as they were.
+    """
     topic_data = search_dashboard_data(
         conn,
         query=q if q.strip() else None,
         status=status if status != "all" else None,
     )
+    if tag:
+        tag = normalize_tag(tag)
+        topic_data = [item for item in topic_data if tag in item["topic"].tags]
     return templates.TemplateResponse(
         request,
         "_topic_list.html",
