@@ -416,12 +416,18 @@ def _topic_row_response(
     topic_id: int,
     *,
     just_checked: bool = False,
+    checking: bool = False,
+    baseline_check_id: int | None = None,
 ) -> Response:
     """Render the topic-row partial for HTMX, or redirect to the detail page for a full navigation.
 
     ``just_checked`` marks the row as the result of a fresh check (emits
     ``data-just-checked`` for the dashboard afterSwap handler) so unrelated
     re-renders like toggle-active don't re-fire a browser notification (OVH-119).
+
+    ``checking`` renders the row polling toward the completion of a just-queued
+    background check, keyed to ``baseline_check_id`` — the newest check result
+    that existed before the check was queued (AUG-217).
     """
     if not request.headers.get("HX-Request"):
         return RedirectResponse(url=f"/topics/{topic_id}", status_code=303)
@@ -429,7 +435,12 @@ def _topic_row_response(
     return templates.TemplateResponse(
         request,
         "_topic_row.html",
-        {**_topic_row_context(conn, topic, topic_id), "just_checked": just_checked},
+        {
+            **_topic_row_context(conn, topic, topic_id),
+            "just_checked": just_checked,
+            "checking": checking,
+            "baseline_check_id": baseline_check_id,
+        },
     )
 
 
@@ -438,21 +449,41 @@ async def topic_row(
     request: Request,
     topic_id: int,
     since: str | None = None,
+    since_check_id: int | None = None,
     conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
 ):
-    """HTMX partial: single dashboard row, polled while a topic is new/researching.
+    """HTMX partial: single dashboard row, polled while a topic is new/researching
+    or while a just-queued manual check is still in flight.
 
     ``since`` is the status the row was rendered with. While unchanged this
     returns 204 (htmx skips the swap, leaving checkbox/focus state untouched);
     on a transition the full row is re-rendered once and, being ready/error, no
-    longer carries poll attributes — the poll terminates itself. GET only — no
-    CSRF needed (web.md).
+    longer carries poll attributes — the poll terminates itself.
+
+    ``since_check_id`` is the newest check result that existed when a manual
+    check was queued (0 if none). A READY topic's status never changes across
+    a manual check, so completion is detected by a newer ``check_results`` row
+    appearing rather than by a status transition (AUG-217): while none exists
+    and the background task is still running, this returns 204; once one
+    exists, the row is re-rendered with ``data-just-checked`` set exactly once.
+    If the task is no longer running and still produced no newer row (e.g. it
+    crashed before ``check_topic``'s transaction committed), the row is
+    rendered as-is so the poll does not spin forever. GET only — no CSRF
+    needed (web.md).
     """
     topic = get_topic(conn, topic_id)
     if topic is None:
         # Topic deleted mid-poll: 200 empty body so the outerHTML swap removes
         # the row and the poll dies with it (OVH-048).
         return HTMLResponse("")
+
+    if since_check_id is not None:
+        latest = list_check_results(conn, topic_id, limit=1)
+        if latest and latest[0].id != since_check_id:
+            return _topic_row_response(request, conn, topic, topic_id, just_checked=True)
+        if await _checking_state.is_checking(topic_id):
+            return Response(status_code=204)
+        return _topic_row_response(request, conn, topic, topic_id)
 
     if since is not None and topic.status.value == since:
         return Response(status_code=204)
@@ -474,9 +505,15 @@ async def check_topic_handler(
 
     Enqueues the fetch+LLM pipeline as a background task (it opens its own
     connection) and returns immediately, so the request connection is never
-    held across the long awaits. HTMX polling (``topic_status``) surfaces the
-    result. HTMX requests get the topic-row partial; plain-form submissions
-    redirect to the topic detail page.
+    held across the long awaits. The response renders a checking row that
+    polls ``topic_row`` toward completion; HTMX requests get the topic-row
+    partial, plain-form submissions redirect to the topic detail page.
+
+    The response cannot claim ``data-just-checked`` here: the background task
+    has not run yet, so this still renders the pre-check row. Doing so anyway
+    let a stale unseen result re-fire a notification while the real completion
+    produced no swap at all (AUG-217) — the marker is set only once
+    ``topic_row``'s poll observes a newer check result.
     """
     await _checking_state.clear_stale(600)
 
@@ -484,9 +521,13 @@ async def check_topic_handler(
     if topic is None:
         raise HTTPException(status_code=404, detail="Topic not found")
 
+    baseline = list_check_results(conn, topic_id, limit=1)
+    baseline_check_id = baseline[0].id if baseline else None
+
     if await _checking_state.is_checking(topic_id):
-        # Already checking — return current state without enqueueing a duplicate.
-        return _topic_row_response(request, conn, topic, topic_id)
+        # Already checking — return current state without enqueueing a duplicate,
+        # still polling toward the in-flight check's completion.
+        return _topic_row_response(request, conn, topic, topic_id, checking=True, baseline_check_id=baseline_check_id)
 
     # Defer the pipeline to a background task with its own connection. The task
     # is the authoritative owner of the per-topic guard: it acquires
@@ -496,7 +537,7 @@ async def check_topic_handler(
     db_path = getattr(request.app.state, "db_path", None)
     background_tasks.add_task(background._run_single_check, topic_id, settings, db_path)
 
-    return _topic_row_response(request, conn, topic, topic_id, just_checked=True)
+    return _topic_row_response(request, conn, topic, topic_id, checking=True, baseline_check_id=baseline_check_id)
 
 
 @router.post("/topics/{topic_id}/toggle-active", dependencies=[Depends(verify_csrf)])
