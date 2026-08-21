@@ -650,7 +650,14 @@ async def _fetch_auto(topic: Topic, request: SourceRequest) -> FeedResponse:
 
         router = default_router
 
-    provider = router.get_provider()
+    provider = router.admit_provider()
+    if provider is None:
+        # Every provider is inside its cooldown and the one half-open probe is
+        # already out. Counted as a failed source rather than an empty one: no
+        # source was consulted, so reporting healthy silence would tell the
+        # silence heartbeat this topic simply had no news (AUG-306).
+        logger.warning("Topic '%s': every news provider is in cooldown; no fetch attempted", topic.name)
+        return FeedResponse(feeds_total=1, feeds_failed=1)
 
     async with httpx.AsyncClient(
         headers={"User-Agent": _USER_AGENT},

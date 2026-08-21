@@ -644,3 +644,17 @@ class TestAutoCascadePolicy:
         assert len(calls) == 1  # no cascade on a budget we no longer have
         assert router.mark_healthy(primary) is True  # the two failures are still there
         assert response.feeds_failed == 1  # still a degraded check
+
+    async def test_a_shared_cooldown_stops_the_fetch_entirely(self) -> None:
+        """AUG-306: a cooldown that still lets both providers be tried is no cooldown."""
+        from app.scraping.routing import _FAILURE_THRESHOLD, ProviderRouter
+
+        router = ProviderRouter()
+        for _ in range(_FAILURE_THRESHOLD):
+            for provider in router.providers:
+                router.mark_unhealthy(provider.name)
+
+        calls, response = await self._run([], router=router)
+
+        assert calls == []  # neither provider is queried, so neither deadline slides
+        assert response.feeds_total == 1 and response.feeds_failed == 1
