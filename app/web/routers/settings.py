@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import re
+import sqlite3
 from datetime import UTC, datetime
 
 import litellm
@@ -22,9 +23,10 @@ from app.config import (
     save_settings_to_yaml,
     strip_env_owned,
 )
+from app.crud import reset_all_heartbeat_state
 from app.notifications import send_notification
 from app.web.csrf import verify_csrf
-from app.web.dependencies import get_settings
+from app.web.dependencies import get_db_conn, get_settings
 from app.web.routers._validation import format_validation_errors, normalize_base_url
 from app.web.routers.templates import _mask_url, templates
 from app.webhooks import send_webhook
@@ -527,7 +529,10 @@ async def settings_view(request: Request):
 
 
 @router.post("/settings", dependencies=[Depends(verify_csrf)])
-async def update_settings(request: Request):
+async def update_settings(
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
+):
     """Save updated settings to config file and reload into app state.
 
     Builds Settings from a single parsed form dict rather than restating each field
@@ -689,7 +694,15 @@ async def update_settings(request: Request):
         # render agree with what a restart would produce.
         new_settings = Settings(**strip_env_owned(submitted))  # type: ignore[call-arg]
         save_settings_to_yaml(new_settings, request.app.state.config_path)
+        previous_heartbeat = getattr(request.app.state.settings, "silence_heartbeat_checks", 0)
         request.app.state.settings = new_settings
+        if previous_heartbeat > 0 and new_settings.silence_heartbeat_checks <= 0:
+            # Switching the feature off reconciles its state now, not whenever each
+            # topic next happens to run: disabling and re-enabling inside one check
+            # interval would otherwise leave the old latch in place (AUG-260).
+            cleared = reset_all_heartbeat_state(conn)
+            conn.commit()
+            logger.info("Silence Heartbeat switched off: cleared %d outage latch(es)", cleared)
     except ValidationError as exc:
         return _render(
             request,

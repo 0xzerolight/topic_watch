@@ -1418,3 +1418,69 @@ class TestTestLLMConfiguration:
             assert response.status_code == 403
         finally:
             app.dependency_overrides.clear()
+
+
+class TestHeartbeatDisableResetsState:
+    """AUG-260: turning the Silence Heartbeat off reconciles state at save time."""
+
+    def _latched_topic(self, db_conn: sqlite3.Connection):
+        from datetime import UTC, datetime
+
+        from app.crud import claim_heartbeat_alert, create_notification_intents, create_topic
+        from app.models import NotificationKind, PendingNotification, Topic, TopicStatus
+
+        topic = create_topic(db_conn, Topic(name="Outage", description="d", status=TopicStatus.READY))
+        claim_heartbeat_alert(db_conn, topic.id, datetime.now(UTC))
+        create_notification_intents(
+            db_conn,
+            [
+                PendingNotification(
+                    topic_id=topic.id,
+                    title="Topic Watch: Outage (sources failing)",
+                    body="body",
+                    url="json://localhost",
+                    kind=NotificationKind.HEARTBEAT_ALERT,
+                    latch_value="2026-08-20T10:00:00+00:00",
+                )
+            ],
+        )
+        db_conn.commit()
+        return topic
+
+    def _state(self, db_conn: sqlite3.Connection, topic_id: int) -> tuple[object, list[str]]:
+        latch = db_conn.execute("SELECT heartbeat_alerted_at FROM topics WHERE id = ?", (topic_id,)).fetchone()[0]
+        statuses = [
+            row[0]
+            for row in db_conn.execute(
+                "SELECT status FROM pending_notifications WHERE topic_id = ?", (topic_id,)
+            ).fetchall()
+        ]
+        return latch, statuses
+
+    async def test_saving_zero_clears_latches_and_queued_messages(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection, tmp_path: Path
+    ) -> None:
+        app.state.settings = _make_settings(silence_heartbeat_checks=3)
+        app.state.config_path = tmp_path / "config.yml"
+        topic = self._latched_topic(db_conn)
+
+        response = await client.post("/settings", data=valid_form_data(silence_heartbeat_checks="0"))
+        assert response.status_code == 303
+
+        latch, statuses = self._state(db_conn, topic.id)
+        assert latch is None
+        assert statuses == ["revoked"]
+
+    async def test_saving_a_positive_value_leaves_state_alone(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection, tmp_path: Path
+    ) -> None:
+        app.state.settings = _make_settings(silence_heartbeat_checks=3)
+        app.state.config_path = tmp_path / "config.yml"
+        topic = self._latched_topic(db_conn)
+
+        response = await client.post("/settings", data=valid_form_data(silence_heartbeat_checks="5"))
+        assert response.status_code == 303
+
+        latch, statuses = self._state(db_conn, topic.id)
+        assert latch is not None
+        assert statuses == ["pending"]
