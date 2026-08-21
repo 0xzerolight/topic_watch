@@ -247,11 +247,23 @@ Settings are managed by Pydantic `BaseSettings` in `app/config.py`.
 On first run, `config.example.yml` is auto-copied to `data/config.yml`.
 
 **State root.** `resolve_state_root()` decides where `config.yml` and the default database
-live, and both resolve through it so they cannot diverge: `TOPIC_WATCH_CONFIG_PATH` wins if
-set, otherwise an existing `data/` directory beside the package (repo checkout, worktree,
-the container's `/app/data`), otherwise a user-level state directory (`$XDG_STATE_HOME` or
-`~/.local/state`, `%LOCALAPPDATA%` on Windows) for an installed wheel. `TOPIC_WATCH_DB_PATH`
-stays authoritative for the database on top of that.
+live, and both resolve through it so they cannot diverge. Highest priority first:
+
+1. `TOPIC_WATCH_CONFIG_PATH` - the pinned file's directory.
+2. Whichever candidate already holds a `config.yml` or a `topic_watch.db`, `data/` beside the
+   package before the user-level directory. This is what makes the root sticky: an install
+   that has written state keeps reading it, and a `data/` directory that appears later
+   (`docker compose` creating the bind-mount source, a documented `mkdir -p data`) cannot
+   take over from a populated user-level directory.
+3. An existing `data/` beside the package - repo checkout, worktree, the container's
+   `/app/data`.
+4. `data/` beside the package when that directory is writable and is not `site-packages` /
+   `dist-packages`. A source checkout lands here on a fresh install, created by the first
+   write.
+5. A user-level state directory (`$XDG_STATE_HOME` or `~/.local/state`, `%LOCALAPPDATA%` on
+   Windows) - an installed wheel, or a package root that cannot be written to.
+
+`TOPIC_WATCH_DB_PATH` stays authoritative for the database on top of that.
 
 **Runtime access:**
 - Web routes: `request.app.state.settings`
@@ -263,7 +275,13 @@ document rather than rebuilding a hand-maintained key list: keys this version do
 are preserved (they warn on load), a cleared optional value deletes its key, and any field
 the environment currently supplies is skipped entirely so an env-derived value is never
 materialized into the file. The write goes to a same-directory temp file and one atomic
-rename, owner-readable only.
+rename, owner-readable only. A symlinked `config.yml` is resolved first, so the link survives
+the rename and the change reaches the file it points at.
+
+**Environment-owned controls.** `env_owned_field_paths()` is the single source of provenance.
+The Settings page renders every control whose field the environment owns as disabled with a
+read-only note, and the setup wizard does the same for the model and API key - a control the
+save path strips must not present itself as editable.
 
 ### Configuration Key Reference
 
