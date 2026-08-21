@@ -14,7 +14,7 @@ from app.checker import retry_pending_notifications
 from app.config import LLMSettings, NotificationSettings, Settings
 from app.crud import create_pending_notification, create_topic, list_pending_notifications
 from app.database import get_connection, init_db
-from app.models import PendingNotification, Topic, TopicStatus
+from app.models import NotificationDelivery, PendingNotification, Topic, TopicStatus
 from app.notifications import (
     NOTIFICATION_BODY_CHAR_LIMIT,
     NOTIFICATION_TITLE_CHAR_LIMIT,
@@ -330,6 +330,29 @@ class TestSendNotification:
         result = await send_notification("Title", "Body", settings)
 
         assert result is False
+
+    async def test_one_targets_timeout_preserves_sibling_successes(self) -> None:
+        """AUG-071: a stalled channel must not fabricate failure for its siblings."""
+        blocker = threading.Event()
+
+        def fake_deliver(title: str, body: str, url: str) -> NotificationDelivery:
+            if url == "json://slow":
+                blocker.wait(2)
+            return NotificationDelivery(url=url, ok=True)
+
+        settings = _make_settings(
+            notifications=NotificationSettings(urls=["json://fast", "json://slow"]),
+            apprise_timeout_seconds=1,
+        )
+        with patch("app.notifications._deliver_one", side_effect=fake_deliver):
+            results = await send_notification_per_url("Title", "Body", settings)
+        blocker.set()
+
+        by_url = {r.url: r for r in results}
+        assert by_url["json://fast"].ok is True
+        assert by_url["json://fast"].timed_out is False
+        assert by_url["json://slow"].ok is False
+        assert by_url["json://slow"].timed_out is True
 
     @patch("app.notifications.apprise.Apprise")
     async def test_returns_false_on_exception(self, mock_apprise: MagicMock) -> None:

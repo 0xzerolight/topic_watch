@@ -216,12 +216,38 @@ def _deliver_one(title: str, body: str, url: str) -> NotificationDelivery:
         return NotificationDelivery(url=url, ok=False, error=str(exc))
 
 
-def _deliver_per_url_sync(title: str, body: str, urls: list[str]) -> list[NotificationDelivery]:
-    """Deliver to each URL independently (blocks on I/O).
+async def send_single_notification(
+    title: str,
+    body: str,
+    url: str,
+    timeout_s: float,
+) -> NotificationDelivery:
+    """Deliver to ONE target under its OWN deadline. Never raises.
 
-    Use send_notification_per_url() for the async wrapper.
+    One deadline per target is the whole point (AUG-071). A single ``wait_for``
+    around a worker that sent every URL in sequence meant one stalled channel
+    fabricated a failure for the channels that had already delivered, and the
+    pipeline then queued retries for messages the user had received.
+
+    ``wait_for`` bounds the awaiting coroutine, not the thread: a thread cannot be
+    cancelled, so an expired send keeps running until Apprise's socket I/O
+    returns. That is why a timeout is reported as ``timed_out`` rather than
+    ``ok=False`` — the outcome is genuinely unknown, and the caller must leave the
+    delivery intent claimed rather than schedule a retry that could duplicate it.
     """
-    return [_deliver_one(title, body, url) for url in urls]
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_deliver_one, title, body, url),
+            timeout=timeout_s,
+        )
+    except TimeoutError:
+        logger.warning(
+            "Notification to %s timed out after %ss (outcome unknown): %s",
+            redact_url(url),
+            timeout_s,
+            title,
+        )
+        return NotificationDelivery(url=url, ok=False, error="timed out", timed_out=True)
 
 
 async def send_notification_per_url(
@@ -233,10 +259,11 @@ async def send_notification_per_url(
 ) -> list[NotificationDelivery]:
     """Deliver a notification per-URL, returning one result per target.
 
-    Each URL gets its own Apprise instance and a per-URL outcome, so a partial
-    failure (one channel down) is attributable and re-queueable on its own
-    rather than re-sending the whole batch (OVH-039). Invalid URLs are reported
-    as failed deliveries rather than silently dropped (OVH-027).
+    Each URL gets its own Apprise instance, its own deadline and its own outcome,
+    so a partial failure (one channel down, one channel hung) is attributable and
+    re-queueable on its own rather than collapsing the whole batch (OVH-039,
+    AUG-071). Invalid URLs are reported as failed deliveries rather than silently
+    dropped (OVH-027).
 
     Args:
         title: Notification title.
@@ -248,33 +275,18 @@ async def send_notification_per_url(
 
     Returns:
         One NotificationDelivery per attempted URL (empty if none configured).
-        Never raises — a timeout yields a single failed delivery per target.
-
-    Timeout semantics (OVH-116): ``wait_for`` bounds only the *awaiting coroutine*,
-    so on timeout the scheduler is freed and never blocked on a hung send. It does
-    NOT cancel the underlying ``to_thread`` worker — a thread cannot be cancelled —
-    so ``_deliver_per_url_sync`` keeps running until Apprise's socket I/O returns,
-    and that executor slot is reclaimed only then, not at the timeout. At
-    single-user scale (default ~32-slot pool) slot pressure is implausible, but a
-    hung send does occupy a worker past its deadline.
+        Never raises.
     """
     urls = [url] if url is not None else list(settings.notifications.urls)
     if not urls:
         logger.debug("No notification URLs configured, skipping notification")
         return []
 
-    try:
-        return await asyncio.wait_for(
-            asyncio.to_thread(_deliver_per_url_sync, title, body, urls),
-            timeout=settings.apprise_timeout_seconds,
+    return list(
+        await asyncio.gather(
+            *(send_single_notification(title, body, u, settings.apprise_timeout_seconds) for u in urls)
         )
-    except TimeoutError:
-        logger.warning(
-            "Notification timed out after %ss: %s",
-            settings.apprise_timeout_seconds,
-            title,
-        )
-        return [NotificationDelivery(url=u, ok=False, error="timed out") for u in urls]
+    )
 
 
 async def send_notification(title: str, body: str, settings: Settings, *, url: str | None = None) -> bool:

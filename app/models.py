@@ -733,11 +733,20 @@ class NotificationDelivery(BaseModel):
 
     Lets the pipeline re-queue only the targets that failed (OVH-039) and
     surface a per-channel reason without leaking the raw URL (OVH-027).
+
+    ``timed_out`` is the third outcome, and it is not a failure: a thread running
+    Apprise cannot be cancelled, so a target that outlived its deadline may still
+    be delivering. Recording it as failed would queue a retry for a message the
+    user is about to receive (AUG-071); the intent is left claimed instead, and
+    the stale-claim release re-arms it once the deadline for that has passed.
     """
 
     url: str
     ok: bool
     error: str | None = None
+    timed_out: bool = False
+    intent_id: int | None = None
+    """Delivery intent this outcome belongs to, when it came from one."""
 
 
 class PendingWebhook(SQLiteModel):
