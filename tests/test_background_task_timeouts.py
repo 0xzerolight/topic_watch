@@ -266,6 +266,77 @@ class TestRunInitTimeout:
         assert survivor.error_message == "Its own failure."
 
 
+class TestRunSingleCheckTimeout:
+    """AUG-264: a single check cannot outlive the slot-eviction threshold.
+
+    ``clear_stale`` hands an over-age entry's slot to the next caller, so an
+    unbounded check stayed live with no guard and a second checker committed and
+    delivered the same finding a second time.
+    """
+
+    async def test_bound_is_below_the_handlers_eviction_threshold(self) -> None:
+        from app.web.routers.background import _CHECK_TIMEOUT_SECONDS
+
+        assert _CHECK_TIMEOUT_SECONDS < 600
+
+    async def test_hanging_check_is_cancelled_and_releases_the_guard(self, db_path: Path, caplog) -> None:
+        import logging
+
+        from app.web.routers.background import _run_single_check
+        from app.web.state import _checking_state
+
+        settings = _make_settings()
+
+        conn = get_connection(db_path)
+        try:
+            topic = _make_topic(conn, status=TopicStatus.READY)
+            topic_id = topic.id
+        finally:
+            conn.close()
+
+        async def _hang(*args, **kwargs):
+            await asyncio.sleep(9999)
+
+        _checking_state._topics.clear()
+        try:
+            with (
+                patch("app.web.routers.background._CHECK_TIMEOUT_SECONDS", 0.05),
+                patch("app.web.routers.background.check_topic", side_effect=_hang),
+                caplog.at_level(logging.ERROR, logger="app.web.routers.background"),
+            ):
+                # Outer bound so an unbounded task fails the test instead of hanging it.
+                await asyncio.wait_for(_run_single_check(topic_id, settings, db_path), timeout=5)
+        finally:
+            _checking_state._topics.clear()
+
+        assert any("timed out" in record.message.lower() for record in caplog.records)
+        assert await _checking_state.is_checking(topic_id) is False
+
+    async def test_normal_completion_runs_the_check(self, db_path: Path) -> None:
+        from app.web.routers.background import _run_single_check
+        from app.web.state import _checking_state
+
+        settings = _make_settings()
+
+        conn = get_connection(db_path)
+        try:
+            topic = _make_topic(conn, status=TopicStatus.READY)
+            topic_id = topic.id
+        finally:
+            conn.close()
+
+        _checking_state._topics.clear()
+        try:
+            with patch(
+                "app.web.routers.background.check_topic", new_callable=AsyncMock, return_value=None
+            ) as mock_check:
+                await _run_single_check(topic_id, settings, db_path)
+        finally:
+            _checking_state._topics.clear()
+
+        mock_check.assert_awaited_once()
+
+
 class TestRunCheckAllTimeout:
     """Tests for _run_check_all() timeout behaviour."""
 

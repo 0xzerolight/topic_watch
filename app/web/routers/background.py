@@ -19,6 +19,12 @@ logger = logging.getLogger(__name__)
 
 _INIT_TIMEOUT_SECONDS = 600  # 10 minutes
 _CHECK_ALL_TIMEOUT_SECONDS = 1800  # 30 minutes
+# Bounds one single-topic check. Deliberately under the 600-second staleness
+# threshold the check handlers pass to ``clear_stale``: eviction frees the slot
+# for a second checker, so an entry old enough to be evicted must already have
+# been released by its owner. Unbounded, this task outlived its own guard and one
+# finding was committed and delivered twice (AUG-264).
+_CHECK_TIMEOUT_SECONDS = 540  # 9 minutes
 
 
 async def _run_init(
@@ -103,6 +109,10 @@ async def _run_single_check(topic_id: int, settings: Settings, db_path: Path | N
     when another check of the same topic is already in flight, then releases the
     guard in ``finally``. ``check_topic`` is called with ``guard=False`` because
     this task already holds the guard.
+
+    Bounded like the other two background tasks: the guard it holds is evictable
+    by ``clear_stale`` once the entry passes the handlers' staleness threshold, and
+    eviction admits a second checker of the same topic.
     """
     from app.database import get_db
 
@@ -115,7 +125,16 @@ async def _run_single_check(topic_id: int, settings: Settings, db_path: Path | N
         with get_db(db_path) as conn:
             topic = get_topic(conn, topic_id)
         if topic:
-            await check_topic(topic, settings, db_path=db_path, guard=False)
+            await asyncio.wait_for(
+                check_topic(topic, settings, db_path=db_path, guard=False),
+                timeout=_CHECK_TIMEOUT_SECONDS,
+            )
+    except TimeoutError:
+        logger.error(
+            "Check timed out for topic %d after %d seconds",
+            topic_id,
+            _CHECK_TIMEOUT_SECONDS,
+        )
     except Exception:
         logger.error("Background check failed for topic %d", topic_id, exc_info=True)
     finally:
