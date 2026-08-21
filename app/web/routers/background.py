@@ -87,6 +87,7 @@ async def _run_init(
                     error_message="Research timed out. Click Retry.",
                     init_attempts=topic.init_attempts,
                     expected_status=TopicStatus.ERROR,
+                    generation=topic.generation,
                 )
                 conn.commit()
     finally:

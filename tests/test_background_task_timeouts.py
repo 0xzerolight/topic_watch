@@ -11,7 +11,7 @@ import pytest
 from app.analysis.knowledge import KnowledgeUpdatePlan
 from app.analysis.llm import TokenUsage
 from app.config import LLMSettings, NotificationSettings, Settings
-from app.crud import create_topic, get_topic
+from app.crud import create_topic, delete_topic, get_topic
 from app.database import get_connection, init_db
 from app.models import Article, Topic, TopicStatus
 from app.scraping import FetchResult
@@ -212,6 +212,58 @@ class TestRunInitTimeout:
         """If the topic has been deleted, _run_init returns without crashing."""
         settings = _make_settings()
         await _run_init(999_999, settings, db_path)  # non-existent topic id
+
+    async def test_timeout_write_spares_a_rowid_reused_replacement(self, db_path: Path) -> None:
+        """The timeout message never lands on the topic that recycled the rowid.
+
+        ``topics.id`` is a plain rowid, so a topic deleted mid-init hands its id to
+        the next INSERT. Fenced on status alone, this write replaced the
+        replacement's own error with a timeout it never had.
+        """
+        settings = _make_settings()
+
+        conn = get_connection(db_path)
+        try:
+            topic = _make_topic(conn)
+            topic_id = topic.id
+        finally:
+            conn.close()
+
+        async def _replace_then_hang(*args, **kwargs):
+            conn = get_connection(db_path)
+            try:
+                delete_topic(conn, topic_id)
+                conn.commit()
+                replacement = create_topic(
+                    conn,
+                    Topic(
+                        name="Replacement",
+                        description="d",
+                        status=TopicStatus.ERROR,
+                        error_message="Its own failure.",
+                    ),
+                )
+                conn.commit()
+                assert replacement.id == topic_id
+            finally:
+                conn.close()
+            await asyncio.sleep(9999)
+
+        with (
+            patch("app.web.routers.background._INIT_TIMEOUT_SECONDS", 0.05),
+            patch("app.checker.fetch_new_articles_for_topic", side_effect=_replace_then_hang),
+        ):
+            await _run_init(topic_id, settings, db_path, claimed=True)
+
+        conn = get_connection(db_path)
+        try:
+            survivor = get_topic(conn, topic_id)
+        finally:
+            conn.close()
+
+        assert survivor is not None
+        assert survivor.name == "Replacement"
+        assert survivor.error_message == "Its own failure."
 
 
 class TestRunCheckAllTimeout:

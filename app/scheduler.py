@@ -200,6 +200,7 @@ async def _init_new_topics(settings: Settings, db_path: Path | None = None) -> N
                         error_message="Research timed out. Click Retry.",
                         init_attempts=topic.init_attempts,
                         expected_status=TopicStatus.ERROR,
+                        generation=topic.generation,
                     )
                     conn.commit()
         finally:

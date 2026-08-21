@@ -539,6 +539,50 @@ class TestGradualInitIsBounded:
         assert refreshed.status == TopicStatus.ERROR
         assert refreshed.error_message == "Research timed out. Click Retry."
 
+    async def test_timeout_write_spares_a_rowid_reused_replacement(self, tmp_path: Path) -> None:
+        """A topic deleted mid-init hands its rowid on; the timeout must not follow it."""
+        from app.crud import create_topic, delete_topic, get_topic
+        from app.database import get_db, init_db
+        from app.models import Topic, TopicStatus
+        from app.scheduler import _init_new_topics
+
+        db_path = tmp_path / "bounded_recycled.db"
+        init_db(db_path)
+        with get_db(db_path) as conn:
+            topic = create_topic(conn, Topic(name="Hangs", description="d", status=TopicStatus.NEW))
+            conn.commit()
+        topic_id = topic.id
+
+        async def _replace_then_hang(*args, **kwargs):
+            import asyncio
+
+            with get_db(db_path) as conn:
+                delete_topic(conn, topic_id)
+                conn.commit()
+                replacement = create_topic(
+                    conn,
+                    Topic(
+                        name="Replacement",
+                        description="d",
+                        status=TopicStatus.ERROR,
+                        error_message="Its own failure.",
+                    ),
+                )
+                conn.commit()
+                assert replacement.id == topic_id
+            await asyncio.sleep(9999)
+
+        with (
+            patch("app.scheduler._INIT_TIMEOUT_SECONDS", 0.05),
+            patch("app.checker.fetch_new_articles_for_topic", side_effect=_replace_then_hang),
+        ):
+            await _init_new_topics(_make_settings(), db_path)
+
+        with get_db(db_path) as conn:
+            survivor = get_topic(conn, topic_id)
+        assert survivor.name == "Replacement"
+        assert survivor.error_message == "Its own failure."
+
 
 class TestLifespanShutdown:
     """AUG-265: the scheduler stops however the lifespan context ends."""
