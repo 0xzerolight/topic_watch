@@ -535,6 +535,19 @@ class TestAddTopic:
             response.text
         )
 
+    async def test_automatic_radio_does_not_claim_google_news(self, client: httpx.AsyncClient) -> None:
+        """AUG-122: routing is Bing-first with Google fallback, not Google News."""
+        response = await client.get("/topics/new")
+        assert "Automatic (Google News)" not in response.text
+
+    async def test_validate_urls_button_has_pending_state(self, client: httpx.AsyncClient) -> None:
+        """AUG-113: the button disables itself and shows a spinner during validation,
+        guarding against a duplicate-submit re-triggering the serial fetch."""
+        response = await client.get("/topics/new")
+        assert 'hx-disabled-elt="this"' in response.text
+        assert "Validate URLs" in response.text
+        assert 'class="htmx-indicator spinner"' in response.text
+
     async def test_create_topic_redirects_to_detail(self, client: httpx.AsyncClient) -> None:
         """POST /topics creates a topic and redirects to its detail page."""
         with patch(
@@ -2226,6 +2239,23 @@ class TestTopicEdit:
         assert '<div id="feed-validation-results" role="status" aria-live="polite" aria-atomic="true"></div>' in (
             response.text
         )
+
+    async def test_automatic_radio_does_not_claim_google_news(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-122: routing is Bing-first with Google fallback, not Google News."""
+        topic = _make_topic(db_conn)
+        response = await client.get(f"/topics/{topic.id}/edit")
+        assert "Automatic (Google News)" not in response.text
+
+    async def test_validate_urls_button_has_pending_state(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-113: the button disables itself and shows a spinner during validation."""
+        topic = _make_topic(db_conn)
+        response = await client.get(f"/topics/{topic.id}/edit")
+        assert 'hx-disabled-elt="this"' in response.text
+        assert 'class="htmx-indicator spinner"' in response.text
 
     async def test_rename_onto_an_existing_name_is_a_validation_error(
         self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
