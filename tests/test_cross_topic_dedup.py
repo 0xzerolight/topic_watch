@@ -692,6 +692,27 @@ class TestChurningRevisionStamps:
         assert len(revised) == 1
         assert revised[0].raw_content == "Correction: he did not resign."
 
+    async def test_a_rotating_campaign_parameter_stores_one_row(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """The stored bodies are read by the URLs the topic wrote, not the entry's.
+
+        Identity strips tracking parameters; the ``url`` column keeps whatever the
+        feed served. A feed minting a new campaign parameter every poll therefore
+        matched no stored row by string, so the comparison set was empty and the
+        moved stamp stored another row on every check.
+        """
+        topic = _make_topic(db_conn, "Topic A")
+        base = self._URL
+        assert len(await self._run(topic, db_path, self._entry(url=f"{base}?utm_content=d1"), self._BODY)) == 1
+
+        for index, minutes in enumerate((15, 30, 45), start=2):
+            stamp = self._PUBLISHED + timedelta(minutes=minutes)
+            entry = self._entry(url=f"{base}?utm_content=d{index}", updated=stamp)
+            assert await self._run(topic, db_path, entry, self._BODY) == []
+
+        assert self._stored_count(db_conn, topic.id) == 1
+
     async def test_a_page_we_can_never_extract_stores_one_row(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         """An empty body is no evidence, so it cannot keep refuting nothing.
 

@@ -256,17 +256,28 @@ class _StoredArticles:
     Read once per check rather than queried per entry, because the story key is
     derived from a stored row's URL and title and so cannot be looked up directly
     without an index this schema does not have.
+
+    ``urls_by_story`` carries the URL strings actually written to the rows, which
+    is the only way to read a story's stored bodies back: identity is canonical
+    (tracking parameters stripped) while the column holds whatever the feed served,
+    so a feed rotating a campaign parameter names a URL that is the same story and
+    matches no row by string.
     """
 
     identities: frozenset[str]
     stories: frozenset[str]
+    urls_by_story: dict[str, list[str]]
 
     @classmethod
     def load(cls, conn: sqlite3.Connection, topic_id: int) -> "_StoredArticles":
         rows = list_article_dedup_keys(conn, topic_id)
+        urls_by_story: dict[str, list[str]] = {}
+        for _, url, title in rows:
+            urls_by_story.setdefault(compute_article_hash(url, title), []).append(url)
         return cls(
             identities=frozenset(content_hash for content_hash, _, _ in rows),
-            stories=frozenset(compute_article_hash(url, title) for _, url, title in rows),
+            stories=frozenset(urls_by_story),
+            urls_by_story=urls_by_story,
         )
 
     def holds(self, entry: FeedEntry) -> bool:
@@ -510,9 +521,8 @@ def _drop_unchanged_representations(
 
     by_story: dict[str, set[str]] = {}
     by_source: dict[tuple[str, str | None], set[str]] = {}
-    for url, title, raw_content, source_provider in list_article_bodies_for_urls(
-        conn, topic_id, [row[0].url for _, row in contested]
-    ):
+    stored_urls = [url for _, row in contested for url in stored.urls_by_story.get(story_identity(row[0]), ())]
+    for url, title, raw_content, source_provider in list_article_bodies_for_urls(conn, topic_id, stored_urls):
         digest = body_digest(raw_content)
         if not digest:
             continue
