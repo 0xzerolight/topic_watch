@@ -75,8 +75,8 @@ knowledge_state_max_tokens: 2000
 # topic detail page. Each revision stores a full copy of the knowledge summary
 # — roughly 8 KB at the default 2000-token budget, ~40 KB at the 10000-token
 # ceiling — so this bounds history growth. Oldest revisions are pruned as new
-# ones land, and only on a write: lowering this later will not retro-prune a
-# topic that has stopped updating.
+# ones land, and the cap is also applied across every topic at startup, so
+# lowering it reclaims history from topics that have stopped updating.
 # Config-only: there is no field for this on the Settings page.
 knowledge_revision_limit: 50
 

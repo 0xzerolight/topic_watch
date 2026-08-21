@@ -1,24 +1,39 @@
 {# Diff body for one knowledge revision, swapped in by HTMX on first expand.
 
+   `mode` says what this body actually is. Only "diff" compared two revisions;
+   the rest are bounded snapshots of a single one, and their added/removed counts
+   and token delta would be invented (AUG-222), so they are not rendered.
+
    Segment text renders through Jinja autoescape as PLAIN TEXT, deliberately not
    the `markdown` filter. That filter is safe (templates.py:113-125 — html=False,
    images disabled, unsafe schemes rejected) and the Knowledge State panel uses it
    correctly; the reason to avoid it here is different. A segment is a fragment —
    "- Trial began." — so rendering fragments individually would emit a separate
    list per segment, and a diff should show the source the model actually wrote,
-   markers and all. #}
-{% if previous is none %}
-<p><small class="quiet">No earlier revision is retained to compare against — showing the full snapshot.</small></p>
-{% else %}
+   markers and all. Leading indentation is part of that source (it decides a
+   bullet's nesting level), so `.diff > *` carries `white-space: pre-wrap`. #}
+{% if mode == "diff" %}
 <p><small class="quiet">
-    {{ inserted }} added · {{ deleted }} removed ·
+    {{ inserted }} added · {{ deleted }} removed
+    {%- if token_delta is not none %} ·
     <span class="num">{{ "+" if token_delta > 0 }}{{ token_delta }}</span> tokens
+    {%- endif %}
 </small></p>
+{% elif mode == "reinitialize" %}
+<p><small class="quiet">Research was re-run for this topic — showing the full snapshot of the new baseline, not a comparison with the earlier one.</small></p>
+{% elif mode == "oversize" %}
+<p><small class="quiet">This revision is too large to compare line by line — showing the full snapshot.</small></p>
+{% elif mode == "unknown_source" %}
+<p><small class="quiet">This revision was written by a version that records a kind of change this one does not recognise — showing the full snapshot.</small></p>
+{% else %}
+<p><small class="quiet">No earlier revision is retained to compare against — showing the full snapshot.</small></p>
 {% endif %}
 {% if revision.change_note %}
 <p class="rev-note"><small><strong>Reported change:</strong> {{ revision.change_note }}</small></p>
 {% endif %}
-{% if inserted or deleted %}
+{% if mode == "diff" and not (inserted or deleted) %}
+<p><small class="quiet">No textual change in this revision.</small></p>
+{% elif segments %}
 <div class="diff" tabindex="0" role="region" aria-label="Knowledge diff">
     {%- for segment in segments %}
     {%- if segment.kind == "insert" %}
@@ -31,5 +46,5 @@
     {%- endfor %}
 </div>
 {% else %}
-<p><small class="quiet">No textual change in this revision.</small></p>
+<p><small class="quiet">This revision stored an empty knowledge state.</small></p>
 {% endif %}
