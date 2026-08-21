@@ -274,7 +274,8 @@ async def test_create_topic_with_tags_via_form(client, db_conn):
             "name": "Tagged New Topic",
             "description": "A topic with tags",
             "feed_mode": "auto",
-            "tags": "ai, tech, ml",
+            # One tag per line: a comma is ordinary tag text now (AUG-339).
+            "tags": "ai\ntech\nml",
             "csrf_token": CSRF_TEST_TOKEN,
         },
         follow_redirects=False,
@@ -301,7 +302,7 @@ async def test_edit_topic_updates_tags(client, db_conn):
             "description": "Description for Edit Me",
             "feed_mode": "manual",
             "feed_urls": "https://example.com/feed.xml",
-            "tags": "new-tag, another",
+            "tags": "new-tag\nanother",
             "csrf_token": CSRF_TEST_TOKEN,
         },
         follow_redirects=False,
