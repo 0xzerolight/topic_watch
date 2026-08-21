@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
+Pre-1.3.0 releases predate that policy: 1.2.1, 1.2.3 and 1.2.5 shipped
+user-visible features as PATCH bumps. Versions before 1.3.0 are not a
+reliable signal of change scope; historical tags are not renumbered.
 
 ## [Unreleased]
 

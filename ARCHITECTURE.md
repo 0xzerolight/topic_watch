@@ -2,14 +2,14 @@
 
 ## System Overview
 
-Topic Watch monitors user-defined topics by fetching articles from RSS feeds, then uses an LLM to determine whether the articles contain genuinely new information compared to what is already known. Notifications are sent only when something novel is found. Silence is the default.
+Topic Watch monitors user-defined topics by fetching articles — from RSS feeds (an auto-generated news search, or manually configured URLs) or, per-topic, the optional Exa AI search API — then uses an LLM to determine whether the articles contain genuinely new information compared to what is already known. Notifications are sent only when something novel clears the topic's confidence, relevance and importance gates. Silence is the default.
 
 ```
-                         ┌─────────────────┐
-                         │   RSS Feeds     │
-                         └────────┬────────┘
-                                  │
-                                  v
+                    ┌──────────────────────────┐
+                    │  RSS Feeds / Exa Search   │
+                    └────────────┬─────────────┘
+                                 │
+                                 v
                     ┌─────────────────────────┐
                     │   Scraping Pipeline      │
                     │  (fetch, dedup, extract)  │
@@ -22,25 +22,37 @@ Topic Watch monitors user-defined topics by fetching articles from RSS feeds, th
                               │
                               v
                 ┌──────────────────────────┐
-                │  LLM Novelty Detection   │
+                │  LLM Novelty Detection    │
                 │  (has_new_info? yes/no)   │
-                └─────────┬────────────────┘
+                └─────────┬─────────────────┘
                           │
-                ┌─────────┴─────────┐
-                │                   │
-              yes                  no
-                │                   │
-                v                   v
-      ┌──────────────────┐   ┌───────────┐
-      │ Update Knowledge │   │  Record   │
-      │ Send Notification│   │  (done)   │
-      │ Record           │   └───────────┘
-      └──────────────────┘
+                ┌─────────┴──────────────────────┐
+                │                                │
+              yes                               no
+                │                                │
+                v                                v
+   ┌───────────────────────────────┐       ┌───────────┐
+   │ Clears confidence/relevance?   │       │  Record   │
+   └──────────┬───────────────┬────┘       │  (done)   │
+            no│               │yes         └───────────┘
+              v               v
+       ┌───────────┐   ┌────────────────────────────┐
+       │  Record   │   │  Update Knowledge State     │
+       │  (done)   │   │  Clears importance?         │
+       └───────────┘   │  no  -> record only         │
+                        │  yes -> record, THEN notify │
+                        └─────────────────────────────┘
 ```
 
-**Two entry points trigger checks:**
+Record always lands before any notification is attempted — the durable transaction (see Request Lifecycle below) commits knowledge, article state and the `CheckResult` first, and only then are notification/webhook deliveries attempted.
+
+**Four entry points trigger checks, all funneling through `check_topic()` / `check_all_topics()`:**
 1. **APScheduler** - a background job ticks every 1 minute, queries which topics are due based on their individual `check_interval_minutes`, and runs the pipeline for each.
-2. **Web UI** - users can trigger manual checks via the dashboard, which runs the same pipeline as a FastAPI background task.
+2. **Web UI** - users can trigger manual checks via the dashboard/topic detail page, which runs the same pipeline as a FastAPI background task.
+3. **JSON API** - `POST /api/v1/topics/{id}/check` runs a check synchronously and returns its outcome.
+4. **CLI** - `python -m app.cli check` / `check-all` run the same pipeline from a separate process.
+
+The scheduler, web UI and API share one process, so their in-flight guards (`app.web.state._checking_state`) coordinate with each other. The CLI is a separate process with its own empty guard state at every invocation — it does not coordinate with a running server, and running it against the same database as a live server can double-check a topic and double-notify (see the CLI module's own docstring).
 
 ## Module Map
 
@@ -50,14 +62,14 @@ All application code lives under `app/`.
 
 | Module | Responsibility |
 |--------|---------------|
-| `checker.py` | Orchestrates the full check pipeline: fetch → analyze → notify → record. `check_topic()` is the primary entry point. `check_all_topics()` iterates due topics. `retry_pending_notifications()` handles failed deliveries. `initialize_new_topic()` builds initial knowledge for NEW topics. |
-| `scheduler.py` | APScheduler 3.x `AsyncIOScheduler`, four jobs: every-minute tick (`_scheduled_check` — runs the check cycle, then initializes one NEW topic), stuck-topic recovery (every 5 min, 15-min timeout), weekly VACUUM (Sun 3 AM), daily article cleanup (4 AM). Only the minute tick has jitter; all jobs coalesce and are single-instance. The check cycle (`_run_check_cycle`) retries pending notifications and webhooks before querying due topics. |
+| `checker.py` | Orchestrates the full check pipeline in phases that never hold a database connection across a network or LLM call: snapshot (P0) → fetch (P1) → analyze (P2) → generate the knowledge update (P3) → one durable transaction committing knowledge + article state + `CheckResult` + delivery intents (C3) → notification/webhook sends (P4) → record the delivery outcome (C4) → Silence Heartbeat (P5). `check_topic()` is the primary entry point. `check_all_topics()` iterates due topics. `retry_pending_notifications()` drains queued delivery intents. `initialize_new_topic()` builds initial knowledge for NEW topics through the same snapshot/offline-work/durable-commit shape. |
+| `scheduler.py` | APScheduler 3.x `AsyncIOScheduler`, four jobs: every-minute tick (`_scheduled_check` — runs the check cycle, then initializes one NEW topic), stuck-topic recovery (every 5 min, 15-min timeout), weekly VACUUM (Sun 3 AM), daily article + delivery-ledger cleanup (4 AM). Only the minute tick has jitter; all jobs coalesce and are single-instance. The check cycle (`_run_check_cycle`) snapshots due topics, then drains pending notification/webhook retries *alongside* the per-topic checks in one `asyncio.gather()` rather than ahead of them, so a retry backlog cannot delay a tick's due-topic work. |
 
 ### LLM Analysis
 
 | Module | Responsibility |
 |--------|---------------|
-| `analysis/llm.py` | LiteLLM + Instructor wrappers. Defines `NoveltyResult` (with `confidence`, `relevance`, and `importance` scores), `KnowledgeStateUpdate`, and `TokenUsage`. Token counting, rate limit backoff with exponential delay. Returns safe default (`has_new_info=False`, `confidence=0.0`) on analysis failure. |
+| `analysis/llm.py` | LiteLLM + Instructor wrappers. `NoveltyResponse` is the strict live provider contract (`relevance`/`importance` required, no defaults); `analyze_articles` decodes into it and converts to `NoveltyResult`, the permissive internal/stored shape every scoring field defaults on (so pre-existing `llm_response` blobs still re-parse). Also defines `KnowledgeStateUpdate` and `TokenUsage`. Token counting, rate limit backoff with exponential delay. Returns safe default (`has_new_info=False`, `confidence=0.0`) on analysis failure. |
 | `analysis/prompts.py` | System and user prompt builders for novelty detection and knowledge init/update/compress. Articles truncated to 1500 chars in prompts. |
 | `analysis/knowledge.py` | Knowledge state initialization and updates with DB persistence. Token budget enforcement via summary compression. |
 | `analysis/restatement.py` | Pure phrase-matching filter (`filter_restated_key_facts`, re-exported by `llm.py`). Drops a key fact only when it is a clear restatement of the existing knowledge summary (normalized verbatim or long contiguous n-gram match), so already-known facts aren't re-flagged as new. Conservative by design. |
@@ -69,6 +81,7 @@ All application code lives under `app/`.
 | Module | Responsibility |
 |--------|---------------|
 | `scraping/__init__.py` | `fetch_new_articles_for_topic()` - orchestrates feed fetch, dedup against DB, cross-topic content reuse, concurrent content extraction (semaphore-limited), and article storage. |
+| `scraping/source.py` | Neutral source layer shared by every fetcher (RSS/Exa alike): `FeedEntry`/`FeedResponse` DTOs, `FetchStatus`, article/story identity and dedup helpers, a monotonic per-attempt `Deadline`, and the `register_source`/`fetch_feeds_for_topic` mode-to-fetcher registry. Sources register themselves at import; this module imports no source. |
 | `scraping/rss.py` | RSS/Atom feed fetching via httpx + feedparser. Converts entries to `FeedEntry` models. Retry on timeouts and 5xx. Feed health callbacks. |
 | `scraping/content.py` | Article HTML fetch + trafilatura content extraction. Falls back to RSS summary on failure. Content truncated to 5000 chars at word boundary. |
 | `scraping/providers.py` | News search provider definitions. `NewsProvider` Protocol plus `GoogleNewsProvider` / `BingNewsProvider` concrete classes that build keyword-search feed URLs from topic name + description (auto feed mode). |
@@ -82,8 +95,8 @@ All application code lives under `app/`.
 |--------|---------------|
 | `models.py` | Pydantic models: `Topic`, `Article`, `KnowledgeState`, `KnowledgeRevision`, `CheckResult`, `FeedHealth`, `DashboardStats`, `PendingNotification`, `PendingWebhook`. Enums: `TopicStatus` (new/researching/ready/error), `FeedMode` (auto/manual/exa), `KnowledgeRevisionSource` (init/update). Each model has `from_row()` and `to_insert_dict()` for SQLite interop; datetime cells are coerced defensively. |
 | `crud.py` | All SQL (parameterized), grouped by model: CRUD, feed-health upserts, notification + webhook retry queues, dashboard aggregation, article retention cleanup, stuck-topic recovery. |
-| `database.py` | SQLite connection factory (WAL mode, foreign keys, busy timeout). Schema init (`init_db`). Migration runner (`run_migrations`) — backs up the DB before applying pending migrations. |
-| `migrations/` | 25 sequential migrations (`m001`–`m025`) registered in `__init__.py` as `(version, description, up_function)` tuples. Tracked in `schema_version`. Append-only. |
+| `database.py` | SQLite connection factory (WAL mode, foreign keys, busy timeout). Schema init (`init_db`). `backup_database()` uses the sqlite3 backup API (not a file copy — safe under WAL) and runs `PRAGMA integrity_check`, discarding and raising `BackupVerificationError` on a bad backup. Migration runner (`run_migrations`) backs up the DB first, validates `schema_version` is an exact contiguous prefix of the registry (else `SchemaLedgerError`), then applies each pending migration's `up()` plus its ledger row inside one `BEGIN IMMEDIATE` per version. |
+| `migrations/` | 29 sequential migrations (`m001`–`m029`) registered in `__init__.py` as `(version, description, up_function)` tuples. Tracked in `schema_version`. Append-only. |
 | `interval.py` | Human-readable interval parsing/formatting (`m`/`h`/`d`/`w`/`M`, combined syntax like `"1w 3d 2h"`). Enforces min/max interval bounds. |
 | `opml.py` | OPML import/export. Parses feeds from RSS readers (FreshRSS, Miniflux, TT-RSS), validates feed URLs, and exports topics as OPML. |
 
@@ -94,18 +107,18 @@ The route handlers live in the `web/routers/` package. The HTMX/HTML routes are 
 | Module | Responsibility |
 |--------|---------------|
 | `web/routers/__init__.py` | Aggregate router. Includes the per-domain routers in include-order so static topic paths (`/topics/search`, `/topics/new`) register before the dynamic `/topics/{topic_id}` route. |
-| `web/routers/dashboard.py` | Dashboard page, `/health` check, and topic search. Reads the dashboard stats cache. |
+| `web/routers/dashboard.py` | Dashboard page, `/health` check, and topic search. Computes dashboard stats directly on each request via `get_dashboard_stats()` — no cache; a TTL cache here used to lag every stat card for up to 60s after a mutation. |
 | `web/routers/topics.py` | Topic CRUD, detail/articles pages, manual check + init triggers, and the knowledge revision timeline — `GET /topics/{topic_id}/knowledge-diff/{revision_id}` returns one revision's diff against its predecessor as an HTMX partial. |
 | `web/routers/exports.py` | Data export endpoints: all-topics JSON (`/export/topics/json`) and per-topic JSON/CSV (`/topics/{id}/export/json`, `/topics/{id}/export/csv`). |
 | `web/routers/settings.py` | Setup wizard, settings editor, and notification-test endpoint. Reads/writes config via `load_settings()` / `save_settings_to_yaml()`. |
 | `web/routers/feed_health.py` | Global feed-health dashboard and feed-URL validation endpoint (rate-limited). |
-| `web/routers/opml.py` | OPML import/export and bulk topic export (JSON). |
+| `web/routers/opml.py` | OPML import/export. Bulk topics-JSON export lives in `exports.py`, not here. |
 | `web/routers/background.py` | Background-task helpers (`_run_init`, check-all) that run after the request connection closes, each opening its own DB connection. Coordinates via the shared `_checking_state`. |
 | `web/routers/templates.py` | Shared `Jinja2Templates` instance and template filters (`timeago`, `sanitize_error`, `mask_url`, `confidence_badge`). Filters are module-level for unit testing. |
 | `web/routers/_validation.py` | Shared topic-form validation (`validate_topic_form`) used by create and edit handlers. |
 | `web/api.py` | JSON API v1 (`/api/v1`). Read-only endpoints (list/get topics, checks, knowledge) plus one CSRF-protected mutation to trigger a check. Reuses CRUD and Pydantic models. |
-| `web/state.py` | Process-global web state: `CheckingState` (in-progress check tracking with stale-lock detection), dashboard stats cache, and the in-memory feed-validation rate limiter. |
-| `web/csrf.py` | Double-submit cookie CSRF middleware + `verify_csrf` dependency. Sets token cookie on responses, validates POST/PUT/DELETE via `X-CSRF-Token` header (HTMX) or `csrf_token` form field. |
+| `web/state.py` | Process-global web state: `CheckingState` (in-progress check tracking with stale-lock detection) and the in-memory feed-validation rate limiter. No cache — dashboard stats are queried at render time. |
+| `web/csrf.py` | Signed double-submit cookie CSRF middleware + `verify_csrf` dependency. Sets an HMAC-signed token cookie on responses (an unsigned legacy cookie is adopted and upgraded in place), validates POST/PUT/DELETE via `Sec-Fetch-Site` first, then the `X-CSRF-Token` header (HTMX) or `csrf_token` form field. |
 | `web/dependencies.py` | FastAPI dependency injection: `get_db_conn` (per-request connection with auto-commit/rollback), `get_settings` (from `app.state`). |
 | `web/setup_middleware.py` | ASGI middleware that redirects all routes to `/setup` while `app.state.setup_required` is set (exempts `/setup`, `/health`, `/static`). |
 
@@ -113,15 +126,15 @@ The route handlers live in the `web/routers/` package. The HTMX/HTML routes are 
 
 | Module | Responsibility |
 |--------|---------------|
-| `main.py` | FastAPI app + lifespan. Runs migrations, starts/stops the scheduler, mounts the web routers, JSON API, CSRF + setup-redirect middleware, and static files. |
+| `main.py` | FastAPI app + lifespan. Runs migrations, starts/stops the scheduler, mounts the web routers, JSON API, and static files. Middleware stack (outermost first): `RequestIdMiddleware` (per-HTTP-request correlation id, distinct from a check's own correlation id — see `check_context.py` below) → `HostAllowlistMiddleware` (rejects an untrusted `Host` header before routing) → `SetupRedirectMiddleware` → `CSRFMiddleware`. |
 | `config.py` | Pydantic `BaseSettings` with YAML source. Priority: env > YAML > defaults. `load_settings()` / `save_settings_to_yaml()`; `CLOUD_PROVIDERS` / `LOCAL_PROVIDER_DEFAULTS` provider lists. |
 | `logging_config.py` | Plain text or JSON structured logging. Controlled by `TOPIC_WATCH_LOG_FORMAT` and `TOPIC_WATCH_LOG_LEVEL` env vars. |
-| `check_context.py` | Correlation IDs via `contextvars.ContextVar`. `CheckIdFilter` injects check ID into all log records. |
+| `check_context.py` | Correlation IDs via `contextvars.ContextVar`. `check_id_var` (per topic-check/init run) and `cycle_id_var` (per scheduler tick) are distinct from `main.py`'s `request_id_var` (per HTTP request) — a request that triggers a synchronous check carries both ids. `CheckIdFilter` injects whichever is set into all log records. |
 | `url_validation.py` | SSRF protection. Blocks private/reserved IPs (localhost, 10.x, 172.16-31.x, 192.168.x, link-local, CGNAT 100.64.0.0/10, IPv6 ULA). |
 | `feed_backoff.py` | `feed_backoff_until()` — stateless exponential backoff for persistently-failing feeds, computed from `feed_health` consecutive failures. Bounded by `feed_backoff_base_minutes` / `feed_backoff_cap_hours`. |
-| `notifications.py` | Apprise wrapper. Formats `NoveltyResult` into title/body. Sync Apprise send wrapped in `asyncio.to_thread()`. Re-exports `redact_url` from `log_redaction.py`. |
+| `notifications.py` | Apprise wrapper. `format_notification()` formats a `NoveltyResult` into title/body. `send_single_notification()` delivers one per-target intent (sync Apprise call wrapped in `asyncio.to_thread()`). Re-exports `redact_url` from `log_redaction.py`. |
 | `log_redaction.py` | Log-hygiene helper. `redact_url` strips userinfo, query strings, fragments, and long (likely-secret) path segments from notification/webhook URLs, keeping scheme + host + a short path prefix for diagnostics. |
-| `webhooks.py` | JSON POST to configured webhook endpoints. Concurrent delivery via `asyncio.gather()`. Failed deliveries are queued in `pending_webhooks` and retried via `retry_pending_webhooks()` at the start of each check cycle. |
+| `webhooks.py` | JSON POST to configured webhook endpoints. `build_webhook_intents()` creates one durable per-target intent inside the check's C3 transaction; `deliver_webhook_intents()` claims, sends and applies the outcome for each, concurrently. `retry_pending_webhooks()` drains due intents alongside each check cycle's due topics. |
 | `heartbeat.py` | Silence Heartbeat decision logic. `evaluate_heartbeat()` counts the leading run of failing `stage_error`s for a topic and returns a pure `HeartbeatAction` (alert, recovery, or nothing) with the formatted message. No DB writes, no sends — the checker owns the latch and the delivery. |
 | `cli.py` | Argparse CLI: `list`, `check`, `check-all`, `init`, `doctor` (secret-safe diagnostic report for bug reports). |
 
@@ -140,21 +153,23 @@ The route handlers live in the `web/routers/` package. The HTMX/HTML routes are 
 
 **LiteLLM for provider abstraction.** Users switch between OpenAI, Anthropic, Ollama, Gemini, or any supported provider by changing one config string. No provider-specific code in the app.
 
-**Instructor for structured output.** Pydantic response models (`NoveltyResult`, `KnowledgeStateUpdate`) with automatic validation retry. Eliminates JSON parsing fragility.
+**Instructor for structured output.** Pydantic response models (`NoveltyResponse`, `KnowledgeStateUpdate`) with automatic validation retry against the live provider. `NoveltyResponse` — the strict wire contract — is converted field-by-field to `NoveltyResult`, the permissive shape actually stored. Eliminates JSON parsing fragility.
 
 **Safe defaults on LLM failure.** `analyze_articles()` returns `has_new_info=False` on any error. Users miss an update rather than get a false alert. Knowledge operations raise because correctness is critical there.
 
-**Knowledge state with token budget.** Rolling summary compressed by sentence-level truncation when exceeding `knowledge_state_max_tokens`. Prevents unbounded context growth.
+**Knowledge state with token budget.** When a summary would exceed `knowledge_state_max_tokens`, the LLM is asked to compress it while preserving every fact; deterministic sentence-level truncation is only the fallback when that call fails or still overflows. Prevents unbounded context growth. Compression failure is swallowed, not raised — only the primary init/update generation raises.
 
-**Knowledge revisions with capped retention.** Every knowledge write also appends a row to `knowledge_revisions`; rows are never rewritten, only pruned oldest-first to `knowledge_revision_limit`. The append happens *after* the state write commits, in its own transaction, so a disk-full abort can never take the knowledge state with it — which is why the append can safely swallow every error. The checker never reads the table. Diffs are computed on read with `difflib`; no diff is ever stored.
+**Knowledge revisions with capped retention.** Every knowledge write also appends a row to `knowledge_revisions` inside the SAME transaction as the state write (see C3 in Request Lifecycle below), not after it — a revision-append failure takes the state write down with it rather than leaving knowledge with no recorded history. Rows are never rewritten, only pruned oldest-first to `knowledge_revision_limit`, both on each write and once at startup for topics that have gone quiet. The checker never reads the table. Diffs are computed on read with `difflib`; no diff is ever stored.
 
 **Apprise for notifications.** Supports 100+ services via URL format. No need for individual service integrations.
 
 **No built-in authentication.** Deliberate choice for a single-user tool. Remote deployments use a reverse proxy with auth (Authelia, Caddy basicauth, etc.).
 
-**CSRF double-submit cookie.** Stateless CSRF protection compatible with HTMX. Cookie is not httponly (HTMX reads it via JS). SameSite=Lax.
+**Signed double-submit CSRF cookie.** Stateless CSRF protection compatible with HTMX: the cookie's value is HMAC-signed with a per-process secret, and a `Sec-Fetch-Site` check refuses cross-site submissions outright — clients that omit the header fall back to plain double-submit. Cookie is not httponly (HTMX reads it via JS). SameSite=Lax.
 
-**Content hash dedup.** `SHA256(lowercase(url|title))` uniquely identifies articles. Cross-topic content reuse avoids re-fetching the same article content for overlapping topics.
+**Host allowlist against DNS rebinding.** `HostAllowlistMiddleware` rejects any `Host` header that is not `localhost`, an IP literal, or listed in `TOPIC_WATCH_ALLOWED_HOSTS`, so a hostile site cannot re-point its own domain at this machine and drive the console same-origin.
+
+**Content hash dedup.** `content_hash` (`article_identity()` in `scraping/source.py`) digests the canonical URL, casefolded title, and the source's revision marker — not URL+title alone, so a correction or update published at the same URL is a new row rather than silently skipped (AUG-320). Cross-topic content reuse avoids re-fetching the same article content for overlapping topics.
 
 **Scheduler ticks every minute.** Rather than scheduling one APScheduler job per topic, a single job ticks every minute and queries which topics are due. This avoids complex job lifecycle management when topics are added/removed/edited.
 
@@ -164,13 +179,13 @@ The route handlers live in the `web/routers/` package. The HTMX/HTML routes are 
 
 | Table | Purpose |
 |-------|---------|
-| `topics` | Core entity. Name, description, `feed_urls` (JSON array), `feed_mode` (auto/manual), `status`, `is_active`, `status_changed_at`, `check_interval_minutes`, `tags` (JSON array), per-topic `confidence_threshold` / `relevance_threshold` (m011, nullable overrides), `init_attempts` (m013), `novelty_instruction` (m022, nullable, ≤500 chars, injected into the novelty prompt), `importance_threshold` (m023, nullable 1-5; NULL = notify on any importance), `heartbeat_alerted_at` (m024, nullable Silence Heartbeat latch — stamped when a "sources failing" alert is sent, cleared on recovery). |
-| `articles` | Fetched articles linked to a topic. Deduped by `content_hash` (unique per topic). `source_provider` records the news provider (m009), `published_at` the feed entry's date (m018). `processed` flag tracks analysis completion. |
-| `knowledge_states` | One per topic. Rolling LLM-generated summary. `token_count` tracks budget usage. |
-| `knowledge_revisions` | History of knowledge-state writes (m025), one row per init/update: `summary_text` (full copy), `token_count`, `source` (init/update), `change_note`, `created_at`. Append-only, pruned oldest-first per topic to `knowledge_revision_limit`. |
-| `check_results` | Audit log of every check cycle. Stores articles found/new, `has_new_info`, full LLM response JSON, notification outcome, `prompt_tokens` / `completion_tokens` (m012), and `stage_error` recording which pipeline stage failed (m015). |
-| `pending_notifications` | Failed notifications queued for retry. Retried at the start of each check cycle. Deleted after `max_retries`. |
-| `pending_webhooks` | Failed webhook deliveries queued for retry (m010). Stores `url`, `payload`, `retry_count`/`max_retries`. Retried at the start of each check cycle; expired entries pruned. |
+| `topics` | Core entity. Name, description, `feed_urls` (JSON array), `feed_mode` (auto/manual/exa), `status`, `is_active`, `status_changed_at`, `check_interval_minutes`, `tags` (JSON array), per-topic `confidence_threshold` / `relevance_threshold` (m011, nullable overrides), `init_attempts` (m013), `novelty_instruction` (m022, nullable, ≤500 chars, injected into the novelty prompt), `importance_threshold` (m023, nullable 1-5; NULL = notify on any importance), `heartbeat_alerted_at` (m024, nullable Silence Heartbeat latch — stamped when a "sources failing" alert is sent, cleared on recovery), `generation` (m026, opaque per-incarnation id; fences a stale in-flight writer from a delete+recreate that recycled the rowid). |
+| `articles` | Fetched articles linked to a topic. Deduped by `content_hash` (unique per topic) — a digest of canonical URL, title and the source's revision marker, not just URL+title, so a same-URL correction or update is treated as new instead of silently skipped (AUG-320). `source_provider` records the news provider (m009), `published_at` the feed entry's date (m018), `analysis_attempts` (m026, caps retries on a persistently-failing article at `MAX_ANALYSIS_ATTEMPTS`). `processed` flag tracks analysis completion. |
+| `knowledge_states` | One per topic. Rolling LLM-generated summary. `token_count` tracks budget usage. `version` (m026) is a CAS counter: a write is rejected if the row moved since it was read, so two overlapping checks can never interleave a lost update. |
+| `knowledge_revisions` | History of knowledge-state writes (m025), one row per init/update: `summary_text` (full copy), `token_count`, `source` (init/update), `change_note`, `created_at`, `model` / `basis_hash` (m029, nullable provenance — the LLM that wrote the summary and a fingerprint of the topic scope it was derived from, so the diff timeline can tell a real edit from a token-count unit change or a since-edited scope). Append-only, pruned oldest-first per topic to `knowledge_revision_limit` on each write and once at startup for quiet topics. |
+| `check_results` | Audit log of every check cycle. Stores articles found/new, `has_new_info`, full LLM response JSON, `prompt_tokens` / `completion_tokens` (m012), `stage_error` recording which pipeline stage failed (m015), and `notify_disposition` (m026: `sent` / `pending` / `pending_knowledge_stale` / `suppressed_importance` / `below_confidence` / `below_relevance` / `no_new_info` / `analysis_failed` — why this check did or did not notify, distinct from a delivery failure). |
+| `pending_notifications` | Durable per-target notification delivery intents (m026 lifecycle columns): `pending` → `sending` (claimed) → `sent` / `abandoned` / `revoked`. Created inside the check's durable transaction, before any send. Retried with backoff (`next_attempt_at`) up to `max_retries`, then `abandoned` and kept — sent/abandoned rows are the delivery ledger the dashboard reads, pruned by age on the daily maintenance tick. |
+| `pending_webhooks` | The webhook half of the same thing (m010, plus m026's intent-lifecycle columns): `url`, `payload`, `retry_count`/`max_retries`, the same claim/retry/abandon lifecycle. |
 | `feed_health` | Per-feed-URL health. Consecutive failures, total fetches/failures, last success/error timestamps, and `etag` / `last_modified` for HTTP conditional requests (m019). |
 | `schema_version` | Migration tracking. Single `version` column. |
 
@@ -180,33 +195,38 @@ The route handlers live in the `web/routers/` package. The HTMX/HTML routes are 
   ┌──────────────┐               ┌──────────────┐    success    ┌─────────┐
   │     NEW      │──────────────>│ RESEARCHING  │──────────────>│  READY  │
   │ (OPML queue) │  one per tick │ (init phase) │               │ (active)│
-  └──────────────┘               └──────┬───────┘               └────┬────┘
-                                        │ failure                    │ LLM/knowledge error
-                                        v                            v
-                                 ┌──────────────┐             ┌──────────────┐
-                                 │    ERROR     │             │    ERROR     │
-                                 │ (user retry) │             │ (user retry) │
-                                 └──────────────┘             └──────────────┘
+  └──────────────┘               └──────┬───────┘               └─────────┘
+                                        │ init failure
+                                        v
+                                 ┌──────────────┐
+                                 │    ERROR     │
+                                 │ (user retry) │
+                                 └──────────────┘
 ```
 
-Topics created through the UI start in **RESEARCHING**: articles are fetched and an initial knowledge state is built via the LLM. OPML imports instead create topics in **NEW**; the every-minute scheduler tick promotes one NEW topic at a time through initialization (gradual processing to avoid hammering the LLM API). On success, the topic moves to **READY** and enters the normal check cycle. On failure, it moves to **ERROR** with a user-visible message. Users can retry from the dashboard.
+Topics created through the UI start in **RESEARCHING**: articles are fetched and an initial knowledge state is built via the LLM. OPML imports instead create topics in **NEW**; the every-minute scheduler tick promotes one NEW topic at a time through initialization (gradual processing to avoid hammering the LLM API). On success, the topic moves to **READY** and enters the normal check cycle. On failure — including an interrupted (Ctrl-C/cancelled) run — it moves to **ERROR** with a user-visible message. Users can retry from the dashboard.
+
+**READY is a stable state.** A routine check's LLM or knowledge-update failure is recorded as that check's `stage_error` and does not move the topic out of READY — it keeps checking on schedule, and the next successful check clears the streak. Only two things move a topic to ERROR: initialization failure (above), and stuck-topic recovery for a RESEARCHING topic that outlives its timeout (see Error Handling below) — neither is a routine check outcome.
 
 ## Request Lifecycle
 
 ### Scheduled Check Cycle
 
 1. APScheduler calls `_scheduled_check()` every 1 minute (with jitter), which runs `_run_check_cycle()` then initializes one NEW topic.
-2. `retry_pending_notifications()` and `retry_pending_webhooks()` retry any failed deliveries from prior cycles (each manages its own short-lived connections).
-3. `get_topics_due_for_check()` finds active READY topics whose last check exceeds their interval. Each topic check uses a fresh, short-lived connection so none is held across the HTTP/LLM awaits.
-4. For each due topic, `check_topic()` runs with a unique correlation ID:
-   - **Fetch** - `fetch_new_articles_for_topic()`: fetch feeds, dedup against DB, extract content.
-   - **Analyze** - `analyze_articles()`: LLM compares articles against knowledge state.
-   - **Update** - If `has_new_info` and confidence/relevance clear their thresholds: update knowledge state via LLM.
-   - **Notify** - Send notification via Apprise + webhooks. Queue for retry on failure. A finding below the topic's `importance_threshold` skips the send only — the knowledge state has already absorbed it, so the same minor fact never re-flags as new.
-   - **Record** - Mark articles processed, create `CheckResult`.
+2. `_run_check_cycle()` snapshots the due topics on one short connection, then runs the notification/webhook retry drain and every due topic's check *concurrently* in one `asyncio.gather()` — the drain no longer runs ahead of due-topic work, so a retry backlog cannot delay a whole tick. `retry_pending_notifications()` / `retry_pending_webhooks()` each manage their own short-lived connections and commit per item.
+3. `get_topics_due_for_check()` finds active READY topics whose last check exceeds their interval.
+4. For each due topic, `check_topic()` runs with a unique correlation ID, in phases that never hold a database connection across a network or LLM call:
+   - **P0 — snapshot.** Re-read the topic and its knowledge state on a short connection; a paused or deleted topic is caught here.
+   - **P1 — fetch.** `fetch_new_articles_for_topic()`: fetch feeds/Exa results, dedup against the DB, extract content. Connection-free.
+   - **P2 — analyze.** `analyze_articles()`: the LLM compares the batch (this cycle's fetch plus any article an earlier cycle stored but never finished analyzing) against the snapshotted knowledge state. Connection-free; never raises.
+   - **P3 — knowledge plan.** If `has_new_info` and confidence/relevance clear their thresholds, generate the knowledge update. Still connection-free — nothing durable exists yet.
+   - **C3 — the durable transaction.** One `BEGIN IMMEDIATE` commit applies the knowledge write, its revision, article disposition and the `CheckResult` together, fenced by the topic's generation and the knowledge version snapshotted at P0. Per-target notification and webhook delivery *intents* are created in this same commit, before any send is attempted — record always precedes notify, and a crash between "decided to notify" and "message sent" cannot lose the alert.
+   - **P4 — send.** Only after C3 commits: each intent is claimed, sent, and its outcome applied. A finding below the topic's `importance_threshold` never reaches this step — the knowledge state already absorbed it in C3, so the same minor fact never re-flags as new.
+   - **C4 — delivery outcome.** The `CheckResult` C3 committed is updated with the aggregate send outcome.
+   - **P5 — Silence Heartbeat.** Runs last, over the row C3 just committed (see below).
 5. Each topic is independent. Errors in one do not affect others.
 
-**Silence Heartbeat.** Each recorded check is classified by its `stage_error`:
+**Silence Heartbeat (P5).** Each recorded check is classified by its `stage_error`:
 `sources_failed`, `scrape_failed` and `sources_unavailable` all mean no source
 produced usable results. `app/heartbeat.py` counts the leading run of those for a
 topic; once it reaches `silence_heartbeat_checks`, the checker claims the
@@ -214,12 +234,13 @@ topic; once it reaches `silence_heartbeat_checks`, the checker claims the
 alert. The latch is what makes it one alert per outage rather than one per check,
 and the conditional UPDATE keeps it exactly-once even when a CLI `check-all` runs
 alongside the server. The first check that sees a working source again clears the
-latch and sends a recovery notice. Both messages go out over the normal Apprise
-channels and share the `pending_notifications` retry queue; webhooks are not
-fired for heartbeat events. Setting `silence_heartbeat_checks` to 0 clears any
-outstanding latch on the next check, silently. The dashboard/detail badge is
-derived from the newest check's `stage_error`, never from the latch, so it always
-reflects the last check's real outcome.
+latch and sends a recovery notice, only to the targets that actually received
+the outage alert. Both messages go through the same per-target delivery-intent
+path as a novelty notification and share the `pending_notifications` ledger;
+webhooks are not fired for heartbeat events. Setting `silence_heartbeat_checks`
+to 0 clears any outstanding latch on the next check, silently. The
+dashboard/detail badge is derived from the newest check's `stage_error`, never
+from the latch, so it always reflects the last check's real outcome.
 
 ### Manual Check (Web UI)
 
@@ -231,9 +252,9 @@ reflects the last check's real outcome.
 ### Topic Creation
 
 1. User submits topic form (name, description, feed URLs or auto mode).
-2. Topic created in DB with `status=RESEARCHING`.
-3. Background task: fetch articles → `initialize_knowledge()` via LLM → set `status=READY`.
-4. On LLM failure: `status=ERROR` with error message. User can retry.
+2. Topic created in DB with `status=RESEARCHING` — an already-won claim, so `initialize_new_topic()` runs with `claimed=True`.
+3. Background task: fetch articles (connection-free) → `prepare_initial_knowledge()` builds the LLM baseline (connection-free) → one durable transaction commits the knowledge state, its revision, article disposition and `status=READY` together.
+4. On LLM/knowledge failure, or an interrupted (Ctrl-C/cancelled) run: `status=ERROR` with an error message. User can retry.
 
 ## Configuration
 
@@ -267,8 +288,9 @@ live, and both resolve through it so they cannot diverge. Highest priority first
 
 **Runtime access:**
 - Web routes: `request.app.state.settings`
-- CLI / scheduler: `load_settings()`
-- Settings page: writes back to YAML via `save_settings_to_yaml()`
+- Scheduler ticks: also `app.state.settings`, resolved live at the start of each tick (`_resolve_settings()`), so a Settings-page save takes effect on the next tick with no restart. Falls back to the settings bound at `start_scheduler()` only when no app is wired (unit tests calling the scheduler directly). Trigger-shaped fields (`scheduler_jitter_seconds`, `scheduler_misfire_grace_time`) are the exception — APScheduler reads those once at job-add time, so changing them needs a restart.
+- CLI: `load_settings()` — each invocation is a fresh process that reads env/YAML from disk
+- Settings page: `POST /settings` saves YAML via `save_settings_to_yaml()` and replaces `app.state.settings` with the resolved object in the same request. Editing `data/config.yml` or the environment directly, outside that route, needs a restart to take effect.
 
 **Writing YAML.** `save_settings_to_yaml()` patches the model's own dump onto the existing
 document rather than rebuilding a hand-maintained key list: keys this version does not know
@@ -342,7 +364,7 @@ A read-only JSON API lives under `/api/v1`, plus one endpoint to trigger a check
 | `GET` | `/api/v1/topics/{id}/knowledge` | Current knowledge state |
 | `POST` | `/api/v1/topics/{id}/check` | Trigger a check. Runs synchronously; requires `X-CSRF-Token`. Returns `409` unless the topic status is `ready` |
 
-The check endpoint returns `{"status": "checked", "has_new_info": <bool>, "check_result_id": <int>}`.
+The check endpoint returns the recorded outcome: `status`, `check_result_id`, `has_new_info`, `articles_found`, `articles_new`, `stage_error`, `notification_sent`, `notification_error`, `notify_disposition` (AUG-203) — the pipeline is fail-safe, so an unreachable source or a failed delivery still returns `200` with `has_new_info=false`, and these fields are what let a caller tell that apart from a clean quiet run.
 
 ### Data Export & OPML
 
@@ -398,11 +420,11 @@ below-threshold findings still update the knowledge state, they just do not send
 
 **Fail safe on notifications.** LLM analysis failure returns `has_new_info=False`. Users miss an update rather than receive a false alert.
 
-**Fail loud on knowledge.** Knowledge init/update raises on LLM failure. The topic transitions to ERROR with a user-visible message so the problem is surfaced.
+**Fail loud on knowledge — but only during initialization.** `initialize_new_topic()` raises on LLM/knowledge failure and the topic transitions to ERROR with a user-visible message. A routine check's knowledge update also raises internally, but `check_topic()` catches it, keeps the topic READY, and records the failure as that check's `stage_error` — a knowledge-update failure alone never disables a working topic.
 
 **Independent topic checks.** One topic's failure doesn't affect other topics in the same check cycle.
 
-**Notification retry queue.** Failed deliveries are stored in `pending_notifications`. Retried at the start of each check cycle, up to `max_retries` (default 3), then discarded.
+**Durable notification/webhook delivery intents.** Every intended send becomes a durable per-target row inside the check's C3 transaction, before any network call — a crash between deciding to notify and the message leaving cannot lose it. The retry drain claims due rows (backed off via `next_attempt_at`) alongside each check cycle's due topics, up to `max_retries` (default 3) attempts, after which a row is marked `abandoned` and kept as the delivery ledger rather than deleted.
 
 **Feed resilience.** Timeouts and 5xx errors get configurable retries. Feed health is tracked per-URL. Empty feeds are not errors.
 
@@ -412,7 +434,9 @@ below-threshold findings still update the knowledge state, they just do not send
 
 **No authentication.** Intentional for a single-user self-hosted tool. Remote deployments must use a reverse proxy with external auth (Authelia, Caddy, Nginx).
 
-**CSRF.** Double-submit cookie on all POST/PUT/DELETE endpoints. HTMX sends the token via `X-CSRF-Token` header. Regular forms use a hidden field. Timing-safe HMAC comparison.
+**CSRF.** Signed double-submit cookie on all POST/PUT/DELETE endpoints, plus a `Sec-Fetch-Site` check that refuses cross-site submissions outright. HTMX sends the token via `X-CSRF-Token` header. Regular forms use a hidden field. Timing-safe HMAC comparison.
+
+**Host allowlist.** `HostAllowlistMiddleware` rejects any request whose `Host` header is not `localhost`/`*.localhost`/`*.local`, an IP literal, or listed in `TOPIC_WATCH_ALLOWED_HOSTS` — closes the DNS-rebinding path where a hostile site re-points its own domain at this machine to drive the console same-origin.
 
 **SSRF protection.** `url_validation.py` blocks requests to private/reserved IP ranges (127.x, 10.x, 172.16-31.x, 192.168.x, 169.254.x, CGNAT 100.64.0.0/10, localhost, IPv6 ULA/link-local).
 
