@@ -1720,24 +1720,6 @@ class TestRetryPendingNotifications:
         # ...and the drain honours it: this row is no longer due.
         assert list_due_notification_intents(db_conn, to_db_utc(datetime.now(UTC)), 10) == []
 
-    async def test_unexpected_send_error_leaves_the_intent_claimed(self, db_conn: sqlite3.Connection) -> None:
-        """An exception mid-send is an unknown outcome, not a failed one."""
-        topic = _make_topic(db_conn)
-        create_pending_notification(
-            db_conn,
-            PendingNotification(topic_id=topic.id, title="T", body="B", url="json://localhost"),
-        )
-        db_conn.commit()
-
-        settings = _make_settings()
-
-        with patch("app.checker.send_single_notification", side_effect=RuntimeError("SMTP error")):
-            await retry_pending_notifications(db_conn, settings)
-
-        row = db_conn.execute("SELECT status, retry_count FROM pending_notifications").fetchone()
-        assert row["status"] == "sending"
-        assert row["retry_count"] == 0
-
     async def test_expired_notifications_are_abandoned(self, db_conn: sqlite3.Connection) -> None:
         """Out-of-attempts intents become 'abandoned', keeping the record."""
         topic = _make_topic(db_conn)
@@ -1838,15 +1820,14 @@ class TestRetryPendingNotifications:
 
         pending = list_pending_notifications(db_conn)
         assert len(pending) == 2
-        first_id = pending[0].id
+        first_id, second_id = pending[0].id, pending[1].id
 
         from app.crud import apply_notification_outcome as real_apply
 
-        call_count = {"n": 0}
-
+        # Every apply for the second row crashes — the recovery apply included, as
+        # a genuinely unwritable database would.
         def crashing_apply(conn, intent_id, claim_token, **kwargs):  # noqa: ANN001
-            call_count["n"] += 1
-            if call_count["n"] == 2:
+            if intent_id == second_id:
                 raise RuntimeError("simulated crash applying item 2")
             return real_apply(conn, intent_id, claim_token, **kwargs)
 
@@ -1999,6 +1980,85 @@ class TestDeliveryIntentDurability:
         db_conn.commit()
         assert released == 1
         assert len(list_pending_notifications(db_conn)) == 1
+
+    async def test_an_escaping_send_error_still_records_a_retryable_failure(self, db_conn: sqlite3.Connection) -> None:
+        """An exception must land an outcome, or the row is stuck 'sending' for good.
+
+        Nothing else can free it: retry_count never moves so it is never
+        abandoned, retention prunes only terminal rows, and the UI queue hides
+        'sending'. Every later drain re-sends it.
+        """
+        topic = _make_topic(db_conn)
+        create_pending_notification(
+            db_conn, PendingNotification(topic_id=topic.id, title="T", body="B", url="json://x", max_retries=3)
+        )
+        db_conn.commit()
+        settings = _make_settings()
+
+        async def boom(title, body, url, timeout_s):  # noqa: ANN001
+            raise ValueError("Invalid IPv6 URL")
+
+        with patch("app.checker.send_single_notification", side_effect=boom):
+            await retry_pending_notifications(db_conn, settings)
+
+            row = db_conn.execute("SELECT * FROM pending_notifications").fetchone()
+            assert row["status"] == "pending"
+            assert row["retry_count"] == 1
+            assert row["last_error"] == "ValueError"
+            assert row["next_attempt_at"] is not None
+
+            # The budget is spent like any other failure, so the row leaves the queue.
+            for _ in range(2):
+                db_conn.execute("UPDATE pending_notifications SET next_attempt_at = NULL")
+                db_conn.commit()
+                await retry_pending_notifications(db_conn, settings)
+
+        row = db_conn.execute("SELECT status, retry_count FROM pending_notifications").fetchone()
+        assert row["status"] == "abandoned"
+        assert row["retry_count"] == 3
+
+    async def test_a_failed_apply_after_a_delivered_send_is_not_re_sent(self, db_conn: sqlite3.Connection) -> None:
+        """Exactly-once holds when the apply write fails, not just when the send does.
+
+        A locked database (the daily VACUUM outliving busy_timeout) after a send
+        that did deliver must not re-arm the row: the user would get the alert
+        twice. The claim fence makes re-applying the delivered outcome a no-op if
+        the first apply landed after all.
+        """
+        topic = _make_topic(db_conn)
+        create_pending_notification(
+            db_conn, PendingNotification(topic_id=topic.id, title="T", body="B", url="json://x")
+        )
+        db_conn.commit()
+        settings = _make_settings()
+
+        sends: list[str] = []
+
+        async def record(title, body, url, timeout_s):  # noqa: ANN001
+            sends.append(url)
+            return NotificationDelivery(url=url, ok=True)
+
+        applies = {"n": 0}
+
+        def flaky_apply(*args, **kwargs):  # noqa: ANN002, ANN003
+            applies["n"] += 1
+            if applies["n"] == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return apply_notification_outcome(*args, **kwargs)
+
+        with (
+            patch("app.checker.send_single_notification", side_effect=record),
+            patch("app.checker.apply_notification_outcome", side_effect=flaky_apply),
+        ):
+            await retry_pending_notifications(db_conn, settings)
+            # The stale-claim window elapses; a re-armed row would send again.
+            release_stale_notification_claims(db_conn, to_db_utc(datetime.now(UTC) + timedelta(hours=1)))
+            db_conn.commit()
+            await retry_pending_notifications(db_conn, settings)
+
+        assert sends == ["json://x"]
+        row = db_conn.execute("SELECT status FROM pending_notifications").fetchone()
+        assert row["status"] == "sent"
 
     async def test_rollup_is_true_only_when_every_intent_sent(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         topic = _make_topic(db_conn, name="Rollup")

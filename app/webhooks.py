@@ -259,35 +259,63 @@ async def _deliver_one_intent(
         logger.debug("Webhook intent id=%d not claimable (claimed, exhausted or not due); skipping", intent_id)
         return False
 
-    outcome = await send_webhook(intent.url, intent.payload)
+    outcome: WebhookOutcome | None = None
+    try:
+        outcome = await send_webhook(intent.url, intent.payload)
 
-    due = (
-        None
-        if outcome.ok or not outcome.retryable
-        else next_attempt_at(intent.retry_count, hint_s=outcome.retry_after_s)
-    )
-    with short_conn(conn, db_path) as apply_conn:
-        applied = apply_webhook_outcome(
-            apply_conn,
-            intent_id,
-            claim_token,
-            sent=outcome.ok,
-            error=outcome.error,
-            next_attempt_at=due,
-            terminal=not outcome.retryable,
+        due = (
+            None
+            if outcome.ok or not outcome.retryable
+            else next_attempt_at(intent.retry_count, hint_s=outcome.retry_after_s)
         )
-        apply_conn.commit()
-    if not applied:
-        logger.warning("Late apply for webhook intent id=%d ignored: the claim is no longer ours", intent_id)
-    elif not outcome.ok and not outcome.retryable:
-        logger.warning(
-            "Abandoning webhook intent id=%d without retry (topic_id=%s url=%s reason=%s)",
-            intent_id,
-            intent.topic_id,
-            redact_url(intent.url),
-            outcome.error,
-        )
-    return outcome.ok
+        with short_conn(conn, db_path) as apply_conn:
+            applied = apply_webhook_outcome(
+                apply_conn,
+                intent_id,
+                claim_token,
+                sent=outcome.ok,
+                error=outcome.error,
+                next_attempt_at=due,
+                terminal=not outcome.retryable,
+            )
+            apply_conn.commit()
+        if not applied:
+            logger.warning("Late apply for webhook intent id=%d ignored: the claim is no longer ours", intent_id)
+        elif not outcome.ok and not outcome.retryable:
+            logger.warning(
+                "Abandoning webhook intent id=%d without retry (topic_id=%s url=%s reason=%s)",
+                intent_id,
+                intent.topic_id,
+                redact_url(intent.url),
+                outcome.error,
+            )
+        return outcome.ok
+    except Exception as exc:
+        # An escaping exception must still land an outcome. Without this the row
+        # stays 'sending' for good: retry_count never moves so it is never
+        # abandoned, retention prunes only terminal rows, the queue view hides it,
+        # and every later drain POSTs it again. ``sent`` carries whatever the POST
+        # already told us, so a payload the endpoint accepted before the apply hit
+        # a locked database is recorded as delivered instead of being sent twice;
+        # the claim fence makes it a no-op if that first apply landed after all.
+        logger.warning("Webhook intent id=%d raised during delivery", intent_id, exc_info=True)
+        sent = outcome is not None and outcome.ok
+        try:
+            with short_conn(conn, db_path) as apply_conn:
+                apply_webhook_outcome(
+                    apply_conn,
+                    intent_id,
+                    claim_token,
+                    sent=sent,
+                    error=type(exc).__name__,
+                    next_attempt_at=None if sent else next_attempt_at(intent.retry_count),
+                )
+                apply_conn.commit()
+        except Exception:
+            # The database is what failed; leave the claim to the stale release
+            # rather than raising into the gather, which records nothing at all.
+            logger.warning("Could not record the outcome for webhook intent id=%d", intent_id, exc_info=True)
+        return sent
 
 
 async def deliver_webhook_intents(
