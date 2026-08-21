@@ -267,7 +267,20 @@ def recover_stuck_researching(conn: sqlite3.Connection, timeout_minutes: int = 1
 # ``llm_response`` blob (several KB) per topic and re-parsing it in Python
 # (OVH-052). The blob is selected only on detail/export paths that need the
 # payload. ``json_extract`` over a fixed column path is parameter-free SQL.
-_DASHBOARD_SELECT = """
+_LATEST_CHECK_ORDER = "ORDER BY checked_at DESC, id DESC"
+"""One definition of "the latest check", shared by every query that needs it.
+
+``checked_at`` is allocated before the pipeline's awaits, so a slower earlier
+check can commit after a faster later one and two checks can carry the same
+timestamp. Ordering on the timestamp alone left each consumer free to pick a
+different row of a tie — the heartbeat could refuse a transition the dashboard
+had already rendered as current, and an acknowledgement could land on a row the
+user never saw (AUG-279). ``id`` is the durable causal order (append-only
+rowid), so it is the tie-break everywhere. No new columns: the wave-A ordering
+policy declines ``started_at``/``completed_at``.
+"""
+
+_DASHBOARD_SELECT = f"""
     SELECT t.*,
            cr.id AS cr_id,
            cr.checked_at AS cr_checked_at,
@@ -279,12 +292,13 @@ _DASHBOARD_SELECT = """
            cr.notification_error AS cr_notification_error,
            cr.stage_error AS cr_stage_error,
            cr.seen_at AS cr_seen_at,
+           cr.notify_disposition AS cr_notify_disposition,
            (SELECT COUNT(*) FROM articles WHERE articles.topic_id = t.id) AS article_count
     FROM topics t
     LEFT JOIN check_results cr ON cr.id = (
         SELECT id FROM check_results
         WHERE topic_id = t.id
-        ORDER BY checked_at DESC LIMIT 1
+        {_LATEST_CHECK_ORDER} LIMIT 1
     )
 """
 
@@ -386,35 +400,81 @@ def delete_topic(conn: sqlite3.Connection, topic_id: int) -> bool:
     return deleted
 
 
+# How far ahead of now a stored check timestamp may sit before it is treated as
+# impossible rather than merely recent. Covers ordinary skew between the writer's
+# clock and this reading; anything beyond it is a clock jump or a restored row.
+FUTURE_ANCHOR_SKEW_MINUTES = 5
+
+# The scheduling anchor is the newest check that is not stamped in the future.
+#
+# Anchoring on the plain newest row let one impossible timestamp park a topic:
+# a check recorded during a forward clock jump stayed the maximum after the
+# clock was corrected, so nothing was due until that future time plus the
+# interval — hours or days of silent non-monitoring, and a current row could not
+# heal it because it never became the anchor (AUG-278). Skipping future-stamped
+# rows makes the very next check the anchor, which is what heals the schedule,
+# and it cannot run away: the topic returns to its ordinary cadence immediately
+# instead of being due on every tick.
+#
+# Both correlated lookups are bare-column comparisons against
+# ``idx_check_results_topic_time (topic_id, checked_at DESC)``, so each is one
+# index seek per candidate topic. The previous form grouped MAX(checked_at) over
+# every row in the table on every minute tick, making admission cost grow with
+# lifetime check history rather than topic count (AUG-029). Wrapping the column
+# in ``datetime()`` here would force a scan; the comparison is exact instead
+# because every writer spells the value through ``to_db_utc`` (AUG-280).
+#
+# ``id DESC`` is deliberately absent from these ORDER BYs, unlike the display
+# queries that share the canonical head order: rows tied on ``checked_at`` name
+# the same instant, so the tie-break cannot change the due time and would only
+# cost a sort on the hottest query in the app.
+_DUE_TOPICS_SQL = """
+    SELECT t.*,
+           (SELECT checked_at FROM check_results
+             WHERE topic_id = t.id AND checked_at > :horizon
+             ORDER BY checked_at DESC LIMIT 1) AS future_anchor
+    FROM topics t
+    WHERE t.is_active = 1
+      AND t.status = 'ready'
+      AND COALESCE(
+          (SELECT datetime(checked_at,
+                      '+' || COALESCE(NULLIF(t.check_interval_minutes, 0), :default_interval) || ' minutes')
+             FROM check_results
+            WHERE topic_id = t.id AND checked_at <= :horizon
+            ORDER BY checked_at DESC LIMIT 1),
+          datetime('now')
+      ) <= datetime('now')
+    ORDER BY t.name
+"""
+
+
 def get_topics_due_for_check(conn: sqlite3.Connection, default_interval_minutes: int) -> list[Topic]:
     """Get active READY topics whose check interval has elapsed.
 
     Uses topic.check_interval_minutes if set, otherwise falls back to
-    default_interval_minutes. Topics with no check results are always due.
-    NULLIF guards against a stored 0 falling through COALESCE as non-NULL.
+    default_interval_minutes. Topics with no check results are always due, and so
+    are topics whose only checks are stamped in the future (see
+    :data:`_DUE_TOPICS_SQL`). NULLIF guards against a stored 0 falling through
+    COALESCE as non-NULL.
     """
+    horizon = to_db_utc(datetime.now(UTC) + timedelta(minutes=FUTURE_ANCHOR_SKEW_MINUTES))
     rows = conn.execute(
-        """
-        SELECT t.*
-        FROM topics t
-        LEFT JOIN (
-            SELECT topic_id, MAX(checked_at) AS last_checked_at
-            FROM check_results
-            GROUP BY topic_id
-        ) cr ON cr.topic_id = t.id
-        WHERE t.is_active = 1
-          AND t.status = 'ready'
-          AND (
-              cr.last_checked_at IS NULL
-              OR datetime(cr.last_checked_at,
-                  '+' || COALESCE(NULLIF(t.check_interval_minutes, 0), ?) || ' minutes'
-              ) <= datetime('now')
-          )
-        ORDER BY t.name
-        """,
-        (default_interval_minutes,),
+        _DUE_TOPICS_SQL,
+        {"horizon": horizon, "default_interval": default_interval_minutes},
     ).fetchall()
-    return [Topic.from_row(row) for row in rows]
+    topics = []
+    for row in rows:
+        if row["future_anchor"] is not None:
+            # Loud because it is not self-correcting data: the row keeps its
+            # impossible timestamp, and everything reading "last checked" keeps
+            # reporting it, until the operator repairs the clock or the row.
+            logger.warning(
+                "Topic '%s' has a check timestamped in the future (%s); scheduling from the newest sane check",
+                row["name"],
+                row["future_anchor"],
+            )
+        topics.append(Topic.from_row(row))
+    return topics
 
 
 # --- Article CRUD ---
@@ -625,7 +685,7 @@ def record_article_analysis_failure(
 
 # Bare-column compare so SQLite can use idx_articles_fetched_at (m014). Wrapping
 # fetched_at in datetime() would force a full table SCAN (OVH-022/050). The bound
-# is a precomputed tz-aware isoformat() string, matching how fetched_at is stored
+# is a canonical ``to_db_utc`` string, matching how fetched_at is stored
 # (Article.to_insert_dict), so the lexicographic comparison is exact.
 _DELETE_OLD_ARTICLES_SQL = "DELETE FROM articles WHERE fetched_at < ?"
 
@@ -633,7 +693,7 @@ _DELETE_OLD_ARTICLES_SQL = "DELETE FROM articles WHERE fetched_at < ?"
 def delete_old_articles(conn: sqlite3.Connection, retention_days: int) -> int:
     """Delete articles older than retention_days. Returns count of deleted rows."""
     cutoff = datetime.now(UTC) - timedelta(days=retention_days)
-    cursor = conn.execute(_DELETE_OLD_ARTICLES_SQL, (cutoff.isoformat(),))
+    cursor = conn.execute(_DELETE_OLD_ARTICLES_SQL, (to_db_utc(cutoff),))
     return cursor.rowcount
 
 
@@ -912,17 +972,17 @@ def mark_latest_check_seen(conn: sqlite3.Connection, topic_id: int) -> None:
     commits.
     """
     conn.execute(
-        """
+        f"""
         UPDATE check_results SET seen_at = ?
         WHERE id = (
             SELECT id FROM check_results
             WHERE topic_id = ?
-            ORDER BY checked_at DESC LIMIT 1
+            {_LATEST_CHECK_ORDER} LIMIT 1
         )
           AND has_new_info = 1
           AND seen_at IS NULL
-        """,
-        (datetime.now(UTC).isoformat(), topic_id),
+        """,  # noqa: S608 - the interpolated fragment is a fixed ORDER BY constant
+        (to_db_utc(datetime.now(UTC)), topic_id),
     )
 
 
@@ -940,7 +1000,7 @@ def mark_check_seen(conn: sqlite3.Connection, topic_id: int, check_id: int) -> N
     keep re-acks a no-op. The caller commits.
     """
     conn.execute(
-        """
+        f"""
         UPDATE check_results SET seen_at = ?
         WHERE id = ?
           AND topic_id = ?
@@ -949,10 +1009,10 @@ def mark_check_seen(conn: sqlite3.Connection, topic_id: int, check_id: int) -> N
           AND id = (
               SELECT id FROM check_results
               WHERE topic_id = ?
-              ORDER BY checked_at DESC LIMIT 1
+              {_LATEST_CHECK_ORDER} LIMIT 1
           )
-        """,
-        (datetime.now(UTC).isoformat(), check_id, topic_id, topic_id),
+        """,  # noqa: S608 - the interpolated fragment is a fixed ORDER BY constant
+        (to_db_utc(datetime.now(UTC)), check_id, topic_id, topic_id),
     )
 
 
@@ -978,12 +1038,12 @@ def list_check_results(
     """
     if cutoff_id is not None:
         rows = conn.execute(
-            "SELECT * FROM check_results WHERE topic_id = ? AND id <= ? ORDER BY checked_at DESC LIMIT ? OFFSET ?",
+            f"SELECT * FROM check_results WHERE topic_id = ? AND id <= ? {_LATEST_CHECK_ORDER} LIMIT ? OFFSET ?",  # noqa: S608 - fixed ORDER BY constant
             (topic_id, cutoff_id, limit, offset),
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT * FROM check_results WHERE topic_id = ? ORDER BY checked_at DESC LIMIT ? OFFSET ?",
+            f"SELECT * FROM check_results WHERE topic_id = ? {_LATEST_CHECK_ORDER} LIMIT ? OFFSET ?",  # noqa: S608 - fixed ORDER BY constant
             (topic_id, limit, offset),
         ).fetchall()
     return [CheckResult.from_row(row) for row in rows]
@@ -1026,10 +1086,10 @@ def list_recent_check_stage_errors(
     is fenced to the exact check its decision was computed from (AUG-131).
     """
     rows = conn.execute(
-        """SELECT id, stage_error FROM check_results
+        f"""SELECT id, stage_error FROM check_results
            WHERE topic_id = ?
-           ORDER BY checked_at DESC, id DESC
-           LIMIT ?""",
+           {_LATEST_CHECK_ORDER}
+           LIMIT ?""",  # noqa: S608 - fixed ORDER BY constant
         (topic_id, limit),
     ).fetchall()
     return [(int(row["id"]), row["stage_error"]) for row in rows]
@@ -1497,7 +1557,7 @@ def upsert_feed_health_success(
     obsolete one to be sent forever (AUG-152). A 304 says only "unchanged", so it
     preserves what is stored and merely refreshes a validator it does supply.
     """
-    now = datetime.now(UTC).isoformat()
+    now = to_db_utc(datetime.now(UTC))
     if replace_validators:
         validator_update = "etag = ?, last_modified = ?"
     else:
@@ -1517,7 +1577,7 @@ def upsert_feed_health_success(
 
 def upsert_feed_health_failure(conn: sqlite3.Connection, feed_url: str, error_msg: str) -> None:
     """Record a failed feed fetch."""
-    now = datetime.now(UTC).isoformat()
+    now = to_db_utc(datetime.now(UTC))
     conn.execute(
         """INSERT INTO feed_health (feed_url, last_error_at, last_error_message,
                consecutive_failures, total_fetches, total_failures)
@@ -1541,7 +1601,7 @@ def upsert_feed_health_aborted(conn: sqlite3.Connection, feed_url: str, error_ms
     and its reason are still recorded, because the Feed Health page has to be able
     to explain why a feed shows no recent success.
     """
-    now = datetime.now(UTC).isoformat()
+    now = to_db_utc(datetime.now(UTC))
     conn.execute(
         """INSERT INTO feed_health (feed_url, last_error_at, last_error_message,
                consecutive_failures, total_fetches, total_failures)
@@ -1633,7 +1693,7 @@ def claim_new_topic_for_init(conn: sqlite3.Connection, topic_id: int) -> bool:
 # treating it as one would refuse every later transition for that topic forever.
 _HEARTBEAT_GENERATION_FENCE = " AND generation = ?"
 _HEARTBEAT_HEAD_FENCE = (
-    " AND (SELECT id FROM check_results WHERE topic_id = topics.id ORDER BY checked_at DESC, id DESC LIMIT 1) = ?"
+    f" AND (SELECT id FROM check_results WHERE topic_id = topics.id {_LATEST_CHECK_ORDER} LIMIT 1) = ?"
 )
 
 

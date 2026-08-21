@@ -279,7 +279,13 @@ class SQLiteModel(BaseModel):
                 d[field] = int(d[field])
         for field in (*self._required_dt_fields, *self._optional_dt_fields):
             if d.get(field) is not None:
-                d[field] = d[field].isoformat()
+                # ``to_db_utc``, never bare ``isoformat()``: the latter emits
+                # whatever offset the value happens to carry, and SQLite compares
+                # these columns as TEXT — so a restored or programmatically
+                # supplied ``12:00+02:00`` sorted ABOVE an ``11:00+00:00``
+                # sibling that is genuinely later, picking the wrong latest check
+                # and shifting cadence and retention (AUG-280).
+                d[field] = to_db_utc(d[field])
         for field, value in list(d.items()):
             if isinstance(value, StrEnum):
                 d[field] = value.value
@@ -733,6 +739,9 @@ class CheckResult(SQLiteModel):
             # Paired with the ``cr.seen_at AS cr_seen_at`` alias in _DASHBOARD_SELECT;
             # one without the other 500s the dashboard.
             seen_at=_coerce_dt(row["cr_seen_at"], "seen_at"),
+            # Paired with ``cr.notify_disposition AS cr_notify_disposition``; the
+            # dashboard row gates its browser notification on it (AUG-129).
+            notify_disposition=row["cr_notify_disposition"],
         )
 
     @property
