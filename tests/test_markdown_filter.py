@@ -92,9 +92,42 @@ class TestMarkdownXssPolicy:
         assert 'href="javascript:' not in out
         assert "<a " not in out
 
-    def test_valid_http_link_renders(self) -> None:
+    def test_http_link_is_inert_text_not_an_anchor(self) -> None:
+        # AUG-016: the summary is model-derived and a malicious feed can steer it,
+        # so a link inside it must not become a clickable anchor on a page the user
+        # trusts. The old assertion here pinned exactly that anchor.
         out = _markdown("[ok](http://example.com)")
-        assert '<a href="http://example.com">ok</a>' in out
+        assert "<a " not in out
+        assert "href=" not in out
+        # The destination stays visible as text — hiding it is the phishing shape.
+        assert "ok" in out
+        assert "http://example.com" in out
+
+    def test_disguised_link_text_cannot_hide_the_destination(self) -> None:
+        out = _markdown("Verify at [your account portal](https://attacker.example/login).")
+        assert "<a " not in out
+        assert "attacker.example" in out
+
+    def test_autolink_is_inert_too(self) -> None:
+        out = _markdown("<https://attacker.example/x>")
+        assert "<a " not in out
+        assert "attacker.example" in out
+
+    def test_reference_link_is_inert_too(self) -> None:
+        out = _markdown("See [the docs][1].\n\n[1]: https://attacker.example/x")
+        assert "<a " not in out
+        assert "attacker.example" in out
+
+    def test_nested_links_do_not_leak_a_destination(self) -> None:
+        # Two links in one paragraph must each keep their own URL.
+        out = _markdown("[a](https://one.example) and [b](https://two.example)")
+        assert "<a " not in out
+        assert "one.example" in out
+        assert "two.example" in out
+
+    def test_inert_link_url_is_html_escaped(self) -> None:
+        out = _markdown('[x](https://e.example/"><script>alert(1)</script>)')
+        assert "<script>" not in out
 
     def test_data_uri_image_is_inert(self) -> None:
         out = _markdown("![a](data:text/html,<b>)")

@@ -10,6 +10,7 @@ import json as json_mod
 import re
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 from fastapi.templating import Jinja2Templates
@@ -31,10 +32,44 @@ templates.env.globals["version"] = __version__
 # any raw HTML in the (article-derived) source and rejects unsafe link schemes
 # (javascript:/data:), so no separate HTML sanitizer is needed. Images are
 # disabled and hard breaks are off — list structure is restored by
-# ``_normalize_markdown`` instead. Built once and shared; ``render()`` is
-# stateless per call, so it is safe across concurrent requests.
+# ``_normalize_markdown`` instead. Anchors are not produced at all: see the two
+# render rules below. Built once and shared; ``render()`` is stateless per call
+# (``env`` is a fresh dict per render), so it is safe across concurrent requests.
 _MD = MarkdownIt("commonmark", {"html": False, "linkify": False, "breaks": False})
 _MD.disable("image")
+
+
+def _render_inert_link_open(self: object, tokens: list[Any], idx: int, options: object, env: dict[str, Any]) -> str:
+    """Open a link as nothing at all, remembering where it pointed.
+
+    The knowledge summary is written by the model from article text an attacker
+    controls, so a link inside it is a link a feed can choose. Rendered as an
+    anchor it becomes a clickable destination on a page the user trusts — the
+    phishing half of AUG-016. Anchors are therefore not produced at all.
+    """
+    token = tokens[idx]
+    # An autolink already IS its URL on screen, so repeating it in parentheses
+    # would only render the same string twice.
+    href = "" if token.markup == "autolink" else (token.attrGet("href") or "")
+    env.setdefault("_inert_link_hrefs", []).append(href)
+    return ""
+
+
+def _render_inert_link_close(self: object, tokens: list[Any], idx: int, options: object, env: dict[str, Any]) -> str:
+    """Close it by showing the destination as inert text.
+
+    Dropping the URL entirely would leave friendly link text with its target
+    hidden, which is the shape the attack wants. Showing it beside the text is
+    what lets a reader see that "your account portal" points somewhere else.
+    """
+    hrefs: list[str] = env.get("_inert_link_hrefs") or []
+    href = hrefs.pop() if hrefs else ""
+    return f" ({escape(href)})" if href else ""
+
+
+_MD.add_render_rule("link_open", _render_inert_link_open)
+_MD.add_render_rule("link_close", _render_inert_link_close)
+
 _MD_LABEL_RE = re.compile(r"^\s*\*\*[^*]+\*\*")
 _MD_LIST_RE = re.compile(r"^\s*([-*+]|\d+\.)\s+")
 
@@ -143,8 +178,10 @@ def _markdown(text: str | None) -> Markup:
 
     ``_MD`` is configured ``html=False`` with images disabled, so raw HTML is
     escaped and unsafe link schemes are rejected at render time — the result is
-    safe to mark as ``Markup`` without a separate sanitizer. ``None``/empty
-    input yields an empty fragment.
+    safe to mark as ``Markup`` without a separate sanitizer. Links render as
+    inert text rather than anchors (AUG-016), because the summary is model-derived
+    from attacker-controllable article text. ``None``/empty input yields an empty
+    fragment.
     """
     if not text:
         return Markup("")
