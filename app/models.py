@@ -66,6 +66,17 @@ def normalize_tags(values: Iterable[str]) -> list[str]:
     return out
 
 
+def to_utc(dt: datetime) -> datetime:
+    """Return ``dt`` as an aware UTC datetime.
+
+    The one rule for what a stored timestamp means, shared by the write side
+    (``to_db_utc``) and the read side (``_coerce_dt``): a naive value is assumed
+    to already be UTC, matching how the DB stores them, and an offset-carrying
+    value names an instant that is re-expressed in UTC.
+    """
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+
+
 def to_db_utc(dt: datetime) -> str:
     """Serialize a datetime as canonical UTC TEXT with an explicit ``+00:00`` offset.
 
@@ -73,12 +84,9 @@ def to_db_utc(dt: datetime) -> str:
     a bare column so SQLite can use the index — see ``_DELETE_OLD_ARTICLES_SQL``).
     That is only correct when every writer spells the same instant identically, so
     a value carrying a local offset (``...+02:00``) would sort and compare wrong
-    against a ``+00:00`` sibling despite naming the same moment. Naive datetimes
-    are assumed to already be UTC, matching how the DB stores them.
+    against a ``+00:00`` sibling despite naming the same moment.
     """
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    return dt.astimezone(UTC).isoformat()
+    return to_utc(dt).isoformat()
 
 
 def new_generation() -> str:
@@ -94,41 +102,53 @@ def new_generation() -> str:
     return secrets.token_hex(8)
 
 
-def _coerce_dt(value: object) -> datetime | None:
-    """Parse a DB datetime cell defensively.
+class CorruptTimestampError(ValueError):
+    """A NOT NULL timestamp column holds something that is not a timestamp.
 
-    Mirrors ``FeedHealth.from_row``: empty/whitespace-only strings and
-    unparseable values become ``None`` rather than reaching Pydantic as a raw
-    string and raising ``ValidationError`` on legacy/migrated/corrupt rows.
-    Already-parsed ``datetime`` instances pass through untouched.
+    Raised by the row->model boundary instead of substituting a value (TW-AUD-013).
+    """
+
+
+def _coerce_dt(value: object) -> datetime | None:
+    """Parse a *nullable* DB datetime cell defensively, as aware UTC.
+
+    Empty/whitespace-only strings and unparseable values become ``None`` rather
+    than reaching Pydantic as a raw string and raising ``ValidationError`` on
+    legacy/migrated/corrupt rows — a nullable column already has "no value" as a
+    meaning it can carry, so degrading to it invents nothing.
+
+    Whatever comes back is aware UTC (``to_utc``): rows written before the
+    canonical spelling existed hold naive text, and a naive datetime raises
+    ``TypeError`` the moment it is compared with or added to an aware one
+    (``feed_backoff_until`` vs ``datetime.now(UTC)``).
     """
     if isinstance(value, datetime):
-        return value
+        return to_utc(value)
     if isinstance(value, str):
         if not value.strip():
             return None
         try:
-            return datetime.fromisoformat(value)
+            return to_utc(datetime.fromisoformat(value))
         except (ValueError, TypeError):
             return None
     return None
 
 
-def _coerce_required_dt(value: object) -> datetime:
-    """Parse a *required* datetime cell, defaulting to now(UTC) when corrupt.
+def _coerce_required_dt(value: object, field: str) -> datetime:
+    """Parse a *required* datetime cell as aware UTC, or raise.
 
-    Required datetime columns cannot be ``None``. A single bad/empty cell must
-    still not 500 the route that loads it, so fall back to the current time.
+    A NOT NULL timestamp has no safe default: substituting ``now(UTC)`` gives the
+    row a ``created_at``/``checked_at``/``fetched_at`` it never had, and that
+    invented instant then drives scheduling, ordering, retention and what the UI
+    reports — silently, and for good once anything writes the row back. Corruption
+    here is a data state to surface, not one to paper over (TW-AUD-013).
     """
     parsed = _coerce_dt(value)
     if parsed is None:
-        if value is None:
-            logger.warning("Required datetime is NULL in DB row; defaulting to now(UTC)")
-        elif value == "":
-            logger.warning("Required datetime is empty string in DB row; defaulting to now(UTC)")
-        else:
-            logger.warning("Corrupt required datetime %r in DB row; defaulting to now(UTC)", value)
-        return datetime.now(UTC)
+        raise CorruptTimestampError(
+            f"Required timestamp column {field!r} holds {value!r}, which is not a timestamp. "
+            "The row is corrupt; repair or remove it (a backup lives beside the database)."
+        )
     return parsed
 
 
@@ -170,10 +190,10 @@ class SQLiteModel(BaseModel):
     Class-level declarations (override per subclass as needed):
 
     * ``_bool_fields``: columns stored as 0/1 INTEGER <-> ``bool``.
-    * ``_required_dt_fields``: NOT NULL datetime columns (corrupt/empty -> now(UTC),
-      via ``_coerce_required_dt``).
+    * ``_required_dt_fields``: NOT NULL datetime columns (corrupt/empty raises
+      ``CorruptTimestampError``, via ``_coerce_required_dt``).
     * ``_optional_dt_fields``: nullable datetime columns (corrupt/empty -> None,
-      via ``_coerce_dt``).
+      via ``_coerce_dt``). Both hydrate as aware UTC.
     * ``_json_fields``: mapping of column name -> empty default (list/dict) for
       JSON TEXT columns coerced via ``_safe_json``.
     * ``_insert_exclude``: extra field names dropped from ``to_insert_dict`` beyond
@@ -200,7 +220,7 @@ class SQLiteModel(BaseModel):
             if field in data:
                 data[field] = bool(data[field])
         for field in cls._required_dt_fields:
-            data[field] = _coerce_required_dt(data.get(field))
+            data[field] = _coerce_required_dt(data.get(field), field)
         for field in cls._optional_dt_fields:
             data[field] = _coerce_dt(data.get(field))
         return data
@@ -618,14 +638,15 @@ class CheckResult(SQLiteModel):
         prefixed aliases and pre-extracts ``confidence`` with SQL ``json_extract``,
         so the full ``llm_response`` blob is never shipped/parsed per topic
         (OVH-052). This maps those aliases to the model, routing the required
-        ``checked_at`` through the same defensive coercion ``from_row`` uses
-        (OVH-108) so a corrupt/legacy cell degrades to now(UTC) instead of 500-ing
-        the dashboard. ``llm_response`` is intentionally left ``None`` on this path.
+        ``checked_at`` through the same coercion ``from_row`` uses (OVH-108) — a
+        legacy/naive cell normalizes, a corrupt one raises rather than reporting an
+        invented check time (TW-AUD-013). ``llm_response`` is intentionally left
+        ``None`` on this path.
         """
         return cls(
             id=row["cr_id"],
             topic_id=topic_id,
-            checked_at=_coerce_required_dt(row["cr_checked_at"]),
+            checked_at=_coerce_required_dt(row["cr_checked_at"], "checked_at"),
             articles_found=row["cr_articles_found"],
             articles_new=row["cr_articles_new"],
             has_new_info=bool(row["cr_has_new_info"]),

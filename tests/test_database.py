@@ -1896,25 +1896,41 @@ class TestGetDashboardData:
         assert data[0]["topic"].name == "Alpha"
         assert data[1]["topic"].name == "Zeta"
 
-    def test_corrupt_checked_at_degrades_not_500(self, db_conn: sqlite3.Connection) -> None:
-        """OVH-108: a corrupt checked_at cell must degrade to now(UTC), not raise.
+    def test_legacy_naive_checked_at_loads_as_aware_utc(self, db_conn: sqlite3.Connection) -> None:
+        """OVH-108: the dashboard path uses the model's coercion, not a raw parse.
 
-        The dashboard builds CheckResult directly from the row; it must route the
-        required datetime through the same defensive coercion the model uses, so a
-        legacy/corrupt cell degrades instead of 500-ing the dashboard.
+        A cell written before the canonical ``+00:00`` spelling existed still
+        renders — it is a valid timestamp, and hydration normalizes it.
         """
-        topic = create_topic(db_conn, Topic(name="Corrupt", description="d"))
+        topic = create_topic(db_conn, Topic(name="Legacy", description="d"))
         cr = create_check_result(db_conn, CheckResult(topic_id=topic.id, articles_found=4))
-        # Corrupt the stored datetime cell directly (simulates legacy/migrated data).
-        db_conn.execute("UPDATE check_results SET checked_at = ? WHERE id = ?", ("not-a-date", cr.id))
+        db_conn.execute("UPDATE check_results SET checked_at = ? WHERE id = ?", ("2026-06-13T12:00:00", cr.id))
         db_conn.commit()
 
         data = get_dashboard_data(db_conn)
         assert len(data) == 1
         last_check = data[0]["last_check"]
         assert last_check is not None
-        assert isinstance(last_check.checked_at, datetime)
+        assert last_check.checked_at == datetime(2026, 6, 13, 12, 0, tzinfo=UTC)
         assert last_check.articles_found == 4
+
+    def test_corrupt_checked_at_fails_loud(self, db_conn: sqlite3.Connection) -> None:
+        """TW-AUD-013 reverses OVH-108's degrade-to-now for this column.
+
+        Rendering the dashboard with an invented check time is worse than not
+        rendering it: the row claims the topic was just checked, the "last checked"
+        ordering silently reshuffles, and nothing says the cell is broken. The
+        error names the column so the operator can repair or restore the row.
+        """
+        from app.models import CorruptTimestampError
+
+        topic = create_topic(db_conn, Topic(name="Corrupt", description="d"))
+        cr = create_check_result(db_conn, CheckResult(topic_id=topic.id, articles_found=4))
+        db_conn.execute("UPDATE check_results SET checked_at = ? WHERE id = ?", ("not-a-date", cr.id))
+        db_conn.commit()
+
+        with pytest.raises(CorruptTimestampError, match="checked_at"):
+            get_dashboard_data(db_conn)
 
 
 class TestGetNewTopics:

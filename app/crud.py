@@ -20,6 +20,7 @@ from app.models import (
     Topic,
     TopicStatus,
     to_db_utc,
+    to_utc,
 )
 
 logger = logging.getLogger(__name__)
@@ -1208,7 +1209,9 @@ def get_dashboard_stats(conn: sqlite3.Connection) -> DashboardStats:
         import contextlib
 
         with contextlib.suppress(ValueError, TypeError):
-            last_notif = datetime.fromisoformat(row["last_notification_at"])
+            # Aware UTC like every other hydrated timestamp, so the template's
+            # relative-time arithmetic cannot meet a naive value (TW-AUD-013).
+            last_notif = to_utc(datetime.fromisoformat(row["last_notification_at"]))
     return DashboardStats(
         total_topics=row["total_topics"],
         active_topics=row["active_topics"],
