@@ -54,6 +54,18 @@ def _build_feed_health_rows(feeds: list[FeedHealth], topics: list[Topic], exa_en
     return rows
 
 
+def _format_backoff_label(until: datetime, now: datetime) -> str:
+    """Format a retry ETA, minutes below two hours and hours thereafter (AUG-123).
+
+    The default first backoff is 15 minutes; rounding straight to hours and
+    clamping to a minimum of one made every sub-hour retry read as "~1h".
+    """
+    minutes = max(1, round((until - now).total_seconds() / 60))
+    if minutes < 120:
+        return f"next retry ~{minutes}m"
+    return f"next retry ~{round(minutes / 60)}h"
+
+
 @router.get("/feeds", response_class=HTMLResponse)
 async def feed_health_page(
     request: Request,
@@ -65,17 +77,24 @@ async def feed_health_page(
     topics = list_topics(conn)
     rows = _build_feed_health_rows(feeds, topics, exa_search_endpoint(settings.exa))
 
+    # AUG-213: feed_backoff_until() is a MANUAL-feed-only formula (its own module
+    # docstring says so) — AUTO uses separate provider cooldown state and EXA is
+    # attempted without this backoff, so applying it to every row could label an
+    # AUTO/EXA source as "backing off" until a time the runtime never honors.
+    manual_urls = {url for topic in topics if topic.feed_mode == FeedMode.MANUAL for url in topic.feed_urls}
+
     now = datetime.now(UTC)
     backoff_map: dict[str, str] = {}
     for feed in feeds:
+        if feed.feed_url not in manual_urls:
+            continue
         until = feed_backoff_until(
             feed,
             base_minutes=settings.feed_backoff_base_minutes,
             cap_hours=settings.feed_backoff_cap_hours,
         )
         if until is not None and until > now:
-            hours = max(1, round((until - now).total_seconds() / 3600))
-            backoff_map[feed.feed_url] = f"next retry ~{hours}h"
+            backoff_map[feed.feed_url] = _format_backoff_label(until, now)
     return templates.TemplateResponse(
         request,
         "feed_health.html",

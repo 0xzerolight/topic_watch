@@ -205,19 +205,21 @@ document.body.addEventListener("htmx:afterSwap", function (event) {
 {% else %}
 <div class="empty-state">
     <p>No articles fetched yet.</p>
-    <p class="empty-state-hint">Articles appear here after the first feed fetch. New topics are fetched on the next scheduler cycle (~1 minute), or use "Check Now" above.</p>
+    {# AUG-240: guidance names the action that actually exists for this topic's
+       current state — "Check Now" only renders for an active READY topic, so
+       every other state pointed at a button the user could not see. #}
+    {% if not topic.is_active %}
+    <p class="empty-state-hint">This topic is disabled, so it will not fetch articles automatically. Enable it above to resume checks.</p>
+    {% elif topic.status.value == "ready" %}
+    <p class="empty-state-hint">Articles appear after the next scheduled check, or use "Check Now" above.</p>
+    {% elif topic.status.value == "new" %}
+    <p class="empty-state-hint">This topic has not been researched yet. It will be initialized on the next scheduler cycle (~1 minute), or use "Initialize Now" above.</p>
+    {% elif topic.status.value == "researching" %}
+    <p class="empty-state-hint">Research is in progress. Articles will appear here once it completes.</p>
+    {% elif topic.status.value == "error" %}
+    <p class="empty-state-hint">Initial research failed. Use "Retry Research" below to try again.</p>
+    {% endif %}
 </div>
-{% endif %}
-
-{# Sources gone dark: the newest check found nothing to read, so this topic's
-   quiet is not evidence of "nothing new". A SIBLING of #status-area, never
-   nested inside it (see the CRITICAL note above). #}
-{% if page == 1 and checks and checks[0].sources_failing %}
-<p class="row-error">
-    <span class="badge badge--bad"><span class="badge-dot"></span>Sources failing</span>
-    The most recent check found no usable source — this topic's silence may not mean "nothing new".
-    <a href="/feeds">Feed Health</a>
-</p>
 {% endif %}
 
 <h2>Check History</h2>
@@ -226,6 +228,17 @@ document.body.addEventListener("htmx:afterSwap", function (event) {
 ({{ total_prompt_tokens }} prompt + {{ total_completion_tokens }} completion)</small></p>
 {% endif %}
 {% if checks %}
+{% if page == 1 %}
+{# TW-AUD-024: acknowledges the topic's latest check now that it has actually
+   rendered, instead of the old GET-time mutation. Keyed to checks[0].id, the
+   check this page is displaying (only page 1 shows the latest one). Fires once
+   per page load; the route's own guards make repeats a no-op. #}
+<div hx-post="/topics/{{ topic.id }}/checks/{{ checks[0].id }}/seen"
+     hx-trigger="load"
+     hx-swap="none"
+     hx-headers='{"X-CSRF-Token": "{{ request.state.csrf_token }}"}'
+     aria-hidden="true"></div>
+{% endif %}
 <table class="data-table">
     <thead>
         <tr>
@@ -248,7 +261,9 @@ document.body.addEventListener("htmx:afterSwap", function (event) {
             <td data-label="Articles Found" class="num">{{ check.articles_found }}</td>
             <td data-label="New Articles" class="num">{{ check.articles_new }}</td>
             <td data-label="New Info">{{ "Yes" if check.has_new_info else "No" }}</td>
-            <td data-label="Confidence">{{ check.llm_response | confidence_badge }}</td>
+            {# AUG-037: check.confidence is already decoded once by CheckResult.from_row
+               (OVH-052) — render that scalar instead of re-parsing llm_response here. #}
+            <td data-label="Confidence">{{ check.confidence | confidence_value }}</td>
             <td data-label="Importance" class="num">{% if check_importance is not none %}{{ check_importance }}/5{% else %}-{% endif %}</td>
             <td data-label="Tokens" class="num">
                 {% set check_tokens = check.prompt_tokens + check.completion_tokens %}

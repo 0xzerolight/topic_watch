@@ -14,13 +14,16 @@ import pytest
 
 from app.config import ExaSettings, LLMSettings, NotificationSettings, Settings
 from app.crud import (
+    create_article,
     create_check_result,
     create_knowledge_state,
     create_topic,
     get_topic_by_name,
+    list_article_headers_for_topic,
 )
 from app.main import REQUEST_ID_PATTERN, app
 from app.models import (
+    Article,
     CheckResult,
     FeedMode,
     KnowledgeState,
@@ -527,16 +530,51 @@ class TestDashboardStatsFreshness:
 
 
 class TestNewInfoSeenBadge:
-    """The 'Ready · new info' badge (``badge--signal``) clears once the topic is opened."""
+    """The 'Ready · new info' badge (``badge--signal``) clears once the topic is
+    acknowledged (TW-AUD-024: an explicit POST fired after the detail page
+    renders, not a GET-time side effect)."""
 
-    async def test_badge_clears_after_open_and_returns_on_new_check(
+    async def test_get_alone_does_not_clear_the_badge(
         self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
     ) -> None:
-        """Regression (fails pre-fix): badge present -> open topic -> badge gone ->
-        a newer new-info check re-badges."""
+        """TW-AUD-024: GET is query-only now — a prefetch/retry/render failure must
+        not silently clear the indicator before the user has actually acknowledged it."""
+        topic = _make_topic(db_conn, name="Query Only Topic", status=TopicStatus.READY)
+        create_check_result(
+            db_conn,
+            CheckResult(topic_id=topic.id, articles_found=2, has_new_info=True),
+        )
+        db_conn.commit()
+
+        detail = await client.get(f"/topics/{topic.id}")
+        assert detail.status_code == 200
+
+        after = await client.get("/")
+        assert "badge--signal" in after.text
+
+    async def test_detail_page_carries_the_ack_trigger(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """The rendered page fires the acknowledgement itself, keyed to the
+        displayed check, once content has actually loaded (``hx-trigger="load"``)."""
+        topic = _make_topic(db_conn, name="Ack Wiring Topic", status=TopicStatus.READY)
+        check = create_check_result(
+            db_conn,
+            CheckResult(topic_id=topic.id, articles_found=2, has_new_info=True),
+        )
+        db_conn.commit()
+
+        detail = await client.get(f"/topics/{topic.id}")
+        assert f'hx-post="/topics/{topic.id}/checks/{check.id}/seen"' in detail.text
+        assert 'hx-trigger="load"' in detail.text
+
+    async def test_badge_clears_after_ack_and_returns_on_new_check(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """badge present -> open + ack -> badge gone -> a newer new-info check re-badges."""
         topic = _make_topic(db_conn, name="Seen Topic", status=TopicStatus.READY)
         now = datetime.now(UTC)
-        create_check_result(
+        check = create_check_result(
             db_conn,
             CheckResult(topic_id=topic.id, articles_found=2, has_new_info=True, checked_at=now),
         )
@@ -548,6 +586,8 @@ class TestNewInfoSeenBadge:
 
         detail = await client.get(f"/topics/{topic.id}")
         assert detail.status_code == 200
+        ack = await client.post(f"/topics/{topic.id}/checks/{check.id}/seen")
+        assert ack.status_code == 204
 
         after = await client.get("/")
         assert "badge--signal" not in after.text
@@ -566,12 +606,36 @@ class TestNewInfoSeenBadge:
         again = await client.get("/")
         assert "badge--signal" in again.text
 
-    async def test_filtered_search_drops_badge_after_open(
+    async def test_ack_for_a_stale_check_id_is_a_noop(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """An ack keyed to a check that is no longer the latest must not clear the
+        badge for a newer check it never actually displayed."""
+        topic = _make_topic(db_conn, name="Stale Ack Topic", status=TopicStatus.READY)
+        now = datetime.now(UTC)
+        older = create_check_result(
+            db_conn,
+            CheckResult(topic_id=topic.id, articles_found=1, has_new_info=True, checked_at=now),
+        )
+        db_conn.commit()
+        create_check_result(
+            db_conn,
+            CheckResult(topic_id=topic.id, articles_found=1, has_new_info=True, checked_at=now + timedelta(hours=1)),
+        )
+        db_conn.commit()
+
+        ack = await client.post(f"/topics/{topic.id}/checks/{older.id}/seen")
+        assert ack.status_code == 204
+
+        after = await client.get("/")
+        assert "badge--signal" in after.text
+
+    async def test_filtered_search_drops_badge_after_ack(
         self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
     ) -> None:
         """The filtered search partial (search_dashboard_data) honors the same gate."""
         topic = _make_topic(db_conn, name="Filter Topic", status=TopicStatus.READY)
-        create_check_result(
+        check = create_check_result(
             db_conn,
             CheckResult(topic_id=topic.id, articles_found=1, has_new_info=True),
         )
@@ -581,6 +645,7 @@ class TestNewInfoSeenBadge:
         assert "badge--signal" in before.text
 
         await client.get(f"/topics/{topic.id}")
+        await client.post(f"/topics/{topic.id}/checks/{check.id}/seen")
 
         after = await client.get("/topics/search?q=Filter")
         assert "badge--signal" not in after.text
@@ -588,17 +653,17 @@ class TestNewInfoSeenBadge:
     async def test_open_preserves_history_and_notify(
         self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
     ) -> None:
-        """Marking seen must NOT mutate has_new_info: the detail history cell still
+        """Acknowledging must NOT mutate has_new_info: the detail history cell still
         reads 'Yes' and the Notify button remains."""
         topic = _make_topic(db_conn, name="History Topic", status=TopicStatus.READY)
-        create_check_result(
+        check = create_check_result(
             db_conn,
             CheckResult(topic_id=topic.id, articles_found=1, has_new_info=True),
         )
         db_conn.commit()
 
-        # First open marks seen; second open still shows history + Notify.
         await client.get(f"/topics/{topic.id}")
+        await client.post(f"/topics/{topic.id}/checks/{check.id}/seen")
         detail = await client.get(f"/topics/{topic.id}")
         assert detail.status_code == 200
         assert "Notify" in detail.text
@@ -630,6 +695,19 @@ class TestAddTopic:
         assert '<div id="feed-validation-results" role="status" aria-live="polite" aria-atomic="true"></div>' in (
             response.text
         )
+
+    async def test_automatic_radio_does_not_claim_google_news(self, client: httpx.AsyncClient) -> None:
+        """AUG-122: routing is Bing-first with Google fallback, not Google News."""
+        response = await client.get("/topics/new")
+        assert "Automatic (Google News)" not in response.text
+
+    async def test_validate_urls_button_has_pending_state(self, client: httpx.AsyncClient) -> None:
+        """AUG-113: the button disables itself and shows a spinner during validation,
+        guarding against a duplicate-submit re-triggering the serial fetch."""
+        response = await client.get("/topics/new")
+        assert 'hx-disabled-elt="this"' in response.text
+        assert "Validate URLs" in response.text
+        assert 'class="htmx-indicator spinner"' in response.text
 
     async def test_create_topic_redirects_to_detail(self, client: httpx.AsyncClient) -> None:
         """POST /topics creates a topic and redirects to its detail page."""
@@ -1129,6 +1207,62 @@ class TestTopicDetail:
         page = await client.get(f"/topics/{topic.id}")
         assert "Sources failing" not in page.text
 
+    async def test_failing_sources_callout_survives_older_history_pages(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-224: the callout used to read checks[0] from the paginated history
+        and only render on page==1, so it vanished while viewing an older page even
+        though the topic's actual latest check was still failing."""
+        settings = _make_settings(web_page_size=5)
+        app.dependency_overrides[get_settings] = lambda: settings
+        try:
+            topic = _make_topic(db_conn, name="HBPaged")
+            now = datetime.now(UTC)
+            # 6 older, healthy checks fill page 1 (page_size=5); the latest, failing
+            # check lands alone on page 2 once ordered checked_at DESC.
+            for i in range(6):
+                create_check_result(db_conn, CheckResult(topic_id=topic.id, checked_at=now + timedelta(minutes=i)))
+            create_check_result(
+                db_conn,
+                CheckResult(
+                    topic_id=topic.id,
+                    stage_error="sources_failed: x",
+                    checked_at=now + timedelta(hours=1),
+                ),
+            )
+            db_conn.commit()
+
+            page2 = await client.get(f"/topics/{topic.id}?page=2")
+            assert page2.status_code == 200
+            assert "Sources failing" in page2.text
+        finally:
+            app.dependency_overrides[get_settings] = lambda: _make_settings()
+
+    async def test_failing_sources_callout_is_not_line_clamped(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-106: the callout gets its own bordered component, not the two-line
+        clamped .row-error class used for table-cell text."""
+        topic = _make_topic(db_conn, name="HBClamp")
+        create_check_result(db_conn, CheckResult(topic_id=topic.id, stage_error="sources_failed: x"))
+        db_conn.commit()
+
+        page = await client.get(f"/topics/{topic.id}")
+        assert 'class="source-warning"' in page.text
+
+    async def test_failing_sources_callout_appears_in_feed_source_fragment(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-224: living in the Feed Source fragment means it refreshes on that
+        section's own 30s poll, independent of a full page reload."""
+        topic = _make_topic(db_conn, name="HBFragment")
+        create_check_result(db_conn, CheckResult(topic_id=topic.id, stage_error="sources_failed: x"))
+        db_conn.commit()
+
+        fragment = await client.get(f"/topics/{topic.id}/feed-source")
+        assert fragment.status_code == 200
+        assert "Sources failing" in fragment.text
+
     async def test_detail_shows_importance_threshold(
         self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
     ) -> None:
@@ -1384,6 +1518,88 @@ class TestTopicDetail:
         response = await client.get(f"/topics/{topic.id}")
         assert "LLM failed" in response.text
         assert "Retry Research" in response.text
+
+
+class TestArticleHeadersForTopic:
+    """AUG-038: the topic-detail article list stops hydrating raw_content, which
+    the template never renders."""
+
+    def test_raw_content_is_not_hydrated(self, db_conn: sqlite3.Connection) -> None:
+        topic = create_topic(db_conn, Topic(name="Headers Only", description="d"))
+        db_conn.commit()
+        create_article(
+            db_conn,
+            Article(
+                topic_id=topic.id,
+                title="Full Article",
+                url="https://example.com/a",
+                content_hash="hash1",
+                raw_content="x" * 5000,
+                source_feed="https://example.com/feed.xml",
+            ),
+        )
+        db_conn.commit()
+
+        headers = list_article_headers_for_topic(db_conn, topic.id)
+        assert len(headers) == 1
+        assert headers[0].title == "Full Article"
+        assert headers[0].raw_content is None
+
+    async def test_detail_page_never_leaks_raw_content(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        topic = _make_topic(db_conn, name="No Leak Topic")
+        create_article(
+            db_conn,
+            Article(
+                topic_id=topic.id,
+                title="Some Article",
+                url="https://example.com/a",
+                content_hash="hash2",
+                raw_content="SECRET-BODY-TEXT-MARKER",
+                source_feed="https://example.com/feed.xml",
+            ),
+        )
+        db_conn.commit()
+
+        response = await client.get(f"/topics/{topic.id}")
+        assert response.status_code == 200
+        assert "SECRET-BODY-TEXT-MARKER" not in response.text
+
+
+class TestEmptyArticlesGuidance:
+    """AUG-240: the zero-article empty state names the action actually available
+    for the topic's current state, instead of always pointing at "Check Now"
+    (which renders only for an active READY topic)."""
+
+    async def test_ready_active_points_at_check_now(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        topic = _make_topic(db_conn, name="Empty Ready", status=TopicStatus.READY)
+        response = await client.get(f"/topics/{topic.id}")
+        assert "Check Now" in response.text
+
+    async def test_disabled_points_at_enable(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn, name="Empty Disabled", status=TopicStatus.READY, is_active=False)
+        response = await client.get(f"/topics/{topic.id}")
+        assert "Enable it above" in response.text
+        assert "Check Now" not in response.text
+
+    async def test_new_points_at_initialize(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn, name="Empty New", status=TopicStatus.NEW)
+        response = await client.get(f"/topics/{topic.id}")
+        assert "Initialize Now" in response.text
+        assert 'Check Now" above' not in response.text
+
+    async def test_researching_points_at_waiting(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn, name="Empty Researching", status=TopicStatus.RESEARCHING)
+        response = await client.get(f"/topics/{topic.id}")
+        assert "Research is in progress" in response.text
+
+    async def test_error_points_at_retry(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn, name="Empty Error", status=TopicStatus.ERROR, error_message="boom")
+        response = await client.get(f"/topics/{topic.id}")
+        assert 'Retry Research" below' in response.text
 
 
 # --- Topic Status (HTMX partial) ---
@@ -1963,7 +2179,7 @@ class TestCheckNow:
         with (
             patch("app.web.routers.background._run_single_check", new_callable=AsyncMock),
             patch("app.web.routers.topics.count_articles_for_topic", return_value=7) as mock_count,
-            patch("app.web.routers.topics.list_articles_for_topic") as mock_list,
+            patch("app.web.routers.topics.list_article_headers_for_topic") as mock_list,
         ):
             response = await client.post(
                 f"/topics/{topic.id}/check",
@@ -2371,6 +2587,23 @@ class TestTopicEdit:
         assert '<div id="feed-validation-results" role="status" aria-live="polite" aria-atomic="true"></div>' in (
             response.text
         )
+
+    async def test_automatic_radio_does_not_claim_google_news(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-122: routing is Bing-first with Google fallback, not Google News."""
+        topic = _make_topic(db_conn)
+        response = await client.get(f"/topics/{topic.id}/edit")
+        assert "Automatic (Google News)" not in response.text
+
+    async def test_validate_urls_button_has_pending_state(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-113: the button disables itself and shows a spinner during validation."""
+        topic = _make_topic(db_conn)
+        response = await client.get(f"/topics/{topic.id}/edit")
+        assert 'hx-disabled-elt="this"' in response.text
+        assert 'class="htmx-indicator spinner"' in response.text
 
     async def test_rename_onto_an_existing_name_is_a_validation_error(
         self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
