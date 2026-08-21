@@ -228,6 +228,17 @@ document.body.addEventListener("htmx:afterSwap", function (event) {
 ({{ total_prompt_tokens }} prompt + {{ total_completion_tokens }} completion)</small></p>
 {% endif %}
 {% if checks %}
+{% if page == 1 %}
+{# TW-AUD-024: acknowledges the topic's latest check now that it has actually
+   rendered, instead of the old GET-time mutation. Keyed to checks[0].id, the
+   check this page is displaying (only page 1 shows the latest one). Fires once
+   per page load; the route's own guards make repeats a no-op. #}
+<div hx-post="/topics/{{ topic.id }}/checks/{{ checks[0].id }}/seen"
+     hx-trigger="load"
+     hx-swap="none"
+     hx-headers='{"X-CSRF-Token": "{{ request.state.csrf_token }}"}'
+     aria-hidden="true"></div>
+{% endif %}
 <table class="data-table">
     <thead>
         <tr>

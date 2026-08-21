@@ -434,16 +434,51 @@ class TestDashboardStatsFreshness:
 
 
 class TestNewInfoSeenBadge:
-    """The 'Ready · new info' badge (``badge--signal``) clears once the topic is opened."""
+    """The 'Ready · new info' badge (``badge--signal``) clears once the topic is
+    acknowledged (TW-AUD-024: an explicit POST fired after the detail page
+    renders, not a GET-time side effect)."""
 
-    async def test_badge_clears_after_open_and_returns_on_new_check(
+    async def test_get_alone_does_not_clear_the_badge(
         self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
     ) -> None:
-        """Regression (fails pre-fix): badge present -> open topic -> badge gone ->
-        a newer new-info check re-badges."""
+        """TW-AUD-024: GET is query-only now — a prefetch/retry/render failure must
+        not silently clear the indicator before the user has actually acknowledged it."""
+        topic = _make_topic(db_conn, name="Query Only Topic", status=TopicStatus.READY)
+        create_check_result(
+            db_conn,
+            CheckResult(topic_id=topic.id, articles_found=2, has_new_info=True),
+        )
+        db_conn.commit()
+
+        detail = await client.get(f"/topics/{topic.id}")
+        assert detail.status_code == 200
+
+        after = await client.get("/")
+        assert "badge--signal" in after.text
+
+    async def test_detail_page_carries_the_ack_trigger(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """The rendered page fires the acknowledgement itself, keyed to the
+        displayed check, once content has actually loaded (``hx-trigger="load"``)."""
+        topic = _make_topic(db_conn, name="Ack Wiring Topic", status=TopicStatus.READY)
+        check = create_check_result(
+            db_conn,
+            CheckResult(topic_id=topic.id, articles_found=2, has_new_info=True),
+        )
+        db_conn.commit()
+
+        detail = await client.get(f"/topics/{topic.id}")
+        assert f'hx-post="/topics/{topic.id}/checks/{check.id}/seen"' in detail.text
+        assert 'hx-trigger="load"' in detail.text
+
+    async def test_badge_clears_after_ack_and_returns_on_new_check(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """badge present -> open + ack -> badge gone -> a newer new-info check re-badges."""
         topic = _make_topic(db_conn, name="Seen Topic", status=TopicStatus.READY)
         now = datetime.now(UTC)
-        create_check_result(
+        check = create_check_result(
             db_conn,
             CheckResult(topic_id=topic.id, articles_found=2, has_new_info=True, checked_at=now),
         )
@@ -455,6 +490,8 @@ class TestNewInfoSeenBadge:
 
         detail = await client.get(f"/topics/{topic.id}")
         assert detail.status_code == 200
+        ack = await client.post(f"/topics/{topic.id}/checks/{check.id}/seen")
+        assert ack.status_code == 204
 
         after = await client.get("/")
         assert "badge--signal" not in after.text
@@ -473,12 +510,36 @@ class TestNewInfoSeenBadge:
         again = await client.get("/")
         assert "badge--signal" in again.text
 
-    async def test_filtered_search_drops_badge_after_open(
+    async def test_ack_for_a_stale_check_id_is_a_noop(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """An ack keyed to a check that is no longer the latest must not clear the
+        badge for a newer check it never actually displayed."""
+        topic = _make_topic(db_conn, name="Stale Ack Topic", status=TopicStatus.READY)
+        now = datetime.now(UTC)
+        older = create_check_result(
+            db_conn,
+            CheckResult(topic_id=topic.id, articles_found=1, has_new_info=True, checked_at=now),
+        )
+        db_conn.commit()
+        create_check_result(
+            db_conn,
+            CheckResult(topic_id=topic.id, articles_found=1, has_new_info=True, checked_at=now + timedelta(hours=1)),
+        )
+        db_conn.commit()
+
+        ack = await client.post(f"/topics/{topic.id}/checks/{older.id}/seen")
+        assert ack.status_code == 204
+
+        after = await client.get("/")
+        assert "badge--signal" in after.text
+
+    async def test_filtered_search_drops_badge_after_ack(
         self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
     ) -> None:
         """The filtered search partial (search_dashboard_data) honors the same gate."""
         topic = _make_topic(db_conn, name="Filter Topic", status=TopicStatus.READY)
-        create_check_result(
+        check = create_check_result(
             db_conn,
             CheckResult(topic_id=topic.id, articles_found=1, has_new_info=True),
         )
@@ -488,6 +549,7 @@ class TestNewInfoSeenBadge:
         assert "badge--signal" in before.text
 
         await client.get(f"/topics/{topic.id}")
+        await client.post(f"/topics/{topic.id}/checks/{check.id}/seen")
 
         after = await client.get("/topics/search?q=Filter")
         assert "badge--signal" not in after.text
@@ -495,17 +557,17 @@ class TestNewInfoSeenBadge:
     async def test_open_preserves_history_and_notify(
         self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
     ) -> None:
-        """Marking seen must NOT mutate has_new_info: the detail history cell still
+        """Acknowledging must NOT mutate has_new_info: the detail history cell still
         reads 'Yes' and the Notify button remains."""
         topic = _make_topic(db_conn, name="History Topic", status=TopicStatus.READY)
-        create_check_result(
+        check = create_check_result(
             db_conn,
             CheckResult(topic_id=topic.id, articles_found=1, has_new_info=True),
         )
         db_conn.commit()
 
-        # First open marks seen; second open still shows history + Notify.
         await client.get(f"/topics/{topic.id}")
+        await client.post(f"/topics/{topic.id}/checks/{check.id}/seen")
         detail = await client.get(f"/topics/{topic.id}")
         assert detail.status_code == 200
         assert "Notify" in detail.text

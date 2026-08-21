@@ -782,6 +782,36 @@ def mark_latest_check_seen(conn: sqlite3.Connection, topic_id: int) -> None:
     )
 
 
+def mark_check_seen(conn: sqlite3.Connection, topic_id: int, check_id: int) -> None:
+    """Stamp ``seen_at`` on one specific check result (TW-AUD-024).
+
+    Companion to :func:`mark_latest_check_seen`, keyed to an explicit ``check_id``
+    instead of "whichever row is latest right now". The detail GET route no
+    longer mutates on read (a prefetch, retry, or failed render used to clear the
+    dashboard badge before the user ever saw the detail); this is called instead,
+    once the page has actually rendered, acknowledging the exact check it
+    displayed. The extra ``id =`` subquery guard means a check that lands after
+    render is never silently marked seen by a late-arriving ack for a stale page.
+    Same ``has_new_info`` / ``seen_at IS NULL`` guards as the sibling function
+    keep re-acks a no-op. The caller commits.
+    """
+    conn.execute(
+        """
+        UPDATE check_results SET seen_at = ?
+        WHERE id = ?
+          AND topic_id = ?
+          AND has_new_info = 1
+          AND seen_at IS NULL
+          AND id = (
+              SELECT id FROM check_results
+              WHERE topic_id = ?
+              ORDER BY checked_at DESC LIMIT 1
+          )
+        """,
+        (datetime.now(UTC).isoformat(), check_id, topic_id, topic_id),
+    )
+
+
 def get_check_result(conn: sqlite3.Connection, check_id: int) -> CheckResult | None:
     """Get a check result by ID, or None if not found."""
     row = conn.execute("SELECT * FROM check_results WHERE id = ?", (check_id,)).fetchone()

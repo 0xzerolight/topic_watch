@@ -26,7 +26,7 @@ from app.crud import (
     list_article_headers_for_topic,
     list_check_results,
     list_knowledge_revision_headers,
-    mark_latest_check_seen,
+    mark_check_seen,
     sum_check_tokens,
     update_topic,
 )
@@ -225,12 +225,12 @@ async def topic_detail(
     if topic is None:
         raise HTTPException(status_code=404, detail="Topic not found")
 
-    # Reading the detail page acknowledges the latest check's new info: clear the
-    # dashboard "new info" badge. No-op unless the latest check has unseen new info
-    # (guarded in the query). A GET side-effect is accepted here — single-user, no
-    # auth — and matches "clicking the topic and reading it clears the badge".
-    mark_latest_check_seen(conn, topic_id)
-    conn.commit()
+    # TW-AUD-024: no mutation on GET. This used to stamp seen_at (clearing the
+    # dashboard "new info" badge) here, before the reads/render below that can
+    # still fail — a prefetch, retry, or render failure could clear the badge
+    # without the user ever seeing the detail. The page instead fires an
+    # idempotent POST to /checks/{check_id}/seen once it has actually rendered
+    # (see the hidden trigger near Check History), keyed to the displayed check.
 
     per_page = settings.web_page_size
     total_checks = count_check_results(conn, topic_id)
@@ -277,6 +277,24 @@ async def topic_detail(
             **_feed_source_context(conn, topic, topic_id),
         },
     )
+
+
+@router.post("/topics/{topic_id}/checks/{check_id}/seen", dependencies=[Depends(verify_csrf)])
+async def mark_check_seen_handler(
+    topic_id: int,
+    check_id: int,
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
+) -> Response:
+    """Acknowledge one displayed check result (TW-AUD-024).
+
+    Fired by the detail page itself once its content has rendered (see the
+    hidden ``hx-trigger="load"`` element near Check History) instead of the old
+    GET-time mutation. Idempotent and keyed to ``check_id``: a stale page (a
+    newer check has since landed) is a no-op rather than acking the wrong row.
+    """
+    mark_check_seen(conn, topic_id, check_id)
+    conn.commit()
+    return Response(status_code=204)
 
 
 @router.get("/topics/{topic_id}/status", response_class=HTMLResponse)
