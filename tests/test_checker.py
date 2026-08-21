@@ -117,6 +117,39 @@ def _make_article(**overrides) -> Article:
     return Article(**defaults)
 
 
+# --- _summarize_exc ---
+
+
+class TestSummarizeExc:
+    """AUG-270: the stored stage_error summary must redact embedded URLs, not
+    just strip newlines and truncate — it is exposed via UI/API/exports and
+    copied verbatim into outbound Silence Heartbeat notification text."""
+
+    def test_redacts_url_embedded_in_exception_text(self) -> None:
+        from app.checker import _summarize_exc
+
+        secret_url = "https://user:s3cr3tpass@proxy.example.com/path?token=QUERYSECRET"
+        summary = _summarize_exc(Exception(f"Proxy connect failed: {secret_url}"))
+
+        assert "s3cr3tpass" not in summary
+        assert "QUERYSECRET" not in summary
+        assert "proxy.example.com" in summary
+        assert summary.startswith("Exception:")
+
+    def test_plain_message_without_a_url_is_unaffected(self) -> None:
+        from app.checker import _summarize_exc
+
+        summary = _summarize_exc(ValueError("bad thing happened"))
+        assert summary == "ValueError: bad thing happened"
+
+    def test_still_truncates_and_strips_newlines(self) -> None:
+        from app.checker import _summarize_exc
+
+        summary = _summarize_exc(Exception("line one\nline two" + "x" * 300), limit=50)
+        assert "\n" not in summary
+        assert len(summary) <= 50
+
+
 # --- check_topic ---
 
 
@@ -169,6 +202,55 @@ class TestCheckTopic:
         assert result.id is not None
         mock_update.assert_called_once()
         mock_send.assert_called_once()
+
+    async def test_completion_log_carries_the_check_result_id(
+        self, db_conn: sqlite3.Connection, db_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AUG-273 (judge-narrowed scope): the completion log line names the
+        durable CheckResult row, so a request's X-Request-ID (findable via the
+        check/request id fields on every log line during the check) can be
+        followed all the way to the row it produced, with no migration needed."""
+        import logging
+
+        topic = _make_topic(db_conn)
+        create_knowledge_state(
+            db_conn,
+            KnowledgeState(topic_id=topic.id, summary_text="Old summary.", token_count=20),
+        )
+        db_conn.commit()
+        settings = _make_settings()
+
+        articles = [_make_article(topic_id=topic.id)]
+        novelty = NoveltyResult(
+            has_new_info=True,
+            summary="New release date",
+            key_facts=["June 2025"],
+            source_urls=["https://example.com/article-1"],
+            confidence=0.9,
+            relevance=0.9,
+        )
+
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=articles, total_feed_entries=len(articles)),
+            ),
+            patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
+            patch(
+                "app.checker.prepare_knowledge_update",
+                new_callable=AsyncMock,
+                return_value=_make_write_result(),
+            ),
+            patch("app.checker.deliver_notification_intents", _per_url_mock(ok=True)),
+            caplog.at_level(logging.INFO, logger="app.checker"),
+        ):
+            result = await check_topic(topic, settings, db_path=db_path)
+
+        assert result.id is not None
+        completion = [r for r in caplog.records if "articles" in r.getMessage() and "new_info" in r.getMessage()]
+        assert completion, "expected the completion log line"
+        assert f"check_result_id={result.id}" in completion[0].getMessage()
 
     async def test_no_new_info_no_notification(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         """Articles found but LLM says nothing new."""
@@ -539,6 +621,33 @@ class TestCheckTopic:
         assert result.stage_error.startswith("pipeline_failed")
         row = db_conn.execute("SELECT stage_error FROM check_results WHERE id = ?", (result.id,)).fetchone()
         assert row["stage_error"].startswith("pipeline_failed")
+
+    async def test_scrape_failure_stage_error_redacts_embedded_url(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """AUG-270: stage_error is exposed via UI/API/exports and Silence Heartbeat
+        copies it verbatim into outbound notification text, so a credential-bearing
+        URL embedded in the raw exception text (a misconfigured proxy, say) must
+        not survive into the stored summary."""
+        topic = _make_topic(db_conn, name="ScrapeFailSecret")
+        settings = _make_settings()
+
+        secret_url = "https://user:s3cr3tpass@proxy.example.com/path?token=QUERYSECRET"
+        with patch(
+            "app.checker.fetch_new_articles_for_topic",
+            new_callable=AsyncMock,
+            side_effect=Exception(f"Proxy connect failed: {secret_url}"),
+        ):
+            result = await check_topic(topic, settings, db_path=db_path)
+
+        assert result.stage_error is not None
+        assert result.stage_error.startswith("pipeline_failed")
+        assert "s3cr3tpass" not in result.stage_error
+        assert "QUERYSECRET" not in result.stage_error
+        assert "proxy.example.com" in result.stage_error  # destination still identifiable
+        row = db_conn.execute("SELECT stage_error FROM check_results WHERE id = ?", (result.id,)).fetchone()
+        assert "s3cr3tpass" not in row["stage_error"]
+        assert "QUERYSECRET" not in row["stage_error"]
 
     async def test_analysis_failure_sets_stage_error(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         """An LLM analysis failure (safe-default) records stage_error='analysis_failed'.
@@ -1000,6 +1109,50 @@ class TestInitAndRetryCarryCheckId:
                 new_callable=AsyncMock,
                 return_value=FetchResult(articles=[], total_feed_entries=0),
             ):
+                await initialize_new_topic(topic, settings, db_path=db_path)
+            assert check_id_var.get() == "outer-sentinel"
+        finally:
+            check_id_var.reset(token)
+
+    async def test_initialize_new_topic_restores_outer_check_id_on_claim_phase_failure(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """AUG-266: a raw DB failure during the claim/snapshot phase (before
+        the pipeline's own try/except exists) must still restore the caller's
+        prior check_id, not just the four explicit TopicInitRefused refusals."""
+        from app.check_context import check_id_var
+        from app.checker import initialize_new_topic
+
+        topic = _make_topic(db_conn, name="InitClaimBoom", status=TopicStatus.NEW, status_changed_at=None)
+        settings = _make_settings()
+
+        token = check_id_var.set("outer-sentinel")
+        try:
+            with (
+                patch("app.checker.get_topic", side_effect=sqlite3.OperationalError("database is locked")),
+                pytest.raises(sqlite3.OperationalError),
+            ):
+                await initialize_new_topic(topic, settings, db_path=db_path)
+            # The failure must not leak this init's generated id into whatever
+            # the caller (scheduler tick, web background task) logs next.
+            assert check_id_var.get() == "outer-sentinel"
+        finally:
+            check_id_var.reset(token)
+
+    async def test_initialize_new_topic_refusal_restores_outer_check_id(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """The existing TopicInitRefused paths still reset exactly once (no
+        double-reset RuntimeError) now that they share the claim-phase except."""
+        from app.check_context import check_id_var
+        from app.checker import TopicInitRefused, initialize_new_topic
+
+        topic = _make_topic(db_conn, name="InitRefused", status=TopicStatus.RESEARCHING, status_changed_at=None)
+        settings = _make_settings()
+
+        token = check_id_var.set("outer-sentinel")
+        try:
+            with pytest.raises(TopicInitRefused):
                 await initialize_new_topic(topic, settings, db_path=db_path)
             assert check_id_var.get() == "outer-sentinel"
         finally:
