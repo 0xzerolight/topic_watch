@@ -140,8 +140,11 @@ CLOUD_PROVIDERS: frozenset[str] = frozenset(
 )
 
 # Default base URLs for self-hosted providers (used as form auto-fill hints).
+# ``ollama_chat`` is LiteLLM's own recommended prefix for an Ollama server and reaches
+# the same endpoint, so it is keyless on the same terms as ``ollama`` (C5-5).
 LOCAL_PROVIDER_DEFAULTS: dict[str, str] = {
     "ollama": "http://localhost:11434",
+    "ollama_chat": "http://localhost:11434",
 }
 
 

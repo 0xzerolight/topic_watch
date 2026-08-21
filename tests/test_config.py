@@ -919,3 +919,19 @@ class TestKeylessProviders:
         assert is_keyless_llm_provider("Ollama/Llama3.3")
         assert not is_keyless_llm_provider("openai/gpt-4o-mini")
         assert not is_keyless_llm_provider("ollama")  # no provider prefix at all
+
+    def test_ollama_chat_is_keyless_too(self) -> None:
+        """LiteLLM's recommended ollama_chat/ prefix hit the key wall (C5-5)."""
+        from app.config import is_keyless_llm_provider
+
+        assert is_keyless_llm_provider("ollama_chat/llama3.3")
+
+    def test_ollama_chat_without_a_key_is_configured(self) -> None:
+        settings = Settings(llm={"model": "ollama_chat/llama3.3", "api_key": ""})
+        assert settings.is_configured()
+
+    def test_ollama_chat_is_a_known_provider(self, caplog: pytest.LogCaptureFixture) -> None:
+        """It must not be reported as a typo of ollama."""
+        with caplog.at_level(logging.WARNING, logger="app.config"):
+            Settings(llm={"model": "ollama_chat/llama3.3", "api_key": ""})
+        assert not [r for r in caplog.records if "Unknown LLM provider" in r.message]
