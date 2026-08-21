@@ -3081,7 +3081,25 @@ class TestExaFeedModeWeb:
 
 
 class TestOpmlUploadSizeGate:
-    """The 1 MiB limit is enforced before anything parses the multipart body (AUG-014)."""
+    """The 1 MiB limit is enforced before anything parses the multipart body (AUG-014).
+
+    Two halves, pinned separately: a declared ``Content-Length`` over the limit is
+    refused without reading a byte, and a body that arrives chunked — where there
+    is no length to check — is counted as it streams and cut off mid-transfer.
+    Either half alone leaves the other's upload through.
+    """
+
+    @staticmethod
+    def _chunked_body(chunks: int = 64, size: int = 64 * 1024):
+        """A multipart body the client hands over lazily, counting what it sent."""
+        sent = {"chunks": 0}
+
+        async def _body():
+            for _ in range(chunks):
+                sent["chunks"] += 1
+                yield b"A" * size
+
+        return _body(), sent
 
     async def test_oversize_upload_rejected_without_parsing(self, client: httpx.AsyncClient) -> None:
         """The multipart parser — which spools file parts to temp storage — never runs."""
@@ -3097,6 +3115,40 @@ class TestOpmlUploadSizeGate:
 
         assert response.status_code == 413
         spool.assert_not_called()
+
+    async def test_declared_length_is_refused_before_a_byte_is_read(self, client: httpx.AsyncClient) -> None:
+        body, sent = self._chunked_body()
+
+        response = await client.post(
+            "/import/opml",
+            content=body,
+            headers={
+                "content-type": "multipart/form-data; boundary=x",
+                "content-length": str(4 * 1024 * 1024),
+            },
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 413
+        assert sent["chunks"] == 0
+
+    async def test_chunked_oversize_upload_is_cut_off_mid_stream(self, client: httpx.AsyncClient) -> None:
+        """No Content-Length to precheck, so only the streaming counter can stop it."""
+        from starlette.formparsers import MultiPartParser
+
+        body, sent = self._chunked_body()
+        with patch.object(MultiPartParser, "parse", autospec=True) as spool:
+            response = await client.post(
+                "/import/opml",
+                content=body,
+                headers={"content-type": "multipart/form-data; boundary=x"},
+                follow_redirects=False,
+            )
+
+        assert response.status_code == 413
+        spool.assert_not_called()
+        # 4 MiB offered, refused a little past the ~1.06 MiB ceiling.
+        assert 0 < sent["chunks"] <= 20
 
     async def test_normal_upload_still_imports(self, client: httpx.AsyncClient) -> None:
         from app.opml import OPMLResult

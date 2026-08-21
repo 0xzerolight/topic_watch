@@ -135,18 +135,37 @@ class TestParseIntervalBounds:
     def test_long_digit_input_rejected_quickly(self) -> None:
         import time
 
-        from app.interval import MAX_INTERVAL_CHARS
-
         payload = "1" * 40000
         start = time.perf_counter()
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="too long"):
             parse_interval(payload)
         elapsed = time.perf_counter() - start
 
-        assert MAX_INTERVAL_CHARS < 40000
+        # Rejected by the length gate, before the parser ever looks at it: the
+        # payload is otherwise a format error the parser would happily report.
         # The unanchored findall() backtracked from every offset: ~17s at this
         # length. Anything near a second means the quadratic scan is back.
         assert elapsed < 1.0
+
+    def test_over_length_input_is_refused_even_when_it_would_parse(self) -> None:
+        """The gate is a length rule, not a side effect of the value being junk.
+
+        Padding between tokens is legal, so this string parses fine once it is
+        past the gate — which is what makes it a test of the gate.
+        """
+        from app.interval import MAX_INTERVAL_CHARS
+
+        padded = "1M" + " " * (MAX_INTERVAL_CHARS - 2) + "1w"
+        assert len(padded) > MAX_INTERVAL_CHARS
+        with pytest.raises(ValueError, match="too long"):
+            parse_interval(padded)
+
+    def test_input_at_the_limit_still_parses(self) -> None:
+        from app.interval import MAX_INTERVAL_CHARS
+
+        padded = "1M" + " " * (MAX_INTERVAL_CHARS - 4) + "1w"
+        assert len(padded) == MAX_INTERVAL_CHARS
+        assert parse_interval(padded) == parse_interval("1M 1w")
 
     def test_error_does_not_echo_the_whole_input(self) -> None:
         payload = "9" * 5000
