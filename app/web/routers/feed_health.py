@@ -104,6 +104,12 @@ async def feed_health_page(
 
 _MAX_VALIDATION_ERROR_CHARS = 150
 
+# Bounds on the Validate Feeds diagnostic. Concurrency keeps a slow feed from
+# hiding every result behind it; the budget keeps the whole request answerable
+# even when several feeds are slow (each fetch is itself two attempts at 10s).
+_VALIDATION_CONCURRENCY = 5
+_VALIDATION_BUDGET_SECONDS = 60.0
+
 
 async def _validate_one(url: str) -> dict:
     """Fetch one URL and report whether it is a feed worth saving.
@@ -146,7 +152,11 @@ async def validate_feed_url(
             status_code=429,
         )
 
-    urls = [u.strip() for u in feed_urls.strip().splitlines() if u.strip()]
+    # Ordered dedup + the same per-topic cap the save path applies: the box used
+    # to accept every nonblank line and fetch them strictly one after another,
+    # so a handful of slow feeds held the request for minutes and hid every
+    # later result behind the earlier ones (AUG-028).
+    urls = list(dict.fromkeys(u.strip() for u in feed_urls.strip().splitlines() if u.strip()))
     if not urls:
         return templates.TemplateResponse(
             request,
@@ -154,14 +164,33 @@ async def validate_feed_url(
             {"results": [{"url": "", "valid": False, "message": "No URLs provided"}]},
         )
 
-    from app.url_validation import is_private_url
+    from app.url_validation import MAX_FEED_URLS_PER_TOPIC, is_private_url
 
-    results = []
-    for url in urls:
-        if await asyncio.to_thread(is_private_url, url):
-            results.append({"url": url, "valid": False, "message": "Private/local URLs are not allowed"})
-            continue
-        results.append(await _validate_one(url))
+    truncated = len(urls) - MAX_FEED_URLS_PER_TOPIC
+    urls = urls[:MAX_FEED_URLS_PER_TOPIC]
+
+    semaphore = asyncio.Semaphore(_VALIDATION_CONCURRENCY)
+
+    async def _check(url: str) -> dict:
+        async with semaphore:
+            if await asyncio.to_thread(is_private_url, url):
+                return {"url": url, "valid": False, "message": "Private/local URLs are not allowed"}
+            return await _validate_one(url)
+
+    try:
+        async with asyncio.timeout(_VALIDATION_BUDGET_SECONDS):
+            results = list(await asyncio.gather(*(_check(url) for url in urls)))
+    except TimeoutError:
+        results = [{"url": url, "valid": False, "message": "Validation timed out — try a shorter list"} for url in urls]
+
+    if truncated > 0:
+        results.append(
+            {
+                "url": "",
+                "valid": False,
+                "message": f"{truncated} more URL(s) not checked (maximum {MAX_FEED_URLS_PER_TOPIC} per run)",
+            }
+        )
 
     return templates.TemplateResponse(
         request,

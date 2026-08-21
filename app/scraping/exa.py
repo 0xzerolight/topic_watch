@@ -33,7 +33,7 @@ from app.scraping.source import (
     bounded,
     register_source,
 )
-from app.url_validation import is_private_url
+from app.url_validation import validate_outbound_url
 
 if TYPE_CHECKING:
     from app.config import ExaSettings
@@ -191,14 +191,15 @@ async def fetch_exa_entries(
 
     endpoint = exa_search_endpoint(exa_settings)
 
-    # base_url is user-configurable, so validate the effective endpoint (SSRF).
+    # base_url is user-configurable and the request carries the paid API key, so
+    # the endpoint goes through the shared outbound gate: http(s) only, no
+    # private/reserved target, and HTTPS for anything public — a plain-http
+    # override put the key and the topic query on the wire in cleartext (AUG-304).
     try:
-        if urlparse(endpoint).scheme not in ("http", "https"):
-            logger.warning("Blocked Exa request to non-http(s) endpoint: %s", redact_url(endpoint))
-            return _failed(endpoint, health_callback, "Non-http(s) endpoint")
-        if await asyncio.to_thread(is_private_url, endpoint):
-            logger.warning("Blocked Exa request to private/reserved endpoint: %s", redact_url(endpoint))
-            return _failed(endpoint, health_callback, "Private/reserved endpoint")
+        await asyncio.to_thread(validate_outbound_url, endpoint, purpose="The Exa endpoint", require_https=True)
+    except ValueError as exc:
+        logger.warning("Blocked Exa request to %s: %s", redact_url(endpoint), exc)
+        return _failed(endpoint, health_callback, "Blocked endpoint")
     except Exception:
         logger.warning("Blocked Exa request to malformed endpoint: %s", redact_url(endpoint), exc_info=True)
         return _failed(endpoint, health_callback, "Malformed endpoint")

@@ -306,14 +306,14 @@ class TestFetchExaEntries:
 
     async def test_private_endpoint_blocked(self) -> None:
         """A base_url resolving to a private host is blocked before any request (SSRF)."""
-        settings = ExaSettings(enabled=True, api_key="k", base_url="http://internal.local")
+        settings = ExaSettings(enabled=True, api_key="k", base_url="https://internal.local")
         calls: list[str] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             calls.append(str(request.url))
             return httpx.Response(200, json={"results": []})
 
-        with patch("app.scraping.exa.is_private_url", return_value=True):
+        with patch("app.url_validation.is_private_url", return_value=True):
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
                 resp = await fetch_exa_entries(_EXA_TOPIC, settings, max_results=5, timeout=5.0, client=client)
         assert resp.feeds_total == 1 and resp.feeds_failed == 1
@@ -400,21 +400,21 @@ class TestExaHealthCallback:
 
     async def test_private_endpoint_records_failure(self) -> None:
         rec = _Recorder()
-        settings = ExaSettings(enabled=True, api_key="k", base_url="http://internal.local")
-        with patch("app.scraping.exa.is_private_url", return_value=True):
+        settings = ExaSettings(enabled=True, api_key="k", base_url="https://internal.local")
+        with patch("app.url_validation.is_private_url", return_value=True):
             async with httpx.AsyncClient(transport=_exa_response([])) as client:
                 await fetch_exa_entries(
                     _EXA_TOPIC, settings, max_results=5, timeout=5.0, client=client, health_callback=rec
                 )
         assert len(rec.calls) == 1
-        assert rec.calls[0].feed_url == "http://internal.local/search"
+        assert rec.calls[0].feed_url == "https://internal.local/search"
         assert rec.calls[0].status is FetchStatus.FAILED
         assert rec.calls[0].error_msg
 
     async def test_malformed_endpoint_records_failure(self) -> None:
-        """The SSRF-check except path (no prior test) records a failure."""
+        """The endpoint-gate's unexpected-exception path records a failure."""
         rec = _Recorder()
-        with patch("app.scraping.exa.is_private_url", side_effect=ValueError):
+        with patch("app.url_validation.is_private_url", side_effect=RuntimeError):
             async with httpx.AsyncClient(transport=_exa_response([])) as client:
                 await fetch_exa_entries(
                     _EXA_TOPIC, _ENABLED, max_results=5, timeout=5.0, client=client, health_callback=rec
@@ -531,3 +531,35 @@ class TestExaPipelineStore:
         assert health.consecutive_failures == 0
         assert health.total_fetches == 1
         assert health.last_success_at is not None
+
+
+class TestExaEndpointTransport:
+    """A public Exa override must not carry the paid API key in cleartext (AUG-304)."""
+
+    async def test_public_http_base_url_blocked(self) -> None:
+        settings = ExaSettings(enabled=True, api_key="k", base_url="http://proxy.example.com")
+        calls: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(200, json={"results": []})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            resp = await fetch_exa_entries(_EXA_TOPIC, settings, max_results=5, timeout=5.0, client=client)
+
+        assert resp.feeds_total == 1 and resp.feeds_failed == 1
+        assert calls == []
+
+    async def test_https_base_url_still_allowed(self) -> None:
+        settings = ExaSettings(enabled=True, api_key="k", base_url="https://proxy.example.com")
+        calls: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(200, json={"results": []})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            resp = await fetch_exa_entries(_EXA_TOPIC, settings, max_results=5, timeout=5.0, client=client)
+
+        assert resp.feeds_failed == 0
+        assert len(calls) == 1

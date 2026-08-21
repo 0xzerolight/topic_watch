@@ -8,7 +8,7 @@ import sqlite3
 from typing import TYPE_CHECKING
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse, StreamingResponse
 
 from app.config import Settings
@@ -21,6 +21,40 @@ if TYPE_CHECKING:
     from app.opml import OPMLResult
 
 router = APIRouter()
+
+# The advertised OPML limit, plus room for multipart framing and the CSRF field
+# around it. The route still applies the exact 1 MiB limit to the file itself.
+MAX_OPML_FILE_BYTES = 1024 * 1024
+_MAX_UPLOAD_BODY_BYTES = MAX_OPML_FILE_BYTES + 64 * 1024
+
+
+async def _limit_upload_body(request: Request) -> None:
+    """Bound the request body before anything parses it (AUG-014).
+
+    ``request.form()`` consumes and spools the whole multipart body — file parts
+    roll to temporary storage regardless of Starlette's ``max_part_size`` — and
+    ``verify_csrf`` triggers that parse before the route's own size check ever
+    ran. So the limit has to be enforced on the raw stream, and this dependency
+    is declared BEFORE ``verify_csrf`` so it runs first.
+
+    A declared over-limit ``Content-Length`` is refused without reading a byte;
+    a chunked body is counted as it arrives and refused the moment it crosses.
+    The bytes we did accept are stored in Starlette's own body cache, so the
+    later ``form()`` parses from memory we have already bounded rather than
+    re-reading the stream.
+    """
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > _MAX_UPLOAD_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="File too large (max 1MB)")
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > _MAX_UPLOAD_BODY_BYTES:
+            raise HTTPException(status_code=413, detail="File too large (max 1MB)")
+        chunks.append(chunk)
+    request._body = b"".join(chunks)
 
 
 def _import_failure_message(result: "OPMLResult") -> str:
@@ -68,7 +102,7 @@ async def export_opml_handler(
     )
 
 
-@router.post("/import/opml", dependencies=[Depends(verify_csrf)])
+@router.post("/import/opml", dependencies=[Depends(_limit_upload_body), Depends(verify_csrf)])
 async def import_opml_handler(
     request: Request,
     conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
@@ -91,8 +125,8 @@ async def import_opml_handler(
         return RedirectResponse(url="/?error=No+file+selected", status_code=303)
 
     # Read file with 1MB size cap
-    content_bytes = await opml_file.read(1024 * 1024 + 1)
-    if len(content_bytes) > 1024 * 1024:
+    content_bytes = await opml_file.read(MAX_OPML_FILE_BYTES + 1)
+    if len(content_bytes) > MAX_OPML_FILE_BYTES:
         return RedirectResponse(url="/?error=File+too+large+(max+1MB)", status_code=303)
 
     try:
