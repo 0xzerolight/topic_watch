@@ -587,3 +587,63 @@ class TestLifespanShutdown:
                 raise asyncio.CancelledError()
 
         assert calls == ["start", "stop"]
+
+
+class TestDeliveryLedgerRetention:
+    """AUG-153: the delivery ledger is pruned by the existing maintenance tick."""
+
+    async def test_cleanup_tick_prunes_finished_intents(self, tmp_path: Path) -> None:
+        from types import SimpleNamespace
+
+        from app.scheduler import _tick_cleanup
+
+        app = SimpleNamespace(state=SimpleNamespace(settings=_make_settings(), db_path=tmp_path / "live.db"))
+        with (
+            patch("app.scheduler._cleanup_old_articles", new_callable=AsyncMock),
+            patch("app.scheduler.delete_old_delivery_intents", return_value=3) as mock_prune,
+        ):
+            await _tick_cleanup(settings=_make_settings(), db_path=None, app=app)
+
+        mock_prune.assert_called_once()
+        assert mock_prune.call_args.args[1] == 30
+
+    def test_only_finished_intents_older_than_the_window_are_removed(self, tmp_path: Path) -> None:
+        from datetime import UTC, datetime, timedelta
+
+        from app.crud import (
+            DELIVERY_INTENT_RETENTION_DAYS,
+            create_pending_notification,
+            create_topic,
+            delete_old_delivery_intents,
+        )
+        from app.database import get_connection, init_db
+        from app.models import PendingNotification, Topic, TopicStatus
+
+        db_path = tmp_path / "ledger.db"
+        init_db(db_path)
+        conn = get_connection(db_path)
+        try:
+            topic = create_topic(conn, Topic(name="T", description="d", status=TopicStatus.READY))
+            old = datetime.now(UTC) - timedelta(days=DELIVERY_INTENT_RETENTION_DAYS + 1)
+            for title, status, created in (
+                ("old-sent", "sent", old),
+                ("old-abandoned", "abandoned", old),
+                ("old-pending", "pending", old),
+                ("fresh-sent", "sent", datetime.now(UTC)),
+            ):
+                intent = create_pending_notification(
+                    conn,
+                    PendingNotification(topic_id=topic.id, title=title, body="B", url="json://x", created_at=created),
+                )
+                conn.execute("UPDATE pending_notifications SET status = ? WHERE id = ?", (status, intent.id))
+            conn.commit()
+
+            removed = delete_old_delivery_intents(conn, DELIVERY_INTENT_RETENTION_DAYS)
+            conn.commit()
+
+            assert removed == 2
+            titles = {r["title"] for r in conn.execute("SELECT title FROM pending_notifications")}
+            # An undelivered intent still owes a delivery, however old it is.
+            assert titles == {"old-pending", "fresh-sent"}
+        finally:
+            conn.close()

@@ -14,8 +14,11 @@ from app.checker import retry_pending_notifications
 from app.config import LLMSettings, NotificationSettings, Settings
 from app.crud import create_pending_notification, create_topic, list_pending_notifications
 from app.database import get_connection, init_db
-from app.models import PendingNotification, Topic, TopicStatus
+from app.models import NotificationDelivery, PendingNotification, Topic, TopicStatus
 from app.notifications import (
+    NOTIFICATION_BODY_CHAR_LIMIT,
+    NOTIFICATION_TITLE_CHAR_LIMIT,
+    _is_placeholder_url,
     format_notification,
     redact_url,
     send_notification,
@@ -54,6 +57,47 @@ class TestPlaceholderGuard:
         assert by_url["json://hooks.example.com"].ok is True
         # The placeholder never reached Apprise; the real URL did.
         inst.add.assert_called_once_with("json://hooks.example.com")
+
+    async def test_marker_as_substring_of_a_component_is_delivered(self) -> None:
+        """AUG-245: a real topic merely containing a marker must not be refused."""
+        real = "ntfy://api_token-alerts"
+        settings = _make_settings(notifications=NotificationSettings(urls=[real]))
+        with patch("app.notifications.apprise.Apprise") as mock_ap:
+            inst = mock_ap.return_value
+            inst.add.return_value = True
+            inst.notify.return_value = True
+            results = await send_notification_per_url("T", "B", settings)
+
+        assert results[0].ok is True
+        inst.add.assert_called_once_with(real)
+
+    def test_shipped_example_urls_are_all_refused(self) -> None:
+        for url in (
+            "ntfy://your-topic-name",
+            "discord://webhook_id/webhook_token",
+            "tgram://bot_token/chat_id",
+            "slack://token_a/token_b/token_c/channel",
+        ):
+            assert _is_placeholder_url(url) is True, url
+
+    def test_credential_bearing_path_is_not_a_placeholder(self) -> None:
+        assert _is_placeholder_url("https://hooks.example.com/api_tokens/abc") is False
+
+
+class TestTargetDeduplication:
+    """AUG-246: a repeated target must not double every alert."""
+
+    def test_repeated_notification_url_is_collapsed(self) -> None:
+        settings = NotificationSettings(urls=["json://a", "json://b", "json://a"])
+        assert settings.urls == ["json://a", "json://b"]
+
+    def test_repeated_webhook_url_is_collapsed(self) -> None:
+        settings = NotificationSettings(webhook_urls=["https://a/h", "https://a/h"])
+        assert settings.webhook_urls == ["https://a/h"]
+
+    def test_distinct_spellings_are_preserved(self) -> None:
+        settings = NotificationSettings(webhook_urls=["https://a/h", "https://a/h/"])
+        assert settings.webhook_urls == ["https://a/h", "https://a/h/"]
 
 
 # --- format_notification ---
@@ -118,6 +162,55 @@ class TestFormatNotification:
         title, body = format_notification("Test", novelty)
         assert title == "Topic Watch: Test"
         assert isinstance(body, str)
+
+    def test_long_topic_name_is_capped_in_the_title(self) -> None:
+        novelty = NoveltyResult(has_new_info=True, summary="x", confidence=0.9)
+        title, _ = format_notification("N" * 5000, novelty)
+        assert len(title) <= NOTIFICATION_TITLE_CHAR_LIMIT
+        assert title.endswith("...")
+
+    def test_oversized_body_is_capped_and_keeps_the_score_footer(self) -> None:
+        novelty = NoveltyResult(
+            has_new_info=True,
+            summary="S" * 4000,
+            key_facts=["F" * 500 for _ in range(20)],
+            source_urls=[f"https://example.com/{'p' * 300}/{i}" for i in range(20)],
+            confidence=0.9,
+            relevance=0.8,
+            importance=4,
+        )
+        _, body = format_notification("Test", novelty)
+        assert len(body) <= NOTIFICATION_BODY_CHAR_LIMIT
+        assert "Confidence: 90%" in body
+        assert "Relevance: 80%" in body
+        assert "Importance: 4/5" in body
+        assert "[trimmed to fit the notification channel]" in body
+
+    def test_source_urls_are_dropped_whole_never_cut(self) -> None:
+        long_url = "https://example.com/" + "p" * 4000
+        novelty = NoveltyResult(
+            has_new_info=True,
+            summary="Short summary",
+            source_urls=[long_url],
+            confidence=0.9,
+        )
+        _, body = format_notification("Test", novelty)
+        # Either the whole URL is present or none of it — never a broken prefix.
+        assert long_url not in body
+        assert "https://example.com/pppp" not in body
+        assert "[trimmed to fit the notification channel]" in body
+
+    def test_normal_payload_carries_no_omission_marker(self) -> None:
+        novelty = NoveltyResult(
+            has_new_info=True,
+            summary="Short",
+            key_facts=["One"],
+            source_urls=["https://example.com/a"],
+            confidence=0.9,
+        )
+        _, body = format_notification("Test", novelty)
+        assert "[trimmed to fit the notification channel]" not in body
+        assert "https://example.com/a" in body
 
     def test_body_includes_confidence_percentage(self) -> None:
         novelty = NoveltyResult(
@@ -238,6 +331,29 @@ class TestSendNotification:
 
         assert result is False
 
+    async def test_one_targets_timeout_preserves_sibling_successes(self) -> None:
+        """AUG-071: a stalled channel must not fabricate failure for its siblings."""
+        blocker = threading.Event()
+
+        def fake_deliver(title: str, body: str, url: str) -> NotificationDelivery:
+            if url == "json://slow":
+                blocker.wait(2)
+            return NotificationDelivery(url=url, ok=True)
+
+        settings = _make_settings(
+            notifications=NotificationSettings(urls=["json://fast", "json://slow"]),
+            apprise_timeout_seconds=1,
+        )
+        with patch("app.notifications._deliver_one", side_effect=fake_deliver):
+            results = await send_notification_per_url("Title", "Body", settings)
+        blocker.set()
+
+        by_url = {r.url: r for r in results}
+        assert by_url["json://fast"].ok is True
+        assert by_url["json://fast"].timed_out is False
+        assert by_url["json://slow"].ok is False
+        assert by_url["json://slow"].timed_out is True
+
     @patch("app.notifications.apprise.Apprise")
     async def test_returns_false_on_exception(self, mock_apprise: MagicMock) -> None:
         mock_instance = MagicMock()
@@ -263,7 +379,7 @@ def _enqueue_notifications(db_path, count: int) -> list[int]:  # noqa: ANN001
         for i in range(count):
             n = create_pending_notification(
                 conn,
-                PendingNotification(topic_id=topic.id, title=f"T{i}", body=f"B{i}"),
+                PendingNotification(topic_id=topic.id, title=f"T{i}", body=f"B{i}", url=f"json://t{i}"),
             )
             ids.append(n.id)
         conn.commit()
@@ -286,13 +402,13 @@ class TestNotificationDrainSingleFlight:
         first_send_started = asyncio.Event()
         release = asyncio.Event()
 
-        async def slow_send(title: str, body: str, _settings, *, url=None) -> bool:  # noqa: ANN001
+        async def slow_send(title: str, body: str, url: str, timeout_s: float) -> NotificationDelivery:
             first_send_started.set()
             await release.wait()
             sent_counts[title] += 1
-            return True
+            return NotificationDelivery(url=url, ok=True)
 
-        with patch("app.checker.send_notification", side_effect=slow_send):
+        with patch("app.checker.send_single_notification", side_effect=slow_send):
             drain1 = asyncio.create_task(retry_pending_notifications(settings=settings, db_path=db_path))
             await first_send_started.wait()
             drain2 = asyncio.create_task(retry_pending_notifications(settings=settings, db_path=db_path))
@@ -310,7 +426,7 @@ class TestNotificationDrainSingleFlight:
 
     async def test_claimed_row_skipped_by_second_drainer(self, tmp_path) -> None:  # noqa: ANN001
         """A row another process already claimed is skipped, not re-sent."""
-        from app.crud import claim_pending_notification
+        from app.crud import claim_notification_intent
 
         db_path = tmp_path / "test.db"
         init_db(db_path)
@@ -318,18 +434,18 @@ class TestNotificationDrainSingleFlight:
 
         claimer = get_connection(db_path)
         try:
-            assert claim_pending_notification(claimer, ids[0], "2999-01-01T00:00:00+00:00") is True
+            assert claim_notification_intent(claimer, ids[0], "other-owner", "2999-01-01T00:00:00+00:00") is True
             claimer.commit()
         finally:
             claimer.close()
 
         send_calls: list[str] = []
 
-        async def record_send(title: str, body: str, _settings, *, url=None) -> bool:  # noqa: ANN001
+        async def record_send(title: str, body: str, url: str, timeout_s: float) -> NotificationDelivery:
             send_calls.append(title)
-            return True
+            return NotificationDelivery(url=url, ok=True)
 
-        with patch("app.checker.send_notification", side_effect=record_send):
+        with patch("app.checker.send_single_notification", side_effect=record_send):
             await retry_pending_notifications(settings=_make_settings(), db_path=db_path)
 
         assert send_calls == []
@@ -382,12 +498,22 @@ class TestSendNotificationPerUrl:
 
     @patch("app.notifications.apprise.Apprise")
     async def test_returns_one_result_per_url(self, mock_apprise: MagicMock) -> None:
-        instances = [MagicMock(), MagicMock()]
-        instances[0].add.return_value = True
-        instances[0].notify.return_value = True
-        instances[1].add.return_value = True
-        instances[1].notify.return_value = False
-        mock_apprise.side_effect = instances
+        # Targets are delivered concurrently, so the stub is keyed by URL rather
+        # than by the order the instances happen to be constructed in.
+        instances: dict[str, MagicMock] = {}
+
+        def make_instance() -> MagicMock:
+            inst = MagicMock()
+
+            def _add(url: str) -> bool:
+                instances[url] = inst
+                inst.notify.return_value = url != "json://b"
+                return True
+
+            inst.add.side_effect = _add
+            return inst
+
+        mock_apprise.side_effect = make_instance
         settings = _make_settings(notifications=NotificationSettings(urls=["json://a", "json://b"]))
 
         results = await send_notification_per_url("T", "B", settings)
@@ -397,11 +523,20 @@ class TestSendNotificationPerUrl:
     @patch("app.notifications.apprise.Apprise")
     async def test_invalid_url_marked_failed_not_dropped(self, mock_apprise: MagicMock) -> None:
         """A URL apprise can't add() is reported as failed (OVH-027), not silently dropped."""
-        good, bad = MagicMock(), MagicMock()
-        good.add.return_value = True
-        good.notify.return_value = True
-        bad.add.return_value = False  # invalid URL
-        mock_apprise.side_effect = [good, bad]
+        instances: dict[str, MagicMock] = {}
+
+        def make_instance() -> MagicMock:
+            inst = MagicMock()
+
+            def _add(url: str) -> bool:
+                instances[url] = inst
+                return url == "json://good"
+
+            inst.add.side_effect = _add
+            inst.notify.return_value = True
+            return inst
+
+        mock_apprise.side_effect = make_instance
         settings = _make_settings(notifications=NotificationSettings(urls=["json://good", "::invalid::"]))
 
         results = await send_notification_per_url("T", "B", settings)
@@ -410,9 +545,9 @@ class TestSendNotificationPerUrl:
         assert by_url["json://good"].ok is True
         assert by_url["::invalid::"].ok is False
         # The valid URL still delivered.
-        good.notify.assert_called_once()
+        instances["json://good"].notify.assert_called_once()
         # The invalid URL was never notify()'d (add failed first).
-        bad.notify.assert_not_called()
+        instances["::invalid::"].notify.assert_not_called()
 
     @patch("app.notifications.apprise.Apprise")
     async def test_only_named_url_sent_when_url_given(self, mock_apprise: MagicMock) -> None:
@@ -480,24 +615,33 @@ class TestSendNotificationStillNonRaising:
 class TestRetryOnlyResendsFailedUrls:
     """A partial failure queues only the failed URL; retry never re-hits the rest."""
 
-    async def test_partial_failure_requeues_only_failed_url(self, tmp_path) -> None:  # noqa: ANN001
-        """check_topic-style queueing: a 3-URL send with one failure queues 1 row for that URL."""
-        from app.checker import _queue_failed_notifications
-        from app.models import NotificationDelivery
+    async def test_partial_failure_leaves_only_the_failed_url_queued(self, tmp_path) -> None:  # noqa: ANN001
+        """A 3-target send with one failure leaves exactly that target owing a delivery."""
+        from app.checker import build_notification_intents, deliver_notification_intents
+        from app.crud import create_notification_intents
 
         db_path = tmp_path / "test.db"
         init_db(db_path)
+        settings = _make_settings(notifications=NotificationSettings(urls=["json://a", "json://b", "json://c"]))
         conn = get_connection(db_path)
         try:
             topic = create_topic(conn, Topic(name="Notif", description="d", status=TopicStatus.READY))
             conn.commit()
-            deliveries = [
-                NotificationDelivery(url="json://a", ok=True),
-                NotificationDelivery(url="json://b", ok=False, error="HTTP 500"),
-                NotificationDelivery(url="json://c", ok=True),
-            ]
-            _queue_failed_notifications(conn, topic.id, "T", "B", deliveries)
+            intents = build_notification_intents("T", "B", settings, topic.id)
+            create_notification_intents(conn, intents)
             conn.commit()
+        finally:
+            conn.close()
+
+        async def one_fails(title: str, body: str, url: str, timeout_s: float) -> NotificationDelivery:
+            ok = url != "json://b"
+            return NotificationDelivery(url=url, ok=ok, error=None if ok else "HTTP 500")
+
+        with patch("app.checker.send_single_notification", side_effect=one_fails):
+            await deliver_notification_intents(intents, settings, db_path)
+
+        conn = get_connection(db_path)
+        try:
             pending = list_pending_notifications(conn)
         finally:
             conn.close()
@@ -522,14 +666,14 @@ class TestRetryOnlyResendsFailedUrls:
         finally:
             conn.close()
 
-        # The retry drain must call send_notification scoped to the queued URL only.
+        # The retry drain must send scoped to the queued URL only.
         sent_urls: list[str | None] = []
 
-        async def record_send(title: str, body: str, _settings, *, url=None) -> bool:  # noqa: ANN001
+        async def record_send(title: str, body: str, url: str, timeout_s: float) -> NotificationDelivery:
             sent_urls.append(url)
-            return True
+            return NotificationDelivery(url=url, ok=True)
 
-        with patch("app.checker.send_notification", side_effect=record_send):
+        with patch("app.checker.send_single_notification", side_effect=record_send):
             await retry_pending_notifications(settings=_make_settings(), db_path=db_path)
 
         assert sent_urls == ["json://b"]

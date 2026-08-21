@@ -65,6 +65,9 @@ def _settings() -> Settings:
     """Build offline-safe Settings (mirrors test_analysis _make_settings)."""
     return Settings(
         llm=LLMSettings(model="openai/gpt-4o-mini", api_key="test-key"),
+        # A configured Apprise target: delivery intents exist only for targets the
+        # user actually named, so a smoke run with none would never deliver.
+        notifications=NotificationSettings(urls=["json://localhost"]),
         knowledge_state_max_tokens=2000,
     )
 
@@ -188,10 +191,10 @@ async def test_initialize_then_check_pipeline(db_conn: sqlite3.Connection, db_pa
         _inject_transport(_build_transport(check_entries)),
         stub_llm_boundary(novelty=novelty),
         patch(
-            "app.checker.send_notification_per_url",
+            "app.checker.deliver_notification_intents",
             new=AsyncMock(return_value=[NotificationDelivery(url="json://localhost", ok=True)]),
         ) as mock_notify,
-        patch("app.checker.send_webhooks", new=AsyncMock(return_value=0)),
+        patch("app.checker.deliver_webhook_intents", new=AsyncMock(return_value=0)),
     ):
         result = await check_topic(topic, settings, db_path=db_path)
 
@@ -313,7 +316,7 @@ async def test_check_topic_queues_webhook_through_held_conn_on_500(db_conn: sqli
         stub_llm_boundary(novelty=novelty),
         # Stub only the Apprise delivery — the webhook queue path stays real.
         patch(
-            "app.checker.send_notification_per_url",
+            "app.checker.deliver_notification_intents",
             new=AsyncMock(return_value=[NotificationDelivery(url="json://localhost", ok=True)]),
         ),
         # Let the real webhook POST reach the MockTransport (skip the SSRF DNS check).
@@ -397,8 +400,8 @@ async def test_below_threshold_suppresses_notification_end_to_end(db_conn: sqlit
     with (
         _inject_transport(_build_transport(check_entries)),
         stub_llm_boundary(novelty=novelty),
-        patch("app.checker.send_notification_per_url", new=AsyncMock()) as mock_notify,
-        patch("app.checker.send_webhooks", new=AsyncMock()) as mock_webhooks,
+        patch("app.checker.deliver_notification_intents", new=AsyncMock()) as mock_notify,
+        patch("app.checker.deliver_webhook_intents", new=AsyncMock()) as mock_webhooks,
     ):
         result = await check_topic(topic, settings, db_path=db_path)
 
@@ -428,12 +431,13 @@ async def test_delivery_failure_queues_pending_notification_end_to_end(
 ) -> None:
     """OVH-161: an above-threshold notify whose delivery fails is queued for retry.
 
-    ``send_notification_per_url`` returns a failed ``NotificationDelivery`` (the
-    real Apprise call is the only thing stubbed); the rest of ``check_topic``
-    runs for real. Pins that the failed URL lands in ``pending_notifications``
-    with its scoped url, correlated to the same committed CheckResult.
+    Only the Apprise call itself is stubbed; the intent creation, claim and apply
+    all run for real. Pins that the failed URL still owes a delivery, scoped to
+    that url and correlated to the same committed CheckResult.
     """
     settings = _settings()
+    failed_url = "tgram://token/chatid"
+    settings.notifications = NotificationSettings(urls=[failed_url])
     topic = await _init_ready_topic(db_conn, settings)
 
     check_entries = [
@@ -452,16 +456,14 @@ async def test_delivery_failure_queues_pending_notification_end_to_end(
         confidence=0.95,
         relevance=0.9,
     )
-    failed_url = "tgram://token/chatid"
+
+    async def failing_send(title, body, url, timeout_s):  # noqa: ANN001
+        return NotificationDelivery(url=url, ok=False, error="boom")
 
     with (
         _inject_transport(_build_transport(check_entries)),
         stub_llm_boundary(novelty=novelty),
-        patch(
-            "app.checker.send_notification_per_url",
-            new=AsyncMock(return_value=[NotificationDelivery(url=failed_url, ok=False, error="boom")]),
-        ),
-        patch("app.checker.send_webhooks", new=AsyncMock(return_value=0)),
+        patch("app.checker.send_single_notification", side_effect=failing_send),
     ):
         result = await check_topic(topic, settings, db_path=db_path)
 
@@ -476,6 +478,9 @@ async def test_delivery_failure_queues_pending_notification_end_to_end(
     queued = pending[0]
     assert queued.url == failed_url
     assert queued.topic_id == topic.id
+    assert queued.check_result_id == result.id
+    assert queued.last_error == "boom"
+    assert queued.retry_count == 1
 
 
 async def test_compression_path_runs_offline_end_to_end(db_conn: sqlite3.Connection, db_path: Path) -> None:

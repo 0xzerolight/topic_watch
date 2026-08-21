@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import re
+from datetime import UTC, datetime
 
 import litellm
 from fastapi import APIRouter, Depends, Form, Request
@@ -26,6 +27,7 @@ from app.web.csrf import verify_csrf
 from app.web.dependencies import get_settings
 from app.web.routers._validation import format_validation_errors, normalize_base_url
 from app.web.routers.templates import _mask_url, templates
+from app.webhooks import send_webhook
 
 logger = logging.getLogger(__name__)
 
@@ -774,13 +776,26 @@ async def test_notification(
     request: Request,
     settings: Settings = Depends(get_settings),
 ):
-    """Send a test notification to verify notification configuration."""
-    if not settings.notifications.urls:
+    """Exercise every configured delivery channel and report each one's result.
+
+    Apprise and webhooks share one Notifications card and one Test button, but
+    the test used to cover only Apprise: a webhook-only setup was told it had
+    nothing configured and could not verify its sole delivery path before a real
+    event depended on it (AUG-108). Each configured channel is now attempted and
+    reported on its own.
+
+    Nothing is queued for retry — a test that failed is information, not a
+    delivery the user is owed.
+    """
+    apprise_urls = settings.notifications.urls
+    webhook_urls = settings.notifications.webhook_urls
+    if not apprise_urls and not webhook_urls:
         return HTMLResponse(
             '<article style="border-left: 4px solid var(--pico-color-orange-500, #f57c00); padding: 1rem;">'
             "<strong>No notification URLs configured.</strong>"
             "<p>To receive notifications, add one or more Apprise notification URLs to your config file "
-            "(<code>data/config.yml</code>) under <code>notifications.urls</code>.</p>"
+            "(<code>data/config.yml</code>) under <code>notifications.urls</code>, or a webhook endpoint "
+            "under <code>notifications.webhook_urls</code>.</p>"
             "<p><small>Supported services include: Ntfy, Discord, Telegram, Slack, Email, Pushover, Gotify, "
             "and <a href='https://github.com/caronc/apprise/wiki#notification-services' target='_blank'>"
             "90+ more via Apprise</a>.</small></p>"
@@ -789,30 +804,33 @@ async def test_notification(
             status_code=200,
         )
 
+    lines: list[str] = []
+    all_ok = True
     try:
-        success = await send_notification(
-            "Topic Watch Test",
-            "This is a test notification from Topic Watch. If you received this, notifications are working correctly.",
-            settings,
-        )
-        if success:
-            return HTMLResponse(
-                '<article style="border-left: 4px solid var(--pico-ins-color, #2e7d32); padding: 1rem;">'
-                "<strong>&#10003; Notification sent successfully!</strong>"
-                "<p><small>Check your notification service to confirm delivery.</small></p>"
-                "</article>",
-                status_code=200,
+        if apprise_urls:
+            sent = await send_notification(
+                "Topic Watch Test",
+                "This is a test notification from Topic Watch. "
+                "If you received this, notifications are working correctly.",
+                settings,
             )
-        else:
-            return HTMLResponse(
-                '<article style="border-left: 4px solid var(--pico-color-orange-500, #f57c00); padding: 1rem;">'
-                "<strong>Notification delivery failed.</strong>"
-                "<p><small>The notification service rejected the message. Check that your notification URLs "
-                "are correct and the service is reachable.</small></p>"
-                "</article>",
-                status_code=200,
-            )
+            all_ok = all_ok and sent
+            lines.append(f"<li>Apprise: {'delivered' if sent else 'failed'}</li>")
+
+        if webhook_urls:
+            payload = {
+                "topic": "Topic Watch Test",
+                "summary": "This is a test webhook from Topic Watch.",
+                "test": True,
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+            outcomes = await asyncio.gather(*(send_webhook(url, payload) for url in webhook_urls))
+            delivered = sum(1 for outcome in outcomes if outcome.ok)
+            all_ok = all_ok and delivered == len(webhook_urls)
+            lines.append(f"<li>Webhooks: {delivered}/{len(webhook_urls)} delivered</li>")
     except Exception:
+        # The old copy told the user to check the logs without ever writing one.
+        logger.warning("Test notification failed unexpectedly", exc_info=True)
         return HTMLResponse(
             '<article style="border-left: 4px solid var(--pico-del-color, #c62828); padding: 1rem;">'
             "<strong>Notification error.</strong>"
@@ -820,3 +838,23 @@ async def test_notification(
             "</article>",
             status_code=200,
         )
+
+    per_channel = f"<ul>{''.join(lines)}</ul>"
+    if all_ok:
+        return HTMLResponse(
+            '<article style="border-left: 4px solid var(--pico-ins-color, #2e7d32); padding: 1rem;">'
+            "<strong>&#10003; Notification sent successfully!</strong>"
+            f"{per_channel}"
+            "<p><small>Check your notification service to confirm delivery.</small></p>"
+            "</article>",
+            status_code=200,
+        )
+    return HTMLResponse(
+        '<article style="border-left: 4px solid var(--pico-color-orange-500, #f57c00); padding: 1rem;">'
+        "<strong>Notification delivery failed.</strong>"
+        f"{per_channel}"
+        "<p><small>The service rejected the message. Check that your notification and webhook URLs "
+        "are correct and the services are reachable.</small></p>"
+        "</article>",
+        status_code=200,
+    )

@@ -1,6 +1,8 @@
 """Tests for the webhook delivery module."""
 
 import sqlite3
+from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -8,14 +10,40 @@ import pytest
 
 from app.analysis.llm import NoveltyResult
 from app.config import LLMSettings, NotificationSettings, Settings
-from app.crud import create_topic, list_pending_webhooks
+from app.crud import create_topic, create_webhook_intents, list_pending_webhooks
 from app.models import Topic, TopicStatus
 from app.webhooks import (
+    WebhookOutcome,
     _build_webhook_payload,
+    build_webhook_intents,
+    deliver_webhook_intents,
     retry_pending_webhooks,
     send_webhook,
-    send_webhooks,
 )
+from tests.helpers import conn_db_path
+
+
+def _ok(status: int = 200) -> WebhookOutcome:
+    return WebhookOutcome(ok=True, status=status)
+
+
+def _fail(**kwargs) -> WebhookOutcome:
+    return WebhookOutcome(ok=False, **kwargs)
+
+
+async def _deliver(
+    conn: sqlite3.Connection,
+    topic_id: int,
+    settings: Settings,
+    *,
+    topic_name: str = "Hooked",
+    novelty: NoveltyResult | None = None,
+) -> int:
+    """The live path in one step: build intents, commit them, then deliver."""
+    intents = build_webhook_intents(topic_name, novelty or _make_novelty(), settings, topic_id)
+    create_webhook_intents(conn, intents)
+    conn.commit()
+    return await deliver_webhook_intents(intents, settings, conn_db_path(conn), conn)
 
 
 def _make_settings(**overrides) -> Settings:
@@ -160,7 +188,7 @@ class TestSendWebhook:
         with patch("app.webhooks.httpx.AsyncClient", return_value=mock_client):
             result = await send_webhook("https://example.com/hook", {"key": "value"})
 
-        assert result is True
+        assert result.ok is True
 
     async def test_returns_false_on_timeout(self) -> None:
         mock_client = AsyncMock()
@@ -171,7 +199,7 @@ class TestSendWebhook:
         with patch("app.webhooks.httpx.AsyncClient", return_value=mock_client):
             result = await send_webhook("https://example.com/hook", {})
 
-        assert result is False
+        assert result.ok is False
 
     async def test_returns_false_on_http_error(self) -> None:
         mock_response = MagicMock()
@@ -192,7 +220,7 @@ class TestSendWebhook:
         with patch("app.webhooks.httpx.AsyncClient", return_value=mock_client):
             result = await send_webhook("https://example.com/hook", {})
 
-        assert result is False
+        assert result.ok is False
 
     async def test_returns_false_on_connection_error(self) -> None:
         mock_client = AsyncMock()
@@ -203,19 +231,19 @@ class TestSendWebhook:
         with patch("app.webhooks.httpx.AsyncClient", return_value=mock_client):
             result = await send_webhook("https://example.com/hook", {})
 
-        assert result is False
+        assert result.ok is False
 
     async def test_blocks_private_url(self) -> None:
         result = await send_webhook("http://localhost:9200/hook", {"key": "value"})
-        assert result is False
+        assert result.ok is False
 
     async def test_blocks_internal_ip(self) -> None:
         result = await send_webhook("http://169.254.169.254/metadata", {})
-        assert result is False
+        assert result.ok is False
 
     async def test_blocks_loopback_ip(self) -> None:
         result = await send_webhook("http://127.0.0.1:8080/hook", {})
-        assert result is False
+        assert result.ok is False
 
     async def test_blocks_file_scheme_before_post(self) -> None:
         """file:// is rejected by the scheme allowlist before any POST (OVH-141).
@@ -225,21 +253,21 @@ class TestSendWebhook:
         """
         with patch("app.webhooks.httpx.AsyncClient") as mock_cls:
             result = await send_webhook("file:///etc/passwd", {"key": "value"})
-        assert result is False
+        assert result.ok is False
         mock_cls.assert_not_called()
 
     async def test_blocks_gopher_scheme_before_post(self) -> None:
         """gopher:// is rejected by the scheme allowlist before any POST (OVH-141)."""
         with patch("app.webhooks.httpx.AsyncClient") as mock_cls:
             result = await send_webhook("gopher://example.com/7", {})
-        assert result is False
+        assert result.ok is False
         mock_cls.assert_not_called()
 
     async def test_blocks_ftp_scheme_before_post(self) -> None:
         """ftp:// is rejected by the scheme allowlist before any POST (OVH-141)."""
         with patch("app.webhooks.httpx.AsyncClient") as mock_cls:
             result = await send_webhook("ftp://example.com/file", {})
-        assert result is False
+        assert result.ok is False
         mock_cls.assert_not_called()
 
     async def test_malformed_ipv6_url_returns_false_not_raises(self) -> None:
@@ -249,7 +277,7 @@ class TestSendWebhook:
         # urlparse("http://[::1") raises ValueError("Invalid IPv6 URL").
         with patch("app.webhooks.httpx.AsyncClient") as mock_cls:
             result = await send_webhook("http://[::1", {"key": "value"})
-        assert result is False
+        assert result.ok is False
         mock_cls.assert_not_called()
 
     async def test_posts_to_correct_url(self) -> None:
@@ -274,108 +302,147 @@ class TestSendWebhook:
 # --- send_webhooks ---
 
 
-class TestSendWebhooks:
-    """Tests for the send_webhooks orchestrator."""
+class TestWebhookOutcomeClassification:
+    """AUG-324: the outcome has to say what happened, not just whether it worked."""
 
-    async def test_returns_zero_with_no_webhook_urls(self) -> None:
+    @staticmethod
+    def _client_returning(status: int, headers: dict | None = None) -> AsyncMock:
+        response = MagicMock()
+        response.status_code = status
+        response.headers = headers or {}
+        response.raise_for_status = MagicMock(
+            side_effect=httpx.HTTPStatusError("err", request=MagicMock(), response=response)
+        )
+        client = AsyncMock()
+        client.post = AsyncMock(return_value=response)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=None)
+        return client
+
+    @pytest.mark.parametrize("status", [400, 401, 403, 404, 410, 413, 422])
+    async def test_permanent_statuses_are_not_retryable(self, status: int) -> None:
+        with patch("app.webhooks.httpx.AsyncClient", return_value=self._client_returning(status)):
+            outcome = await send_webhook("https://example.com/hook", {})
+        assert outcome.ok is False
+        assert outcome.status == status
+        assert outcome.retryable is False
+        assert outcome.error == f"HTTP {status}"
+
+    @pytest.mark.parametrize("status", [408, 425, 429, 500, 503])
+    async def test_transient_statuses_stay_retryable(self, status: int) -> None:
+        with patch("app.webhooks.httpx.AsyncClient", return_value=self._client_returning(status)):
+            outcome = await send_webhook("https://example.com/hook", {})
+        assert outcome.retryable is True
+
+    async def test_retry_after_delta_seconds_is_parsed(self) -> None:
+        client = self._client_returning(429, {"Retry-After": "120"})
+        with patch("app.webhooks.httpx.AsyncClient", return_value=client):
+            outcome = await send_webhook("https://example.com/hook", {})
+        assert outcome.retry_after_s == pytest.approx(120.0)
+
+    async def test_retry_after_http_date_is_parsed(self) -> None:
+        when = datetime.now(UTC) + timedelta(seconds=300)
+        client = self._client_returning(503, {"Retry-After": format_datetime(when, usegmt=True)})
+        with patch("app.webhooks.httpx.AsyncClient", return_value=client):
+            outcome = await send_webhook("https://example.com/hook", {})
+        assert outcome.retry_after_s is not None
+        assert 250 < outcome.retry_after_s <= 300
+
+    async def test_retry_after_is_clamped_and_never_negative(self) -> None:
+        client = self._client_returning(429, {"Retry-After": "999999"})
+        with patch("app.webhooks.httpx.AsyncClient", return_value=client):
+            outcome = await send_webhook("https://example.com/hook", {})
+        assert outcome.retry_after_s == pytest.approx(3600.0)
+
+        past = datetime.now(UTC) - timedelta(hours=1)
+        client = self._client_returning(429, {"Retry-After": format_datetime(past, usegmt=True)})
+        with patch("app.webhooks.httpx.AsyncClient", return_value=client):
+            outcome = await send_webhook("https://example.com/hook", {})
+        assert outcome.retry_after_s == pytest.approx(0.0)
+
+    async def test_unparseable_retry_after_is_ignored(self) -> None:
+        client = self._client_returning(429, {"Retry-After": "next tuesday"})
+        with patch("app.webhooks.httpx.AsyncClient", return_value=client):
+            outcome = await send_webhook("https://example.com/hook", {})
+        assert outcome.retry_after_s is None
+        assert outcome.retryable is True
+
+    async def test_permanent_status_ignores_retry_after(self) -> None:
+        client = self._client_returning(422, {"Retry-After": "60"})
+        with patch("app.webhooks.httpx.AsyncClient", return_value=client):
+            outcome = await send_webhook("https://example.com/hook", {})
+        assert outcome.retryable is False
+        assert outcome.retry_after_s is None
+
+    async def test_blocked_targets_are_terminal_not_transient(self) -> None:
+        """A private address or a bad scheme will not become valid on a retry."""
+        for url in ("http://127.0.0.1:8080/hook", "file:///etc/passwd", "http://[::1"):
+            outcome = await send_webhook(url, {})
+            assert outcome.ok is False, url
+            assert outcome.retryable is False, url
+
+
+class TestWebhookIntents:
+    """Building and delivering per-target webhook intents."""
+
+    def test_no_webhook_urls_builds_no_intents(self) -> None:
         settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=[]))
-        novelty = _make_novelty()
+        assert build_webhook_intents("My Topic", _make_novelty(), settings, 1) == []
 
-        result = await send_webhooks("My Topic", novelty, settings)
-
-        assert result == 0
-
-    async def test_returns_count_of_successful_deliveries(self) -> None:
-        settings = _make_settings(
-            notifications=NotificationSettings(
-                urls=[],
-                webhook_urls=["https://a.com/hook", "https://b.com/hook", "https://c.com/hook"],
-            )
-        )
-        novelty = _make_novelty()
-
-        # First two succeed, third fails
-        async def fake_send_webhook(url: str, payload: dict, timeout: float = 10.0) -> bool:
-            return url != "https://c.com/hook"
-
-        with patch("app.webhooks.send_webhook", side_effect=fake_send_webhook):
-            result = await send_webhooks("My Topic", novelty, settings)
-
-        assert result == 2
-
-    async def test_returns_full_count_when_all_succeed(self) -> None:
-        settings = _make_settings(
-            notifications=NotificationSettings(
-                urls=[],
-                webhook_urls=["https://a.com/hook", "https://b.com/hook"],
-            )
-        )
-        novelty = _make_novelty()
-
-        with patch("app.webhooks.send_webhook", return_value=True):
-            result = await send_webhooks("My Topic", novelty, settings)
-
-        assert result == 2
-
-    async def test_returns_zero_when_all_fail(self) -> None:
-        settings = _make_settings(
-            notifications=NotificationSettings(
-                urls=[],
-                webhook_urls=["https://a.com/hook", "https://b.com/hook"],
-            )
-        )
-        novelty = _make_novelty()
-
-        with patch("app.webhooks.send_webhook", return_value=False):
-            result = await send_webhooks("My Topic", novelty, settings)
-
-        assert result == 0
-
-    async def test_sends_to_all_configured_urls(self) -> None:
+    def test_one_intent_per_configured_url(self) -> None:
         urls = ["https://a.com/hook", "https://b.com/hook"]
         settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=urls))
-        novelty = _make_novelty()
-        called_urls: list[str] = []
+        intents = build_webhook_intents("My Topic", _make_novelty(), settings, 7, 42)
+        assert [i.url for i in intents] == urls
+        assert {i.topic_id for i in intents} == {7}
+        assert {i.check_result_id for i in intents} == {42}
 
-        async def capture_url(url: str, payload: dict, timeout: float = 10.0) -> bool:
-            called_urls.append(url)
-            return True
-
-        with patch("app.webhooks.send_webhook", side_effect=capture_url):
-            await send_webhooks("My Topic", novelty, settings)
-
-        assert sorted(called_urls) == sorted(urls)
-
-    async def test_passes_correct_payload_fields(self) -> None:
+    def test_intent_payload_carries_the_novelty_fields(self) -> None:
         settings = _make_settings(
-            notifications=NotificationSettings(
-                urls=[],
-                webhook_urls=["https://hook.example.com"],
-            )
+            notifications=NotificationSettings(urls=[], webhook_urls=["https://hook.example.com"])
         )
         novelty = _make_novelty(
-            summary="Big news",
-            key_facts=["fact1"],
-            source_urls=["https://src.com"],
-            confidence=0.9,
+            summary="Big news", key_facts=["fact1"], source_urls=["https://src.com"], confidence=0.9
         )
-        captured_payloads: list[dict] = []
-
-        async def capture_payload(url: str, payload: dict, timeout: float = 10.0) -> bool:
-            captured_payloads.append(payload)
-            return True
-
-        with patch("app.webhooks.send_webhook", side_effect=capture_payload):
-            await send_webhooks("My Topic", novelty, settings)
-
-        assert len(captured_payloads) == 1
-        payload = captured_payloads[0]
+        payload = build_webhook_intents("My Topic", novelty, settings, 1)[0].payload
         assert payload["topic"] == "My Topic"
         assert payload["summary"] == "Big news"
         assert payload["key_facts"] == ["fact1"]
         assert payload["source_urls"] == ["https://src.com"]
         assert payload["confidence"] == pytest.approx(0.9)
         assert "timestamp" in payload
+
+    async def test_returns_count_of_successful_deliveries(self, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn)
+        settings = _make_settings(
+            notifications=NotificationSettings(
+                urls=[],
+                webhook_urls=["https://a.com/hook", "https://b.com/hook", "https://c.com/hook"],
+            )
+        )
+
+        async def fake_send(url: str, payload: dict, timeout: float = 10.0) -> WebhookOutcome:
+            return _ok() if url != "https://c.com/hook" else _fail(status=500, error="HTTP 500")
+
+        with patch("app.webhooks.send_webhook", side_effect=fake_send):
+            delivered = await _deliver(db_conn, topic.id, settings)
+
+        assert delivered == 2
+
+    async def test_sends_to_all_configured_urls(self, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn)
+        urls = ["https://a.com/hook", "https://b.com/hook"]
+        settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=urls))
+        called: list[str] = []
+
+        async def capture(url: str, payload: dict, timeout: float = 10.0) -> WebhookOutcome:
+            called.append(url)
+            return _ok()
+
+        with patch("app.webhooks.send_webhook", side_effect=capture):
+            await _deliver(db_conn, topic.id, settings)
+
+        assert sorted(called) == sorted(urls)
 
 
 # --- pending_webhooks retry queue ---
@@ -388,16 +455,15 @@ def _make_topic(conn: sqlite3.Connection) -> Topic:
 
 
 class TestWebhookRetryQueue:
-    """Tests for the persistent webhook retry queue."""
+    """Tests for the persistent webhook delivery queue."""
 
-    async def test_failed_webhook_is_enqueued(self, db_conn: sqlite3.Connection) -> None:
-        """A failed delivery is persisted to pending_webhooks instead of dropped."""
+    async def test_failed_webhook_stays_queued(self, db_conn: sqlite3.Connection) -> None:
+        """A failed delivery keeps its intent, which is what the retry drain finds."""
         topic = _make_topic(db_conn)
         settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=["https://a.com/hook"]))
-        novelty = _make_novelty()
 
-        with patch("app.webhooks.send_webhook", return_value=False):
-            count = await send_webhooks("Hooked", novelty, settings, conn=db_conn, topic_id=topic.id)
+        with patch("app.webhooks.send_webhook", return_value=_fail(status=500, error="HTTP 500")):
+            count = await _deliver(db_conn, topic.id, settings)
 
         assert count == 0
         pending = list_pending_webhooks(db_conn)
@@ -405,39 +471,47 @@ class TestWebhookRetryQueue:
         assert pending[0].url == "https://a.com/hook"
         assert pending[0].topic_id == topic.id
         assert pending[0].payload["topic"] == "Hooked"
+        assert pending[0].last_error == "HTTP 500"
 
-    async def test_successful_webhook_not_enqueued(self, db_conn: sqlite3.Connection) -> None:
+    async def test_successful_webhook_leaves_the_queue(self, db_conn: sqlite3.Connection) -> None:
         topic = _make_topic(db_conn)
         settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=["https://a.com/hook"]))
-        novelty = _make_novelty()
 
-        with patch("app.webhooks.send_webhook", return_value=True):
-            await send_webhooks("Hooked", novelty, settings, conn=db_conn, topic_id=topic.id)
-
-        assert list_pending_webhooks(db_conn) == []
-
-    async def test_no_enqueue_without_conn(self, db_conn: sqlite3.Connection) -> None:
-        """Without a conn/topic_id, failures are not enqueued (legacy behaviour)."""
-        settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=["https://a.com/hook"]))
-        novelty = _make_novelty()
-
-        with patch("app.webhooks.send_webhook", return_value=False):
-            await send_webhooks("Hooked", novelty, settings)
+        with patch("app.webhooks.send_webhook", return_value=_ok()):
+            await _deliver(db_conn, topic.id, settings)
 
         assert list_pending_webhooks(db_conn) == []
+        row = db_conn.execute("SELECT status, delivered_at FROM pending_webhooks").fetchone()
+        assert row["status"] == "sent"
+        assert row["delivered_at"] is not None
 
-    async def test_retry_resends_and_clears_on_success(self, db_conn: sqlite3.Connection) -> None:
+    async def test_intent_exists_before_any_post(self, db_conn: sqlite3.Connection) -> None:
+        """TW-AUD-004: the row is durable before the first POST, not after a failure."""
         topic = _make_topic(db_conn)
         settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=["https://a.com/hook"]))
-        novelty = _make_novelty()
+        seen: list[int] = []
 
-        # First delivery fails → enqueued.
-        with patch("app.webhooks.send_webhook", return_value=False):
-            await send_webhooks("Hooked", novelty, settings, conn=db_conn, topic_id=topic.id)
+        async def observe(url: str, payload: dict, timeout: float = 10.0) -> WebhookOutcome:
+            seen.append(db_conn.execute("SELECT COUNT(*) FROM pending_webhooks").fetchone()[0])
+            return _ok()
+
+        with patch("app.webhooks.send_webhook", side_effect=observe):
+            await _deliver(db_conn, topic.id, settings)
+
+        assert seen == [1]
+
+    async def test_retry_resends_and_records_on_success(self, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn)
+        settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=["https://a.com/hook"]))
+
+        with patch("app.webhooks.send_webhook", return_value=_fail(status=500, error="HTTP 500")):
+            await _deliver(db_conn, topic.id, settings)
         assert len(list_pending_webhooks(db_conn)) == 1
+        # A retry is scheduled, so clear the backoff to exercise the drain now.
+        db_conn.execute("UPDATE pending_webhooks SET next_attempt_at = NULL")
+        db_conn.commit()
 
-        # Retry succeeds → row cleared.
-        with patch("app.webhooks.send_webhook", new_callable=AsyncMock, return_value=True) as mock_send:
+        with patch("app.webhooks.send_webhook", new_callable=AsyncMock, return_value=_ok()) as mock_send:
             await retry_pending_webhooks(db_conn, settings)
 
         mock_send.assert_awaited_once()
@@ -449,43 +523,86 @@ class TestWebhookRetryQueue:
     async def test_retry_failure_increments_and_keeps(self, db_conn: sqlite3.Connection) -> None:
         topic = _make_topic(db_conn)
         settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=["https://a.com/hook"]))
-        novelty = _make_novelty()
 
-        with patch("app.webhooks.send_webhook", return_value=False):
-            await send_webhooks("Hooked", novelty, settings, conn=db_conn, topic_id=topic.id)
+        with patch("app.webhooks.send_webhook", return_value=_fail(status=500, error="HTTP 500")):
+            await _deliver(db_conn, topic.id, settings)
+        db_conn.execute("UPDATE pending_webhooks SET next_attempt_at = NULL")
+        db_conn.commit()
 
-        with patch("app.webhooks.send_webhook", new_callable=AsyncMock, return_value=False):
+        with patch("app.webhooks.send_webhook", new_callable=AsyncMock, return_value=_fail(status=503)):
             await retry_pending_webhooks(db_conn, settings)
 
         row = db_conn.execute("SELECT retry_count FROM pending_webhooks").fetchone()
-        assert row["retry_count"] == 1
+        assert row["retry_count"] == 2
         # Still pending (default max_retries=3).
         assert len(list_pending_webhooks(db_conn)) == 1
 
-    async def test_exhausted_retries_are_dropped(self, db_conn: sqlite3.Connection) -> None:
+    async def test_exhausted_retries_are_abandoned(self, db_conn: sqlite3.Connection) -> None:
         topic = _make_topic(db_conn)
         settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=["https://a.com/hook"]))
-        novelty = _make_novelty()
 
-        with patch("app.webhooks.send_webhook", return_value=False):
-            await send_webhooks("Hooked", novelty, settings, conn=db_conn, topic_id=topic.id)
+        with patch("app.webhooks.send_webhook", return_value=_fail(status=500, error="HTTP 500")):
+            await _deliver(db_conn, topic.id, settings)
 
-        # Fail the retry up to max_retries; the row hits retry_count == max_retries
-        # and is purged by delete_expired_webhooks on the following pass.
         for _ in range(4):
-            with patch("app.webhooks.send_webhook", new_callable=AsyncMock, return_value=False):
+            db_conn.execute("UPDATE pending_webhooks SET next_attempt_at = NULL")
+            db_conn.commit()
+            with patch("app.webhooks.send_webhook", new_callable=AsyncMock, return_value=_fail(status=503)):
                 await retry_pending_webhooks(db_conn, settings)
 
         assert list_pending_webhooks(db_conn) == []
-        remaining = db_conn.execute("SELECT COUNT(*) FROM pending_webhooks").fetchone()[0]
-        assert remaining == 0
+        row = db_conn.execute("SELECT status, retry_count FROM pending_webhooks").fetchone()
+        assert row["status"] == "abandoned"
+        assert row["retry_count"] == 3
+
+    async def test_terminal_status_abandons_without_retry(self, db_conn: sqlite3.Connection) -> None:
+        """AUG-324: a 422 will still be a 422; do not burn the retry budget on it."""
+        topic = _make_topic(db_conn)
+        settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=["https://a.com/hook"]))
+
+        with patch("app.webhooks.send_webhook", return_value=_fail(status=422, retryable=False, error="HTTP 422")):
+            await _deliver(db_conn, topic.id, settings)
+
+        row = db_conn.execute("SELECT status, retry_count, next_attempt_at FROM pending_webhooks").fetchone()
+        assert row["status"] == "abandoned"
+        assert row["retry_count"] == 1
+        assert row["next_attempt_at"] is None
+        assert list_pending_webhooks(db_conn) == []
+
+    async def test_retry_after_sets_the_due_time_and_the_drain_waits(self, db_conn: sqlite3.Connection) -> None:
+        """AUG-324: a 429 is scheduled at the receiver's stated recovery time."""
+        topic = _make_topic(db_conn)
+        settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=["https://a.com/hook"]))
+
+        with patch(
+            "app.webhooks.send_webhook",
+            return_value=_fail(status=429, retry_after_s=1800.0, error="HTTP 429"),
+        ):
+            await _deliver(db_conn, topic.id, settings)
+
+        row = db_conn.execute("SELECT status, next_attempt_at FROM pending_webhooks").fetchone()
+        assert row["status"] == "pending"
+        due = datetime.fromisoformat(row["next_attempt_at"])
+        assert timedelta(minutes=25) < due - datetime.now(UTC) < timedelta(minutes=35)
+
+        # Not due yet: the drain must skip it entirely.
+        with patch("app.webhooks.send_webhook", new_callable=AsyncMock, return_value=_ok()) as mock_send:
+            await retry_pending_webhooks(db_conn, settings)
+        mock_send.assert_not_awaited()
+
+        # Once due, it goes out.
+        db_conn.execute("UPDATE pending_webhooks SET next_attempt_at = NULL")
+        db_conn.commit()
+        with patch("app.webhooks.send_webhook", new_callable=AsyncMock, return_value=_ok()) as mock_send:
+            await retry_pending_webhooks(db_conn, settings)
+        mock_send.assert_awaited_once()
 
 
 class TestAbandonedWebhookLogging:
     """A permanently-dropped webhook must be observable (OVH-040)."""
 
     async def test_abandoned_webhook_warns_with_ids_and_redacted_url(self, db_conn: sqlite3.Connection, caplog) -> None:  # noqa: ANN001
-        """Pruning an exhausted delivery emits a WARNING naming topic/check ids.
+        """Retiring an exhausted delivery emits a WARNING naming topic/check ids.
 
         The secret-bearing full URL must NOT appear in the log; only the
         redacted destination.
@@ -519,20 +636,21 @@ class TestAbandonedWebhookLogging:
         # Redacted host present, secret token absent.
         assert "hooks.slack.com" in msg
         assert "SECRETWEBHOOKTOKEN123" not in msg
-        # The row is gone.
-        remaining = db_conn.execute("SELECT COUNT(*) FROM pending_webhooks").fetchone()[0]
-        assert remaining == 0
+        # The row is retired, not deleted: it is the delivery ledger (AUG-153).
+        row = db_conn.execute("SELECT status FROM pending_webhooks WHERE id = ?", (wid,)).fetchone()
+        assert row["status"] == "abandoned"
 
 
 class TestWebhookRetryCrashSafety:
     """Per-item commits must survive a mid-loop crash (no rollback of work)."""
 
     async def test_crash_midloop_preserves_already_applied_results(self, db_conn: sqlite3.Connection) -> None:
-        """If applying item 2 crashes, item 1's delete must already be committed.
+        """If applying item 2 crashes, item 1's apply must already be committed.
 
         Old code committed once after the whole loop, so a crash rolled back
-        every delete/increment from that pass — letting a failing URL retry
-        unbounded. Per-item commits must keep already-applied work durable.
+        every apply from that pass — letting a failing URL retry unbounded.
+        Per-item commits must keep already-applied work durable, and the drain
+        must keep ownership of every sibling until it settles (AUG-263).
         """
         topic = _make_topic(db_conn)
         settings = _make_settings(
@@ -541,56 +659,55 @@ class TestWebhookRetryCrashSafety:
                 webhook_urls=["https://first.com/hook", "https://second.com/hook"],
             )
         )
-        novelty = _make_novelty()
 
-        # Enqueue two failed webhooks.
-        with patch("app.webhooks.send_webhook", return_value=False):
-            await send_webhooks("Hooked", novelty, settings, conn=db_conn, topic_id=topic.id)
+        # Enqueue two intents.
+        with patch("app.webhooks.send_webhook", return_value=_fail(status=500, error="HTTP 500")):
+            await _deliver(db_conn, topic.id, settings)
+        db_conn.execute("UPDATE pending_webhooks SET next_attempt_at = NULL")
+        db_conn.commit()
         pending = list_pending_webhooks(db_conn)
         assert len(pending) == 2
         first_id = pending[0].id
 
         # Retry: both sends "succeed", but applying the SECOND result crashes.
-        from app.crud import delete_pending_webhook as real_delete_pending_webhook
+        from app.crud import apply_webhook_outcome as real_apply
 
         call_count = {"n": 0}
 
-        def crashing_delete(conn, webhook_id, *, claim_token=None):  # noqa: ANN001
+        def crashing_apply(conn, intent_id, claim_token, **kwargs):  # noqa: ANN001
             call_count["n"] += 1
             if call_count["n"] == 2:
                 raise RuntimeError("simulated crash applying item 2")
-            return real_delete_pending_webhook(conn, webhook_id, claim_token=claim_token)
+            return real_apply(conn, intent_id, claim_token, **kwargs)
 
         with (
-            patch("app.webhooks.send_webhook", new_callable=AsyncMock, return_value=True),
-            patch("app.webhooks.delete_pending_webhook", side_effect=crashing_delete),
-            pytest.raises(RuntimeError, match="simulated crash"),
+            patch("app.webhooks.send_webhook", new_callable=AsyncMock, return_value=_ok()),
+            patch("app.webhooks.apply_webhook_outcome", side_effect=crashing_apply),
         ):
             await retry_pending_webhooks(db_conn, settings)
 
-        # Item 1's delete was committed before item 2 crashed: it is gone,
-        # item 2 remains. The pass did NOT roll back already-applied work.
-        remaining = db_conn.execute("SELECT id FROM pending_webhooks").fetchall()
-        remaining_ids = {r["id"] for r in remaining}
-        assert first_id not in remaining_ids
-        assert len(remaining_ids) == 1
+        # Item 1's apply was committed before item 2 crashed.
+        statuses = {r["id"]: r["status"] for r in db_conn.execute("SELECT id, status FROM pending_webhooks").fetchall()}
+        assert statuses[first_id] == "sent"
+        assert sorted(statuses.values()) == ["sending", "sent"]
 
     async def test_no_connection_held_across_send(self, db_conn: sqlite3.Connection) -> None:
         """The network send must run with no open transaction on the snapshot conn."""
         topic = _make_topic(db_conn)
         settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=["https://a.com/hook"]))
-        novelty = _make_novelty()
 
-        with patch("app.webhooks.send_webhook", return_value=False):
-            await send_webhooks("Hooked", novelty, settings, conn=db_conn, topic_id=topic.id)
+        with patch("app.webhooks.send_webhook", return_value=_fail(status=500, error="HTTP 500")):
+            await _deliver(db_conn, topic.id, settings)
+        db_conn.execute("UPDATE pending_webhooks SET next_attempt_at = NULL")
+        db_conn.commit()
 
         in_transaction_during_send: list[bool] = []
 
-        async def observe(url: str, payload: dict, timeout: float = 10.0) -> bool:
+        async def observe(url: str, payload: dict, timeout: float = 10.0) -> WebhookOutcome:
             # When a connection holds an uncommitted write, in_transaction is
-            # True. The snapshot must have been committed before the send.
+            # True. The claim must have been committed before the send.
             in_transaction_during_send.append(db_conn.in_transaction)
-            return True
+            return _ok()
 
         with patch("app.webhooks.send_webhook", side_effect=observe):
             await retry_pending_webhooks(db_conn, settings)
@@ -606,13 +723,14 @@ class TestWebhookRetryCrashSafety:
         conn = get_connection(db_path)
         topic = _make_topic(conn)
         settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=["https://a.com/hook"]))
-        novelty = _make_novelty()
 
-        with patch("app.webhooks.send_webhook", return_value=False):
-            await send_webhooks("Hooked", novelty, settings, conn=conn, topic_id=topic.id)
+        with patch("app.webhooks.send_webhook", return_value=_fail(status=500, error="HTTP 500")):
+            await _deliver(conn, topic.id, settings)
+        conn.execute("UPDATE pending_webhooks SET next_attempt_at = NULL")
+        conn.commit()
         conn.close()
 
-        with patch("app.webhooks.send_webhook", new_callable=AsyncMock, return_value=True):
+        with patch("app.webhooks.send_webhook", new_callable=AsyncMock, return_value=_ok()):
             await retry_pending_webhooks(settings=settings, db_path=db_path)
 
         verify = get_connection(db_path)
@@ -632,9 +750,8 @@ class TestWebhookDrainSingleFlight:
         try:
             topic = _make_topic(conn)
             settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=urls))
-            novelty = _make_novelty()
-            with patch("app.webhooks.send_webhook", return_value=False):
-                await send_webhooks("Hooked", novelty, settings, conn=conn, topic_id=topic.id)
+            create_webhook_intents(conn, build_webhook_intents("Hooked", _make_novelty(), settings, topic.id))
+            conn.commit()
         finally:
             conn.close()
 
@@ -655,12 +772,12 @@ class TestWebhookDrainSingleFlight:
         first_send_started = asyncio.Event()
         release = asyncio.Event()
 
-        async def slow_send(url: str, payload: dict, timeout: float = 10.0) -> bool:
+        async def slow_send(url: str, payload: dict, timeout: float = 10.0) -> WebhookOutcome:
             # Block the first drain mid-send so the second drain overlaps it.
             first_send_started.set()
             await release.wait()
             sent_counts[url] += 1
-            return True
+            return _ok()
 
         with patch("app.webhooks.send_webhook", side_effect=slow_send):
             drain1 = asyncio.create_task(retry_pending_webhooks(settings=settings, db_path=db_path))
@@ -682,7 +799,7 @@ class TestWebhookDrainSingleFlight:
 
     async def test_claimed_row_skipped_by_second_drainer(self, tmp_path) -> None:  # noqa: ANN001
         """A row another process already claimed is skipped, not re-sent."""
-        from app.crud import claim_pending_webhook
+        from app.crud import claim_webhook_intent
         from app.database import get_connection, init_db
 
         db_path = tmp_path / "test.db"
@@ -695,16 +812,16 @@ class TestWebhookDrainSingleFlight:
         try:
             row = claimer.execute("SELECT id FROM pending_webhooks").fetchone()
             webhook_id = row["id"]
-            assert claim_pending_webhook(claimer, webhook_id, "2999-01-01T00:00:00+00:00") is True
+            assert claim_webhook_intent(claimer, webhook_id, "other-owner", "2999-01-01T00:00:00+00:00") is True
             claimer.commit()
         finally:
             claimer.close()
 
         send_calls: list[str] = []
 
-        async def record_send(url: str, payload: dict, timeout: float = 10.0) -> bool:
+        async def record_send(url: str, payload: dict, timeout: float = 10.0) -> WebhookOutcome:
             send_calls.append(url)
-            return True
+            return _ok()
 
         with patch("app.webhooks.send_webhook", side_effect=record_send):
             await retry_pending_webhooks(settings=settings, db_path=db_path)
@@ -736,9 +853,8 @@ class TestWebhookDrainBoundedConcurrency:
         try:
             topic = _make_topic(conn)
             settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=urls))
-            novelty = _make_novelty()
-            with patch("app.webhooks.send_webhook", return_value=False):
-                await send_webhooks("Hooked", novelty, settings, conn=conn, topic_id=topic.id)
+            create_webhook_intents(conn, build_webhook_intents("Hooked", _make_novelty(), settings, topic.id))
+            conn.commit()
         finally:
             conn.close()
 
@@ -759,7 +875,7 @@ class TestWebhookDrainBoundedConcurrency:
         gate = asyncio.Event()
         started = 0
 
-        async def overlapping_send(url: str, payload: dict, timeout: float = 10.0) -> bool:
+        async def overlapping_send(url: str, payload: dict, timeout: float = 10.0) -> WebhookOutcome:
             nonlocal concurrent, max_concurrent, started
             concurrent += 1
             started += 1
@@ -772,7 +888,7 @@ class TestWebhookDrainBoundedConcurrency:
                 await asyncio.wait_for(gate.wait(), timeout=5.0)
             finally:
                 concurrent -= 1
-            return True
+            return _ok()
 
         with patch("app.webhooks.send_webhook", side_effect=overlapping_send):
             await retry_pending_webhooks(settings=settings, db_path=db_path)
@@ -790,7 +906,7 @@ class TestWebhookDrainBoundedConcurrency:
         """Bounded concurrency must not break the per-item claim: one send each."""
         import collections
 
-        from app.crud import claim_pending_webhook
+        from app.crud import claim_webhook_intent
         from app.database import get_connection, init_db
 
         db_path = tmp_path / "test.db"
@@ -802,17 +918,17 @@ class TestWebhookDrainBoundedConcurrency:
         sent_counts: collections.Counter[str] = collections.Counter()
         claim_calls = {"n": 0}
 
-        def counting_claim(conn, webhook_id, claimed_at, *, claim_token=None):  # noqa: ANN001
+        def counting_claim(conn, intent_id, claim_token, now_iso):  # noqa: ANN001
             claim_calls["n"] += 1
-            return claim_pending_webhook(conn, webhook_id, claimed_at, claim_token=claim_token)
+            return claim_webhook_intent(conn, intent_id, claim_token, now_iso)
 
-        async def record_send(url: str, payload: dict, timeout: float = 10.0) -> bool:
+        async def record_send(url: str, payload: dict, timeout: float = 10.0) -> WebhookOutcome:
             sent_counts[url] += 1
-            return True
+            return _ok()
 
         with (
             patch("app.webhooks.send_webhook", side_effect=record_send),
-            patch("app.webhooks.claim_pending_webhook", side_effect=counting_claim),
+            patch("app.webhooks.claim_webhook_intent", side_effect=counting_claim),
         ):
             await retry_pending_webhooks(settings=settings, db_path=db_path)
 
@@ -853,7 +969,11 @@ class TestWebhookTotalDeadline:
             result = await send_webhook("https://hook.example.com/x", {"key": "value"}, timeout=0.3)
         elapsed = asyncio.get_running_loop().time() - start
 
-        assert result is False
+        assert result.ok is False
+        assert result.error == "deadline exceeded"
+        # A slow endpoint is transient, so the intent is rescheduled rather than
+        # abandoned.
+        assert result.retryable is True
         # Each chunk lands inside httpx's per-operation read timeout, so only a
         # total deadline can stop this: 200 x 20ms would otherwise take 4s.
         assert elapsed < 2.0
