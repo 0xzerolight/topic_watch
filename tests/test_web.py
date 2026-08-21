@@ -1781,6 +1781,29 @@ class TestTopicStatus:
         assert "<li>fact a</li>" in response.text
         assert "**Current Status:**" not in response.text
 
+    async def test_status_new_promises_an_init_and_polls(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """An active NEW topic really is queued for the scheduler, so it keeps polling."""
+        topic = _make_topic(db_conn, status=TopicStatus.NEW)
+        response = await client.get(f"/topics/{topic.id}/status")
+        assert "next scheduler cycle" in response.text
+        assert "hx-trigger" in response.text
+
+    async def test_status_paused_new_says_initialization_is_on_hold(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """A paused NEW topic is skipped by the gradual initializer (AUG-140).
+
+        The fragment used to promise an init on the next cycle and poll for it
+        every 30s, indefinitely, with nothing saying that pausing was the reason.
+        """
+        topic = _make_topic(db_conn, status=TopicStatus.NEW, is_active=False)
+        response = await client.get(f"/topics/{topic.id}/status")
+        assert "next scheduler cycle" not in response.text
+        assert "Monitoring is disabled" in response.text
+        assert "hx-trigger" not in response.text
+
     async def test_status_error_shows_retry(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
         """ERROR status fragment shows error and retry button."""
         topic = _make_topic(db_conn, status=TopicStatus.ERROR, error_message="Init failed")

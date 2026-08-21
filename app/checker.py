@@ -1452,6 +1452,13 @@ async def initialize_new_topic(
                 error_message=error_message,
                 init_attempts=init_attempts,
                 expected_status=TopicStatus.RESEARCHING,
+                # ``topics.id`` is a recyclable rowid and a newly created topic is
+                # already RESEARCHING, so the status fence alone matches the
+                # replacement that took the deleted topic's id: this initializer's
+                # ERROR landed on a stranger, whose own init then lost the fence in
+                # ``_commit_init_transition`` and rolled its knowledge back
+                # (AUG-020/TW-AUD-007). Fence to the incarnation that was claimed.
+                generation=topic.generation,
             )
             conn.commit()
         if not won:

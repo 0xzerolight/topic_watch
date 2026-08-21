@@ -636,13 +636,15 @@ async def test_cross_entry_point_check_topic_blocks_api_trigger(
 # --- Lifecycle fencing across a delete + rowid reuse (AUG-020 / TW-AUD-007) ---
 
 
-def _recreate_reusing_rowid(conn: sqlite3.Connection, original: Topic) -> Topic:
+def _recreate_reusing_rowid(
+    conn: sqlite3.Connection, original: Topic, status: TopicStatus = TopicStatus.READY
+) -> Topic:
     """Delete a topic and create a replacement that reuses its freed rowid."""
     from app.crud import delete_topic
 
     delete_topic(conn, original.id)
     conn.commit()
-    replacement = create_topic(conn, Topic(name="Replacement", description="d", status=TopicStatus.READY))
+    replacement = create_topic(conn, Topic(name="Replacement", description="d", status=status))
     conn.commit()
     assert replacement.id == original.id
     assert replacement.generation != original.generation
@@ -738,6 +740,100 @@ async def test_stale_check_aborts_and_leaves_the_replacement_untouched(tmp_path,
     with get_db(db_path) as conn:
         assert list_check_results(conn, replacement.id) == []
         assert get_topic(conn, replacement.id).heartbeat_alerted_at is None
+
+
+async def test_stale_initializer_cannot_write_onto_a_rowid_reused_replacement(tmp_path, monkeypatch) -> None:
+    """An initializer that outlived its topic writes nothing to its successor.
+
+    A topic created from the UI is already RESEARCHING, so fencing the terminal
+    init write to ``expected_status`` alone matched the replacement that recycled
+    the deleted topic's rowid: the stale worker moved a stranger to ERROR, with
+    the deleted topic's error message.
+    """
+    from app.checker import initialize_new_topic
+    from app.database import get_db, init_db
+    from app.scraping import FetchResult
+
+    db_path = tmp_path / "stale_init.db"
+    init_db(db_path)
+    with get_db(db_path) as seed:
+        original = create_topic(seed, Topic(name="Doomed", description="d", status=TopicStatus.RESEARCHING))
+        seed.commit()
+        replacement = _recreate_reusing_rowid(seed, original, status=TopicStatus.RESEARCHING)
+
+    async def _empty(*args, **kwargs):
+        return FetchResult(articles=[], total_feed_entries=0, feeds_total=1, feeds_failed=0)
+
+    monkeypatch.setattr("app.checker.fetch_new_articles_for_topic", _empty)
+
+    # The stale worker was started with the claim already made (web/scheduler path).
+    await initialize_new_topic(original, _make_settings(), db_path=db_path, claimed=True)
+
+    with get_db(db_path) as conn:
+        survivor = get_topic(conn, replacement.id)
+    assert survivor.name == "Replacement"
+    assert survivor.status == TopicStatus.RESEARCHING
+    assert survivor.error_message is None
+
+
+async def test_replacements_own_initialization_survives_a_stale_initializer(tmp_path, monkeypatch) -> None:
+    """The replacement's completed research is kept, not rolled back.
+
+    Full consequence of the missing fence: the stale ERROR passed the status
+    fence, so the replacement's own initializer then failed the same fence in
+    ``_commit_init_transition`` and its whole knowledge write was rolled back.
+    """
+    from app.analysis.knowledge import KnowledgeUpdatePlan
+    from app.checker import initialize_new_topic
+    from app.crud import get_knowledge_state
+    from app.database import get_db, init_db
+    from app.models import Article
+    from app.scraping import FetchResult
+
+    db_path = tmp_path / "stale_init_loss.db"
+    init_db(db_path)
+    with get_db(db_path) as seed:
+        original = create_topic(seed, Topic(name="Doomed", description="d", status=TopicStatus.RESEARCHING))
+        seed.commit()
+        replacement = _recreate_reusing_rowid(seed, original, status=TopicStatus.RESEARCHING)
+
+    article = Article(
+        topic_id=replacement.id,
+        title="A story",
+        url="https://example.com/a",
+        content_hash="h1",
+        raw_content="body",
+        source_feed="https://example.com/feed.xml",
+    )
+    empty = FetchResult(articles=[], total_feed_entries=0, feeds_total=1, feeds_failed=0)
+    full = FetchResult(articles=[article], total_feed_entries=1, feeds_total=1, feeds_failed=0)
+
+    async def _fetch(*args, **kwargs):
+        return full
+
+    async def _fetch_empty(*args, **kwargs):
+        # The stale worker finds nothing: every article is already stored and the
+        # scraper deduplicates against stored hashes.
+        return empty
+
+    async def _prepare(*args, **kwargs):
+        # While the replacement is in its LLM phase, the stale worker finishes and
+        # lands its terminal write.
+        monkeypatch.setattr("app.checker.fetch_new_articles_for_topic", _fetch_empty)
+        await initialize_new_topic(original, _make_settings(), db_path=db_path, claimed=True)
+        monkeypatch.setattr("app.checker.fetch_new_articles_for_topic", _fetch)
+        return KnowledgeUpdatePlan(summary_text="Baseline for the replacement", token_count=10, sufficient_data=True)
+
+    monkeypatch.setattr("app.checker.fetch_new_articles_for_topic", _fetch)
+    monkeypatch.setattr("app.checker.prepare_initial_knowledge", _prepare)
+
+    await initialize_new_topic(replacement, _make_settings(), db_path=db_path, claimed=True)
+
+    with get_db(db_path) as conn:
+        survivor = get_topic(conn, replacement.id)
+        knowledge = get_knowledge_state(conn, replacement.id)
+    assert survivor.status == TopicStatus.READY
+    assert knowledge is not None and knowledge.summary_text == "Baseline for the replacement"
 
 
 # --- Retry claims recheck eligibility and fence late applies (TW-AUD-006) ---

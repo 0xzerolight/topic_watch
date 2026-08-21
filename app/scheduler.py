@@ -193,7 +193,7 @@ async def _init_new_topics(settings: Settings, db_path: Path | None = None) -> N
                 # this only names the reason, fenced so it cannot land on a topic
                 # somebody re-claimed in between.
                 with get_db(db_path) as conn:
-                    update_topic_init_status(
+                    landed = update_topic_init_status(
                         conn,
                         topic_id,
                         status=TopicStatus.ERROR,
@@ -201,8 +201,14 @@ async def _init_new_topics(settings: Settings, db_path: Path | None = None) -> N
                         error_message="Research timed out. Click Retry.",
                         init_attempts=topic.init_attempts,
                         expected_status=TopicStatus.ERROR,
+                        generation=topic.generation,
                     )
                     conn.commit()
+                if not landed:
+                    logger.warning(
+                        "Timeout reason for topic %d not recorded: it left ERROR or was replaced",
+                        topic_id,
+                    )
         finally:
             await _checking_state.finish_check(topic_id, owner)
     except Exception:
