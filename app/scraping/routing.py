@@ -6,9 +6,9 @@ table (which tracks individual feed URLs for the UI dashboard).
 """
 
 import logging
-import time
 from dataclasses import dataclass, field
 
+from app import clock
 from app.models import FeedMode, Topic
 from app.scraping.providers import BingNewsProvider, GoogleNewsProvider, NewsProvider
 
@@ -128,7 +128,7 @@ class ProviderRouter:
         was_below_threshold = health.consecutive_failures < _FAILURE_THRESHOLD
         health.consecutive_failures += 1
         health.epoch += 1
-        health.failed_at = time.monotonic()
+        health.failed_at = clock.monotonic_now()
         health.probe_until = None  # the probe, if this was one, has reported
         logger.debug(
             "Provider %s: failure %d/%d",
@@ -173,7 +173,7 @@ class ProviderRouter:
         The candidate is the one whose cooldown elapsed earliest — the provider
         that has been waiting longest is the one worth re-testing first.
         """
-        now = time.monotonic()
+        now = clock.monotonic_now()
         candidates = [p for p in self.providers if self._is_recovering(p.name, now)]
         if not candidates:
             return None

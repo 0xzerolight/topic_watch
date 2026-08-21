@@ -42,6 +42,51 @@ def _check(topic_id: int, checked_at: datetime, **overrides) -> CheckResult:
     return CheckResult(**data)
 
 
+class TestRateLimitWindow:
+    """AUG-283 — the feed-validation window is elapsed time, not wall time."""
+
+    def _fresh(self, monkeypatch: pytest.MonkeyPatch, ip: str) -> list[float]:
+        from app.web.state import _rate_limit_store
+
+        _rate_limit_store.pop(ip, None)
+        return _rate_limit_store.setdefault(ip, [])
+
+    def test_forward_wall_clock_step_does_not_refund_the_quota(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import time as time_mod
+
+        from app import clock
+        from app.web.state import _check_rate_limit
+
+        ip = "10.0.0.101"
+        self._fresh(monkeypatch, ip)
+        monkeypatch.setattr(clock, "monotonic_now", lambda: 1000.0)
+        for _ in range(10):
+            assert _check_rate_limit(ip) is True
+
+        # The host clock jumps an hour forward; elapsed time has not moved.
+        wall = time_mod.time()
+        monkeypatch.setattr(time_mod, "time", lambda: wall + 3600)
+        assert _check_rate_limit(ip) is False
+
+    def test_backward_wall_clock_step_does_not_extend_the_window(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import time as time_mod
+
+        from app import clock
+        from app.web.state import _check_rate_limit
+
+        ip = "10.0.0.102"
+        self._fresh(monkeypatch, ip)
+        monkeypatch.setattr(clock, "monotonic_now", lambda: 1000.0)
+        for _ in range(10):
+            _check_rate_limit(ip)
+
+        # The host clock is corrected an hour backwards, but 61 seconds really passed.
+        wall = time_mod.time()
+        monkeypatch.setattr(time_mod, "time", lambda: wall - 3600)
+        monkeypatch.setattr(clock, "monotonic_now", lambda: 1061.0)
+        assert _check_rate_limit(ip) is True
+
+
 class TestLatestCheckOrdering:
     """AUG-279 — every "latest check" query uses the heartbeat's own head order."""
 

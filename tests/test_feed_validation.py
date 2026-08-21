@@ -1,12 +1,12 @@
 """Tests for feed URL validation endpoint and rate limiter."""
 
-import time
 from collections.abc import AsyncGenerator
 from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 
+from app.clock import monotonic_now
 from app.config import LLMSettings, NotificationSettings, Settings
 from app.main import app
 from app.scraping.rss import FeedEntry
@@ -81,7 +81,7 @@ def test_rate_limit_resets_after_window():
     _rate_limit_store.pop(test_ip, None)
 
     # Fill the window with old timestamps (older than 60s)
-    old_time = time.time() - 61
+    old_time = monotonic_now() - 61
     _rate_limit_store[test_ip] = [old_time] * 10
 
     # Should be allowed now because all timestamps are stale
@@ -163,7 +163,7 @@ async def test_validate_rate_limit_exceeded(client: httpx.AsyncClient):
     _rate_limit_store.pop(test_ip, None)
 
     # Saturate the rate limit manually
-    _rate_limit_store[test_ip] = [time.time()] * 10
+    _rate_limit_store[test_ip] = [monotonic_now()] * 10
 
     response = await client.post(
         "/feeds/validate",

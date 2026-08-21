@@ -8,7 +8,8 @@ where concurrent access is possible.
 
 import asyncio
 import secrets
-import time
+
+from app import clock
 
 # --- In-progress check tracker ---
 
@@ -44,7 +45,7 @@ class CheckingState:
                 return None
             token = _new_owner_token()
             self._topics[topic_id] = token
-            self._start_times[topic_id] = time.monotonic()
+            self._start_times[topic_id] = clock.monotonic_now()
             return token
 
     async def finish_check(self, topic_id: int, token: str) -> None:
@@ -92,7 +93,7 @@ class CheckingState:
         that every task holding a slot is bounded below the thresholds callers
         pass here (``app.web.routers.background``).
         """
-        now = time.monotonic()
+        now = clock.monotonic_now()
         async with self._lock:
             stale = [tid for tid, start in self._start_times.items() if now - start > timeout_seconds]
             for tid in stale:
@@ -117,8 +118,15 @@ def _check_rate_limit(ip: str) -> bool:
 
     Evicts entries whose timestamps have all fallen outside the window so the
     store cannot grow without bound (one entry per IP would otherwise leak).
+
+    Recorded and aged monotonically (AUG-283): the window means "the last 60
+    seconds of elapsed time". Differencing wall-clock readings made it mean "the
+    last 60 seconds of what the host clock currently says", so a backward
+    correction kept spent requests alive until the clock caught up — a 429 at a
+    moment the user did nothing to earn one — and a forward one handed back the
+    whole quota.
     """
-    now = time.time()
+    now = clock.monotonic_now()
     timestamps = _rate_limit_store.get(ip, [])
     active = [t for t in timestamps if now - t < _RATE_LIMIT_WINDOW]
     if len(active) >= _RATE_LIMIT_MAX:
