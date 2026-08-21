@@ -125,7 +125,8 @@ async def _init_new_topics(settings: Settings, db_path: Path | None = None) -> N
         # In-process guard: shares the same slot the web background init
         # (_run_init) holds, so a same-process Retry click and this tick
         # can't both run init. Skip rather than queue behind it.
-        if not await _checking_state.start_check(topic_id):
+        owner = await _checking_state.start_check(topic_id)
+        if owner is None:
             logger.debug("NEW topic init: topic '%s' already being initialized; skipping", topic.name)
             return
         try:
@@ -146,7 +147,7 @@ async def _init_new_topics(settings: Settings, db_path: Path | None = None) -> N
             # its own short-lived one per phase (AUG-136).
             await initialize_new_topic(topic, settings, db_path=db_path)
         finally:
-            await _checking_state.finish_check(topic_id)
+            await _checking_state.finish_check(topic_id, owner)
     except Exception:
         logger.error("NEW topic initialization failed", exc_info=True)
 

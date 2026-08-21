@@ -1776,7 +1776,7 @@ class TestCheckNow:
         topic = _make_topic(db_conn)
         from app.web.state import _checking_state
 
-        await _checking_state.start_check(topic.id)
+        owner = await _checking_state.start_check(topic.id)
         try:
             with patch("app.web.routers.background._run_single_check", new_callable=AsyncMock) as mock_bg:
                 response = await client.post(
@@ -1789,7 +1789,7 @@ class TestCheckNow:
             # Already checking — do not enqueue a second pipeline run.
             mock_bg.assert_not_called()
         finally:
-            await _checking_state.finish_check(topic.id)
+            await _checking_state.finish_check(topic.id, owner)
 
     async def test_check_already_checking_non_htmx_redirects(
         self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
@@ -1798,7 +1798,7 @@ class TestCheckNow:
         topic = _make_topic(db_conn)
         from app.web.state import _checking_state
 
-        await _checking_state.start_check(topic.id)
+        owner = await _checking_state.start_check(topic.id)
         try:
             response = await client.post(
                 f"/topics/{topic.id}/check",
@@ -1807,7 +1807,7 @@ class TestCheckNow:
             assert response.status_code == 303
             assert response.headers["location"] == f"/topics/{topic.id}"
         finally:
-            await _checking_state.finish_check(topic.id)
+            await _checking_state.finish_check(topic.id, owner)
 
     async def test_check_counts_articles_with_count_query(
         self, client: httpx.AsyncClient, db_conn: sqlite3.Connection

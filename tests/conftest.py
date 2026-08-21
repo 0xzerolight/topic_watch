@@ -124,7 +124,7 @@ def _reset_checking_state():
     def _clear() -> None:
         _checking_state._topics.clear()
         _checking_state._start_times.clear()
-        _checking_state._checking_all = False
+        _checking_state._checking_all = None
 
     _clear()
     yield

@@ -460,10 +460,10 @@ class TestAPITriggerCheck:
         topic = _seed_topic(db_conn, status="ready")
         db_conn.commit()
 
-        async def _slot_taken(topic_id: int) -> bool:
-            return False
+        async def _slot_taken(topic_id: int) -> str | None:
+            return None
 
-        async def _noop(topic_id: int) -> None:
+        async def _noop(topic_id: int, token: str) -> None:
             return None
 
         async def _should_not_run(t, settings, *, db_path=None, guard=True):
@@ -496,7 +496,7 @@ class TestAPITriggerCheck:
         topic = _seed_topic(db_conn, status="ready")
         db_conn.commit()
 
-        start = AsyncMock(return_value=True)
+        start = AsyncMock(return_value="owner-token")
         finish = AsyncMock(return_value=None)
         monkeypatch.setattr("app.web.api._checking_state.start_check", start)
         monkeypatch.setattr("app.web.api._checking_state.finish_check", finish)
@@ -516,6 +516,6 @@ class TestAPITriggerCheck:
                 csrf_token = home.cookies.get("csrf_token", "")
                 client.post(f"/api/v1/topics/{topic.id}/check", headers={"X-CSRF-Token": csrf_token})
                 start.assert_awaited_once_with(topic.id)
-                finish.assert_awaited_once_with(topic.id)
+                finish.assert_awaited_once_with(topic.id, "owner-token")
         finally:
             app.dependency_overrides.pop(get_db_conn, None)

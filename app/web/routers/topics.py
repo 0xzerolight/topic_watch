@@ -770,9 +770,10 @@ async def check_all_handler(
     settings: Settings = Depends(get_settings),
 ):
     """Trigger a check of all ready topics in the background."""
-    if await _checking_state.start_check_all():
+    owner = _checking_state.start_check_all()
+    if owner is not None:
         db_path = getattr(request.app.state, "db_path", None)
-        background_tasks.add_task(background._run_check_all, settings, db_path)
+        background_tasks.add_task(background._run_check_all, settings, db_path, owner)
     return RedirectResponse(url="/", status_code=303)
 
 

@@ -38,20 +38,26 @@ def state() -> CheckingState:
 # --- start_check / finish_check ---
 
 
-async def test_start_check_returns_true_first_time(state: CheckingState) -> None:
-    result = await state.start_check(1)
-    assert result is True
+async def test_start_check_returns_token_first_time(state: CheckingState) -> None:
+    token = await state.start_check(1)
+    assert isinstance(token, str) and token
 
 
-async def test_start_check_returns_false_when_already_checking(state: CheckingState) -> None:
+async def test_start_check_returns_none_when_already_checking(state: CheckingState) -> None:
     await state.start_check(1)
-    result = await state.start_check(1)
-    assert result is False
+    assert await state.start_check(1) is None
 
 
 async def test_start_check_allows_different_topics(state: CheckingState) -> None:
-    assert await state.start_check(1) is True
-    assert await state.start_check(2) is True
+    assert await state.start_check(1) is not None
+    assert await state.start_check(2) is not None
+
+
+async def test_start_check_tokens_are_unique(state: CheckingState) -> None:
+    first = await state.start_check(1)
+    await state.finish_check(1, first)
+    second = await state.start_check(1)
+    assert first != second
 
 
 async def test_is_checking_true_after_start(state: CheckingState) -> None:
@@ -64,35 +70,63 @@ async def test_is_checking_false_before_start(state: CheckingState) -> None:
 
 
 async def test_finish_check_releases(state: CheckingState) -> None:
-    await state.start_check(1)
-    await state.finish_check(1)
+    token = await state.start_check(1)
+    await state.finish_check(1, token)
     assert await state.is_checking(1) is False
 
 
 async def test_finish_check_allows_restart(state: CheckingState) -> None:
-    await state.start_check(1)
-    await state.finish_check(1)
-    result = await state.start_check(1)
-    assert result is True
+    token = await state.start_check(1)
+    await state.finish_check(1, token)
+    assert await state.start_check(1) is not None
 
 
 async def test_finish_check_nonexistent_is_noop(state: CheckingState) -> None:
     # Should not raise
-    await state.finish_check(999)
+    await state.finish_check(999, "no-such-token")
+
+
+async def test_finish_check_with_foreign_token_keeps_guard(state: CheckingState) -> None:
+    """A release presenting someone else's token leaves the live owner in place."""
+    await state.start_check(1)
+    await state.finish_check(1, "not-the-owner")
+    assert await state.is_checking(1) is True
+
+
+async def test_evicted_owner_release_does_not_steal_successor_slot(state: CheckingState) -> None:
+    """A-evict-B-A-release leaves B's guard held (AUG-264 ABA hole).
+
+    A claims the slot and outlives the stale-eviction threshold; ``clear_stale``
+    frees it and B takes it. When A finally releases, the id-only release used to
+    drop B's guard too, admitting a third concurrent check of the same topic.
+    """
+    a_token = await state.start_check(7)
+    state._start_times[7] = time.monotonic() - 700
+    assert await state.clear_stale(600) == [7]
+
+    b_token = await state.start_check(7)
+    assert b_token is not None and b_token != a_token
+
+    await state.finish_check(7, a_token)
+
+    assert await state.is_checking(7) is True
+    assert await state.start_check(7) is None
+    # Only B can release its own slot.
+    await state.finish_check(7, b_token)
+    assert await state.is_checking(7) is False
 
 
 # --- start_check_all / finish_check_all / is_checking_all ---
 
 
-async def test_start_check_all_returns_true_first_time(state: CheckingState) -> None:
-    result = await state.start_check_all()
-    assert result is True
+async def test_start_check_all_returns_token_first_time(state: CheckingState) -> None:
+    token = state.start_check_all()
+    assert isinstance(token, str) and token
 
 
-async def test_start_check_all_returns_false_when_running(state: CheckingState) -> None:
-    await state.start_check_all()
-    result = await state.start_check_all()
-    assert result is False
+async def test_start_check_all_returns_none_when_running(state: CheckingState) -> None:
+    state.start_check_all()
+    assert state.start_check_all() is None
 
 
 async def test_is_checking_all_false_initially(state: CheckingState) -> None:
@@ -100,21 +134,26 @@ async def test_is_checking_all_false_initially(state: CheckingState) -> None:
 
 
 async def test_is_checking_all_true_after_start(state: CheckingState) -> None:
-    await state.start_check_all()
+    state.start_check_all()
     assert await state.is_checking_all() is True
 
 
 async def test_finish_check_all_resets_flag(state: CheckingState) -> None:
-    await state.start_check_all()
-    await state.finish_check_all()
+    token = state.start_check_all()
+    state.finish_check_all(token)
     assert await state.is_checking_all() is False
 
 
+async def test_finish_check_all_with_foreign_token_is_noop(state: CheckingState) -> None:
+    state.start_check_all()
+    state.finish_check_all("not-the-owner")
+    assert await state.is_checking_all() is True
+
+
 async def test_finish_check_all_allows_restart(state: CheckingState) -> None:
-    await state.start_check_all()
-    await state.finish_check_all()
-    result = await state.start_check_all()
-    assert result is True
+    token = state.start_check_all()
+    state.finish_check_all(token)
+    assert state.start_check_all() is not None
 
 
 # --- clear_stale ---
@@ -162,34 +201,33 @@ async def test_clear_stale_multiple_topics(state: CheckingState) -> None:
 async def test_concurrent_start_check_only_one_wins(state: CheckingState) -> None:
     """Only one coroutine should win the start_check race."""
     results = await asyncio.gather(*[state.start_check(5) for _ in range(10)])
-    assert results.count(True) == 1
-    assert results.count(False) == 9
+    assert len([r for r in results if r is not None]) == 1
+    assert results.count(None) == 9
 
 
-async def test_concurrent_start_check_all_only_one_wins(state: CheckingState) -> None:
-    """Only one coroutine should win the start_check_all race."""
-    results = await asyncio.gather(*[state.start_check_all() for _ in range(10)])
-    assert results.count(True) == 1
-    assert results.count(False) == 9
+def test_concurrent_start_check_all_only_one_wins(state: CheckingState) -> None:
+    """Only one caller wins the whole-cycle gate (no await between test and set)."""
+    results = [state.start_check_all() for _ in range(10)]
+    assert len([r for r in results if r is not None]) == 1
+    assert results.count(None) == 9
 
 
 async def test_concurrent_different_topics_all_win(state: CheckingState) -> None:
     """Each different topic_id should be able to start independently."""
     topic_ids = list(range(100, 110))
     results = await asyncio.gather(*[state.start_check(tid) for tid in topic_ids])
-    assert all(results)
+    assert all(r is not None for r in results)
 
 
 async def test_state_not_corrupted_after_concurrent_finish(state: CheckingState) -> None:
     """Concurrent finish_check calls should not corrupt internal state."""
-    for tid in range(5):
-        await state.start_check(tid)
-    await asyncio.gather(*[state.finish_check(tid) for tid in range(5)])
+    tokens = {tid: await state.start_check(tid) for tid in range(5)}
+    await asyncio.gather(*[state.finish_check(tid, tokens[tid]) for tid in range(5)])
     for tid in range(5):
         assert await state.is_checking(tid) is False
     # All entries should be startable again
     for tid in range(5):
-        assert await state.start_check(tid) is True
+        assert await state.start_check(tid) is not None
 
 
 # --- Retry-drain atomic claim (cross-process double-delivery guard, OVH-017) ---
@@ -262,11 +300,11 @@ def clean_state():
     """Ensure the process-global _checking_state singleton is empty around a test."""
     _checking_state._topics.clear()
     _checking_state._start_times.clear()
-    _checking_state._checking_all = False
+    _checking_state._checking_all = None
     yield _checking_state
     _checking_state._topics.clear()
     _checking_state._start_times.clear()
-    _checking_state._checking_all = False
+    _checking_state._checking_all = None
 
 
 def _patch_empty_fetch(monkeypatch):
@@ -293,7 +331,7 @@ async def test_check_topic_skips_when_already_in_flight(
     monkeypatch.setattr("app.checker.fetch_new_articles_for_topic", fetch_spy)
 
     # Simulate an in-flight check by pre-claiming the per-topic slot.
-    assert await clean_state.start_check(topic.id) is True
+    assert await clean_state.start_check(topic.id) is not None
     result = await check_topic(topic, settings, db_path=db_path)
 
     assert result.stage_error == "skipped: already in flight"
@@ -315,7 +353,7 @@ async def test_check_topic_acquires_and_releases_guard(
     await check_topic(topic, settings, db_path=db_path)
     # Released in finally -> startable again.
     assert await clean_state.is_checking(topic.id) is False
-    assert await clean_state.start_check(topic.id) is True
+    assert await clean_state.start_check(topic.id) is not None
 
 
 async def test_check_topic_guard_false_does_not_touch_state(
@@ -333,7 +371,7 @@ async def test_check_topic_guard_false_does_not_touch_state(
     _patch_empty_fetch(monkeypatch)
 
     # Caller already holds the slot; guard=False must still execute the pipeline.
-    assert await clean_state.start_check(topic.id) is True
+    assert await clean_state.start_check(topic.id) is not None
     result = await check_topic(topic, settings, db_path=db_path, guard=False)
     assert result.stage_error != "skipped: already in flight"
     # The slot the caller owns is untouched by the inner run.
@@ -386,7 +424,7 @@ async def test_check_all_skips_when_cycle_already_in_flight(monkeypatch, clean_s
     monkeypatch.setattr("app.checker._check_all_topics_inner", inner)
 
     # Simulate a web check-all already holding the whole-cycle gate.
-    assert await clean_state.start_check_all() is True
+    assert clean_state.start_check_all() is not None
     result = await check_all_topics(settings)
     assert result == []
     inner.assert_not_awaited()
@@ -402,7 +440,7 @@ async def test_check_all_releases_gate_after_run(monkeypatch, clean_state) -> No
     await check_all_topics(settings)
     assert await clean_state.is_checking_all() is False
     # Gate is free again.
-    assert await clean_state.start_check_all() is True
+    assert clean_state.start_check_all() is not None
 
 
 async def test_check_all_guard_false_skips_gate(monkeypatch, clean_state) -> None:
@@ -413,7 +451,7 @@ async def test_check_all_guard_false_skips_gate(monkeypatch, clean_state) -> Non
     inner = AsyncMock(return_value=[])
     monkeypatch.setattr("app.checker._check_all_topics_inner", inner)
 
-    assert await clean_state.start_check_all() is True
+    assert clean_state.start_check_all() is not None
     await check_all_topics(settings, guard=False)
     inner.assert_awaited_once()
 

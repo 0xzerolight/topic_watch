@@ -251,11 +251,12 @@ class TestRunCheckAllTimeout:
         async def _hang(*args, **kwargs):
             await asyncio.sleep(9999)
 
+        owner = _checking_state.start_check_all()
         with (
             patch("app.web.routers.background._CHECK_ALL_TIMEOUT_SECONDS", 0.05),
             patch("app.web.routers.background.check_all_topics", side_effect=_hang),
         ):
-            await _run_check_all(settings, db_path)
+            await _run_check_all(settings, db_path, owner)
 
         assert not await _checking_state.is_checking_all()
 
@@ -265,12 +266,13 @@ class TestRunCheckAllTimeout:
 
         settings = _make_settings()
 
+        owner = _checking_state.start_check_all()
         with patch(
             "app.web.routers.background.check_all_topics",
             new_callable=AsyncMock,
             return_value=[],
         ):
-            await _run_check_all(settings, db_path)
+            await _run_check_all(settings, db_path, owner)
 
         assert not await _checking_state.is_checking_all()
 

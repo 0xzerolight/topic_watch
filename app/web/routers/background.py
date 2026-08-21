@@ -31,7 +31,8 @@ async def _run_init(topic_id: int, settings: Settings, db_path: Path | None = No
     from app.checker import initialize_new_topic
     from app.database import get_db
 
-    if not await _checking_state.start_check(topic_id):
+    owner = await _checking_state.start_check(topic_id)
+    if owner is None:
         logger.info("Init background task: topic %d already being initialized, skipping", topic_id)
         return
 
@@ -60,7 +61,7 @@ async def _run_init(topic_id: int, settings: Settings, db_path: Path | None = No
                 update_topic(conn, topic)
                 conn.commit()
     finally:
-        await _checking_state.finish_check(topic_id)
+        await _checking_state.finish_check(topic_id, owner)
 
 
 async def _run_single_check(topic_id: int, settings: Settings, db_path: Path | None = None) -> None:
@@ -75,7 +76,8 @@ async def _run_single_check(topic_id: int, settings: Settings, db_path: Path | N
     """
     from app.database import get_db
 
-    if not await _checking_state.start_check(topic_id):
+    owner = await _checking_state.start_check(topic_id)
+    if owner is None:
         logger.info("Single check: topic %d already being checked; skipping", topic_id)
         return
 
@@ -87,15 +89,16 @@ async def _run_single_check(topic_id: int, settings: Settings, db_path: Path | N
     except Exception:
         logger.error("Background check failed for topic %d", topic_id, exc_info=True)
     finally:
-        await _checking_state.finish_check(topic_id)
+        await _checking_state.finish_check(topic_id, owner)
 
 
-async def _run_check_all(settings: Settings, db_path: Path | None = None) -> None:
+async def _run_check_all(settings: Settings, db_path: Path | None = None, owner: str | None = None) -> None:
     """Background task: check all topics for new information.
 
     The web ``/check-all`` handler acquires the whole-cycle ``start_check_all``
     gate synchronously to decide whether to enqueue, so this task runs the cycle
-    with ``guard=False`` and releases the gate in ``finally`` (OVH-034).
+    with ``guard=False`` and releases the gate — with the handler's owner token —
+    in ``finally`` (OVH-034/AUG-264).
     """
     try:
         try:
@@ -105,4 +108,5 @@ async def _run_check_all(settings: Settings, db_path: Path | None = None) -> Non
     except Exception:
         logger.error("Check all background task failed", exc_info=True)
     finally:
-        await _checking_state.finish_check_all()
+        if owner is not None:
+            _checking_state.finish_check_all(owner)

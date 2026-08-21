@@ -316,13 +316,14 @@ async def check_topic(
     if not guard:
         return await _check_topic_guarded(topic, settings, db_path)
 
-    if not await _checking_state.start_check(topic_id):
+    owner = await _checking_state.start_check(topic_id)
+    if owner is None:
         logger.info("Topic '%s' (id=%d) already being checked; skipping", topic.name, topic_id)
         return CheckResult(topic_id=topic_id, stage_error="skipped: already in flight")
     try:
         return await _check_topic_guarded(topic, settings, db_path)
     finally:
-        await _checking_state.finish_check(topic_id)
+        await _checking_state.finish_check(topic_id, owner)
 
 
 async def _check_topic_guarded(
@@ -964,13 +965,14 @@ async def check_all_topics(
     if not guard:
         return await _check_all_topics_inner(settings, db_path)
 
-    if not await _checking_state.start_check_all():
+    owner = _checking_state.start_check_all()
+    if owner is None:
         logger.info("Check-all already in flight; skipping overlapping cycle")
         return []
     try:
         return await _check_all_topics_inner(settings, db_path)
     finally:
-        await _checking_state.finish_check_all()
+        _checking_state.finish_check_all(owner)
 
 
 async def _check_all_topics_inner(

@@ -286,7 +286,7 @@ class TestSingleCheckGuard:
         _checking_state._start_times.clear()
         try:
             # Slot already taken (e.g. the manual /check is mid-flight).
-            assert await _checking_state.start_check(topic.id) is True
+            assert await _checking_state.start_check(topic.id) is not None
             with patch("app.web.routers.background.check_topic", new_callable=AsyncMock) as mock_check:
                 await background._run_single_check(topic.id, settings, db_path)
             mock_check.assert_not_awaited()
