@@ -12,6 +12,7 @@ from app.analysis.knowledge_diff import diff_segments
 from app.analysis.llm import NoveltyResult
 from app.config import Settings
 from app.crud import (
+    claim_topic_for_init,
     count_articles_for_topic,
     count_check_results,
     create_topic,
@@ -29,6 +30,8 @@ from app.crud import (
     mark_latest_check_seen,
     sum_check_tokens,
     update_topic,
+    update_topic_config,
+    update_topic_init_status,
 )
 from app.models import (
     NOVELTY_INSTRUCTION_MAX_CHARS,
@@ -164,7 +167,9 @@ async def create_topic_handler(
 
     assert created.id is not None
     db_path = getattr(request.app.state, "db_path", None)
-    background_tasks.add_task(background._run_init, created.id, settings, db_path)
+    # The INSERT above created the row already in RESEARCHING, so this request owns
+    # the claim outright — nobody else can have seen the topic yet.
+    background_tasks.add_task(background._run_init, created.id, settings, db_path, None, claimed=True)
 
     return RedirectResponse(url=f"/topics/{created.id}", status_code=303)
 
@@ -586,23 +591,47 @@ async def reinit_topic(
     conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
     settings: Settings = Depends(get_settings),
 ):
-    """Re-trigger initial research for error recovery."""
+    """Re-trigger initial research for error recovery.
+
+    Ownership is taken before the status changes, not after. The handler used to
+    commit RESEARCHING and then queue a task that tried to claim the in-flight
+    guard; if a check of the same topic held it, the task exited silently and the
+    topic sat in RESEARCHING until stuck recovery called it an error (AUG-137).
+    Both the guard and the durable claim are decided here, so a refusal is
+    something the user sees and no status is written for work that never starts.
+    """
     topic = get_topic(conn, topic_id)
     if topic is None:
         raise HTTPException(status_code=404, detail="Topic not found")
 
-    topic.status = TopicStatus.RESEARCHING
-    topic.status_changed_at = datetime.now(UTC)
-    topic.error_message = None
-    # Reset the (now vestigial) init_attempts counter so a re-init starts clean,
-    # in case stale DB state from an older build left it non-zero.
-    topic.init_attempts = 0
-    update_topic(conn, topic)
+    assert topic.id is not None
+    if not topic.is_active:
+        raise HTTPException(status_code=409, detail="Topic is paused. Enable it before re-initializing.")
+
+    owner = await _checking_state.start_check(topic_id)
+    if owner is None:
+        raise HTTPException(status_code=409, detail="This topic is busy right now. Try again when it finishes.")
+
+    claimed = claim_topic_for_init(conn, topic_id, topic.status)
+    if not claimed:
+        await _checking_state.finish_check(topic_id, owner)
+        raise HTTPException(status_code=409, detail="This topic is busy right now. Try again when it finishes.")
+
+    # An explicit Retry starts from a clean slate (OVH-098): reset the vestigial
+    # init_attempts counter, fenced to the claim this handler just won.
+    update_topic_init_status(
+        conn,
+        topic_id,
+        status=TopicStatus.RESEARCHING,
+        status_changed_at=datetime.now(UTC),
+        error_message=None,
+        init_attempts=0,
+        expected_status=TopicStatus.RESEARCHING,
+    )
     conn.commit()
 
-    assert topic.id is not None
     db_path = getattr(request.app.state, "db_path", None)
-    background_tasks.add_task(background._run_init, topic.id, settings, db_path)
+    background_tasks.add_task(background._run_init, topic.id, settings, db_path, owner, claimed=True)
 
     return RedirectResponse(url=f"/topics/{topic_id}", status_code=303)
 
@@ -740,7 +769,10 @@ async def edit_topic_handler(
     topic.novelty_instruction = instruction
     topic.importance_threshold = imp_threshold
     try:
-        update_topic(conn, topic)
+        # Configuration columns only: this snapshot is older than the DNS
+        # validation above, so writing its lifecycle fields back would undo any
+        # status transition that landed during that await (AUG-022).
+        update_topic_config(conn, topic)
         conn.commit()
     except sqlite3.IntegrityError:
         # Defense-in-depth against a name race between the check above and the
@@ -811,9 +843,10 @@ async def check_all_handler(
     settings: Settings = Depends(get_settings),
 ):
     """Trigger a check of all ready topics in the background."""
-    if await _checking_state.start_check_all():
+    owner = _checking_state.start_check_all()
+    if owner is not None:
         db_path = getattr(request.app.state, "db_path", None)
-        background_tasks.add_task(background._run_check_all, settings, db_path)
+        background_tasks.add_task(background._run_check_all, settings, db_path, owner)
     return RedirectResponse(url="/", status_code=303)
 
 

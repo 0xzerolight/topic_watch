@@ -172,12 +172,13 @@ async def api_trigger_check(
     # Clear entries from a crashed prior run (mirrors the UI handler) before
     # claiming the guard, so a stale slot can never wedge the endpoint.
     await _checking_state.clear_stale(600)
-    if not await _checking_state.start_check(topic_id):
+    owner = await _checking_state.start_check(topic_id)
+    if owner is None:
         raise HTTPException(status_code=409, detail="A check for this topic is already in progress")
     try:
         result = await check_topic(topic, settings, db_path=db_path, guard=False)
     finally:
-        await _checking_state.finish_check(topic_id)
+        await _checking_state.finish_check(topic_id, owner)
     return CheckTriggerResponse(
         status="checked",
         check_result_id=result.id,

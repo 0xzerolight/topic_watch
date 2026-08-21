@@ -240,7 +240,7 @@ async def _cmd_init(topic_name: str) -> None:
     transition commit. Its only real job is turning the outcome into text and an
     exit code (TW-AUD-027).
     """
-    from app.checker import initialize_new_topic
+    from app.checker import TopicInitRefused, initialize_new_topic
 
     settings = load_settings()
     db_path = _open_database(settings)
@@ -251,21 +251,22 @@ async def _cmd_init(topic_name: str) -> None:
     if topic is None:
         logger.error("Topic not found: '%s'", topic_name)
         sys.exit(1)
-    if topic.status == TopicStatus.RESEARCHING:
-        # Another init (scheduler gradual init or a second CLI run) already
-        # holds the RESEARCHING claim — cooperate and bail (OVH-018).
-        logger.error(
-            "Topic '%s' is already being researched; skipping concurrent init.",
-            topic_name,
-        )
-        sys.exit(1)
 
     topic_id = topic.id
     assert topic_id is not None
     verb = "Re-initializing" if topic.status == TopicStatus.READY else "Initializing"
     print(f"{verb} knowledge for '{terminal_safe(topic_name, width=None)}'...")
 
-    await initialize_new_topic(topic, settings, db_path=db_path)
+    # The status check that used to live here was a read followed by an
+    # unconditional write, so two CLI runs (or a CLI racing the scheduler) could
+    # both pass it. ``initialize_new_topic`` now decides ownership with one
+    # conditional UPDATE and refuses out loud (AUG-288).
+    try:
+        await initialize_new_topic(topic, settings, db_path=db_path)
+    except TopicInitRefused as exc:
+        logger.error("Cannot initialize '%s': %s", topic_name, exc)
+        print(f"  Cannot initialize: {exc}")
+        sys.exit(1)
 
     with get_db(db_path) as conn:
         final = get_topic(conn, topic_id)

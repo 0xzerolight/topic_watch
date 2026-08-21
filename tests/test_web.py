@@ -17,6 +17,7 @@ from app.crud import (
     create_check_result,
     create_knowledge_state,
     create_topic,
+    get_topic_by_name,
 )
 from app.main import REQUEST_ID_PATTERN, app
 from app.models import (
@@ -399,6 +400,85 @@ class TestOpmlImportErrorRedirect:
             )
 
         assert "2 feed URL(s) rejected" in unquote(response.headers["location"])
+
+
+class TestOpmlImportRechecksAfterValidation:
+    """AUG-287: admission is decided against live state, after the DNS work."""
+
+    _OPML = (
+        '<?xml version="1.0"?><opml version="2.0"><body>'
+        '<outline text="Dup" type="rss" xmlUrl="https://feeds.example.com/dup"/>'
+        "</body></opml>"
+    )
+
+    async def test_name_taken_during_validation_is_skipped_not_a_500(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """A concurrent import that wins the name loses this batch, not the request.
+
+        The snapshot of existing names is taken before the DNS-validating parse, so
+        an overlapping import of the same file passed admission twice; the loser hit
+        the UNIQUE constraint uncaught and rolled its whole batch back.
+        """
+        from urllib.parse import unquote
+
+        from app.opml import OPMLResult
+
+        parsed = OPMLResult()
+        parsed.topics.append({"name": "Dup", "feed_urls": ["https://feeds.example.com/dup"], "tags": []})
+        parsed.topics.append({"name": "Fresh", "feed_urls": ["https://feeds.example.com/fresh"], "tags": []})
+
+        def _parse_and_race(*args, **kwargs):
+            # The competing import commits while this one is inside parse_opml.
+            create_topic(db_conn, Topic(name="Dup", description="d", status=TopicStatus.NEW))
+            db_conn.commit()
+            return parsed
+
+        with patch("app.opml.parse_opml", new=_parse_and_race):
+            response = await client.post(
+                "/import/opml",
+                files={"opml_file": ("feeds.opml", self._OPML, "text/xml")},
+                follow_redirects=False,
+            )
+
+        assert response.status_code == 303
+        location = unquote(response.headers["location"])
+        assert "Imported 1 topic(s)" in location
+        assert "skipped 1 duplicate(s)" in location
+        # The topic that was still unique survived the batch.
+        assert get_topic_by_name(db_conn, "Fresh") is not None
+
+    async def test_feed_url_taken_during_validation_is_skipped(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """A URL that became a duplicate during validation does not import twice."""
+        from app.opml import OPMLResult
+
+        parsed = OPMLResult()
+        parsed.topics.append({"name": "Second Name", "feed_urls": ["https://feeds.example.com/dup"], "tags": []})
+
+        def _parse_and_race(*args, **kwargs):
+            create_topic(
+                db_conn,
+                Topic(
+                    name="First Name",
+                    description="d",
+                    status=TopicStatus.NEW,
+                    feed_urls=["https://feeds.example.com/dup"],
+                ),
+            )
+            db_conn.commit()
+            return parsed
+
+        with patch("app.opml.parse_opml", new=_parse_and_race):
+            response = await client.post(
+                "/import/opml",
+                files={"opml_file": ("feeds.opml", self._OPML, "text/xml")},
+                follow_redirects=False,
+            )
+
+        assert response.status_code == 303
+        assert get_topic_by_name(db_conn, "Second Name") is None
 
 
 class TestDashboardStatsFreshness:
@@ -1785,7 +1865,7 @@ class TestCheckNow:
         baseline = create_check_result(db_conn, CheckResult(topic_id=topic.id))
         from app.web.state import _checking_state
 
-        await _checking_state.start_check(topic.id)
+        owner = await _checking_state.start_check(topic.id)
         try:
             response = await client.get(
                 f"/topics/{topic.id}/row?since_check_id={baseline.id}", headers={"HX-Request": "true"}
@@ -1794,7 +1874,7 @@ class TestCheckNow:
 
             create_check_result(db_conn, CheckResult(topic_id=topic.id, has_new_info=True))
         finally:
-            await _checking_state.finish_check(topic.id)
+            await _checking_state.finish_check(topic.id, owner)
 
         response = await client.get(
             f"/topics/{topic.id}/row?since_check_id={baseline.id}", headers={"HX-Request": "true"}
@@ -1841,7 +1921,7 @@ class TestCheckNow:
         topic = _make_topic(db_conn)
         from app.web.state import _checking_state
 
-        await _checking_state.start_check(topic.id)
+        owner = await _checking_state.start_check(topic.id)
         try:
             with patch("app.web.routers.background._run_single_check", new_callable=AsyncMock) as mock_bg:
                 response = await client.post(
@@ -1854,7 +1934,7 @@ class TestCheckNow:
             # Already checking — do not enqueue a second pipeline run.
             mock_bg.assert_not_called()
         finally:
-            await _checking_state.finish_check(topic.id)
+            await _checking_state.finish_check(topic.id, owner)
 
     async def test_check_already_checking_non_htmx_redirects(
         self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
@@ -1863,7 +1943,7 @@ class TestCheckNow:
         topic = _make_topic(db_conn)
         from app.web.state import _checking_state
 
-        await _checking_state.start_check(topic.id)
+        owner = await _checking_state.start_check(topic.id)
         try:
             response = await client.post(
                 f"/topics/{topic.id}/check",
@@ -1872,7 +1952,7 @@ class TestCheckNow:
             assert response.status_code == 303
             assert response.headers["location"] == f"/topics/{topic.id}"
         finally:
-            await _checking_state.finish_check(topic.id)
+            await _checking_state.finish_check(topic.id, owner)
 
     async def test_check_counts_articles_with_count_query(
         self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
@@ -2369,6 +2449,47 @@ class TestTopicEdit:
         assert updated.description == "New description"
         assert updated.feed_urls == ["https://new.example.com/feed.xml"]
         assert updated.feed_mode == FeedMode.MANUAL
+
+    async def test_edit_does_not_overwrite_a_concurrent_lifecycle_transition(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-022: an edit writes configuration only, never lifecycle columns.
+
+        The handler snapshots the topic, awaits DNS validation of the submitted
+        feeds, then writes. An initialization finishing inside that await used to
+        be undone by the stale snapshot: the topic went back to RESEARCHING (or was
+        marked READY while still initializing) on the strength of an unrelated
+        rename.
+        """
+        from app.crud import get_topic, update_topic_init_status
+
+        topic = _make_topic(db_conn, name="Racing", status=TopicStatus.RESEARCHING)
+
+        async def _validate_then_finish_init(feed_mode, feed_urls, check_interval):
+            # Stand in for the initializer committing READY during the DNS await.
+            update_topic_init_status(
+                db_conn,
+                topic.id,
+                status=TopicStatus.READY,
+                status_changed_at=datetime.now(UTC),
+                error_message=None,
+                init_attempts=0,
+            )
+            db_conn.commit()
+            return FeedMode.AUTO, [], None, []
+
+        with patch("app.web.routers.topics.validate_topic_form", new=_validate_then_finish_init):
+            response = await client.post(
+                f"/topics/{topic.id}/edit",
+                data={"name": "Renamed", "description": "d", "feed_mode": "auto"},
+                follow_redirects=False,
+            )
+
+        assert response.status_code == 303
+        updated = get_topic(db_conn, topic.id)
+        assert updated.name == "Renamed"
+        assert updated.status == TopicStatus.READY
+        assert updated.error_message is None
 
     async def test_edit_persists_novelty_instruction(
         self, client: httpx.AsyncClient, db_conn: sqlite3.Connection

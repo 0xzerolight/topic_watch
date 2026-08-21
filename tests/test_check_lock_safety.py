@@ -3,6 +3,7 @@
 import asyncio
 import sqlite3
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -13,9 +14,11 @@ from app.crud import (
     claim_new_topic_for_init,
     claim_pending_notification,
     claim_pending_webhook,
+    claim_topic_for_init,
     create_pending_notification,
     create_pending_webhook,
     create_topic,
+    get_new_topics,
     get_topic,
     release_stale_notification_claims,
     release_stale_webhook_claims,
@@ -38,20 +41,26 @@ def state() -> CheckingState:
 # --- start_check / finish_check ---
 
 
-async def test_start_check_returns_true_first_time(state: CheckingState) -> None:
-    result = await state.start_check(1)
-    assert result is True
+async def test_start_check_returns_token_first_time(state: CheckingState) -> None:
+    token = await state.start_check(1)
+    assert isinstance(token, str) and token
 
 
-async def test_start_check_returns_false_when_already_checking(state: CheckingState) -> None:
+async def test_start_check_returns_none_when_already_checking(state: CheckingState) -> None:
     await state.start_check(1)
-    result = await state.start_check(1)
-    assert result is False
+    assert await state.start_check(1) is None
 
 
 async def test_start_check_allows_different_topics(state: CheckingState) -> None:
-    assert await state.start_check(1) is True
-    assert await state.start_check(2) is True
+    assert await state.start_check(1) is not None
+    assert await state.start_check(2) is not None
+
+
+async def test_start_check_tokens_are_unique(state: CheckingState) -> None:
+    first = await state.start_check(1)
+    await state.finish_check(1, first)
+    second = await state.start_check(1)
+    assert first != second
 
 
 async def test_is_checking_true_after_start(state: CheckingState) -> None:
@@ -64,35 +73,63 @@ async def test_is_checking_false_before_start(state: CheckingState) -> None:
 
 
 async def test_finish_check_releases(state: CheckingState) -> None:
-    await state.start_check(1)
-    await state.finish_check(1)
+    token = await state.start_check(1)
+    await state.finish_check(1, token)
     assert await state.is_checking(1) is False
 
 
 async def test_finish_check_allows_restart(state: CheckingState) -> None:
-    await state.start_check(1)
-    await state.finish_check(1)
-    result = await state.start_check(1)
-    assert result is True
+    token = await state.start_check(1)
+    await state.finish_check(1, token)
+    assert await state.start_check(1) is not None
 
 
 async def test_finish_check_nonexistent_is_noop(state: CheckingState) -> None:
     # Should not raise
-    await state.finish_check(999)
+    await state.finish_check(999, "no-such-token")
+
+
+async def test_finish_check_with_foreign_token_keeps_guard(state: CheckingState) -> None:
+    """A release presenting someone else's token leaves the live owner in place."""
+    await state.start_check(1)
+    await state.finish_check(1, "not-the-owner")
+    assert await state.is_checking(1) is True
+
+
+async def test_evicted_owner_release_does_not_steal_successor_slot(state: CheckingState) -> None:
+    """A-evict-B-A-release leaves B's guard held (AUG-264 ABA hole).
+
+    A claims the slot and outlives the stale-eviction threshold; ``clear_stale``
+    frees it and B takes it. When A finally releases, the id-only release used to
+    drop B's guard too, admitting a third concurrent check of the same topic.
+    """
+    a_token = await state.start_check(7)
+    state._start_times[7] = time.monotonic() - 700
+    assert await state.clear_stale(600) == [7]
+
+    b_token = await state.start_check(7)
+    assert b_token is not None and b_token != a_token
+
+    await state.finish_check(7, a_token)
+
+    assert await state.is_checking(7) is True
+    assert await state.start_check(7) is None
+    # Only B can release its own slot.
+    await state.finish_check(7, b_token)
+    assert await state.is_checking(7) is False
 
 
 # --- start_check_all / finish_check_all / is_checking_all ---
 
 
-async def test_start_check_all_returns_true_first_time(state: CheckingState) -> None:
-    result = await state.start_check_all()
-    assert result is True
+async def test_start_check_all_returns_token_first_time(state: CheckingState) -> None:
+    token = state.start_check_all()
+    assert isinstance(token, str) and token
 
 
-async def test_start_check_all_returns_false_when_running(state: CheckingState) -> None:
-    await state.start_check_all()
-    result = await state.start_check_all()
-    assert result is False
+async def test_start_check_all_returns_none_when_running(state: CheckingState) -> None:
+    state.start_check_all()
+    assert state.start_check_all() is None
 
 
 async def test_is_checking_all_false_initially(state: CheckingState) -> None:
@@ -100,21 +137,26 @@ async def test_is_checking_all_false_initially(state: CheckingState) -> None:
 
 
 async def test_is_checking_all_true_after_start(state: CheckingState) -> None:
-    await state.start_check_all()
+    state.start_check_all()
     assert await state.is_checking_all() is True
 
 
 async def test_finish_check_all_resets_flag(state: CheckingState) -> None:
-    await state.start_check_all()
-    await state.finish_check_all()
+    token = state.start_check_all()
+    state.finish_check_all(token)
     assert await state.is_checking_all() is False
 
 
+async def test_finish_check_all_with_foreign_token_is_noop(state: CheckingState) -> None:
+    state.start_check_all()
+    state.finish_check_all("not-the-owner")
+    assert await state.is_checking_all() is True
+
+
 async def test_finish_check_all_allows_restart(state: CheckingState) -> None:
-    await state.start_check_all()
-    await state.finish_check_all()
-    result = await state.start_check_all()
-    assert result is True
+    token = state.start_check_all()
+    state.finish_check_all(token)
+    assert state.start_check_all() is not None
 
 
 # --- clear_stale ---
@@ -162,34 +204,33 @@ async def test_clear_stale_multiple_topics(state: CheckingState) -> None:
 async def test_concurrent_start_check_only_one_wins(state: CheckingState) -> None:
     """Only one coroutine should win the start_check race."""
     results = await asyncio.gather(*[state.start_check(5) for _ in range(10)])
-    assert results.count(True) == 1
-    assert results.count(False) == 9
+    assert len([r for r in results if r is not None]) == 1
+    assert results.count(None) == 9
 
 
-async def test_concurrent_start_check_all_only_one_wins(state: CheckingState) -> None:
-    """Only one coroutine should win the start_check_all race."""
-    results = await asyncio.gather(*[state.start_check_all() for _ in range(10)])
-    assert results.count(True) == 1
-    assert results.count(False) == 9
+def test_concurrent_start_check_all_only_one_wins(state: CheckingState) -> None:
+    """Only one caller wins the whole-cycle gate (no await between test and set)."""
+    results = [state.start_check_all() for _ in range(10)]
+    assert len([r for r in results if r is not None]) == 1
+    assert results.count(None) == 9
 
 
 async def test_concurrent_different_topics_all_win(state: CheckingState) -> None:
     """Each different topic_id should be able to start independently."""
     topic_ids = list(range(100, 110))
     results = await asyncio.gather(*[state.start_check(tid) for tid in topic_ids])
-    assert all(results)
+    assert all(r is not None for r in results)
 
 
 async def test_state_not_corrupted_after_concurrent_finish(state: CheckingState) -> None:
     """Concurrent finish_check calls should not corrupt internal state."""
-    for tid in range(5):
-        await state.start_check(tid)
-    await asyncio.gather(*[state.finish_check(tid) for tid in range(5)])
+    tokens = {tid: await state.start_check(tid) for tid in range(5)}
+    await asyncio.gather(*[state.finish_check(tid, tokens[tid]) for tid in range(5)])
     for tid in range(5):
         assert await state.is_checking(tid) is False
     # All entries should be startable again
     for tid in range(5):
-        assert await state.start_check(tid) is True
+        assert await state.start_check(tid) is not None
 
 
 # --- Retry-drain atomic claim (cross-process double-delivery guard, OVH-017) ---
@@ -262,11 +303,11 @@ def clean_state():
     """Ensure the process-global _checking_state singleton is empty around a test."""
     _checking_state._topics.clear()
     _checking_state._start_times.clear()
-    _checking_state._checking_all = False
+    _checking_state._checking_all = None
     yield _checking_state
     _checking_state._topics.clear()
     _checking_state._start_times.clear()
-    _checking_state._checking_all = False
+    _checking_state._checking_all = None
 
 
 def _patch_empty_fetch(monkeypatch):
@@ -293,7 +334,7 @@ async def test_check_topic_skips_when_already_in_flight(
     monkeypatch.setattr("app.checker.fetch_new_articles_for_topic", fetch_spy)
 
     # Simulate an in-flight check by pre-claiming the per-topic slot.
-    assert await clean_state.start_check(topic.id) is True
+    assert await clean_state.start_check(topic.id) is not None
     result = await check_topic(topic, settings, db_path=db_path)
 
     assert result.stage_error == "skipped: already in flight"
@@ -315,7 +356,7 @@ async def test_check_topic_acquires_and_releases_guard(
     await check_topic(topic, settings, db_path=db_path)
     # Released in finally -> startable again.
     assert await clean_state.is_checking(topic.id) is False
-    assert await clean_state.start_check(topic.id) is True
+    assert await clean_state.start_check(topic.id) is not None
 
 
 async def test_check_topic_guard_false_does_not_touch_state(
@@ -333,7 +374,7 @@ async def test_check_topic_guard_false_does_not_touch_state(
     _patch_empty_fetch(monkeypatch)
 
     # Caller already holds the slot; guard=False must still execute the pipeline.
-    assert await clean_state.start_check(topic.id) is True
+    assert await clean_state.start_check(topic.id) is not None
     result = await check_topic(topic, settings, db_path=db_path, guard=False)
     assert result.stage_error != "skipped: already in flight"
     # The slot the caller owns is untouched by the inner run.
@@ -386,7 +427,7 @@ async def test_check_all_skips_when_cycle_already_in_flight(monkeypatch, clean_s
     monkeypatch.setattr("app.checker._check_all_topics_inner", inner)
 
     # Simulate a web check-all already holding the whole-cycle gate.
-    assert await clean_state.start_check_all() is True
+    assert clean_state.start_check_all() is not None
     result = await check_all_topics(settings)
     assert result == []
     inner.assert_not_awaited()
@@ -402,7 +443,7 @@ async def test_check_all_releases_gate_after_run(monkeypatch, clean_state) -> No
     await check_all_topics(settings)
     assert await clean_state.is_checking_all() is False
     # Gate is free again.
-    assert await clean_state.start_check_all() is True
+    assert clean_state.start_check_all() is not None
 
 
 async def test_check_all_guard_false_skips_gate(monkeypatch, clean_state) -> None:
@@ -413,7 +454,7 @@ async def test_check_all_guard_false_skips_gate(monkeypatch, clean_state) -> Non
     inner = AsyncMock(return_value=[])
     monkeypatch.setattr("app.checker._check_all_topics_inner", inner)
 
-    assert await clean_state.start_check_all() is True
+    assert clean_state.start_check_all() is not None
     await check_all_topics(settings, guard=False)
     inner.assert_awaited_once()
 
@@ -438,6 +479,68 @@ def test_claim_new_topic_for_init_noop_when_not_new(db_conn: sqlite3.Connection)
     topic = create_topic(db_conn, Topic(name="Ready", description="d", status=TopicStatus.READY))
     db_conn.commit()
     assert claim_new_topic_for_init(db_conn, topic.id) is False
+
+
+def test_claim_new_topic_for_init_refuses_paused_topic(db_conn: sqlite3.Connection) -> None:
+    """A paused NEW topic is never claimed for automatic initialization (AUG-140)."""
+    topic = create_topic(db_conn, Topic(name="Paused", description="d", status=TopicStatus.NEW, is_active=False))
+    db_conn.commit()
+
+    assert claim_new_topic_for_init(db_conn, topic.id) is False
+    assert get_topic(db_conn, topic.id).status == TopicStatus.NEW
+
+
+def test_get_new_topics_excludes_paused_topics(db_conn: sqlite3.Connection) -> None:
+    """The gradual-init selection skips paused topics, so no LLM/Exa spend (AUG-140)."""
+    create_topic(db_conn, Topic(name="Off", description="d", status=TopicStatus.NEW, is_active=False))
+    active = create_topic(db_conn, Topic(name="On", description="d", status=TopicStatus.NEW))
+    db_conn.commit()
+
+    selected = get_new_topics(db_conn, limit=10)
+    assert [t.id for t in selected] == [active.id]
+
+
+def test_claim_topic_for_init_requires_the_expected_status(db_conn: sqlite3.Connection) -> None:
+    """The claim is a compare-and-set: a stale expectation loses (AUG-288)."""
+    topic = create_topic(db_conn, Topic(name="Stale", description="d", status=TopicStatus.ERROR))
+    db_conn.commit()
+
+    # A caller that read READY before the row became ERROR must not claim it.
+    assert claim_topic_for_init(db_conn, topic.id, TopicStatus.READY) is False
+    assert get_topic(db_conn, topic.id).status == TopicStatus.ERROR
+    # The caller that read the live status wins.
+    assert claim_topic_for_init(db_conn, topic.id, TopicStatus.ERROR) is True
+    assert get_topic(db_conn, topic.id).status == TopicStatus.RESEARCHING
+
+
+def test_claim_topic_for_init_refuses_paused_topic(db_conn: sqlite3.Connection) -> None:
+    """Pausing a topic between the read and the claim stops the init (AUG-140)."""
+    topic = create_topic(db_conn, Topic(name="PausedError", description="d", status=TopicStatus.ERROR))
+    db_conn.commit()
+    db_conn.execute("UPDATE topics SET is_active = 0 WHERE id = ?", (topic.id,))
+    db_conn.commit()
+
+    assert claim_topic_for_init(db_conn, topic.id, TopicStatus.ERROR) is False
+    assert get_topic(db_conn, topic.id).status == TopicStatus.ERROR
+
+
+async def test_concurrent_reinit_claim_only_one_wins(tmp_path) -> None:
+    """Two processes re-initializing the same READY topic: exactly one claims it."""
+    from app.database import get_db, init_db
+
+    db_path = tmp_path / "reinit.db"
+    init_db(db_path)
+    with get_db(db_path) as seed:
+        topic = create_topic(seed, Topic(name="Reinit", description="d", status=TopicStatus.READY))
+        seed.commit()
+
+    def _claim() -> bool:
+        with get_db(db_path) as conn:
+            return claim_topic_for_init(conn, topic.id, TopicStatus.READY)
+
+    results = await asyncio.gather(asyncio.to_thread(_claim), asyncio.to_thread(_claim))
+    assert results.count(True) == 1
+    assert results.count(False) == 1
 
 
 async def test_concurrent_init_claim_only_one_wins(tmp_path) -> None:
@@ -526,3 +629,188 @@ async def test_cross_entry_point_check_topic_blocks_api_trigger(
     result = pipeline.result()
     assert result.stage_error != "skipped: already in flight"
     assert await clean_state.is_checking(topic.id) is False
+
+
+# --- Lifecycle fencing across a delete + rowid reuse (AUG-020 / TW-AUD-007) ---
+
+
+def _recreate_reusing_rowid(conn: sqlite3.Connection, original: Topic) -> Topic:
+    """Delete a topic and create a replacement that reuses its freed rowid."""
+    from app.crud import delete_topic
+
+    delete_topic(conn, original.id)
+    conn.commit()
+    replacement = create_topic(conn, Topic(name="Replacement", description="d", status=TopicStatus.READY))
+    conn.commit()
+    assert replacement.id == original.id
+    assert replacement.generation != original.generation
+    return replacement
+
+
+def test_heartbeat_claim_refuses_a_stale_generation(db_conn: sqlite3.Connection) -> None:
+    """A check holding a deleted topic cannot latch the replacement (AUG-020)."""
+    from app.crud import claim_heartbeat_alert
+
+    original = create_topic(db_conn, Topic(name="Doomed", description="d", status=TopicStatus.READY))
+    db_conn.commit()
+    replacement = _recreate_reusing_rowid(db_conn, original)
+
+    won = claim_heartbeat_alert(db_conn, original.id, datetime(2026, 1, 1, tzinfo=UTC), generation=original.generation)
+    db_conn.commit()
+
+    assert won is False
+    assert get_topic(db_conn, replacement.id).heartbeat_alerted_at is None
+
+
+def test_heartbeat_clear_refuses_a_stale_generation(db_conn: sqlite3.Connection) -> None:
+    """Nor can it clear the replacement's own outage latch (AUG-020)."""
+    from app.crud import claim_heartbeat_alert, clear_heartbeat_alert
+
+    original = create_topic(db_conn, Topic(name="Doomed", description="d", status=TopicStatus.READY))
+    db_conn.commit()
+    replacement = _recreate_reusing_rowid(db_conn, original)
+
+    # The replacement has its own, live outage announced.
+    assert claim_heartbeat_alert(
+        db_conn, replacement.id, datetime(2026, 1, 2, tzinfo=UTC), generation=replacement.generation
+    )
+    db_conn.commit()
+
+    assert clear_heartbeat_alert(db_conn, original.id, generation=original.generation) is False
+    db_conn.commit()
+    assert get_topic(db_conn, replacement.id).heartbeat_alerted_at is not None
+
+
+def test_heartbeat_claim_refuses_a_superseded_head_check(db_conn: sqlite3.Connection) -> None:
+    """A decision computed from check N does not land once check N+1 exists."""
+    from app.crud import claim_heartbeat_alert, create_check_result
+    from app.models import CheckResult
+
+    topic = create_topic(db_conn, Topic(name="Streaky", description="d", status=TopicStatus.READY))
+    db_conn.commit()
+    first = create_check_result(db_conn, CheckResult(topic_id=topic.id))
+    second = create_check_result(db_conn, CheckResult(topic_id=topic.id))
+    db_conn.commit()
+
+    stale = claim_heartbeat_alert(db_conn, topic.id, datetime(2026, 1, 1, tzinfo=UTC), head_check_id=first.id)
+    db_conn.commit()
+    assert stale is False
+
+    fresh = claim_heartbeat_alert(db_conn, topic.id, datetime(2026, 1, 1, tzinfo=UTC), head_check_id=second.id)
+    db_conn.commit()
+    assert fresh is True
+
+
+async def test_stale_check_aborts_and_leaves_the_replacement_untouched(tmp_path, monkeypatch, clean_state) -> None:
+    """A check whose topic is deleted mid-flight writes nothing to its successor.
+
+    The rowid is recycled by the next INSERT, so without the generation fence the
+    stale worker files its CheckResult against — and latches the heartbeat of — a
+    topic it never looked at (TW-AUD-007).
+    """
+    from app.checker import check_topic
+    from app.crud import list_check_results
+    from app.database import get_db, init_db
+    from app.scraping import FetchResult
+
+    db_path = tmp_path / "recycled.db"
+    init_db(db_path)
+    with get_db(db_path) as seed:
+        original = create_topic(seed, Topic(name="Doomed", description="d", status=TopicStatus.READY))
+        seed.commit()
+
+    replacement_holder: dict[str, Topic] = {}
+
+    async def _delete_and_recreate(*args, **kwargs):
+        # The user deletes the topic and adds a new one while the fetch is running.
+        with get_db(db_path) as conn:
+            replacement_holder["topic"] = _recreate_reusing_rowid(conn, original)
+        return FetchResult(articles=[], total_feed_entries=0)
+
+    monkeypatch.setattr("app.checker.fetch_new_articles_for_topic", _delete_and_recreate)
+
+    result = await check_topic(original, _make_settings(), db_path=db_path)
+
+    replacement = replacement_holder["topic"]
+    assert result.stage_error is not None and result.stage_error.startswith("transition_aborted:")
+    with get_db(db_path) as conn:
+        assert list_check_results(conn, replacement.id) == []
+        assert get_topic(conn, replacement.id).heartbeat_alerted_at is None
+
+
+# --- Retry claims recheck eligibility and fence late applies (TW-AUD-006) ---
+
+
+def test_exhausted_notification_cannot_be_claimed(db_conn: sqlite3.Connection) -> None:
+    """A row already at max_retries is rejected by the claim, not just by the list query."""
+    topic = _make_topic(db_conn)
+    n = create_pending_notification(
+        db_conn,
+        PendingNotification(topic_id=topic.id, title="T", body="B", retry_count=3, max_retries=3),
+    )
+    db_conn.commit()
+
+    assert claim_pending_notification(db_conn, n.id, "2026-01-01T00:00:00+00:00") is False
+
+
+def test_exhausted_webhook_cannot_be_claimed(db_conn: sqlite3.Connection) -> None:
+    """Same predicate on the webhook queue."""
+    topic = _make_topic(db_conn)
+    webhook_id = create_pending_webhook(db_conn, topic.id, "https://a.com/hook", {"k": "v"}, max_retries=1)
+    db_conn.commit()
+    db_conn.execute("UPDATE pending_webhooks SET retry_count = 1 WHERE id = ?", (webhook_id,))
+    db_conn.commit()
+
+    assert claim_pending_webhook(db_conn, webhook_id, "2026-01-01T00:00:00+00:00") is False
+
+
+def test_late_notification_apply_with_a_stale_token_is_a_noop(db_conn: sqlite3.Connection) -> None:
+    """A drainer whose claim was released and re-taken cannot consume the new owner's attempt."""
+    from app.crud import delete_pending_notification, increment_notification_retry
+
+    first_owner, second_owner = "owner-a", "owner-b"
+    topic = _make_topic(db_conn)
+    n = create_pending_notification(db_conn, PendingNotification(topic_id=topic.id, title="T", body="B"))
+    db_conn.commit()
+
+    assert claim_pending_notification(db_conn, n.id, "2020-01-01T00:00:00+00:00", claim_token=first_owner) is True
+    db_conn.commit()
+    # The first owner is declared stale and a second drainer takes the row.
+    release_stale_notification_claims(db_conn, "2020-06-01T00:00:00+00:00")
+    db_conn.commit()
+    assert claim_pending_notification(db_conn, n.id, "2026-01-01T00:00:00+00:00", claim_token=second_owner) is True
+    db_conn.commit()
+
+    # The first owner finally comes back with both possible applies.
+    assert increment_notification_retry(db_conn, n.id, "late failure", claim_token=first_owner) is False
+    assert delete_pending_notification(db_conn, n.id, claim_token=first_owner) is False
+    db_conn.commit()
+
+    row = db_conn.execute("SELECT retry_count, claim_token FROM pending_notifications WHERE id = ?", (n.id,)).fetchone()
+    assert row is not None
+    assert row["retry_count"] == 0
+    assert row["claim_token"] == second_owner
+
+
+def test_late_webhook_apply_with_a_stale_token_is_a_noop(db_conn: sqlite3.Connection) -> None:
+    """Same fence on the webhook queue."""
+    from app.crud import delete_pending_webhook, increment_webhook_retry
+
+    first_owner, second_owner = "owner-a", "owner-b"
+    topic = _make_topic(db_conn)
+    webhook_id = create_pending_webhook(db_conn, topic.id, "https://a.com/hook", {"k": "v"})
+    db_conn.commit()
+
+    assert claim_pending_webhook(db_conn, webhook_id, "2020-01-01T00:00:00+00:00", claim_token=first_owner) is True
+    db_conn.commit()
+    release_stale_webhook_claims(db_conn, "2020-06-01T00:00:00+00:00")
+    db_conn.commit()
+    assert claim_pending_webhook(db_conn, webhook_id, "2026-01-01T00:00:00+00:00", claim_token=second_owner) is True
+    db_conn.commit()
+
+    assert increment_webhook_retry(db_conn, webhook_id, claim_token=first_owner) is False
+    assert delete_pending_webhook(db_conn, webhook_id, claim_token=first_owner) is False
+    db_conn.commit()
+
+    row = db_conn.execute("SELECT retry_count FROM pending_webhooks WHERE id = ?", (webhook_id,)).fetchone()
+    assert row is not None and row["retry_count"] == 0

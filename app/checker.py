@@ -7,6 +7,7 @@ state, sends notifications for genuine updates, and records the outcome.
 
 import asyncio
 import logging
+import secrets
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -26,6 +27,7 @@ from app.crud import (
     MAX_ANALYSIS_ATTEMPTS,
     claim_heartbeat_alert,
     claim_pending_notification,
+    claim_topic_for_init,
     clear_heartbeat_alert,
     create_check_result,
     create_pending_notification,
@@ -78,6 +80,16 @@ def _summarize_exc(exc: BaseException, *, limit: int = 200) -> str:
     """One-line, length-bounded exception summary for the stored stage_error."""
     summary = f"{type(exc).__name__}: {exc}".replace("\n", " ").strip()
     return summary[:limit]
+
+
+class TopicInitRefused(Exception):
+    """Initialization never started because this caller does not own the topic.
+
+    Raised instead of silently returning so every entry point (CLI exit code, web
+    response, scheduler log) can say what happened: the topic was already being
+    initialized by someone else, is paused, or disappeared. A refusal writes
+    nothing — in particular it never takes a RESEARCHING claim it cannot release.
+    """
 
 
 class CheckTransitionAborted(Exception):
@@ -316,13 +328,14 @@ async def check_topic(
     if not guard:
         return await _check_topic_guarded(topic, settings, db_path)
 
-    if not await _checking_state.start_check(topic_id):
+    owner = await _checking_state.start_check(topic_id)
+    if owner is None:
         logger.info("Topic '%s' (id=%d) already being checked; skipping", topic.name, topic_id)
         return CheckResult(topic_id=topic_id, stage_error="skipped: already in flight")
     try:
         return await _check_topic_guarded(topic, settings, db_path)
     finally:
-        await _checking_state.finish_check(topic_id)
+        await _checking_state.finish_check(topic_id, owner)
 
 
 async def _check_topic_guarded(
@@ -660,9 +673,18 @@ async def _check_topic_inner(
     return result
 
 
-def _record_result(db_path: Path | None, result: CheckResult) -> CheckResult:
-    """Persist a CheckResult on a short connection (the no-send early-return paths)."""
+def _record_result(db_path: Path | None, result: CheckResult, *, generation: str | None) -> CheckResult:
+    """Persist a CheckResult on a short connection (the no-send early-return paths).
+
+    Fenced by the topic's generation for the same reason the full transition is: a
+    rowid freed by a delete is handed to the next topic created, so a check that
+    started before the delete would otherwise file its result against a topic it
+    never looked at (TW-AUD-007).
+    """
     with get_db(db_path) as conn:
+        topic_id = result.topic_id
+        if generation is not None and topic_id is not None and not topic_generation_matches(conn, topic_id, generation):
+            raise CheckTransitionAborted(f"topic_id={topic_id} was deleted or replaced during this check")
         created = create_check_result(conn, result)
         conn.commit()
     return created
@@ -675,7 +697,12 @@ async def _finish_check(
     settings: Settings,
 ) -> CheckResult:
     """Persist a no-send check result, then run the Silence Heartbeat over it."""
-    recorded = _record_result(db_path, result)
+    try:
+        recorded = _record_result(db_path, result, generation=topic.generation)
+    except CheckTransitionAborted as exc:
+        logger.warning("Check for topic '%s' aborted before recording its result: %s", topic.name, exc)
+        result.stage_error = f"transition_aborted: {exc}"
+        return result
     await _run_heartbeat(db_path, topic, recorded.id, settings)
     return recorded
 
@@ -708,7 +735,7 @@ async def _run_heartbeat(
             # and fires a phantom "recovered" whenever the feature is re-enabled.
             if topic.heartbeat_alerted_at is not None:
                 with get_db(db_path) as conn:
-                    if clear_heartbeat_alert(conn, topic.id):
+                    if clear_heartbeat_alert(conn, topic.id, generation=topic.generation):
                         conn.commit()
             return
 
@@ -717,10 +744,13 @@ async def _run_heartbeat(
             if action is None:
                 return
 
+            # Fenced to this topic's generation: a check that outlived a delete can
+            # reach a replacement topic that recycled the rowid, and latching it
+            # would suppress the replacement's own outage notice (AUG-020).
             if action.kind == "alert":
-                won = claim_heartbeat_alert(conn, topic.id, datetime.now(UTC))
+                won = claim_heartbeat_alert(conn, topic.id, datetime.now(UTC), generation=topic.generation)
             else:
-                won = clear_heartbeat_alert(conn, topic.id)
+                won = clear_heartbeat_alert(conn, topic.id, generation=topic.generation)
             if not won:
                 # Another checker (e.g. a CLI run against the live server) already
                 # sent this one. Release the implicit write transaction the UPDATE
@@ -888,8 +918,13 @@ async def _drain_pending_notifications(
         # already claimed it returns rowcount 0 here, so we skip — only the
         # winner sends, preventing double-delivery (OVH-017).
         claimed_at = datetime.now(UTC).isoformat()
+        # The claim carries an owner token and rechecks eligibility, so a drainer
+        # working from a stale snapshot cannot retry a row another drainer has
+        # since exhausted, and this drainer's apply below cannot land after a
+        # stale-claim release handed the row to someone else (TW-AUD-006).
+        claim_token = secrets.token_hex(8)
         with short_conn(conn, db_path) as claim_conn:
-            won = claim_pending_notification(claim_conn, notification.id, claimed_at)
+            won = claim_pending_notification(claim_conn, notification.id, claimed_at, claim_token=claim_token)
             claim_conn.commit()
         if not won:
             logger.debug("Notification id=%d already claimed by another drain; skipping", notification.id)
@@ -913,12 +948,17 @@ async def _drain_pending_notifications(
         # can re-claim and retry.
         with short_conn(conn, db_path) as apply_conn:
             if sent:
-                delete_pending_notification(apply_conn, notification.id)
+                applied = delete_pending_notification(apply_conn, notification.id, claim_token=claim_token)
                 logger.info("Retry succeeded for notification id=%d", notification.id)
             else:
-                increment_notification_retry(apply_conn, notification.id, last_error)
+                applied = increment_notification_retry(apply_conn, notification.id, last_error, claim_token=claim_token)
                 logger.warning("Retry failed for notification id=%d", notification.id)
             apply_conn.commit()
+        if not applied:
+            logger.warning(
+                "Late apply for notification id=%d ignored: the claim is no longer ours",
+                notification.id,
+            )
 
 
 async def check_all_topics(
@@ -964,13 +1004,14 @@ async def check_all_topics(
     if not guard:
         return await _check_all_topics_inner(settings, db_path)
 
-    if not await _checking_state.start_check_all():
+    owner = _checking_state.start_check_all()
+    if owner is None:
         logger.info("Check-all already in flight; skipping overlapping cycle")
         return []
     try:
         return await _check_all_topics_inner(settings, db_path)
     finally:
-        await _checking_state.finish_check_all()
+        _checking_state.finish_check_all(owner)
 
 
 async def _check_all_topics_inner(
@@ -1065,14 +1106,21 @@ def _commit_init_transition(
         )
 
     mark_articles_processed(conn, article_ids)
-    update_topic_init_status(
+    if not update_topic_init_status(
         conn,
         topic_id,
         status=TopicStatus.READY,
         status_changed_at=datetime.now(UTC),
         error_message=None,
         init_attempts=0,
-    )
+        expected_status=TopicStatus.RESEARCHING,
+    ):
+        # Stuck recovery gave up on this initialization and moved the row to ERROR
+        # while the LLM phase was running, so a Retry may already be under way. The
+        # claim is gone; landing READY here would make the terminal status
+        # last-writer-wins between recovery and abandoned work (AUG-139). Abort the
+        # whole transition instead — nothing is written and the next attempt is clean.
+        raise CheckTransitionAborted(f"topic_id={topic_id} left RESEARCHING during initialization")
     conn.commit()
 
 
@@ -1081,11 +1129,22 @@ async def initialize_new_topic(
     settings: Settings,
     *,
     db_path: Path | None = None,
+    claimed: bool = False,
 ) -> None:
     """Initialize a topic's knowledge state from its first batch of articles.
 
-    Transitions: NEW/RESEARCHING → RESEARCHING → READY (or ERROR on failure).
-    Called by both the web layer (background task) and the scheduler (gradual init).
+    Transitions: NEW/READY/ERROR → RESEARCHING → READY (or ERROR on failure).
+    Called by the web layer (background task), the scheduler (gradual init) and
+    the CLI.
+
+    Ownership: the RESEARCHING transition is a conditional claim, not an
+    unconditional write (AUG-288). Callers that already won the claim durably —
+    the scheduler's ``claim_new_topic_for_init``, the web Retry handler, the
+    just-INSERTed row of a topic creation — pass ``claimed=True``; everyone else
+    lets this function claim, and gets :class:`TopicInitRefused` when the topic is
+    already being initialized, is paused, or is gone. Every terminal write is
+    fenced back to that claim, so an initializer stuck recovery has already
+    written off cannot overwrite the recovered state (AUG-139).
 
     Connection invariant (AUG-136): no connection is open across the fetch or LLM
     awaits. Status writes each take a short connection of their own, the fetch and
@@ -1110,24 +1169,54 @@ async def initialize_new_topic(
     # never clobbered by a stale in-memory snapshot (OVH-100).
 
     def _set_init_status(status: TopicStatus, *, error_message: str | None, init_attempts: int) -> None:
+        """Write a terminal status, but only while this initializer still owns the claim."""
         now = datetime.now(UTC)
         with get_db(db_path) as conn:
-            update_topic_init_status(
+            won = update_topic_init_status(
                 conn,
                 topic_id,
                 status=status,
                 status_changed_at=now,
                 error_message=error_message,
                 init_attempts=init_attempts,
+                expected_status=TopicStatus.RESEARCHING,
             )
             conn.commit()
+        if not won:
+            logger.warning(
+                "Topic id=%d left RESEARCHING during initialization; not writing %s",
+                topic_id,
+                status.value,
+            )
+            return
         topic.status = status
         topic.status_changed_at = now
         topic.error_message = error_message
         topic.init_attempts = init_attempts
 
-    # Immediately mark as RESEARCHING (concurrency guard: UI shows spinner, prevents re-trigger).
-    _set_init_status(TopicStatus.RESEARCHING, error_message=None, init_attempts=topic.init_attempts)
+    # The status this call took the claim from, so a cancellation can hand it back
+    # (AUG-243). ``None`` when the caller claimed on our behalf and we never saw it.
+    prior_status: TopicStatus | None = None
+
+    if not claimed:
+        # One conditional UPDATE decides who initializes. Reading the status and
+        # then writing RESEARCHING let two initializers both pass (AUG-288).
+        with get_db(db_path) as conn:
+            live = get_topic(conn, topic_id)
+            if live is None:
+                check_id_var.reset(token)
+                raise TopicInitRefused(f"Topic id={topic_id} no longer exists")
+            if live.status == TopicStatus.RESEARCHING:
+                check_id_var.reset(token)
+                raise TopicInitRefused(f"Topic '{live.name}' is already being initialized")
+            if not live.is_active:
+                check_id_var.reset(token)
+                raise TopicInitRefused(f"Topic '{live.name}' is paused; enable it before initializing")
+            if not claim_topic_for_init(conn, topic_id, live.status):
+                check_id_var.reset(token)
+                raise TopicInitRefused(f"Topic '{live.name}' was claimed by another initializer")
+            prior_status = live.status
+        topic.status = TopicStatus.RESEARCHING
 
     with get_db(db_path) as conn:
         snapshot = _snapshot_topic(conn, topic_id)
@@ -1202,6 +1291,25 @@ async def initialize_new_topic(
                 topic.name,
             )
 
+    except asyncio.CancelledError:
+        # Ctrl-C on the CLI — and task cancellation generally — is not an
+        # ``Exception``, so it walked straight past the handler below and left the
+        # committed RESEARCHING claim behind. Offline, nothing ever recovers that:
+        # every later CLI init refuses the topic until the server is started
+        # (AUG-243). Hand the claim back before re-raising. All of this is
+        # synchronous on purpose; an await here would be cancelled again.
+        restored = prior_status if prior_status is not None else TopicStatus.ERROR
+        logger.warning(
+            "Initialization of topic '%s' was cancelled; restoring status %s",
+            topic.name,
+            restored.value,
+        )
+        _set_init_status(
+            restored,
+            error_message=("Initialization interrupted. Click Retry." if restored is TopicStatus.ERROR else None),
+            init_attempts=topic.init_attempts,
+        )
+        raise
     except Exception as exc:
         logger.error("Knowledge init failed for topic '%s'", topic.name, exc_info=True)
         _set_init_status(TopicStatus.ERROR, error_message=str(exc), init_attempts=topic.init_attempts)

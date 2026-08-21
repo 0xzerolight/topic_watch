@@ -110,13 +110,29 @@ async def import_opml_handler(
     if result.warnings and not result.topics:
         return RedirectResponse(url=f"/?error={quote(_import_failure_message(result))}", status_code=303)
 
-    # Create topics with NEW status (collisions already filtered by parse_opml).
+    # The names and URLs above were read BEFORE the DNS work, so they are a
+    # minutes-old view by now. Re-read them under one short write transaction and
+    # reconcile against live state: two overlapping imports of the same file used
+    # to both pass admission, after which the loser hit the UNIQUE name constraint
+    # as an unhandled 500 and rolled its whole batch back, while topics whose feed
+    # URL had since been taken imported twice (AUG-287). No DNS work happens inside
+    # this transaction.
+    conn.execute("BEGIN IMMEDIATE")
+    live_names = get_all_topic_names(conn)
+    live_urls = get_all_feed_urls(conn)
+
     created = 0
+    stale_dupes = 0
     for topic_data in result.topics:
+        name = topic_data["name"]
+        urls = [url for url in topic_data["feed_urls"] if url not in live_urls]
+        if name in live_names or not urls:
+            stale_dupes += 1
+            continue
         topic = Topic(
-            name=topic_data["name"],
-            description=f"News monitoring for {topic_data['name']}",
-            feed_urls=topic_data["feed_urls"],
+            name=name,
+            description=f"News monitoring for {name}",
+            feed_urls=urls,
             feed_mode=FeedMode.MANUAL,
             status=TopicStatus.NEW,
             # NULL, not the current global value. OPML carries no interval, and
@@ -126,14 +142,21 @@ async def import_opml_handler(
             check_interval_minutes=None,
             tags=topic_data.get("tags", []),
         )
-        create_topic(conn, topic)
+        try:
+            create_topic(conn, topic)
+        except sqlite3.IntegrityError:
+            # Another connection committed this name between the re-read and here.
+            stale_dupes += 1
+            continue
+        live_names.add(name)
+        live_urls.update(urls)
         created += 1
 
     conn.commit()
 
     # Build summary message
     parts = [f"Imported {created} topic(s)"]
-    total_skipped = result.skipped_dupes + result.skipped_name_dupes
+    total_skipped = result.skipped_dupes + result.skipped_name_dupes + stale_dupes
     if total_skipped:
         parts.append(f"skipped {total_skipped} duplicate(s)")
     if result.skipped_invalid:

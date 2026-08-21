@@ -6,6 +6,7 @@ new information is found, complementing the Apprise notifications.
 
 import asyncio
 import logging
+import secrets
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -286,8 +287,12 @@ async def _drain_pending_webhooks(
             # that already claimed it returns rowcount 0 here, so we skip — only
             # the winner sends, preventing double-delivery (OVH-017).
             claimed_at = datetime.now(UTC).isoformat()
+            # Owner token + eligibility inside the claim, mirroring the
+            # notification drain: no retry past max_retries and no late apply from
+            # a superseded owner (TW-AUD-006).
+            claim_token = secrets.token_hex(8)
             with short_conn(conn, db_path) as claim_conn:
-                won = claim_pending_webhook(claim_conn, webhook_id, claimed_at)
+                won = claim_pending_webhook(claim_conn, webhook_id, claimed_at, claim_token=claim_token)
                 claim_conn.commit()
             if not won:
                 logger.debug("Webhook id=%d already claimed by another drain; skipping", webhook_id)
@@ -305,11 +310,16 @@ async def _drain_pending_webhooks(
             # re-claim and retry.
             with short_conn(conn, db_path) as apply_conn:
                 if sent:
-                    delete_pending_webhook(apply_conn, webhook_id)
+                    applied = delete_pending_webhook(apply_conn, webhook_id, claim_token=claim_token)
                     logger.info("Retry succeeded for webhook id=%d", webhook_id)
                 else:
-                    increment_webhook_retry(apply_conn, webhook_id)
+                    applied = increment_webhook_retry(apply_conn, webhook_id, claim_token=claim_token)
                     logger.warning("Retry failed for webhook id=%d", webhook_id)
                 apply_conn.commit()
+            if not applied:
+                logger.warning(
+                    "Late apply for webhook id=%d ignored: the claim is no longer ours",
+                    webhook_id,
+                )
 
     await asyncio.gather(*(_process(webhook) for webhook in pending))

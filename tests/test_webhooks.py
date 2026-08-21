@@ -555,11 +555,11 @@ class TestWebhookRetryCrashSafety:
 
         call_count = {"n": 0}
 
-        def crashing_delete(conn, webhook_id):  # noqa: ANN001
+        def crashing_delete(conn, webhook_id, *, claim_token=None):  # noqa: ANN001
             call_count["n"] += 1
             if call_count["n"] == 2:
                 raise RuntimeError("simulated crash applying item 2")
-            real_delete_pending_webhook(conn, webhook_id)
+            return real_delete_pending_webhook(conn, webhook_id, claim_token=claim_token)
 
         with (
             patch("app.webhooks.send_webhook", new_callable=AsyncMock, return_value=True),
@@ -802,9 +802,9 @@ class TestWebhookDrainBoundedConcurrency:
         sent_counts: collections.Counter[str] = collections.Counter()
         claim_calls = {"n": 0}
 
-        def counting_claim(conn, webhook_id, claimed_at):  # noqa: ANN001
+        def counting_claim(conn, webhook_id, claimed_at, *, claim_token=None):  # noqa: ANN001
             claim_calls["n"] += 1
-            return claim_pending_webhook(conn, webhook_id, claimed_at)
+            return claim_pending_webhook(conn, webhook_id, claimed_at, claim_token=claim_token)
 
         async def record_send(url: str, payload: dict, timeout: float = 10.0) -> bool:
             sent_counts[url] += 1

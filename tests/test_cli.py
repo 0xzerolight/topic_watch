@@ -1,5 +1,6 @@
 """Tests for the CLI module: commands and error handling."""
 
+import asyncio
 import sqlite3
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -9,6 +10,7 @@ import pytest
 from app.cli import _cmd_check, _cmd_check_all, _cmd_doctor, _cmd_init, _cmd_list
 from app.config import LLMSettings, NotificationSettings, Settings
 from app.crud import (
+    claim_new_topic_for_init,
     create_topic,
     get_topic,
     get_topic_by_name,
@@ -893,6 +895,91 @@ class TestCmdInitResearchingClaim:
 
         # Bailed before any fetch/LLM work was attempted.
         fetch_mock.assert_not_called()
+
+    async def test_ctrl_c_restores_the_prior_status(self, tmp_path: Path) -> None:
+        """AUG-243: cancellation hands the RESEARCHING claim back before propagating.
+
+        Ctrl-C raises ``CancelledError``, which is not an ``Exception`` and so
+        walked past every terminal handler, leaving the committed claim behind.
+        Offline there is nothing to recover it: the next CLI init would refuse the
+        topic until the server was started.
+        """
+        db_path = _real_db(tmp_path)
+        with get_db(db_path) as setup:
+            create_topic(setup, Topic(name="Interrupted", description="d", status=TopicStatus.NEW))
+
+        observed: dict[str, TopicStatus] = {}
+
+        async def _interrupt(*args, **kwargs):
+            # Prove the claim was really committed before the interrupt lands.
+            other = get_connection(db_path)
+            try:
+                observed["status"] = get_topic_by_name(other, "Interrupted").status
+            finally:
+                other.close()
+            raise asyncio.CancelledError()
+
+        with (
+            patch("app.cli.load_settings", return_value=_make_settings(db_path=str(db_path))),
+            patch("app.cli.init_db"),
+            patch("app.checker.fetch_new_articles_for_topic", new=_interrupt),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await _cmd_init("Interrupted")
+
+        assert observed["status"] == TopicStatus.RESEARCHING
+        with get_db(db_path) as check:
+            after = get_topic_by_name(check, "Interrupted")
+        assert after.status == TopicStatus.NEW
+        assert after.error_message is None
+
+    async def test_ctrl_c_during_reinit_restores_ready(self, tmp_path: Path) -> None:
+        """A cancelled re-init leaves the topic READY on its existing knowledge."""
+        db_path = _real_db(tmp_path)
+        with get_db(db_path) as setup:
+            create_topic(setup, Topic(name="ReadyInterrupted", description="d", status=TopicStatus.READY))
+
+        async def _interrupt(*args, **kwargs):
+            raise asyncio.CancelledError()
+
+        with (
+            patch("app.cli.load_settings", return_value=_make_settings(db_path=str(db_path))),
+            patch("app.cli.init_db"),
+            patch("app.checker.fetch_new_articles_for_topic", new=_interrupt),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await _cmd_init("ReadyInterrupted")
+
+        with get_db(db_path) as check:
+            after = get_topic_by_name(check, "ReadyInterrupted")
+        assert after.status == TopicStatus.READY
+
+    async def test_second_cli_init_loses_the_claim_and_exits(self, tmp_path: Path, capsys) -> None:
+        """AUG-288: the claim is a conditional UPDATE, not a read-then-write.
+
+        A CLI process that read the topic while it was still NEW, then started its
+        init after another initializer won the claim, must lose at the claim rather
+        than run a second paid initialization.
+        """
+        db_path = _real_db(tmp_path)
+        with get_db(db_path) as setup:
+            topic = create_topic(setup, Topic(name="Contended", description="d", status=TopicStatus.NEW))
+
+        # Another initializer wins the claim between this CLI's read and its own claim.
+        with get_db(db_path) as other:
+            assert claim_new_topic_for_init(other, topic.id) is True
+
+        fetch_mock = AsyncMock(return_value=FetchResult(articles=[], total_feed_entries=0))
+        with (
+            patch("app.cli.load_settings", return_value=_make_settings(db_path=str(db_path))),
+            patch("app.cli.init_db"),
+            patch("app.checker.fetch_new_articles_for_topic", fetch_mock),
+            pytest.raises(SystemExit, match="1"),
+        ):
+            await _cmd_init("Contended")
+
+        fetch_mock.assert_not_called()
+        assert "Cannot initialize" in capsys.readouterr().out
 
 
 class TestCmdLogging:

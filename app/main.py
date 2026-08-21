@@ -88,9 +88,15 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Topic Watch started in setup mode — visit /setup to configure")
 
-    yield
-    stop_scheduler()
-    logger.info("Topic Watch web UI stopped")
+    try:
+        yield
+    finally:
+        # An exceptional or cancelled exit is thrown in at the ``yield``, so cleanup
+        # placed after it was skipped entirely — leaving the only scheduler shutdown
+        # hook uncalled and its timers and in-flight jobs alive past the failure
+        # (AUG-265).
+        stop_scheduler()
+        logger.info("Topic Watch web UI stopped")
 
 
 app = FastAPI(title="Topic Watch", version=_app_version, lifespan=lifespan)
