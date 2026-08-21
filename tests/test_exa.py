@@ -305,17 +305,18 @@ class TestFetchExaEntries:
         assert resp.feeds_failed == 1
 
     async def test_private_endpoint_blocked(self) -> None:
-        """A base_url resolving to a private host is blocked before any request (SSRF)."""
-        settings = ExaSettings(enabled=True, api_key="k", base_url="https://internal.local")
+        """A base_url on a private host is blocked before any request (SSRF)."""
+        # A real RFC-1918 literal, so the gate runs its own classification rather
+        # than a patched verdict.
+        settings = ExaSettings(enabled=True, api_key="k", base_url="https://192.168.1.50")
         calls: list[str] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             calls.append(str(request.url))
             return httpx.Response(200, json={"results": []})
 
-        with patch("app.url_validation.is_private_url", return_value=True):
-            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-                resp = await fetch_exa_entries(_EXA_TOPIC, settings, max_results=5, timeout=5.0, client=client)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            resp = await fetch_exa_entries(_EXA_TOPIC, settings, max_results=5, timeout=5.0, client=client)
         assert resp.feeds_total == 1 and resp.feeds_failed == 1
         assert calls == []
 
@@ -400,21 +401,20 @@ class TestExaHealthCallback:
 
     async def test_private_endpoint_records_failure(self) -> None:
         rec = _Recorder()
-        settings = ExaSettings(enabled=True, api_key="k", base_url="https://internal.local")
-        with patch("app.url_validation.is_private_url", return_value=True):
-            async with httpx.AsyncClient(transport=_exa_response([])) as client:
-                await fetch_exa_entries(
-                    _EXA_TOPIC, settings, max_results=5, timeout=5.0, client=client, health_callback=rec
-                )
+        settings = ExaSettings(enabled=True, api_key="k", base_url="https://192.168.1.50")
+        async with httpx.AsyncClient(transport=_exa_response([])) as client:
+            await fetch_exa_entries(
+                _EXA_TOPIC, settings, max_results=5, timeout=5.0, client=client, health_callback=rec
+            )
         assert len(rec.calls) == 1
-        assert rec.calls[0].feed_url == "https://internal.local/search"
+        assert rec.calls[0].feed_url == "https://192.168.1.50/search"
         assert rec.calls[0].status is FetchStatus.FAILED
         assert rec.calls[0].error_msg
 
     async def test_malformed_endpoint_records_failure(self) -> None:
         """The endpoint-gate's unexpected-exception path records a failure."""
         rec = _Recorder()
-        with patch("app.url_validation.is_private_url", side_effect=RuntimeError):
+        with patch("app.url_validation._classify_url", side_effect=RuntimeError):
             async with httpx.AsyncClient(transport=_exa_response([])) as client:
                 await fetch_exa_entries(
                     _EXA_TOPIC, _ENABLED, max_results=5, timeout=5.0, client=client, health_callback=rec

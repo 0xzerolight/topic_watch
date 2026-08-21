@@ -2941,6 +2941,35 @@ class TestLlmEndpointPolicy:
 
         mock_create.assert_called_once()
 
+    async def test_unresolvable_cleartext_base_url_is_refused_and_not_cached(self, monkeypatch) -> None:
+        """A DNS blip must not exempt a public endpoint for the process lifetime.
+
+        ``allow_private`` waives the SSRF rule for an unresolvable host; when that
+        also waived the cleartext rule, the pass was cached and every later call
+        sent the provider key and the whole prompt over plain http.
+        """
+        import socket
+
+        from app.analysis import llm as llm_mod
+
+        def _fails(*_args, **_kwargs):
+            raise socket.gaierror("name resolution failed")
+
+        monkeypatch.setattr(socket, "getaddrinfo", _fails)
+        mock_client, mock_create = _mock_instructor_client(NoveltyResult(has_new_info=False, confidence=0.5))
+        settings = _make_settings(
+            llm=LLMSettings(model="openai/glm-5.2", api_key="k", base_url="http://llm.corp.example:8000/v1")
+        )
+
+        with patch("app.analysis.llm._get_client", return_value=mock_client):
+            result = await analyze_articles([_make_article()], "Known facts.", _make_topic(), settings)
+
+        mock_create.assert_not_called()
+        assert result.has_new_info is False
+        assert result.error
+        # Nothing was proven, so nothing was remembered: the check runs again.
+        assert llm_mod._validated_base_urls == set()
+
     async def test_public_https_base_url_is_allowed(self) -> None:
         expected = NoveltyResult(has_new_info=False, confidence=0.5)
         mock_client, mock_create = _mock_instructor_client(expected)

@@ -397,14 +397,35 @@ class TestBlockedUrlHealth:
         from app.scraping.rss import fetch_feed_outcome
 
         callback = MagicMock()
-        with patch("app.url_validation.is_private_url", return_value=True):
-            result = await fetch_feed_outcome("https://internal.local/feed.xml", health_callback=callback)
+        # A real RFC-1918 literal rather than a patched verdict, so the fetch runs
+        # the classification it actually ships with.
+        result = await fetch_feed_outcome("https://192.168.1.10/feed.xml", health_callback=callback)
 
         assert result.status is FetchStatus.FAILED
         outcome = callback.call_args[0][0]
-        assert outcome.feed_url == "https://internal.local/feed.xml"
+        assert outcome.feed_url == "https://192.168.1.10/feed.xml"
         assert outcome.status is FetchStatus.FAILED
         assert outcome.error_msg and "Blocked" in outcome.error_msg
+
+    async def test_saturated_resolver_is_aborted_not_failed(self) -> None:
+        """A busy resolver pool is the check's problem, never the feed's (AUG-013).
+
+        ``FAILED`` here advances the per-feed streak, and three of them put an
+        untouched healthy feed into exponential backoff for up to 24 hours.
+        """
+        from app.scraping.rss import fetch_feed_outcome
+        from app.url_validation import ResolverSaturatedError
+
+        callback = MagicMock()
+        # Raised where the real saturation is detected, so the whole chain --
+        # classification, safe_send, the fetch's own handlers -- runs unpatched.
+        with patch("app.url_validation._getaddrinfo_bounded", side_effect=ResolverSaturatedError("saturated")):
+            result = await fetch_feed_outcome("https://healthy.example/feed.xml", health_callback=callback)
+
+        assert result.status is FetchStatus.ABORTED
+        outcome = callback.call_args[0][0]
+        assert outcome.status is FetchStatus.ABORTED
+        assert outcome.error_msg and "resolver" in outcome.error_msg.lower()
 
 
 class TestAllRejectedEntries:

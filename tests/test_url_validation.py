@@ -1,6 +1,9 @@
 """Tests for SSRF protection in URL validation."""
 
+import gzip
 import socket
+import tracemalloc
+import zlib
 
 import httpx
 import pytest
@@ -392,10 +395,30 @@ class TestNumericLabelHostnames:
         assert is_private_url("http://192.168.1.1/x") is True
 
 
-class TestResolverPoolBounded:
-    """Timed-out resolver lookups must not spawn unbounded worker threads (AUG-013)."""
+def _drain(uv) -> None:
+    """Block until every slot of the process-wide resolver pool is free again."""
+    for _ in range(uv._RESOLVER_POOL_SIZE):
+        assert uv._resolver_slots.acquire(timeout=15)
+    for _ in range(uv._RESOLVER_POOL_SIZE):
+        uv._resolver_slots.release()
 
-    def test_resolver_threads_are_bounded(self, monkeypatch) -> None:
+
+class TestResolverPoolBounded:
+    """Timed-out resolver lookups must not spawn unbounded worker threads (AUG-013).
+
+    Two independent mechanisms, pinned by one test each: a fixed process-wide pool
+    caps how many resolver threads can exist, and an admission semaphore turns
+    away a caller that cannot get a slot instead of letting it queue behind the
+    lookups already stuck. Either one alone leaves the other's failure mode open.
+    """
+
+    @staticmethod
+    def _run_against_a_full_pool(monkeypatch) -> tuple[list[str], set[int], int]:
+        """Run ``pool size + 8`` callers against a resolver that never answers.
+
+        Returns each caller's outcome, the distinct threads ``getaddrinfo`` ran
+        on, and how many lookups reached it at all.
+        """
         import threading
         from concurrent.futures import ThreadPoolExecutor
 
@@ -404,20 +427,30 @@ class TestResolverPoolBounded:
         release = threading.Event()
         worker_threads: set[int] = set()
         lock = threading.Lock()
+        started = 0
 
         def _blocking(*_args, **_kwargs):
+            nonlocal started
             with lock:
+                started += 1
                 worker_threads.add(threading.get_ident())
             release.wait(10)
             return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", 0))]
 
         monkeypatch.setattr(socket, "getaddrinfo", _blocking)
 
+        # The pool is process-wide and an earlier test abandons a slow lookup that
+        # keeps its slot until the OS resolver returns. Start from a full pool so
+        # the counts below are about this test's own callers.
+        _drain(uv)
+
         callers = uv._RESOLVER_POOL_SIZE + 8
 
         def _lookup(index: int) -> str:
             try:
                 uv._getaddrinfo_bounded(f"host{index}.example.com", 0.3)
+            except uv.ResolverSaturatedError:
+                return "saturated"
             except TimeoutError:
                 return "timeout"
             return "ok"
@@ -427,9 +460,32 @@ class TestResolverPoolBounded:
                 outcomes = list(pool.map(_lookup, range(callers)))
         finally:
             release.set()
+            # Hand every slot back before the next test asks for one.
+            _drain(uv)
 
-        assert outcomes.count("timeout") == callers
-        # HEAD spawns one executor per lookup, so every caller gets its own thread.
+        return outcomes, worker_threads, started
+
+    def test_overflow_callers_are_turned_away_not_queued(self, monkeypatch) -> None:
+        from app import url_validation as uv
+
+        outcomes, _threads, started = self._run_against_a_full_pool(monkeypatch)
+
+        # One lookup per slot reached the resolver and nothing else did: without
+        # admission control the extra callers queue behind the stuck lookups and
+        # every one of them reports the ordinary lookup timeout instead. A
+        # per-lookup executor makes this the caller count.
+        assert started == uv._RESOLVER_POOL_SIZE
+        assert outcomes.count("timeout") == uv._RESOLVER_POOL_SIZE
+        assert outcomes.count("saturated") == len(outcomes) - uv._RESOLVER_POOL_SIZE
+        assert outcomes.count("ok") == 0
+
+    def test_resolver_threads_are_bounded(self, monkeypatch) -> None:
+        from app import url_validation as uv
+
+        _outcomes, worker_threads, _started = self._run_against_a_full_pool(monkeypatch)
+
+        # A per-lookup executor gives every caller its own thread, so the count
+        # tracks the callers rather than the pool.
         assert len(worker_threads) <= uv._RESOLVER_POOL_SIZE
 
 
@@ -507,6 +563,212 @@ class TestSafeSendByteCap:
 
         assert response.text == "final"
         assert redirect_chunks == 0
+
+
+def _gzip_expanding_to(total_bytes: int) -> bytes:
+    """A gzip stream that decodes to ``total_bytes`` of zeros, built incrementally.
+
+    Built a megabyte at a time so the fixture itself never holds the expansion it
+    describes.
+    """
+    compressor = zlib.compressobj(9, zlib.DEFLATED, zlib.MAX_WBITS | 16)
+    block = b"\0" * (1024 * 1024)
+    parts = []
+    remaining = total_bytes
+    while remaining > 0:
+        take = min(len(block), remaining)
+        remaining -= take
+        parts.append(compressor.compress(block[:take]))
+    parts.append(compressor.flush())
+    return b"".join(parts)
+
+
+class TestSafeSendCompressedBodyCap:
+    """The byte budget bounds the DECODER, not just what it hands back (AUG-006).
+
+    Counting decoded bytes *between* chunks cannot bound a decoder that is itself
+    unbounded: httpx decodes a whole raw chunk in one unbounded ``decompress()``
+    call, and a stacked ``Content-Encoding`` multiplies that per layer.
+    """
+
+    async def test_stacked_content_encoding_refused(self, monkeypatch) -> None:
+        """A tiny body naming three gzip layers must never reach a decoder."""
+        from app.url_validation import ResponseTooLargeError
+
+        _stub_resolves_to(monkeypatch, "93.184.216.34")
+        nested = gzip.compress(gzip.compress(_gzip_expanding_to(64 * 1024 * 1024), 9), 9)
+        assert len(nested) < 64 * 1024
+        pulled = 0
+
+        async def _body():
+            nonlocal pulled
+            pulled += 1
+            yield nested
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, headers={"content-encoding": "gzip, gzip, gzip"}, content=_body())
+
+        transport = httpx.MockTransport(_handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+            with pytest.raises(ResponseTooLargeError, match="[Ss]tacked"):
+                await safe_get(client, "https://example.com/feed.xml", max_bytes=65536)
+
+        # Refused on the headers alone: not one byte was pulled or decoded.
+        assert pulled == 0
+
+    async def test_single_layer_bomb_peaks_near_the_budget(self, monkeypatch) -> None:
+        """One raw chunk expanding far past the budget must not be materialised."""
+        from app.url_validation import ResponseTooLargeError
+
+        _stub_resolves_to(monkeypatch, "93.184.216.34")
+        bomb = _gzip_expanding_to(64 * 1024 * 1024)
+
+        async def _body():
+            yield bomb
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, headers={"content-encoding": "gzip"}, content=_body())
+
+        transport = httpx.MockTransport(_handler)
+        tracemalloc.start()
+        try:
+            async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+                with pytest.raises(ResponseTooLargeError):
+                    await safe_get(client, "https://example.com/feed.xml", max_bytes=65536)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        # An unbounded decompress() puts the whole 64 MiB expansion in one bytes
+        # object before any counter runs. A bounded one never allocates past the
+        # budget, so the peak stays within a small multiple of it.
+        assert peak < 4 * 1024 * 1024, f"peak {peak} bytes for a 65536-byte budget"
+
+    async def test_wire_bytes_are_bounded_even_when_nothing_decodes(self, monkeypatch) -> None:
+        """A stream of empty deflate blocks decodes to ~0, so only a wire bound stops it."""
+        from app.url_validation import ResponseTooLargeError
+
+        _stub_resolves_to(monkeypatch, "93.184.216.34")
+        compressor = zlib.compressobj(9, zlib.DEFLATED, zlib.MAX_WBITS | 16)
+        head = compressor.compress(b"hello") + compressor.flush(zlib.Z_SYNC_FLUSH)
+        # A byte-aligned stored block with LEN=0: valid deflate, zero output.
+        empty_block = b"\x00\x00\x00\xff\xff"
+        chunks_produced = 0
+
+        async def _body():
+            nonlocal chunks_produced
+            yield head
+            for _ in range(500):
+                chunks_produced += 1
+                yield empty_block * 1024
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, headers={"content-encoding": "gzip"}, content=_body())
+
+        transport = httpx.MockTransport(_handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+            with pytest.raises(ResponseTooLargeError):
+                await safe_get(client, "https://example.com/feed.xml", max_bytes=65536)
+
+        assert chunks_produced <= 16
+
+    async def test_gzip_body_under_cap_decoded_intact(self, monkeypatch) -> None:
+        _stub_resolves_to(monkeypatch, "93.184.216.34")
+        payload = b"<rss><channel><title>ok</title></channel></rss>" * 100
+        body = gzip.compress(payload)
+
+        async def _stream():
+            # Split so the decoder is driven across chunk boundaries, as a real
+            # transport does at 64 KiB.
+            yield body[: len(body) // 2]
+            yield body[len(body) // 2 :]
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, headers={"content-encoding": "gzip"}, content=_stream())
+
+        transport = httpx.MockTransport(_handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+            response = await safe_get(client, "https://example.com/feed.xml", max_bytes=65536)
+
+        assert response.content == payload
+        assert "content-encoding" not in response.headers
+
+    @pytest.mark.parametrize("wbits", [zlib.MAX_WBITS, -zlib.MAX_WBITS])
+    async def test_deflate_body_decoded_in_both_framings(self, monkeypatch, wbits: int) -> None:
+        """``deflate`` is zlib-wrapped or raw in the wild; both must still decode."""
+        _stub_resolves_to(monkeypatch, "93.184.216.34")
+        payload = b"<rss>deflate</rss>" * 50
+        compressor = zlib.compressobj(9, zlib.DEFLATED, wbits)
+        body = compressor.compress(payload) + compressor.flush()
+
+        async def _stream():
+            yield body
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, headers={"content-encoding": "deflate"}, content=_stream())
+
+        transport = httpx.MockTransport(_handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+            response = await safe_get(client, "https://example.com/feed.xml", max_bytes=65536)
+
+        assert response.content == payload
+
+    async def test_identity_alongside_one_codec_is_not_stacking(self, monkeypatch) -> None:
+        _stub_resolves_to(monkeypatch, "93.184.216.34")
+        payload = b"<rss>ok</rss>"
+
+        async def _stream():
+            yield gzip.compress(payload)
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, headers={"content-encoding": "identity, gzip"}, content=_stream())
+
+        transport = httpx.MockTransport(_handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+            response = await safe_get(client, "https://example.com/feed.xml", max_bytes=65536)
+
+        assert response.content == payload
+
+
+class TestSafeSendOwnsRedirectFollowing:
+    """Per-hop SSRF checks must not depend on how the caller built its client.
+
+    ``client.send()`` inherits ``client.follow_redirects``; when that is True httpx
+    follows the chain internally, ``next_request`` is never populated, and the loop
+    below hands back the final body as an ordinary result. The invariant used to be
+    a docstring line only.
+    """
+
+    async def test_redirect_to_private_blocked_on_a_following_client(self, monkeypatch) -> None:
+        _stub_resolves_to(monkeypatch, "93.184.216.34")
+        private_hits = 0
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            nonlocal private_hits
+            if request.url.host == "127.0.0.1":
+                private_hits += 1
+                return httpx.Response(200, text="INTERNAL-DATA")
+            return httpx.Response(302, headers={"location": "http://127.0.0.1/internal"})
+
+        transport = httpx.MockTransport(_handler)
+        # Deliberately NOT follow_redirects=False: the helper must hold the line
+        # on its own.
+        async with httpx.AsyncClient(transport=transport, follow_redirects=True) as client:
+            with pytest.raises(PrivateRedirectError):
+                await safe_get(client, "https://example.com/start")
+
+        assert private_hits == 0
+
+    async def test_redirect_limit_holds_on_a_following_client(self, monkeypatch) -> None:
+        _stub_resolves_to(monkeypatch, "93.184.216.34")
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(302, headers={"location": "https://example.com/next"})
+
+        transport = httpx.MockTransport(_handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=True) as client:
+            with pytest.raises(PrivateRedirectError, match="maximum of 3 redirects"):
+                await safe_get(client, "https://example.com/start", max_redirects=3)
 
 
 class TestSafeSendRedirectCredentials:
@@ -701,6 +963,68 @@ class TestValidateOutboundUrl:
 
         with pytest.raises(ValueError, match="private"):
             validate_outbound_url("http://127.0.0.1:8080/v1", purpose="the Exa API")
+
+    def test_allows_resolved_private_cleartext(self, monkeypatch) -> None:
+        """A LAN gateway that really resolves private keeps the documented http path."""
+        from app.url_validation import validate_outbound_url
+
+        _stub_resolves_to(monkeypatch, "192.168.1.50")
+        validate_outbound_url(
+            "http://ollama.lan:11434", purpose="the LLM endpoint", allow_private=True, require_https=True
+        )
+
+    def test_unresolvable_host_does_not_waive_require_https(self, monkeypatch) -> None:
+        """An absent DNS answer is not a private-address verdict.
+
+        ``allow_private`` lets an unresolvable host through the SSRF rule, and
+        folding "private" and "unresolvable" into one bool then let it skip the
+        cleartext rule as well: one DNS blip sent the provider key and the whole
+        prompt to a public endpoint over plain http.
+        """
+        from app.url_validation import validate_outbound_url
+
+        def _fails(*_args, **_kwargs):
+            raise socket.gaierror("name resolution failed")
+
+        monkeypatch.setattr(socket, "getaddrinfo", _fails)
+        with pytest.raises(ValueError, match="cleartext"):
+            validate_outbound_url(
+                "http://llm.corp.example:8000/v1",
+                purpose="The LLM base URL",
+                allow_private=True,
+                require_https=True,
+            )
+
+    def test_unresolvable_host_still_allowed_over_https(self, monkeypatch) -> None:
+        """The rule is about the transport, so https is unaffected by a DNS blip."""
+        from app.url_validation import validate_outbound_url
+
+        def _fails(*_args, **_kwargs):
+            raise socket.gaierror("name resolution failed")
+
+        monkeypatch.setattr(socket, "getaddrinfo", _fails)
+        validate_outbound_url(
+            "https://llm.corp.example:8000/v1",
+            purpose="The LLM base URL",
+            allow_private=True,
+            require_https=True,
+        )
+
+    def test_saturated_resolver_does_not_waive_require_https(self, monkeypatch) -> None:
+        """A busy pool is even less of a private-address verdict than a NXDOMAIN."""
+        from app import url_validation as uv
+
+        def _saturated(*_args, **_kwargs):
+            raise uv.ResolverSaturatedError("saturated")
+
+        monkeypatch.setattr(uv, "_getaddrinfo_bounded", _saturated)
+        with pytest.raises(ValueError, match="cleartext"):
+            uv.validate_outbound_url(
+                "http://llm.corp.example:8000/v1",
+                purpose="The LLM base URL",
+                allow_private=True,
+                require_https=True,
+            )
 
 
 class TestIsAbsoluteHttpUrl:
