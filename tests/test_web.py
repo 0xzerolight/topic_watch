@@ -2305,6 +2305,47 @@ class TestTopicEdit:
         assert updated.feed_urls == ["https://new.example.com/feed.xml"]
         assert updated.feed_mode == FeedMode.MANUAL
 
+    async def test_edit_does_not_overwrite_a_concurrent_lifecycle_transition(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-022: an edit writes configuration only, never lifecycle columns.
+
+        The handler snapshots the topic, awaits DNS validation of the submitted
+        feeds, then writes. An initialization finishing inside that await used to
+        be undone by the stale snapshot: the topic went back to RESEARCHING (or was
+        marked READY while still initializing) on the strength of an unrelated
+        rename.
+        """
+        from app.crud import get_topic, update_topic_init_status
+
+        topic = _make_topic(db_conn, name="Racing", status=TopicStatus.RESEARCHING)
+
+        async def _validate_then_finish_init(feed_mode, feed_urls, check_interval):
+            # Stand in for the initializer committing READY during the DNS await.
+            update_topic_init_status(
+                db_conn,
+                topic.id,
+                status=TopicStatus.READY,
+                status_changed_at=datetime.now(UTC),
+                error_message=None,
+                init_attempts=0,
+            )
+            db_conn.commit()
+            return FeedMode.AUTO, [], None, []
+
+        with patch("app.web.routers.topics.validate_topic_form", new=_validate_then_finish_init):
+            response = await client.post(
+                f"/topics/{topic.id}/edit",
+                data={"name": "Renamed", "description": "d", "feed_mode": "auto"},
+                follow_redirects=False,
+            )
+
+        assert response.status_code == 303
+        updated = get_topic(db_conn, topic.id)
+        assert updated.name == "Renamed"
+        assert updated.status == TopicStatus.READY
+        assert updated.error_message is None
+
     async def test_edit_persists_novelty_instruction(
         self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
     ) -> None:

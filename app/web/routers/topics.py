@@ -30,6 +30,7 @@ from app.crud import (
     mark_latest_check_seen,
     sum_check_tokens,
     update_topic,
+    update_topic_config,
     update_topic_init_status,
 )
 from app.models import (
@@ -727,7 +728,10 @@ async def edit_topic_handler(
     topic.novelty_instruction = instruction
     topic.importance_threshold = imp_threshold
     try:
-        update_topic(conn, topic)
+        # Configuration columns only: this snapshot is older than the DNS
+        # validation above, so writing its lifecycle fields back would undo any
+        # status transition that landed during that await (AUG-022).
+        update_topic_config(conn, topic)
         conn.commit()
     except sqlite3.IntegrityError:
         # Defense-in-depth against a name race between the check above and the

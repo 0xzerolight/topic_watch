@@ -123,6 +123,38 @@ def update_topic(conn: sqlite3.Connection, topic: Topic) -> Topic:
     return topic
 
 
+def update_topic_config(conn: sqlite3.Connection, topic: Topic) -> Topic:
+    """Update only the columns the edit form owns. Does not commit.
+
+    The edit handler loads a ``Topic``, awaits DNS validation of the submitted
+    feed URLs, and only then writes. A full-row ``update_topic`` from that
+    pre-await snapshot also rewrites status, status_changed_at, error_message and
+    init_attempts — so an initialization that finished during the await was undone,
+    putting a READY topic back into RESEARCHING until stuck recovery marked it
+    ERROR, or marking an in-flight one READY and letting checks run against
+    knowledge that does not exist yet (AUG-022). Lifecycle columns are owned by the
+    init/check paths and are left alone here; ``is_active`` belongs to the
+    enable/disable command.
+    """
+    if topic.id is None:
+        raise ValueError("Cannot update a topic without an ID")
+    data = topic.to_insert_dict()
+    data["id"] = topic.id
+    conn.execute(
+        """UPDATE topics SET name=:name, description=:description,
+           feed_urls=:feed_urls, feed_mode=:feed_mode,
+           check_interval_minutes=:check_interval_minutes, tags=:tags,
+           confidence_threshold=:confidence_threshold,
+           relevance_threshold=:relevance_threshold,
+           novelty_instruction=:novelty_instruction,
+           importance_threshold=:importance_threshold
+           WHERE id=:id""",
+        data,
+    )
+    logger.info("Updated topic configuration: %s (id=%d)", topic.name, topic.id)
+    return topic
+
+
 def update_topic_init_status(
     conn: sqlite3.Connection,
     topic_id: int,
