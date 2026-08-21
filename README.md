@@ -126,7 +126,7 @@ The database is automatically backed up before any schema migration.
 - Novelty detection: per-topic knowledge state, not keyword matching or summarization - ignores the 10th article rehashing the same story
 - Any LLM via [LiteLLM](https://docs.litellm.ai/docs/providers) - OpenAI, Anthropic, Gemini, Groq, and more. BYOK, or run free and local with Ollama
 - Cheap: ~$0.0003/check on GPT-5.4 Nano (under $0.20/month for 5 topics checked 4×/day), or free with Ollama
-- Private and self-hosted on SQLite - no database server, no JavaScript build step. Outbound traffic: RSS feeds, your LLM provider, your notifier
+- Private and self-hosted on SQLite - no database server, no JavaScript build step. Outbound traffic: RSS feeds and the pages they link to, your LLM provider, your notifier, and your topic names to Exa if you enable it
 - Auto feeds (Bing News, falling back to Google News), manual RSS/Atom URLs, or optional [Exa](https://exa.ai) AI semantic search per topic
 - Per-topic check intervals (10 min to 6 months: `6h`, `1w 3d`, `2h 30m`) and a plain-English novelty instruction ("official announcements only, ignore rumors")
 - 100+ notification services via [Apprise](https://github.com/caronc/apprise/wiki) - Discord, Slack, Telegram, email, ntfy, etc.
@@ -135,7 +135,7 @@ The database is automatically backed up before any schema migration.
 <summary><strong>More features</strong></summary>
 
 - Importance scoring: every finding is rated 1-5, with an optional per-topic threshold that mutes minor findings without dropping them from the knowledge state
-- Knowledge history: every update to a topic's knowledge state is kept as a revision, with an inline diff timeline showing what the AI added or removed
+- Knowledge history: recent updates to a topic's knowledge state are kept as revisions, with an inline diff timeline showing what the AI added or removed
 - Silence Heartbeat: one "sources failing" alert per topic after consecutive empty checks, and a recovery notice when sources return
 - Custom JSON webhooks and a notification retry queue
 - Feed health dashboard
@@ -204,8 +204,9 @@ page (`ntfy://your-topic`, `discord://webhook_id/webhook_token`, ...). Multiple 
 supported; **Test Notification** verifies them.
 
 Everything else lives in `data/config.yml` (auto-copied from
-[`config.example.yml`](config.example.yml) on first run) and is editable on the Settings
-page. Any key can be overridden with the `TOPIC_WATCH_` env prefix, using `__` for nested
+[`config.example.yml`](config.example.yml) on first run) and most of it is editable on the
+Settings page; anything the environment supplies shows there as read-only. Any key can be
+overridden with the `TOPIC_WATCH_` env prefix, using `__` for nested
 keys (e.g. `TOPIC_WATCH_LLM__API_KEY`). Full key reference:
 [`config.example.yml`](config.example.yml) and [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -218,7 +219,7 @@ keys (e.g. `TOPIC_WATCH_LLM__API_KEY`). Full key reference:
 <details>
 <summary><strong>Reaching it from other devices</strong></summary>
 
-To reach it from other devices, set `TOPIC_WATCH_BIND_ADDR=0.0.0.0` in `.env` (the installer offers this as a question) and put it behind a reverse proxy with auth ([Authelia](https://www.authelia.com/), [Authentik](https://goauthentik.io/), Caddy `basicauth`, Nginx basic auth). A host firewall is not a substitute: Docker publishes ports ahead of `ufw` and `firewalld` rules. See [SECURITY.md](SECURITY.md).
+To reach it from other devices, set `TOPIC_WATCH_BIND_ADDR=0.0.0.0` in `.env` (the installer offers this as a question) and put it behind a reverse proxy with auth ([Authelia](https://www.authelia.com/), [Authentik](https://goauthentik.io/), Caddy `basicauth`, Nginx basic auth). A host firewall is not a substitute: Docker publishes ports ahead of `ufw` and `firewalld` rules. If the proxy forwards a hostname other than `localhost`, `*.local` or an IP address, list it too: `TOPIC_WATCH_ALLOWED_HOSTS=topic-watch.example.com`. See [SECURITY.md](SECURITY.md).
 
 </details>
 
@@ -233,9 +234,10 @@ To reach it from other devices, set `TOPIC_WATCH_BIND_ADDR=0.0.0.0` in `.env` (t
 | **Topic stuck in "Researching"** | Auto-recovers after 15 minutes (set to Error). Retry from the topic page. Usually an LLM connectivity issue. |
 | **Docker container exits** | `docker compose logs` for details. Check that `data/` is writable. The installer sets `PUID`/`PGID` automatically; see [SECURITY.md](SECURITY.md). |
 | **Can't reach it from another device** | The port is published on `127.0.0.1` by default. Set `TOPIC_WATCH_BIND_ADDR=0.0.0.0` in `.env` and run `docker compose up -d`. Add a reverse proxy with auth first - there is no login screen. |
+| **"Invalid host header" (HTTP 400)** | You are reaching it by hostname. Set `TOPIC_WATCH_ALLOWED_HOSTS` to that hostname in `.env` (comma-separated for several) and restart. `localhost` and IP addresses need no setting. |
 | **High memory** | Lower `max_articles_per_check` or `content_fetch_concurrency`. Increase check intervals. |
 
-Still stuck? `python -m app.cli doctor` (Docker: `docker compose exec topic-watch python -m app.cli doctor`) prints a secret-safe diagnostic snapshot to paste into a bug report. Update to the latest release first.
+Still stuck? `python -m app.cli doctor` (Docker: `docker compose exec topic-watch python -m app.cli doctor`) prints a diagnostic snapshot for a bug report, with your API key and notification URLs redacted. Issues are public: feed hosts and short path segments still show, and logs are not redacted at all. Update to the latest release first.
 
 ## Contributing
 
