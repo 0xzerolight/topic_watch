@@ -238,6 +238,32 @@ class TestReinitOwnership:
         mock_init.assert_not_called()
         assert get_topic(db_conn, topic.id).status == TopicStatus.ERROR
 
+    async def test_researching_topic_refuses_a_second_initializer(
+        self,
+        client: httpx.AsyncClient,
+        db_conn: sqlite3.Connection,
+    ) -> None:
+        """A claim held by another process still refuses this one (AUG-288).
+
+        The in-flight guard is process-local, so a CLI ``init`` or a second
+        container leaves the slot free. Passing the topic's current status as the
+        expected one made the claim a RESEARCHING -> RESEARCHING self-transition
+        that always won, admitting a second initializer for the same work.
+        """
+        from app.web.state import _checking_state
+
+        topic = _make_topic(db_conn, status=TopicStatus.RESEARCHING, error_message=None)
+        assert await _checking_state.is_checking(topic.id) is False
+
+        with patch("app.web.routers.background._run_init", new_callable=AsyncMock) as mock_init:
+            response = await client.post(f"/topics/{topic.id}/init", follow_redirects=False)
+
+        assert response.status_code == 409
+        mock_init.assert_not_called()
+        assert get_topic(db_conn, topic.id).status == TopicStatus.RESEARCHING
+        # Refused before the guard is taken, so the live initializer's slot is free.
+        assert await _checking_state.is_checking(topic.id) is False
+
     async def test_accepted_retry_hands_the_guard_to_the_task(
         self,
         client: httpx.AsyncClient,
