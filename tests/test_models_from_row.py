@@ -318,6 +318,44 @@ class TestCheckResultFromRow:
         with pytest.raises(CorruptTimestampError, match="checked_at"):
             CheckResult.from_row(row)
 
+    def test_one_decode_yields_both_scalars(self) -> None:
+        """AUG-037: the history table used to parse each blob three times — model
+        hydration plus one template filter per scalar."""
+        import json
+        from unittest.mock import patch
+
+        row = self._base_row()
+        row["llm_response"] = json.dumps({"has_new_info": True, "confidence": 0.82, "importance": 4})
+
+        with patch("app.models.json.loads", wraps=json.loads) as loads:
+            result = CheckResult.from_row(row)
+
+        assert result.confidence == 0.82
+        assert result.importance == 4
+        assert loads.call_count == 1
+
+    def test_missing_and_unusable_scalars_are_none(self) -> None:
+        import json
+
+        for blob in (None, "", "not json {{{", "[1, 2, 3]", "42", json.dumps({"importance": "high"})):
+            row = self._base_row()
+            row["llm_response"] = blob
+            result = CheckResult.from_row(row)
+            assert result.confidence is None
+            assert result.importance is None
+
+    def test_float_importance_truncates_like_the_filter_did(self) -> None:
+        import json
+
+        row = self._base_row()
+        row["llm_response"] = json.dumps({"importance": 4.0})
+        assert CheckResult.from_row(row).importance == 4
+
+    def test_derived_scalars_are_never_persisted(self) -> None:
+        insertable = CheckResult(topic_id=1, confidence=0.5, importance=3).to_insert_dict()
+        assert "confidence" not in insertable
+        assert "importance" not in insertable
+
 
 class TestKnowledgeStateFromRow:
     """KnowledgeState.from_row defensive handling of updated_at."""
@@ -374,19 +412,21 @@ class TestKnowledgeRevisionFromRow:
         with pytest.raises(CorruptTimestampError, match="created_at"):
             KnowledgeRevision.from_row(row)
 
-    def test_unknown_source_degrades_to_update(self, caplog: pytest.LogCaptureFixture) -> None:
-        """A value written by a future version must not 500 the detail page."""
+    def test_unknown_source_degrades_to_unknown(self, caplog: pytest.LogCaptureFixture) -> None:
+        """AUG-155: a value written by a future version must not 500 the detail
+        page — and must not be relabelled ``update`` either, which is a plausible,
+        false lineage the diff view would then compare adjacently."""
         row = self._base_row()
         row["source"] = "from-the-future"
         with caplog.at_level(logging.WARNING, logger="app.models"):
             revision = KnowledgeRevision.from_row(row)
-        assert revision.source == KnowledgeRevisionSource.UPDATE
+        assert revision.source == KnowledgeRevisionSource.UNKNOWN
         assert any("source" in r.message for r in caplog.records)
 
-    def test_non_string_source_degrades_to_update(self) -> None:
+    def test_non_string_source_degrades_to_unknown(self) -> None:
         row = self._base_row()
         row["source"] = 42
-        assert KnowledgeRevision.from_row(row).source == KnowledgeRevisionSource.UPDATE
+        assert KnowledgeRevision.from_row(row).source == KnowledgeRevisionSource.UNKNOWN
 
 
 class TestPendingNotificationFromRow:
