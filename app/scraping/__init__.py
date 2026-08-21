@@ -502,11 +502,14 @@ def _drop_unchanged_representations(
     that disagreement as a revision is what left the story rule dead for Exa and
     re-stored a topic's whole history on a mode switch.
 
-    When there is nothing comparable, the two cases differ because the evidence
-    does: prefetched text on its own is not a claim, so the entry is held; an
-    ``updated`` stamp IS the source's explicit claim, and one that cannot be
-    refuted is honoured. That costs at most one row, since the row it stores then
-    becomes the body every later poll is compared against.
+    When the same source produced nothing comparable, a body from ANOTHER provider
+    stands in: the two extractors disagree about boilerplate, so the entry is
+    stored, and that row is the baseline every later poll from this source is
+    compared against. Holding the entry instead looked cheaper and was permanent —
+    a drop stores nothing, so the source's bucket for that story stayed empty and
+    every later body it produced, corrections included, was dropped the same way.
+    The stand-in costs one row per story the first time a provider meets a story
+    another one already carried, then goes quiet.
 
     An entry that arrived with no body at all is a third case, and the one that
     reinstated the unbounded ingest this function exists to stop: an empty body
@@ -538,9 +541,9 @@ def _drop_unchanged_representations(
             settled = True
         elif _is_prefetched(entry):
             known = by_source.get((story, origin_provider if origin_provider is not None else provider_name), set())
-            settled = not known or offered in known
+            settled = offered in (known or by_story.get(story, set()))
         else:
-            settled = bool(by_story.get(story)) and offered in by_story[story]
+            settled = offered in by_story.get(story, set())
         if settled:
             logger.info("Story unchanged since it was stored; not re-storing: %s", entry.url)
             unchanged.add(index)

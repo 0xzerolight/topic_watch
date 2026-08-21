@@ -780,13 +780,39 @@ class TestSearchResultsDedupAgainstFeeds:
         ):
             return (await fetch_new_articles_for_topic(topic, db_path=db_path)).articles
 
-    async def test_a_search_hit_on_a_story_the_feed_stored_is_skipped(
+    def _stored_count(self, conn: sqlite3.Connection, topic_id: int) -> int:
+        return conn.execute("SELECT COUNT(*) FROM articles WHERE topic_id = ?", (topic_id,)).fetchone()[0]
+
+    async def test_a_search_hit_on_a_feed_story_costs_one_row_then_goes_quiet(
         self, db_conn: sqlite3.Connection, db_path: Path
     ) -> None:
+        """The search source needs a body of its own before it can compare anything.
+
+        Its extractor disagrees with ours about boilerplate, so the feed's body
+        cannot settle whether a search hit is new. Dropping the hit outright never
+        gave the source a baseline, because a drop stores nothing — so one row is
+        stored, and it is what every later hit is compared against.
+        """
         topic = _make_topic(db_conn, "Topic A")
         self._store_feed_row(db_conn, topic.id)
+        text = "The search engine's own extraction of that page."
 
-        assert await self._run_exa(topic, db_path, "The search engine's own extraction of that page.") == []
+        assert len(await self._run_exa(topic, db_path, text)) == 1
+        assert await self._run_exa(topic, db_path, text) == []
+        assert self._stored_count(db_conn, topic.id) == 2
+
+    async def test_a_correction_reaches_a_search_topic_holding_a_feed_row(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """AUG-320: the baseline is what makes a later correction visible at all."""
+        topic = _make_topic(db_conn, "Topic A")
+        self._store_feed_row(db_conn, topic.id)
+        assert len(await self._run_exa(topic, db_path, "The search engine's own extraction.")) == 1
+
+        corrected = await self._run_exa(topic, db_path, "Correction: the minister did not resign after all.")
+
+        assert len(corrected) == 1
+        assert corrected[0].raw_content == "Correction: the minister did not resign after all."
 
     async def test_a_rewritten_search_body_is_still_stored(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         """The claim holds against a body the same source produced earlier."""
