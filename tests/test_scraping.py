@@ -2,10 +2,11 @@
 
 import asyncio
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import feedparser
 import httpx
 import pytest
 import trafilatura
@@ -27,7 +28,12 @@ from app.scraping.rss import (
     fetch_feed,
     fetch_feeds_for_topic,
 )
-from app.scraping.source import Deadline
+from app.scraping.source import (
+    Deadline,
+    article_identity,
+    collapse_duplicate_entries,
+    normalize_published,
+)
 
 # --- Sample RSS/Atom XML for mocking ---
 
@@ -118,10 +124,21 @@ class TestComputeArticleHash:
         h2 = compute_article_hash("https://example.com/a", "Title")
         assert h1 == h2
 
-    def test_case_insensitive(self) -> None:
-        h1 = compute_article_hash("https://Example.com/A", "TITLE")
+    def test_host_case_and_title_case_are_ignored(self) -> None:
+        h1 = compute_article_hash("https://Example.com/a", "TITLE")
         h2 = compute_article_hash("https://example.com/a", "title")
         assert h1 == h2
+
+    def test_path_case_is_significant(self) -> None:
+        """AUG-183: /A and /a are different resources on a case-sensitive host."""
+        assert compute_article_hash("https://example.com/A", "T") != compute_article_hash("https://example.com/a", "T")
+
+    def test_query_case_is_significant(self) -> None:
+        assert compute_article_hash("https://e.com/p?id=Ab", "T") != compute_article_hash("https://e.com/p?id=aB", "T")
+
+    def test_a_pipe_in_the_title_cannot_forge_another_pair(self) -> None:
+        """AUG-183: field serialization is injective, so no delimiter collision."""
+        assert compute_article_hash("https://e.com/a|b", "c") != compute_article_hash("https://e.com/a", "b|c")
 
     def test_different_inputs_different_hashes(self) -> None:
         h1 = compute_article_hash("url1", "title1")
@@ -132,6 +149,168 @@ class TestComputeArticleHash:
         h = compute_article_hash("url", "title")
         assert len(h) == 64
         assert all(c in "0123456789abcdef" for c in h)
+
+
+# ============================================================
+# TestArticleIdentity
+# ============================================================
+
+
+class TestArticleIdentity:
+    """AUG-320/AUG-180/AUG-183: what makes two feed entries the same article."""
+
+    def _entry(self, **kwargs) -> FeedEntry:
+        fields = {
+            "title": "Headline",
+            "url": "https://publisher.example/story",
+            "source_feed": "https://publisher.example/rss",
+        }
+        fields.update(kwargs)
+        return FeedEntry(**fields)
+
+    def test_same_representation_is_the_same_article(self) -> None:
+        assert article_identity(self._entry()) == article_identity(self._entry())
+
+    def test_a_revised_entry_is_a_different_representation(self) -> None:
+        """AUG-320: a correction at a stable URL must not read as already-stored."""
+        original = self._entry(published=datetime(2025, 1, 1, tzinfo=UTC))
+        revised = self._entry(
+            published=datetime(2025, 1, 1, tzinfo=UTC),
+            updated=datetime(2025, 1, 2, tzinfo=UTC),
+        )
+        assert article_identity(original) != article_identity(revised)
+
+    def test_an_updated_stamp_equal_to_published_is_not_a_revision(self) -> None:
+        stamp = datetime(2025, 1, 1, tzinfo=UTC)
+        assert article_identity(self._entry(published=stamp)) == article_identity(
+            self._entry(published=stamp, updated=stamp)
+        )
+
+    def test_changed_prefetched_text_is_a_different_representation(self) -> None:
+        """AUG-320: Exa hands over the body itself, so a rewritten body is visible."""
+        assert article_identity(self._entry(content="First account.")) != article_identity(
+            self._entry(content="Corrected account.")
+        )
+
+    def test_reformatted_prefetched_text_is_the_same_representation(self) -> None:
+        assert article_identity(self._entry(content="One  two\nthree")) == article_identity(
+            self._entry(content="One two three")
+        )
+
+    def test_summary_churn_is_not_a_revision(self) -> None:
+        """Aggregator summaries carry related-coverage lists that change on their own."""
+        assert article_identity(self._entry(summary="Related: A, B")) == article_identity(
+            self._entry(summary="Related: C, D")
+        )
+
+    def test_tracking_parameters_do_not_split_a_story(self) -> None:
+        """AUG-180: the same URL shared through a campaign is the same article."""
+        plain = self._entry(url="https://publisher.example/story?id=7")
+        tagged = self._entry(url="https://publisher.example/story?id=7&utm_source=x&fbclid=y")
+        assert article_identity(plain) == article_identity(tagged)
+
+    def test_a_meaningful_query_parameter_still_counts(self) -> None:
+        assert article_identity(self._entry(url="https://p.example/s?page=1")) != article_identity(
+            self._entry(url="https://p.example/s?page=2")
+        )
+
+    def test_fragment_and_default_port_do_not_split_a_story(self) -> None:
+        assert article_identity(self._entry(url="https://publisher.example:443/story#top")) == article_identity(
+            self._entry(url="https://publisher.example/story")
+        )
+
+    def test_a_non_default_port_is_a_different_host(self) -> None:
+        assert article_identity(self._entry(url="https://publisher.example:8443/story")) != article_identity(
+            self._entry(url="https://publisher.example/story")
+        )
+
+    def test_unparseable_url_still_compares_equal_to_itself(self) -> None:
+        assert article_identity(self._entry(url="not a url")) == article_identity(self._entry(url="not a url"))
+
+    def test_a_malformed_netloc_still_compares_equal_to_itself(self) -> None:
+        """An invalid port makes urlparse raise; identity must survive it."""
+        broken = "https://publisher.example:notaport/story"
+        assert article_identity(self._entry(url=broken)) == article_identity(self._entry(url=broken))
+
+
+# ============================================================
+# TestCollapseDuplicateEntries
+# ============================================================
+
+
+class TestCollapseDuplicateEntries:
+    """AUG-179/AUG-322: repeats merge, and the surviving copy is the best one."""
+
+    def _entry(self, url: str, **kwargs) -> FeedEntry:
+        fields = {"title": "Headline", "url": url, "source_feed": "feed"}
+        fields.update(kwargs)
+        return FeedEntry(**fields)
+
+    def test_distinct_articles_are_all_kept_in_order(self) -> None:
+        entries = [self._entry("https://e.example/1"), self._entry("https://e.example/2")]
+        assert [e.url for e in collapse_duplicate_entries(entries)] == [
+            "https://e.example/1",
+            "https://e.example/2",
+        ]
+
+    def test_repeats_collapse_to_one(self) -> None:
+        entries = [self._entry("https://e.example/1"), self._entry("https://e.example/1?utm_source=x")]
+        assert len(collapse_duplicate_entries(entries)) == 1
+
+    def test_the_newest_revision_survives(self) -> None:
+        """AUG-322: not the copy whose feed the user happened to list first."""
+        stale = self._entry("https://e.example/1", summary="First wording", published=datetime(2025, 1, 1, tzinfo=UTC))
+        fresh = self._entry(
+            "https://e.example/1",
+            summary="Corrected wording",
+            published=datetime(2025, 1, 1, tzinfo=UTC),
+            updated=datetime(2025, 1, 3, tzinfo=UTC),
+        )
+        assert collapse_duplicate_entries([stale, fresh])[0].summary == "Corrected wording"
+
+    def test_the_copy_with_text_survives_a_tie(self) -> None:
+        empty = self._entry("https://e.example/1", summary="")
+        rich = self._entry("https://e.example/1", summary="The actual dek")
+        assert collapse_duplicate_entries([empty, rich])[0].summary == "The actual dek"
+
+    def test_the_surviving_copy_keeps_the_first_position(self) -> None:
+        first = self._entry("https://e.example/1", summary="")
+        second = self._entry("https://e.example/2")
+        better_first = self._entry("https://e.example/1", summary="text")
+        collapsed = collapse_duplicate_entries([first, second, better_first])
+        assert [e.url for e in collapsed] == ["https://e.example/1", "https://e.example/2"]
+        assert collapsed[0].summary == "text"
+
+    def test_ties_keep_the_first_copy(self) -> None:
+        first = self._entry("https://e.example/1", summary="one")
+        second = self._entry("https://e.example/1", summary="two")
+        assert collapse_duplicate_entries([first, second])[0].summary == "one"
+
+
+# ============================================================
+# TestNormalizePublished
+# ============================================================
+
+
+class TestNormalizePublished:
+    """AUG-184: a publisher's clock does not get to own the recency ranking."""
+
+    def test_a_past_date_is_kept(self) -> None:
+        stamp = datetime(2025, 1, 1, tzinfo=UTC)
+        assert normalize_published(stamp) == stamp
+
+    def test_a_naive_date_is_read_as_utc(self) -> None:
+        assert normalize_published(datetime(2025, 1, 1)) == datetime(2025, 1, 1, tzinfo=UTC)
+
+    def test_a_far_future_date_is_unknown(self) -> None:
+        assert normalize_published(datetime(2999, 1, 1, tzinfo=UTC)) is None
+
+    def test_a_small_clock_difference_is_tolerated(self) -> None:
+        now = datetime.now(UTC)
+        assert normalize_published(now + timedelta(minutes=5), now=now) is not None
+
+    def test_missing_stays_missing(self) -> None:
+        assert normalize_published(None) is None
 
 
 # ============================================================
@@ -196,6 +375,24 @@ class TestParseEntry:
         assert entry.url == "https://example.com/test"
         assert entry.summary == "A summary."
         assert entry.source_feed == "https://example.com/feed.xml"
+
+    def test_plain_rss_entry_carries_no_revision_stamp(self) -> None:
+        """AUG-320: feedparser answers ``updated_parsed`` with ``published_parsed``.
+
+        A plain RSS item published no revision stamp, so inheriting one would make
+        every entry look revised the first time it is seen.
+        """
+        raw = feedparser.parse(_SAMPLE_RSS).entries[0]
+        entry = _parse_entry(raw, "https://example.com/feed.xml")
+        assert entry is not None
+        assert entry.published is not None
+        assert entry.updated is None
+
+    def test_atom_entry_keeps_its_own_revision_stamp(self) -> None:
+        raw = feedparser.parse(_SAMPLE_ATOM).entries[0]
+        entry = _parse_entry(raw, "https://reddit.com/feed")
+        assert entry is not None
+        assert entry.updated == datetime(2025, 1, 3, 10, 0, tzinfo=UTC)
 
     def test_missing_title_returns_none(self) -> None:
         raw = {"link": "https://example.com/test"}
@@ -1106,6 +1303,52 @@ class TestFetchFeedsForTopic:
 
         # Should dedup: both feeds have same 2 URLs
         assert len(response.entries) == 2
+
+    async def test_duplicate_feed_urls_are_fetched_once(self) -> None:
+        """AUG-188: a URL listed twice is one feed, not two requests and two health writes."""
+        topic = Topic(
+            name="T",
+            description="d",
+            feed_mode=FeedMode.MANUAL,
+            feed_urls=["https://example.com/feed.xml", "https://example.com/feed.xml"],
+        )
+        fetch = AsyncMock(return_value=([], True))
+        with patch("app.scraping.rss.fetch_feed_with_status", fetch):
+            response = await fetch_feeds_for_topic(topic)
+
+        assert fetch.await_count == 1
+        assert response.feeds_total == 1
+
+    async def test_manual_merge_keeps_the_revised_representation(self) -> None:
+        """AUG-322: the corrected copy survives, whichever feed is configured first."""
+        url = "https://publisher.example/story"
+        stale = FeedEntry(
+            title="Headline",
+            url=url,
+            summary="First wording",
+            source_feed="https://example.com/feed1.xml",
+            published=datetime(2025, 1, 1, tzinfo=UTC),
+        )
+        revised = FeedEntry(
+            title="Headline",
+            url=url,
+            summary="Corrected wording",
+            source_feed="https://example.com/feed2.xml",
+            published=datetime(2025, 1, 1, tzinfo=UTC),
+            updated=datetime(2025, 1, 2, tzinfo=UTC),
+        )
+        topic = Topic(
+            name="T",
+            description="d",
+            feed_mode=FeedMode.MANUAL,
+            feed_urls=["https://example.com/feed1.xml", "https://example.com/feed2.xml"],
+        )
+        fetch = AsyncMock(side_effect=[([stale], True), ([revised], True)])
+        with patch("app.scraping.rss.fetch_feed_with_status", fetch):
+            response = await fetch_feeds_for_topic(topic)
+
+        assert len(response.entries) == 1
+        assert response.entries[0].summary == "Corrected wording"
 
     async def test_empty_feed_urls_manual_mode(self) -> None:
         topic = Topic(name="T", description="d", feed_mode=FeedMode.MANUAL, feed_urls=[])
@@ -2458,6 +2701,254 @@ class TestResolveRedirectUrls:
         with patch("app.scraping.resolve_google_news_urls", new_callable=AsyncMock) as mock_resolve:
             await _resolve_redirect_urls(fetch_batch, response, 5.0, Deadline.after())
         mock_resolve.assert_not_called()
+
+
+class TestStoryDedup:
+    """AUG-180: one story is one article, whichever provider or wrapper carries it."""
+
+    _WRAPPER = "https://news.google.com/rss/articles/ABC123?oc=5"
+    _OTHER_WRAPPER = "https://news.google.com/rss/articles/XYZ789?oc=5"
+    _PUBLISHER = "https://publisher.example/the-story"
+
+    def _topic(self, conn: sqlite3.Connection) -> Topic:
+        topic = create_topic(conn, Topic(name="Resolved", description="d"))
+        conn.commit()
+        return topic
+
+    def _store_publisher_row(self, conn: sqlite3.Connection, topic: Topic, content_hash: str) -> None:
+        create_article(
+            conn,
+            Article(
+                topic_id=topic.id,
+                title="The Story",
+                url=self._PUBLISHER,
+                content_hash=content_hash,
+                raw_content="Body",
+                source_feed="https://www.bing.com/news/search?q=x&format=rss",
+            ),
+        )
+        conn.commit()
+
+    async def _run_google(
+        self,
+        topic: Topic,
+        db_path: Path,
+        extract: AsyncMock,
+        resolver: AsyncMock,
+        url: str | None = None,
+    ) -> list[Article]:
+        entry = FeedEntry(title="The Story", url=url or self._WRAPPER, summary="s", source_feed="feed")
+        response = FeedResponse(entries=[entry], provider_name="google_news", needs_url_resolution=True)
+        with (
+            patch("app.scraping.fetch_feeds_for_topic", return_value=response),
+            patch("app.scraping.resolve_google_news_urls", resolver),
+            patch("app.scraping.extract_article_content", extract),
+        ):
+            return (await fetch_new_articles_for_topic(topic, db_path=db_path)).articles
+
+    def _resolver(self, mapping: dict[str, str]) -> AsyncMock:
+        return AsyncMock(return_value=mapping)
+
+    async def test_a_new_story_is_stored_with_its_publisher_url(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        topic = self._topic(db_conn)
+        stored = await self._run_google(
+            topic, db_path, AsyncMock(return_value="Body"), self._resolver({self._WRAPPER: self._PUBLISHER})
+        )
+
+        assert len(stored) == 1
+        assert stored[0].url == self._PUBLISHER
+
+    async def test_a_repeated_wrapper_is_skipped_without_resolving_it_again(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """The stored key is the one the feed hands over, so a repeat costs no request."""
+        topic = self._topic(db_conn)
+        resolver = self._resolver({self._WRAPPER: self._PUBLISHER})
+        first = await self._run_google(topic, db_path, AsyncMock(return_value="Body"), resolver)
+        assert len(first) == 1
+
+        second_resolver = self._resolver({self._WRAPPER: self._PUBLISHER})
+        extract = AsyncMock(return_value="Body")
+        second = await self._run_google(topic, db_path, extract, second_resolver)
+
+        assert second == []
+        second_resolver.assert_not_awaited()
+        extract.assert_not_called()
+
+    async def test_a_changed_wrapper_for_a_stored_story_is_dropped_after_resolution(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        topic = self._topic(db_conn)
+        self._store_publisher_row(db_conn, topic, "some-earlier-key")
+
+        extract = AsyncMock(return_value="Body")
+        stored = await self._run_google(
+            topic,
+            db_path,
+            extract,
+            self._resolver({self._OTHER_WRAPPER: self._PUBLISHER}),
+            url=self._OTHER_WRAPPER,
+        )
+
+        assert stored == []
+        # Dropped before its content is fetched a second time.
+        extract.assert_not_called()
+
+    async def test_another_providers_copy_of_a_stored_story_is_skipped(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """Bing hands over the publisher URL directly, so no resolution is involved."""
+        topic = self._topic(db_conn)
+        self._store_publisher_row(db_conn, topic, "google-sourced-key")
+
+        entry = FeedEntry(title="The Story", url=self._PUBLISHER, summary="s", source_feed="feed")
+        extract = AsyncMock(return_value="Body")
+        with (
+            patch(
+                "app.scraping.fetch_feeds_for_topic",
+                return_value=FeedResponse(entries=[entry], provider_name="bing_news"),
+            ),
+            patch("app.scraping.extract_article_content", extract),
+        ):
+            stored = (await fetch_new_articles_for_topic(topic, db_path=db_path)).articles
+
+        assert stored == []
+        extract.assert_not_called()
+
+    async def test_a_revision_of_a_stored_story_still_gets_through(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """AUG-320: the story rule must not swallow the correction it was stored for."""
+        topic = self._topic(db_conn)
+        self._store_publisher_row(db_conn, topic, "earlier-key")
+
+        entry = FeedEntry(
+            title="The Story",
+            url=self._PUBLISHER,
+            summary="s",
+            source_feed="feed",
+            published=datetime(2025, 1, 1, tzinfo=UTC),
+            updated=datetime(2025, 1, 2, tzinfo=UTC),
+        )
+        with (
+            patch(
+                "app.scraping.fetch_feeds_for_topic",
+                return_value=FeedResponse(entries=[entry], provider_name="bing_news"),
+            ),
+            patch("app.scraping.extract_article_content", AsyncMock(return_value="Corrected body")),
+        ):
+            stored = (await fetch_new_articles_for_topic(topic, db_path=db_path)).articles
+
+        assert len(stored) == 1
+        assert stored[0].raw_content == "Corrected body"
+
+    async def test_a_retitled_article_is_a_different_story(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
+        topic = self._topic(db_conn)
+        self._store_publisher_row(db_conn, topic, "earlier-key")
+
+        entry = FeedEntry(title="The Story, corrected", url=self._PUBLISHER, summary="s", source_feed="feed")
+        with (
+            patch(
+                "app.scraping.fetch_feeds_for_topic",
+                return_value=FeedResponse(entries=[entry], provider_name="bing_news"),
+            ),
+            patch("app.scraping.extract_article_content", AsyncMock(return_value="Body")),
+        ):
+            stored = (await fetch_new_articles_for_topic(topic, db_path=db_path)).articles
+
+        assert len(stored) == 1
+
+
+class TestCandidateSelection:
+    """AUG-179/AUG-184: which candidates get the bounded article slots."""
+
+    def _topic(self, conn: sqlite3.Connection) -> Topic:
+        topic = create_topic(conn, Topic(name="Selection", description="d"))
+        conn.commit()
+        return topic
+
+    async def _store(self, topic: Topic, db_path: Path, entries: list[FeedEntry], max_articles: int) -> list[Article]:
+        with (
+            patch("app.scraping.fetch_feeds_for_topic", return_value=FeedResponse(entries=entries)),
+            patch("app.scraping.extract_article_content", AsyncMock(return_value="Content")),
+        ):
+            return (await fetch_new_articles_for_topic(topic, db_path=db_path, max_articles=max_articles)).articles
+
+    async def test_repeats_do_not_consume_article_slots(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
+        """AUG-179: a duplicate-duplicate-unique batch with a cap of 2 stores 2 stories."""
+        topic = self._topic(db_conn)
+        entries = [
+            FeedEntry(title="Repeat", url="https://e.example/repeat", summary="s", source_feed="feed"),
+            FeedEntry(title="Repeat", url="https://e.example/repeat", summary="s", source_feed="feed"),
+            FeedEntry(title="Unique", url="https://e.example/unique", summary="s", source_feed="feed"),
+        ]
+        stored = await self._store(topic, db_path, entries, max_articles=2)
+
+        assert sorted(a.url for a in stored) == ["https://e.example/repeat", "https://e.example/unique"]
+
+    async def test_an_impossible_date_does_not_crowd_out_current_stories(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """AUG-184: a year-2999 pubDate ranks as unknown, not as the newest story."""
+        topic = self._topic(db_conn)
+        recent = datetime.now(UTC) - timedelta(hours=1)
+        entries = [
+            FeedEntry(
+                title="Recent",
+                url="https://e.example/recent",
+                summary="s",
+                source_feed="feed",
+                published=recent,
+            ),
+            FeedEntry(
+                title="Impossible",
+                url="https://e.example/impossible",
+                summary="s",
+                source_feed="feed",
+                published=datetime(2999, 1, 1, tzinfo=UTC),
+            ),
+            FeedEntry(title="Undated", url="https://e.example/undated", summary="s", source_feed="feed"),
+        ]
+        stored = await self._store(topic, db_path, entries, max_articles=2)
+
+        # Undated and impossible-dated both rank at retrieval time, in feed order;
+        # the genuinely dated story is an hour old, so it ranks below them.
+        assert sorted(a.url for a in stored) == ["https://e.example/impossible", "https://e.example/undated"]
+
+    async def test_an_impossible_date_is_not_stored(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
+        topic = self._topic(db_conn)
+        entries = [
+            FeedEntry(
+                title="Impossible",
+                url="https://e.example/impossible",
+                summary="s",
+                source_feed="feed",
+                published=datetime(2999, 1, 1, tzinfo=UTC),
+            )
+        ]
+        stored = await self._store(topic, db_path, entries, max_articles=5)
+
+        assert stored[0].published_at is None
+
+    async def test_undated_entries_are_not_starved_by_dated_ones(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        topic = self._topic(db_conn)
+        entries = [
+            FeedEntry(title="Undated", url="https://e.example/undated", summary="s", source_feed="feed"),
+            FeedEntry(
+                title="Dated",
+                url="https://e.example/dated",
+                summary="s",
+                source_feed="feed",
+                published=datetime.now(UTC) - timedelta(minutes=30),
+            ),
+        ]
+        stored = await self._store(topic, db_path, entries, max_articles=1)
+
+        assert [a.url for a in stored] == ["https://e.example/undated"]
 
 
 class TestFeedStateHelpers:

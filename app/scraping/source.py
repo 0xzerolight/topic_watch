@@ -9,6 +9,9 @@ the pipeline lives here rather than in any one source's module (TW-AUD-022):
   identity plus capabilities of whatever produced them. ``provider_name`` and
   ``needs_url_resolution`` are response-level because AUTO can cascade between
   providers mid-fetch, so only the response knows which one actually answered.
+- ``article_identity`` / ``collapse_duplicate_entries`` — what makes two entries
+  the same article. One definition for every source, so dedup does not depend on
+  which provider happened to answer.
 - ``FeedHealthCallback`` / ``FeedStateLoader`` — the health side-channel.
 - ``SourceRequest`` — the per-attempt inputs a fetcher needs beyond the topic.
 - ``register_source`` / ``fetch_feeds_for_topic`` — mode-to-fetcher dispatch.
@@ -21,13 +24,14 @@ module. This module imports no source, which is what keeps that possible.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, TypeVar
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from pydantic import BaseModel
 
@@ -155,12 +159,188 @@ class FeedEntry(BaseModel):
     title: str
     url: str
     published: datetime | None = None
+    updated: datetime | None = None
+    """When the source says this article was last revised, if it says so distinctly.
+
+    Kept apart from ``published`` because it is the one signal a feed gives that the
+    story at a stable URL is not the story it told last time (AUG-320): it feeds
+    ``article_identity`` and picks the winner when two entries describe one URL."""
     summary: str = ""
     source_feed: str
     content: str | None = None
     """Pre-extracted full text, when the source already provides it (e.g. Exa search).
     ``None`` for RSS entries, whose text is fetched during content extraction. When set
     and non-empty, it short-circuits the network fetch in ``extract_article_content``."""
+
+
+# --- Article identity ---------------------------------------------------------
+
+_TRACKING_PARAMS = frozenset(
+    {"fbclid", "gclid", "gbraid", "wbraid", "msclkid", "dclid", "yclid", "igshid", "mc_cid", "mc_eid"}
+)
+"""Query parameters that identify the click, not the article. Plus any ``utm_*``."""
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+_MAX_CLOCK_SKEW = timedelta(hours=1)
+"""How far ahead of us a publisher's clock may plausibly be (AUG-184)."""
+
+_UNDATED = datetime.min.replace(tzinfo=UTC)
+
+
+def as_utc(value: datetime | None) -> datetime | None:
+    """A feed datetime in UTC; a naive one is read as UTC rather than local time."""
+    if value is None:
+        return None
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+def normalize_published(value: datetime | None, *, now: datetime | None = None) -> datetime | None:
+    """UTC-normalize a publication date, discarding impossible ones (AUG-184).
+
+    A timestamp further ahead than a plausible clock difference is a publisher
+    defect, not a scoop. Trusting it puts that entry permanently at the head of
+    the recency ranking, where it displaces real stories from the article cap on
+    every check; returning ``None`` files it with the undated entries instead,
+    which are ranked by retrieval order.
+    """
+    stamp = as_utc(value)
+    if stamp is None:
+        return None
+    if stamp > (now or datetime.now(UTC)) + _MAX_CLOCK_SKEW:
+        logger.debug("Discarding impossible publication date %s", stamp.isoformat())
+        return None
+    return stamp
+
+
+def _is_tracking_param(name: str) -> bool:
+    key = name.lower()
+    return key.startswith("utm_") or key in _TRACKING_PARAMS
+
+
+def canonical_url(url: str) -> str:
+    """The comparable form of an article URL.
+
+    Case is folded only where the URL grammar says it is insignificant — the
+    scheme and the host — because a path or query IS case-sensitive on many
+    publishers, and folding it made ``/A`` and ``/a`` the same article (AUG-183).
+    Beyond that: userinfo and default ports are dropped, the fragment is dropped
+    (it never reaches the server), and click-tracking parameters are removed so
+    the same story shared through two campaigns is one story (AUG-180).
+
+    A URL too malformed to parse is returned stripped, so it still compares
+    equal to itself.
+    """
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+        port = parsed.port
+    except ValueError:  # malformed netloc (bad port, unbalanced IPv6 brackets)
+        return url.strip()
+    if not host:
+        return url.strip()
+    scheme = parsed.scheme.lower()
+    netloc = host.rstrip(".")
+    if port is not None and port != _DEFAULT_PORTS.get(scheme):
+        netloc = f"{netloc}:{port}"
+    query = urlencode([(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if not _is_tracking_param(k)])
+    return urlunparse((scheme, netloc, parsed.path, parsed.params, query, ""))
+
+
+def _identity_digest(*parts: str) -> str:
+    """Hash a fixed field list so no two different field sets serialize alike.
+
+    Each field is length-prefixed rather than joined by a delimiter: with a plain
+    ``|`` join, a title containing a pipe could produce the same string as a
+    different URL/title pair (AUG-183).
+    """
+    payload = "\n".join(f"{len(part)}:{part}" for part in parts)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def revision_marker(entry: FeedEntry) -> str:
+    """What distinguishes this representation of a story from an earlier one.
+
+    Empty unless the source itself said the article changed: an ``updated`` stamp
+    that differs from ``published``, or prefetched full text (Exa) whose digest
+    moved. The entry summary is deliberately NOT in here — aggregator summaries
+    carry related-coverage lists and blurbs that churn on their own, and every
+    churn would cost a content fetch, a row and an LLM analysis for an article
+    nobody revised.
+    """
+    parts: list[str] = []
+    revised = as_utc(entry.updated)
+    if revised is not None and revised != as_utc(entry.published):
+        parts.append(revised.isoformat())
+    text = " ".join((entry.content or "").split())
+    if text:
+        parts.append(hashlib.sha256(text.encode()).hexdigest())
+    return "\x1f".join(parts)
+
+
+def article_identity(entry: FeedEntry) -> str:
+    """The dedup key for one article representation — the single definition.
+
+    Every source path keys off this: what is stored in ``articles.content_hash``,
+    what same-topic dedup skips on, and what cross-topic content reuse matches.
+
+    Identity is the story it is (``story_identity``) AND the revision the source is
+    currently serving. Keying on the story alone meant a correction, retraction or
+    expansion published at the same URL under the same headline was indistinguishable
+    from the copy already stored, so it was skipped before anything could read it and
+    the knowledge state kept the superseded facts (AUG-320). With the revision in the
+    key, an unchanged article still deduplicates silently and only a changed one
+    reaches novelty analysis.
+    """
+    return _identity_digest(canonical_url(entry.url), entry.title.casefold(), revision_marker(entry))
+
+
+def story_identity(entry: FeedEntry) -> str:
+    """Which article this is, regardless of which revision of it.
+
+    The coarser half of the pair: two entries share a story when they name the
+    same canonical URL under the same headline, whatever wrapper, tracking
+    parameters or provider they arrived through.
+    """
+    return compute_article_hash(entry.url, entry.title)
+
+
+def compute_article_hash(url: str, title: str) -> str:
+    """``story_identity`` for callers holding only a URL and a title.
+
+    Same serialization, no revision marker — one recipe, not a second one.
+    """
+    return _identity_digest(canonical_url(url), title.casefold(), "")
+
+
+def _representation_rank(entry: FeedEntry) -> tuple[datetime, int]:
+    """Sort key deciding which of two entries for one URL is the better copy."""
+    stamps = [s for s in (as_utc(entry.updated), as_utc(entry.published)) if s is not None]
+    return (max(stamps) if stamps else _UNDATED, 1 if (entry.content or entry.summary).strip() else 0)
+
+
+def collapse_duplicate_entries(entries: list[FeedEntry]) -> list[FeedEntry]:
+    """One entry per canonical URL, keeping the best copy, in first-seen order.
+
+    Repeats reach the pipeline routinely — two configured feeds carrying one
+    story, an aggregator listing it twice. Left in, they occupy the bounded
+    article slots that unique stories needed and pay for the same content fetch
+    twice (AUG-179).
+
+    Which copy survives is decided by the entries themselves — newest revision
+    first, then the one that actually carries text — never by which feed was
+    configured first, which silently threw away the corrected or richer version
+    of an article (AUG-322).
+    """
+    best: dict[str, FeedEntry] = {}
+    for entry in entries:
+        key = canonical_url(entry.url)
+        current = best.get(key)
+        # dict keeps the first insertion's position when a value is replaced,
+        # so the surviving copy stays where the story first appeared.
+        if current is None or _representation_rank(entry) > _representation_rank(current):
+            best[key] = entry
+    return list(best.values())
 
 
 @dataclass(frozen=True)

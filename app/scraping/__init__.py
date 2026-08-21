@@ -15,10 +15,10 @@ from typing import TYPE_CHECKING
 import httpx
 
 from app.crud import (
-    article_hash_exists,
     create_article,
     find_article_by_hash,
     get_feed_health,
+    list_article_dedup_keys,
     upsert_feed_health_failure,
     upsert_feed_health_success,
 )
@@ -27,10 +27,19 @@ from app.models import Article, FeedHealth, Topic
 from app.scraping.content import extract_article_content
 from app.scraping.exa import fetch_exa_source as fetch_exa_source
 from app.scraping.google_news import is_google_news_url, resolve_google_news_urls
-from app.scraping.rss import FeedEntry, compute_article_hash, fetch_feeds_for_topic
+from app.scraping.rss import FeedEntry, fetch_feeds_for_topic
 from app.scraping.rss import FeedResponse as FeedResponse
 from app.scraping.source import Deadline as Deadline
-from app.scraping.source import bounded
+from app.scraping.source import (
+    article_identity,
+    as_utc,
+    bounded,
+    collapse_duplicate_entries,
+    compute_article_hash,
+    normalize_published,
+    revision_marker,
+    story_identity,
+)
 
 if TYPE_CHECKING:
     from app.config import ExaSettings
@@ -219,10 +228,59 @@ def _log_feed_coverage(topic: Topic, feeds_total: int, feeds_failed: int) -> Non
         logger.warning("Topic '%s': all %d feed fetch(es) failed", topic.name, feeds_total)
 
 
+def _prepare_entries(entries: list[FeedEntry]) -> list[FeedEntry]:
+    """Normalize what the source returned before anything spends budget on it.
+
+    Two source-agnostic corrections, applied once for every provider rather than
+    per fetcher: impossible publication dates are discarded so they cannot own
+    the top of the recency ranking (AUG-184), and entries describing one article
+    collapse to their best copy so repeats stop consuming article slots and
+    content fetches (AUG-179).
+    """
+    now = datetime.now(UTC)
+    for entry in entries:
+        entry.published = normalize_published(entry.published, now=now)
+    return collapse_duplicate_entries(entries)
+
+
+@dataclass(frozen=True)
+class _StoredArticles:
+    """What a topic already holds, as the two keys dedup compares an entry against.
+
+    Read once per check rather than queried per entry, because the story key is
+    derived from a stored row's URL and title and so cannot be looked up directly
+    without an index this schema does not have.
+    """
+
+    identities: frozenset[str]
+    stories: frozenset[str]
+
+    @classmethod
+    def load(cls, conn: sqlite3.Connection, topic_id: int) -> "_StoredArticles":
+        rows = list_article_dedup_keys(conn, topic_id)
+        return cls(
+            identities=frozenset(content_hash for content_hash, _, _ in rows),
+            stories=frozenset(compute_article_hash(url, title) for _, url, title in rows),
+        )
+
+    def holds(self, entry: FeedEntry) -> bool:
+        """True when this entry is an article the topic has already stored.
+
+        Either the exact representation is stored, or the story is stored and the
+        entry offers no evidence of a revision. The second rule is what makes a
+        provider's redirect wrapper, a tracking variant and another provider's copy
+        of one story a single article (AUG-180); the revision exception is what
+        lets a correction through (AUG-320).
+        """
+        if article_identity(entry) in self.identities:
+            return True
+        return not revision_marker(entry) and story_identity(entry) in self.stories
+
+
 def _split_dedup_candidates(
     entries: list[FeedEntry],
+    stored: _StoredArticles,
     conn: sqlite3.Connection,
-    topic_id: int,
 ) -> tuple[list[tuple[FeedEntry, str]], list[tuple[FeedEntry, str, str, str | None]]]:
     """Filter feed entries to those not already stored; split reuse vs. fetch-needed.
 
@@ -236,8 +294,8 @@ def _split_dedup_candidates(
     new_entries: list[tuple[FeedEntry, str]] = []
     reuse_entries: list[tuple[FeedEntry, str, str, str | None]] = []
     for entry in entries:
-        content_hash = compute_article_hash(entry.url, entry.title)
-        if article_hash_exists(conn, topic_id, content_hash):
+        content_hash = article_identity(entry)
+        if stored.holds(entry):
             continue
         existing = find_article_by_hash(conn, content_hash)
         if existing and existing.raw_content:
@@ -267,12 +325,17 @@ def _select_candidates(
     the originating one for reused rows and ``None`` for fresh fetches (stamped with
     this topic's provider later). Returns ``(reuse_batch, fetch_batch)`` after the
     limit, where ``fetch_batch`` is the ``(entry, hash)`` subset still needing a fetch.
+
+    An entry with no usable date ranks at retrieval time, not at year 1 (AUG-184):
+    feeds list newest first, so an undated entry is a story just discovered, and
+    filing it below every dated one let a busy feed starve it out of the cap on
+    every check. Ties keep source order, since the sort is stable.
     """
-    datetime_min = datetime.min.replace(tzinfo=UTC)
+    now = datetime.now(UTC)
     all_candidates: list[tuple[FeedEntry, str, str | None, str | None]] = [
         (e, h, c, p) for e, h, c, p in reuse_entries
     ] + [(e, h, None, None) for e, h in new_entries]
-    all_candidates.sort(key=lambda t: t[0].published or datetime_min, reverse=True)
+    all_candidates.sort(key=lambda t: as_utc(t[0].published) or now, reverse=True)
     all_candidates = all_candidates[:max_articles]
 
     reuse_batch: list[tuple[FeedEntry, str, str | None, str | None]] = [
@@ -287,8 +350,11 @@ async def _resolve_redirect_urls(
     response: FeedResponse,
     feed_fetch_timeout: float,
     deadline: Deadline,
-) -> None:
+) -> bool:
     """Resolve provider redirect URLs in-place for entries needing content fetch.
+
+    Returns whether any URL actually changed, which is what tells the caller the
+    identities computed before this point need re-checking.
 
     Gated by the provider's ``needs_url_resolution`` (carried on the FeedResponse)
     rather than a hardcoded host substring (OVH-157): only providers that emit
@@ -298,14 +364,45 @@ async def _resolve_redirect_urls(
     dedup+limiting to minimize requests (typically ~10 URLs, not 100).
     """
     if not response.needs_url_resolution:
-        return
+        return False
     to_resolve = [e.url for e, _ in fetch_batch if is_google_news_url(e.url)]
     if not to_resolve:
-        return
+        return False
     resolved = await resolve_google_news_urls(to_resolve, timeout=feed_fetch_timeout, deadline=deadline)
+    changed = False
     for entry, _ in fetch_batch:
         if entry.url in resolved:
             entry.url = resolved[entry.url]
+            changed = True
+    return changed
+
+
+def _drop_resolved_duplicates(
+    fetch_batch: list[tuple[FeedEntry, str]],
+    stored: _StoredArticles,
+) -> list[tuple[FeedEntry, str]]:
+    """Re-apply dedup to entries whose real URL only appeared during resolution.
+
+    A Google News entry names an opaque wrapper until it is resolved, so the
+    story it belongs to is unknown while the first dedup pass runs. Once the
+    publisher URL is known, an entry the topic already holds — under a previous
+    wrapper, or from the other provider, which hands that URL over directly — is
+    dropped before its content is fetched (AUG-180). Entries that collapse onto
+    each other inside the batch are dropped the same way.
+
+    The stored key stays the one computed from what the feed handed over, so a
+    later check recognises an unchanged entry without spending a resolution on it.
+    """
+    kept: list[tuple[FeedEntry, str]] = []
+    seen_stories: set[str] = set()
+    for entry, content_hash in fetch_batch:
+        story = story_identity(entry)
+        if stored.holds(entry) or story in seen_stories:
+            logger.info("Resolved URL belongs to a story this topic already has: %s", entry.url)
+            continue
+        seen_stories.add(story)
+        kept.append((entry, content_hash))
+    return kept
 
 
 async def _extract_contents(
@@ -472,7 +569,7 @@ async def fetch_new_articles_for_topic(
         _commit_feed_health(db_path, health_outcomes)
         raise
 
-    entries = response.entries
+    entries = _prepare_entries(response.entries)
     feeds_total = response.feeds_total
     feeds_failed = response.feeds_failed
     _log_feed_coverage(topic, feeds_total, feeds_failed)
@@ -492,7 +589,8 @@ async def fetch_new_articles_for_topic(
         conn.commit()
         if not entries:
             return empty_result
-        new_entries, reuse_entries = _split_dedup_candidates(entries, conn, topic.id)
+        already_held = _StoredArticles.load(conn, topic.id)
+        new_entries, reuse_entries = _split_dedup_candidates(entries, already_held, conn)
 
     if not new_entries and not reuse_entries:
         return empty_result
@@ -501,7 +599,11 @@ async def fetch_new_articles_for_topic(
     reuse_batch, fetch_batch = _select_candidates(new_entries, reuse_entries, max_articles)
 
     # --- P1b: redirect resolution and content extraction, still connection-free.
-    await _resolve_redirect_urls(fetch_batch, response, feed_fetch_timeout, budget)
+    if await _resolve_redirect_urls(fetch_batch, response, feed_fetch_timeout, budget):
+        # Resolution revealed which story these entries belong to, so dedup runs
+        # once more before their content is fetched (AUG-180). No connection is
+        # needed: the topic's keys were read in the phase above.
+        fetch_batch = _drop_resolved_duplicates(fetch_batch, already_held)
     contents = await _extract_contents(fetch_batch, article_fetch_timeout, concurrency, budget)
 
     # --- C2: one short connection normalizes both batches and inserts.

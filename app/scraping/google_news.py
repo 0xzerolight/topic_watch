@@ -260,7 +260,11 @@ async def resolve_google_news_urls(
         Dict mapping original Google News URLs to resolved URLs.
         Only contains entries for URLs that were successfully resolved.
     """
-    google_urls = [u for u in urls if is_google_news_url(u)]
+    # One resolution per distinct URL, in first-seen order: the result is keyed by
+    # URL anyway, so a repeated entry used to buy the same answer twice — spending
+    # one of the three slots a unique URL needed and counting itself as a miss in
+    # the batch metrics (AUG-311).
+    google_urls = list(dict.fromkeys(u for u in urls if is_google_news_url(u)))
     if not google_urls:
         return {}
 

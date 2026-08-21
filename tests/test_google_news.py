@@ -304,6 +304,25 @@ class TestResolveGoogleNewsUrls:
         resolved = await resolve_google_news_urls(["https://example.com/article"])
         assert resolved == {}
 
+    async def test_a_repeated_url_is_resolved_once(self, caplog) -> None:
+        """AUG-311: duplicates used to buy the same answer twice and count as misses."""
+        attempts: list[str] = []
+
+        async def mock_resolve(url, client):
+            attempts.append(url)
+            return _REAL_ARTICLE_URL
+
+        with (
+            patch("app.scraping.google_news._resolve_or_raise", side_effect=mock_resolve),
+            caplog.at_level("INFO", logger="app.scraping.google_news"),
+        ):
+            resolved = await resolve_google_news_urls([_GOOGLE_RSS_URL, _GOOGLE_RSS_URL], request_delay=0)
+
+        assert attempts == [_GOOGLE_RSS_URL]
+        assert resolved == {_GOOGLE_RSS_URL: _REAL_ARTICLE_URL}
+        # Metrics count the work actually done, not the repeats.
+        assert "Resolved 1/1 Google News URLs" in caplog.text
+
     async def test_resolution_failure_excluded_from_results(self) -> None:
         """URLs that fail to resolve are not in the returned dict."""
 
