@@ -2,10 +2,12 @@
 
 import json
 import sqlite3
+import time
 from pathlib import Path
 from unittest.mock import patch
 
 import httpx
+import pytest
 
 from app.crud import create_topic
 from app.models import FeedMode, Topic
@@ -17,6 +19,17 @@ from app.scraping.google_news import (
     resolve_google_news_urls,
 )
 from app.scraping.rss import FeedEntry, FeedResponse
+
+
+@pytest.fixture(autouse=True)
+def _clear_google_rate_limit():
+    """The 429 guard is process-wide (AUG-305), so each test starts from clear."""
+    from app.scraping import google_news
+
+    google_news._rate_limited_until = 0.0
+    yield
+    google_news._rate_limited_until = 0.0
+
 
 # --- Mock HTML for Google News article page ---
 
@@ -520,3 +533,101 @@ class TestGoogleNewsIntegration:
 # Helper for async context manager mock
 async def _make_async(obj):
     return obj
+
+
+class TestNoResultFrameClassification:
+    """AUG-310: Google's normal 'no URL for this article' frame is not a break."""
+
+    async def test_null_payload_is_an_ordinary_miss(self, caplog) -> None:
+        import logging
+
+        from app.scraping.google_news import _decode_url
+
+        transport = _mock_transport({"batchexecute": (200, _batchexecute_error_response())})
+        with caplog.at_level(logging.WARNING, logger="app.scraping.google_news"):
+            async with httpx.AsyncClient(transport=transport) as client:
+                decoded = await _decode_url(_GOOGLE_ARTICLE_ID, "sig", "ts", client)
+
+        assert decoded is None
+        assert not [r for r in caplog.records if "decoder broke" in r.getMessage()]
+
+    async def test_a_batch_of_ordinary_misses_raises_no_format_alarm(self, caplog) -> None:
+        import logging
+
+        transport = _mock_transport(
+            {
+                f"/articles/{_GOOGLE_ARTICLE_ID}": (200, _google_article_html()),
+                f"/rss/articles/{_GOOGLE_ARTICLE_ID}": (200, _google_article_html()),
+                "batchexecute": (200, _batchexecute_error_response()),
+            }
+        )
+
+        original_init = httpx.AsyncClient.__init__
+
+        def patched_init(self_client, **kwargs):
+            kwargs["transport"] = transport
+            original_init(self_client, **kwargs)
+
+        with (
+            patch.object(httpx.AsyncClient, "__init__", patched_init),
+            caplog.at_level(logging.WARNING, logger="app.scraping.google_news"),
+        ):
+            resolved = await resolve_google_news_urls([_GOOGLE_RSS_URL], request_delay=0)
+
+        assert resolved == {}
+        assert not [r for r in caplog.records if "decoder broke" in r.getMessage()]
+
+    async def test_a_missing_record_is_still_a_decoder_break(self) -> None:
+        from app.scraping.google_news import _decode_url, _DecoderBrokeError
+
+        body = ")]}'\n\n" + json.dumps([["di", 8], ["af.httprm", 8, "123", 12]])
+        transport = _mock_transport({"batchexecute": (200, body)})
+        async with httpx.AsyncClient(transport=transport) as client:
+            with pytest.raises(_DecoderBrokeError):
+                await _decode_url(_GOOGLE_ARTICLE_ID, "sig", "ts", client)
+
+
+class TestSharedRateLimitGuard:
+    """AUG-305: one batch's 429 has to stop the others."""
+
+    async def test_a_429_short_circuits_a_later_batch(self) -> None:
+        from app.scraping import google_news
+
+        requests: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(str(request.url))
+            return httpx.Response(429, text="Too Many Requests")
+
+        original_init = httpx.AsyncClient.__init__
+
+        def patched_init(self_client, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            original_init(self_client, **kwargs)
+
+        with patch.object(httpx.AsyncClient, "__init__", patched_init):
+            await resolve_google_news_urls([_GOOGLE_RSS_URL], request_delay=0)
+            first_batch = len(requests)
+            assert first_batch > 0
+            # A concurrent topic check starting now must not pile on.
+            assert await resolve_google_news_urls([_GOOGLE_ARTICLES_URL], request_delay=0) == {}
+
+        assert len(requests) == first_batch
+        assert google_news._rate_limited_until > 0
+
+    async def test_retry_after_sets_the_cooldown(self) -> None:
+        from app.scraping import google_news
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(429, text="slow down", headers={"Retry-After": "45"})
+
+        original_init = httpx.AsyncClient.__init__
+
+        def patched_init(self_client, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            original_init(self_client, **kwargs)
+
+        with patch.object(httpx.AsyncClient, "__init__", patched_init):
+            await resolve_google_news_urls([_GOOGLE_RSS_URL], request_delay=0)
+
+        assert 0 < google_news._rate_limited_until - time.monotonic() <= 45

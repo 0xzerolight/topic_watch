@@ -13,6 +13,8 @@ import json
 import logging
 import re
 import secrets
+import time
+from typing import Any
 from urllib.parse import quote, urlparse
 
 import httpx
@@ -43,6 +45,59 @@ _REQUEST_DELAY = 0.5  # max jittered delay before each request, to avoid rate li
 _RESOLVE_CONCURRENCY = 3
 _BATCHEXECUTE_URL = "https://news.google.com/_/DotsSplashUi/data/batchexecute"
 _USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
+_RPC_ID = "Fbv4je"
+"""The batchexecute RPC whose record carries the decoded URL."""
+
+_RATE_LIMIT_COOLDOWN_SECONDS = 300.0
+_MAX_RATE_LIMIT_COOLDOWN_SECONDS = 3600.0
+
+_rate_limited_until = 0.0
+"""Monotonic deadline until which Google has told us to stop (AUG-305).
+
+Process-wide, because the throttle is: the semaphore and abort flag used to be
+allocated per call, so the default three concurrent topic checks each got their
+own three-wide gate, and a 429 seen by one batch could not stop the next batch
+from resolving against the same provider. Monotonic, so a clock adjustment
+cannot lift the cooldown early or strand it (wave-A clock policy)."""
+
+_resolver_gate: tuple[object, asyncio.Semaphore] | None = None
+
+
+def _shared_gate() -> asyncio.Semaphore:
+    """The process-wide concurrency gate for Google resolution.
+
+    Rebuilt when the running loop changes, because an ``asyncio.Semaphore``
+    binds to the first loop that awaits it; every process that matters runs one
+    loop, so in practice this is created once and shared by every batch.
+    """
+    global _resolver_gate
+    loop = asyncio.get_running_loop()
+    if _resolver_gate is None or _resolver_gate[0] is not loop:
+        _resolver_gate = (loop, asyncio.Semaphore(_RESOLVE_CONCURRENCY))
+    return _resolver_gate[1]
+
+
+def _rate_limit_cooldown(retry_after: float | None) -> float:
+    """Seconds to stay away, honouring a usable ``Retry-After`` within bounds."""
+    if retry_after is None or retry_after <= 0:
+        return _RATE_LIMIT_COOLDOWN_SECONDS
+    return min(retry_after, _MAX_RATE_LIMIT_COOLDOWN_SECONDS)
+
+
+def _enter_rate_limit_cooldown(retry_after: float | None) -> None:
+    global _rate_limited_until
+    _rate_limited_until = max(_rate_limited_until, time.monotonic() + _rate_limit_cooldown(retry_after))
+
+
+def _parse_retry_after(response: httpx.Response) -> float | None:
+    """The ``Retry-After`` delay in seconds, when the header carries a usable one."""
+    raw = response.headers.get("retry-after")
+    if not raw:
+        return None
+    try:
+        return float(raw.strip())
+    except ValueError:
+        return None  # HTTP-date form: fall back to the default cooldown
 
 
 def is_google_news_url(url: str) -> bool:
@@ -71,7 +126,12 @@ class _RateLimitedError(Exception):
 
     Distinguishes a genuine rate-limit (where retrying further URLs is futile)
     from an ordinary per-URL resolution failure (where the batch should continue).
+    Carries the ``Retry-After`` delay when Google supplied a usable one.
     """
+
+    def __init__(self, retry_after: float | None = None) -> None:
+        super().__init__("Google News rate limited (429)")
+        self.retry_after = retry_after
 
 
 class _DecoderBrokeError(Exception):
@@ -103,7 +163,7 @@ async def _get_decoding_params(
             response = await safe_get(client, url)
             if response.status_code == 429:
                 logger.warning("Google News rate limited (429) fetching decoding params")
-                raise _RateLimitedError
+                raise _RateLimitedError(_parse_retry_after(response))
             response.raise_for_status()
         except httpx.HTTPError as exc:
             logger.debug("Failed to fetch Google News article page (%s): %s", path_prefix, exc)
@@ -161,29 +221,56 @@ async def _decode_url(
         response = await safe_send(client, request)
         if response.status_code == 429:
             logger.warning("Google News rate limited (429) during URL decode")
-            raise _RateLimitedError
+            raise _RateLimitedError(_parse_retry_after(response))
         response.raise_for_status()
     except httpx.HTTPError as exc:
         logger.debug("batchexecute request failed: %s", exc)
         return None
 
+    payload = _rpc_payload(response.text)
+    if payload is None:
+        # The record is there and says Google has no URL for this article — an
+        # ordinary miss. Feeding that null to json.loads raised TypeError and
+        # dressed every normal no-result frame up as a format change (AUG-310).
+        return None
+
     try:
-        # Response format: )]}'\n\n<json data>
-        parts = response.text.split("\n\n", 1)
-        if len(parts) < 2:
-            # No JSON body at all — a structural break in the 200 response shape.
-            raise _DecoderBrokeError("batchexecute response had no JSON body")
-        parsed = json.loads(parts[1])[:-2]
-        decoded_url: str = json.loads(parsed[0][2])[1]
+        decoded_url: str = json.loads(payload)[1]
     except (json.JSONDecodeError, IndexError, TypeError, KeyError) as exc:
-        # A 200 body that no longer matches the expected shape: the decoder broke
-        # (Google changed the format), distinct from an unresolvable URL (OVH-134).
-        logger.debug("Failed to parse batchexecute response: %s", exc)
+        # A record whose payload no longer matches the expected shape: the decoder
+        # broke (Google changed the format), distinct from an unresolvable URL.
+        logger.debug("Failed to parse batchexecute payload: %s", exc)
         raise _DecoderBrokeError(str(exc)) from exc
 
     if decoded_url and isinstance(decoded_url, str) and decoded_url.startswith("http"):
         return decoded_url
     return None
+
+
+def _rpc_payload(body: str) -> Any | None:
+    """The decode RPC's payload from a batchexecute body, or ``None`` for a miss.
+
+    Separates "the response is not the shape we know" from "the response says
+    there is no URL". Only the first is a decoder break: a missing JSON body, a
+    non-list container or no record for our RPC id means Google changed the
+    format, and that warrants the format-change warning. A present record with a
+    null payload is Google's normal way of saying it could not resolve this one.
+    """
+    # Response format: )]}'\n\n<json data>
+    parts = body.split("\n\n", 1)
+    if len(parts) < 2:
+        raise _DecoderBrokeError("batchexecute response had no JSON body")
+    try:
+        frames = json.loads(parts[1])
+    except json.JSONDecodeError as exc:
+        logger.debug("Failed to parse batchexecute response: %s", exc)
+        raise _DecoderBrokeError(str(exc)) from exc
+    if not isinstance(frames, list):
+        raise _DecoderBrokeError(f"batchexecute body was {type(frames).__name__}, expected a list")
+    for frame in frames:
+        if isinstance(frame, list) and len(frame) > 2 and _RPC_ID in frame[:2]:
+            return frame[2]
+    raise _DecoderBrokeError(f"no {_RPC_ID} record in the batchexecute response")
 
 
 async def resolve_google_news_url(
@@ -237,15 +324,20 @@ async def resolve_google_news_urls(
 ) -> dict[str, str]:
     """Batch-resolve Google News redirect URLs to actual article URLs.
 
-    Resolves under a small bounded ``Semaphore`` (``_RESOLVE_CONCURRENCY``) via
+    Resolves under the process-wide bounded gate (``_RESOLVE_CONCURRENCY``) via
     ``asyncio.gather`` instead of strict O(N) serialization, with a jittered
     pre-request throttle (0..``request_delay``) replacing the fixed inter-request
     sleep — the same average request rate at a fraction of the wall-clock latency
     (OVH-056). A single URL failing to resolve does NOT abort the batch; the
-    resolver resolves as many as possible. A genuine HTTP 429 sets a shared abort
-    flag that short-circuits every task not yet started (preserving the previous
-    "stop on 429" semantics); tasks already in flight when the 429 lands may
-    finish, but at most ``_RESOLVE_CONCURRENCY`` are ever in flight at once.
+    resolver resolves as many as possible.
+
+    The gate and the 429 cooldown are shared by every concurrent batch (AUG-305).
+    Allocating them per call gave each of the three concurrent topic checks its
+    own three-wide gate — nine in flight against one provider — and left a 429
+    observed by one batch unable to stop another from starting. A 429 now puts
+    the whole process into a bounded cooldown (honouring ``Retry-After``), so
+    later batches short-circuit instead of piling on; tasks already in flight may
+    finish, and their unresolved entries simply keep their redirect URL.
 
     Args:
         urls: List of URLs (may include non-Google News URLs, which are skipped).
@@ -273,7 +365,11 @@ async def resolve_google_news_urls(
     failures = 0
     decoder_breaks = 0
     out_of_budget = False
-    semaphore = asyncio.Semaphore(_RESOLVE_CONCURRENCY)
+    if time.monotonic() < _rate_limited_until:
+        logger.info("Google News is rate-limiting; %d URL(s) keep their redirect", len(google_urls))
+        return {}
+
+    semaphore = _shared_gate()
     # Shared 429 abort flag: once Google rate-limits, every not-yet-started task
     # short-circuits rather than piling on more throttled requests.
     aborted = asyncio.Event()
@@ -303,8 +399,9 @@ async def resolve_google_news_urls(
                     await asyncio.sleep(budget.slice(secrets.SystemRandom().uniform(0, request_delay)))
                 try:
                     result = await bounded(budget, "Google News resolution", _resolve_or_raise(url, client))
-                except _RateLimitedError:
+                except _RateLimitedError as exc:
                     aborted.set()
+                    _enter_rate_limit_cooldown(exc.retry_after)
                     return url, None, False
                 except _DecoderBrokeError:
                     return url, None, True
