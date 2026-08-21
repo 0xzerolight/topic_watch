@@ -1198,11 +1198,15 @@ async def _check_all_topics_inner(
     db_path: Path | None,
 ) -> list[CheckResult]:
     """Run one whole check cycle (caller owns the whole-cycle gate)."""
-    # Retry any failed deliveries from previous cycles. Each retry function
-    # manages its own short-lived connections: it snapshots pending rows,
-    # sends with NO connection held, and commits per item.
-    await retry_pending_notifications(settings=settings, db_path=db_path)
-    await retry_pending_webhooks(settings=settings, db_path=db_path)
+
+    async def _drain_retries() -> None:
+        """Retry failed deliveries from previous cycles.
+
+        Each retry function manages its own short-lived connections: it snapshots
+        pending rows, sends with NO connection held, and commits per item.
+        """
+        await retry_pending_notifications(settings=settings, db_path=db_path)
+        await retry_pending_webhooks(settings=settings, db_path=db_path)
 
     # Snapshot the due topics, then release the connection before the long
     # per-topic HTTP/LLM work begins.
@@ -1210,6 +1214,7 @@ async def _check_all_topics_inner(
         due_topics = get_topics_due_for_check(conn, settings.check_interval_minutes)
 
     if not due_topics:
+        await _drain_retries()
         return []
 
     logger.info("Starting check cycle for %d due topics", len(due_topics))
@@ -1238,8 +1243,25 @@ async def _check_all_topics_inner(
                 )
                 return None
 
-    gathered = await asyncio.gather(*(_check_one(topic) for topic in due_topics))
-    results: list[CheckResult] = [r for r in gathered if r is not None]
+    # The retry backlog runs BESIDE the due topics, not in front of them: a
+    # source outage can queue one heartbeat row per topic per target, and each of
+    # those can burn the full Apprise deadline before the first topic would
+    # otherwise start — long enough for the single-instance scheduler to skip
+    # later ticks entirely (AUG-027). The drain is bounded per cycle; the topics
+    # no longer wait for it either way. One gather owns all of it, so the cycle
+    # never returns while a drain it started is still writing (AUG-263).
+    gathered = await asyncio.gather(
+        _drain_retries(),
+        *(_check_one(topic) for topic in due_topics),
+        return_exceptions=True,
+    )
+    drain_outcome, *topic_outcomes = gathered
+    if isinstance(drain_outcome, BaseException):
+        logger.error(
+            "Retry drain failed during the check cycle",
+            exc_info=(type(drain_outcome), drain_outcome, drain_outcome.__traceback__),
+        )
+    results: list[CheckResult] = [r for r in topic_outcomes if isinstance(r, CheckResult)]
 
     logger.info(
         "Check cycle complete: %d topics checked, %d with new info",

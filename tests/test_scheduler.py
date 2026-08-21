@@ -716,3 +716,47 @@ class TestStartupHeartbeatReset:
         latch, statuses = await self._boot(monkeypatch, tmp_path, threshold=3)
         assert latch is not None
         assert statuses == ["pending"]
+
+
+class TestRetryDrainDoesNotStarveDueTopics:
+    """AUG-027: a queued retry backlog cannot hold every due topic behind it."""
+
+    async def test_due_topics_run_alongside_the_retry_drain(self, db_conn, db_path: Path) -> None:
+        import asyncio
+
+        from app.checker import check_all_topics
+
+        _make_ready_topic(db_conn)
+        drain_started = asyncio.Event()
+        topic_checked = asyncio.Event()
+
+        async def _slow_drain(*args, **kwargs) -> None:
+            drain_started.set()
+            # The backlog only finishes once a due topic has been checked: with the
+            # drain in front of the cycle this never happens and the wait times out.
+            await asyncio.wait_for(topic_checked.wait(), timeout=5)
+
+        async def _fake_check(topic, settings, *, db_path=None, guard=True):
+            await drain_started.wait()
+            topic_checked.set()
+            return None
+
+        with (
+            patch("app.checker.retry_pending_notifications", _slow_drain),
+            patch("app.checker.retry_pending_webhooks", new=AsyncMock()),
+            patch("app.checker.check_topic", _fake_check),
+        ):
+            await asyncio.wait_for(check_all_topics(_make_settings(), db_path), timeout=5)
+
+        assert topic_checked.is_set()
+
+    async def test_the_drain_still_runs_with_no_due_topics(self, db_conn, db_path: Path) -> None:
+        from app.checker import check_all_topics
+
+        drain = AsyncMock()
+        with (
+            patch("app.checker.retry_pending_notifications", drain),
+            patch("app.checker.retry_pending_webhooks", new=AsyncMock()),
+        ):
+            assert await check_all_topics(_make_settings(), db_path) == []
+        drain.assert_awaited_once()
