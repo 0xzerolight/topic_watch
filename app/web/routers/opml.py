@@ -47,12 +47,19 @@ def _import_failure_message(result: "OPMLResult") -> str:
 async def export_opml_handler(
     conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
 ):
-    """Export all topics as OPML XML."""
+    """Export all topics as OPML XML.
+
+    OPML can only carry a stored feed URL, so AUTO and Exa topics have nothing to
+    write. They used to vanish from the file with no trace; the count now travels
+    with the export so a download is never mistaken for a full backup
+    (TW-AUD-026).
+    """
     from app.opml import export_opml
 
     topics = list_topics(conn)
-    topic_dicts = [{"name": t.name, "feed_urls": t.feed_urls, "tags": t.tags} for t in topics]
-    xml_content = export_opml(topic_dicts)
+    exportable = [t for t in topics if t.feed_urls]
+    topic_dicts = [{"name": t.name, "feed_urls": t.feed_urls, "tags": t.tags} for t in exportable]
+    xml_content = export_opml(topic_dicts, omitted_count=len(topics) - len(exportable))
 
     return StreamingResponse(
         iter([xml_content]),
@@ -106,14 +113,17 @@ async def import_opml_handler(
     # Create topics with NEW status (collisions already filtered by parse_opml).
     created = 0
     for topic_data in result.topics:
-        default_interval = settings.check_interval_minutes
         topic = Topic(
             name=topic_data["name"],
             description=f"News monitoring for {topic_data['name']}",
             feed_urls=topic_data["feed_urls"],
             feed_mode=FeedMode.MANUAL,
             status=TopicStatus.NEW,
-            check_interval_minutes=default_interval,
+            # NULL, not the current global value. OPML carries no interval, and
+            # writing today's global number froze every imported topic on it: a
+            # later change to the global cadence left them behind, looking as
+            # though the user had chosen a custom one (TW-AUD-025).
+            check_interval_minutes=None,
             tags=topic_data.get("tags", []),
         )
         create_topic(conn, topic)

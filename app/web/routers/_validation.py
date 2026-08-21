@@ -57,7 +57,12 @@ async def validate_topic_form(
     if mode == FeedMode.MANUAL:
         urls = [u.strip() for u in feed_urls.strip().splitlines() if u.strip()]
         if urls:
-            errors = await asyncio.to_thread(validate_feed_urls, urls)
+            errors.extend(await asyncio.to_thread(validate_feed_urls, urls))
+        else:
+            # An empty MANUAL list used to be accepted and persisted, producing a
+            # topic with no source at all that failed its first initialization
+            # with a source-unavailable error. Fail here instead (AUG-097).
+            errors.append("Manual mode needs at least one feed URL.")
 
     parsed_interval: int | None = None
     if check_interval.strip():
@@ -67,6 +72,21 @@ async def validate_topic_form(
             errors.append(str(e))
 
     return mode, urls, parsed_interval, errors
+
+
+def parse_topic_name(value: str, errors: list[str]) -> str:
+    """Trim a submitted topic name and reject a blank one.
+
+    The browser's ``required`` attribute and the UNIQUE constraint both accept
+    whitespace-only input, and ``""`` and ``" "`` are distinct to SQLite — so the
+    form could create several visually unnamed topics, each with a meaningless
+    source query (AUG-150). Trimming is part of the fix: the stored name is the
+    one shown, so surrounding whitespace must not survive into identity.
+    """
+    text = value.strip()
+    if not text:
+        errors.append("Topic name is required.")
+    return text
 
 
 def parse_threshold(value: str, label: str, errors: list[str]) -> float | None:

@@ -147,6 +147,46 @@ class TestAPIChecksClamp:
         finally:
             app.dependency_overrides.pop(get_db_conn, None)
 
+    def test_above_final_page_clamps(self, db_conn: sqlite3.Connection):
+        """TW-AUD-023: an out-of-range page returns the last page, not an empty set."""
+        topic = _seed_topic(db_conn)
+        _seed_check(db_conn, topic.id)
+        db_conn.commit()
+
+        from app.web.dependencies import get_db_conn
+
+        app.dependency_overrides[get_db_conn] = lambda: db_conn
+        try:
+            with TestClient(app) as client:
+                resp = client.get(f"/api/v1/topics/{topic.id}/checks?page={2**63}")
+                assert resp.status_code == 200
+                data = resp.json()
+                assert data["page"] == 1
+                assert len(data["checks"]) == 1
+        finally:
+            app.dependency_overrides.pop(get_db_conn, None)
+
+
+class TestAPITagFilterNormalization:
+    """AUG-338: a tag query differing only in spacing/Unicode form still matches."""
+
+    def test_equivalent_tag_query_matches(self, db_conn: sqlite3.Connection):
+        _seed_topic(db_conn, "Tagged", tags=["Tech News"])
+        db_conn.commit()
+
+        from app.web.dependencies import get_db_conn
+
+        app.dependency_overrides[get_db_conn] = lambda: db_conn
+        try:
+            with TestClient(app) as client:
+                resp = client.get("/api/v1/topics", params={"tag": "  Tech   News "})
+                assert resp.status_code == 200
+                data = resp.json()
+                assert len(data) == 1
+                assert data[0]["name"] == "Tagged"
+        finally:
+            app.dependency_overrides.pop(get_db_conn, None)
+
 
 class TestAPIChecksSeenAt:
     def test_marking_seen_does_not_mutate_has_new_info(self, db_conn: sqlite3.Connection):
@@ -311,9 +351,53 @@ class TestAPITriggerCheck:
                 data = resp.json()
                 assert data == {
                     "status": "checked",
-                    "has_new_info": True,
                     "check_result_id": 42,
+                    "has_new_info": True,
+                    "articles_found": 3,
+                    "articles_new": 1,
+                    "stage_error": None,
+                    "notification_sent": False,
+                    "notification_error": None,
+                    "notify_disposition": None,
                 }
+        finally:
+            app.dependency_overrides.pop(get_db_conn, None)
+
+    def test_trigger_check_reports_a_recorded_pipeline_failure(self, db_conn: sqlite3.Connection, monkeypatch) -> None:
+        """AUG-203: a fail-safe 200 must not look identical to clean silence."""
+        topic = _seed_topic(db_conn, status="ready")
+        db_conn.commit()
+
+        fake_result = CheckResult(
+            id=7,
+            topic_id=topic.id,
+            has_new_info=False,
+            stage_error="sources_failed: all feed source(s) failed (see logs)",
+            notification_error="apprise refused",
+            notify_disposition="analysis_failed",
+        )
+
+        async def _fake_check_topic(t, settings, *, db_path=None, guard=True):
+            return fake_result
+
+        monkeypatch.setattr("app.web.api.check_topic", _fake_check_topic)
+
+        from app.web.dependencies import get_db_conn
+
+        app.dependency_overrides[get_db_conn] = lambda: db_conn
+        try:
+            with TestClient(app) as client:
+                home = client.get("/")
+                csrf_token = home.cookies.get("csrf_token", "")
+                resp = client.post(
+                    f"/api/v1/topics/{topic.id}/check",
+                    headers={"X-CSRF-Token": csrf_token},
+                )
+                assert resp.status_code == 200
+                data = resp.json()
+                assert data["stage_error"].startswith("sources_failed:")
+                assert data["notification_error"] == "apprise refused"
+                assert data["notify_disposition"] == "analysis_failed"
         finally:
             app.dependency_overrides.pop(get_db_conn, None)
 

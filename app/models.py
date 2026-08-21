@@ -6,8 +6,11 @@ data transfer between layers, and serialization to/from SQLite rows.
 
 import json
 import logging
+import re
 import secrets
 import sqlite3
+import unicodedata
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import ClassVar, Self
@@ -15,6 +18,52 @@ from typing import ClassVar, Self
 from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger(__name__)
+
+# Characters that draw nothing but keep two visually identical tags apart: the
+# bidi formatting set, zero-width marks and the BOM. Stripped rather than
+# escaped — a tag is a label the user picked, not untrusted output.
+_TAG_INVISIBLE = re.compile(
+    "["
+    "؜"  # Arabic letter mark
+    "​-‏"  # zero-width space/joiners, LRM, RLM
+    "‪-‮"  # bidi embeddings and overrides
+    "⁠-⁤"  # word joiner and invisible operators
+    "⁦-⁩"  # bidi isolates
+    "﻿"  # BOM / zero-width no-break space
+    "]"
+)
+
+
+def normalize_tag(value: str) -> str:
+    """Canonical form of one tag.
+
+    NFC-normalized, invisible formatting characters removed, every remaining
+    control or separator character folded to a space, and whitespace collapsed.
+    Case is deliberately preserved: casefolding would rewrite every chip the user
+    sees, and it is not needed to make canonically-equivalent variants of one tag
+    resolve to the same identity (AUG-338).
+    """
+    text = _TAG_INVISIBLE.sub("", unicodedata.normalize("NFC", value))
+    text = "".join(" " if unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp") else ch for ch in text)
+    return " ".join(text.split())
+
+
+def normalize_tags(values: Iterable[str]) -> list[str]:
+    """Canonicalize a tag list, drop blanks, and stable-deduplicate it.
+
+    Form input, OPML folders and stored rows all pass through here, so one
+    logical tag can no longer exist as several indistinguishable labels that
+    filter differently (AUG-338). Order is the order first seen.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        tag = normalize_tag(value)
+        if not tag or tag in seen:
+            continue
+        seen.add(tag)
+        out.append(tag)
+    return out
 
 
 def to_db_utc(dt: datetime) -> str:
@@ -253,6 +302,17 @@ class Topic(SQLiteModel):
     # ``crud.create_topic`` and deliberately absent from ``update_topic``'s column
     # list, so an edit carrying a stale Topic can never rotate or blank it.
     generation: str = Field(default_factory=new_generation)
+
+    @field_validator("tags", mode="after")
+    @classmethod
+    def _canonicalize_tags(cls, value: list[str]) -> list[str]:
+        """Canonicalize and deduplicate tags on every construction (AUG-338).
+
+        Applied on the read path too, so a row written before this existed still
+        renders and filters as one identity. Never raises: like the clamping
+        validators above, a bad stored value degrades instead of 500-ing a page.
+        """
+        return normalize_tags(value)
 
     @field_validator("confidence_threshold", "relevance_threshold", mode="before")
     @classmethod

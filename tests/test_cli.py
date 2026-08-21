@@ -1,13 +1,12 @@
 """Tests for the CLI module: commands and error handling."""
 
 import sqlite3
-from functools import partial
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from app.cli import _cmd_check, _cmd_doctor, _cmd_init, _cmd_list
+from app.cli import _cmd_check, _cmd_check_all, _cmd_doctor, _cmd_init, _cmd_list
 from app.config import LLMSettings, NotificationSettings, Settings
 from app.crud import (
     create_topic,
@@ -18,7 +17,7 @@ from app.crud import (
 )
 from app.database import get_connection, get_db, get_schema_version, init_db
 from app.migrations import MIGRATIONS
-from app.models import Article, FeedMode, Topic, TopicStatus
+from app.models import Article, CheckResult, FeedMode, Topic, TopicStatus
 from app.scraping import FetchResult
 from app.scraping.rss import FeedResponse
 
@@ -26,6 +25,10 @@ from app.scraping.rss import FeedResponse
 def _make_settings(**overrides) -> Settings:
     defaults = {
         "llm": LLMSettings(model="openai/gpt-4o-mini", api_key="test-key"),
+        # CLI commands resolve the CONFIGURED db_path (TW-AUD-027), so an unset
+        # one would resolve to the developer's real data/topic_watch.db. Default
+        # to a path that cannot exist; tests needing a real database pass their own.
+        "db_path": "/nonexistent/cli-test.db",
     }
     defaults.update(overrides)
     return Settings(**defaults)
@@ -124,6 +127,31 @@ class TestCmdDoctor:
         assert "SECRETTOKEN" not in out
         assert "feeds: 0 OK / 1 failing" in out
         assert "(x2)" in out
+
+    def test_malformed_notification_url_does_not_crash_doctor(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """AUG-328: one unparseable entry must not defeat the whole report."""
+        urls = ["slack://a/b/c", "http://[::1"]
+        s = _make_settings(notifications=NotificationSettings(urls=urls), db_path="/nonexistent/x.db")
+        out = self._run(s, capsys)
+        assert "notifications.urls: 2" in out
+        assert "1 unparseable" in out
+        assert "is_configured:" in out  # the report continued past the bad entry
+
+    def test_failing_feeds_are_capped_with_an_omitted_count(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        """AUG-332: a large import's dead feeds cannot flood the report."""
+        from app.cli import _MAX_LISTED_ITEMS
+
+        db_path = _real_db(tmp_path)
+        total = _MAX_LISTED_ITEMS + 5
+        with get_db(db_path) as conn:
+            for i in range(total):
+                upsert_feed_health_failure(conn, f"https://example.com/feed{i}", "boom")
+        out = self._run(_make_settings(db_path=str(db_path)), capsys)
+        assert f"feeds: 0 OK / {total} failing" in out
+        assert out.count("    failing: ") == _MAX_LISTED_ITEMS
+        assert f"... and {total - _MAX_LISTED_ITEMS} more failing feed(s)" in out
 
     def test_exa_block_rendered_secret_safe(self, capsys: pytest.CaptureFixture[str]) -> None:
         from app.config import ExaSettings
@@ -232,14 +260,16 @@ class TestCmdDoctor:
 
 @pytest.fixture
 def cli_db(db_conn: sqlite3.Connection, db_path: Path, monkeypatch: pytest.MonkeyPatch) -> sqlite3.Connection:
-    """Make the default database path resolve to this test's database.
+    """Point every CLI command at this test's database.
 
-    CLI commands hand the pipeline a path rather than a connection, and each phase
-    opens its own short-lived one, so redirecting the ``app.cli.get_db`` name is no
-    longer enough — every layer must land on the same file. ``_cmd_*`` resolve
-    ``db_path=None``, which is exactly the default this redirects.
+    CLI commands resolve the CONFIGURED ``db_path`` and thread it into ``get_db``
+    and into the pipeline (TW-AUD-027), so putting every layer on one file is a
+    matter of what ``load_settings`` returns. ``DEFAULT_DB_PATH`` is redirected as
+    well, so a path that still falls through to ``None`` lands on this file rather
+    than on the developer's real database.
     """
     monkeypatch.setattr("app.database.DEFAULT_DB_PATH", db_path)
+    monkeypatch.setattr("app.cli.load_settings", lambda: _make_settings(db_path=str(db_path)))
     return db_conn
 
 
@@ -250,34 +280,205 @@ class TestCmdCheck:
     def _use_cli_db(self, cli_db):
         return cli_db
 
-    async def test_check_existing_topic(self, db_conn: sqlite3.Connection) -> None:
+    async def test_check_existing_topic(self, db_conn: sqlite3.Connection, capsys) -> None:
         create_topic(
             db_conn,
             Topic(name="CLI Topic", description="d", status=TopicStatus.READY),
         )
         db_conn.commit()
-        settings = _make_settings()
 
         with (
-            patch("app.cli.load_settings", return_value=settings),
             patch("app.cli.init_db"),
             patch(
                 "app.checker.fetch_new_articles_for_topic",
                 new_callable=AsyncMock,
-                return_value=FetchResult(articles=[], total_feed_entries=0),
+                # A healthy source with nothing new: the only shape that is a
+                # genuine "no change".
+                return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=1),
             ),
         ):
             await _cmd_check("CLI Topic")
 
-    async def test_check_nonexistent_topic_exits(self, db_conn: sqlite3.Connection) -> None:
-        settings = _make_settings()
+        assert "Outcome: no change" in capsys.readouterr().out
 
+    async def test_check_nonexistent_topic_exits(self, db_conn: sqlite3.Connection) -> None:
         with (
-            patch("app.cli.load_settings", return_value=settings),
             patch("app.cli.init_db"),
             pytest.raises(SystemExit, match="1"),
         ):
             await _cmd_check("Nonexistent")
+
+    async def test_source_failure_is_reported_and_exits_nonzero(self, db_conn: sqlite3.Connection, capsys) -> None:
+        """AUG-075: an unavailable source is not a successful 'no change' check."""
+        create_topic(db_conn, Topic(name="Down", description="d", status=TopicStatus.READY))
+        db_conn.commit()
+
+        with (
+            patch("app.cli.init_db"),
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=2, feeds_failed=2),
+            ),
+            pytest.raises(SystemExit, match="1"),
+        ):
+            await _cmd_check("Down")
+
+        out = capsys.readouterr().out
+        assert "SOURCE FAILURE" in out
+        assert "sources_failed" in out
+        assert "Outcome: no change" not in out
+
+    async def test_not_ready_topic_is_reported_as_skipped(self, db_conn: sqlite3.Connection, capsys) -> None:
+        """A check that never ran must not print like one that did (AUG-075)."""
+        create_topic(db_conn, Topic(name="Paused", description="d", status=TopicStatus.ERROR))
+        db_conn.commit()
+
+        with (
+            patch("app.cli.init_db"),
+            pytest.raises(SystemExit, match="1"),
+        ):
+            await _cmd_check("Paused")
+
+        assert "skipped: topic not ready" in capsys.readouterr().out
+
+    async def test_uses_the_configured_database_not_the_default(self, tmp_path: Path, capsys) -> None:
+        """TW-AUD-027: a non-default db_path is where the CLI looks for topics."""
+        configured = tmp_path / "configured.db"
+        init_db(configured)
+        with get_db(configured) as conn:
+            create_topic(conn, Topic(name="Elsewhere", description="d", status=TopicStatus.READY))
+
+        with (
+            patch("app.cli.load_settings", return_value=_make_settings(db_path=str(configured))),
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=1),
+            ),
+        ):
+            await _cmd_check("Elsewhere")
+
+        assert "Check complete for 'Elsewhere'" in capsys.readouterr().out
+
+
+class TestSummarizeCheck:
+    """AUG-075: every recorded failure shape reads differently from clean silence."""
+
+    def test_clean_result_is_not_a_failure(self) -> None:
+        from app.cli import summarize_check
+
+        assert summarize_check(CheckResult(topic_id=1)) == ("no change", False)
+
+    def test_new_info(self) -> None:
+        from app.cli import summarize_check
+
+        assert summarize_check(CheckResult(topic_id=1, has_new_info=True)) == ("NEW INFO", False)
+
+    def test_internal_failure_is_labelled_distinctly(self) -> None:
+        from app.cli import summarize_check
+
+        summary, failed = summarize_check(CheckResult(topic_id=1, stage_error="pipeline_failed: disk full"))
+        assert failed
+        assert summary.startswith("PIPELINE FAILURE")
+
+    def test_analysis_failure_keeps_the_outcome_and_flags_it(self) -> None:
+        from app.cli import summarize_check
+
+        summary, failed = summarize_check(CheckResult(topic_id=1, stage_error="analysis_failed: timeout"))
+        assert failed
+        assert "no change" in summary and "analysis_failed" in summary
+
+    def test_delivery_failure_is_surfaced(self) -> None:
+        from app.cli import summarize_check
+
+        summary, failed = summarize_check(CheckResult(topic_id=1, has_new_info=True, notification_error="smtp refused"))
+        assert failed
+        assert "NEW INFO" in summary and "smtp refused" in summary
+
+
+class TestCmdCheckAll:
+    """AUG-076: check-all checks DUE topics and says which it left alone."""
+
+    @pytest.fixture(autouse=True)
+    def _use_cli_db(self, cli_db):
+        return cli_db
+
+    async def test_reports_active_topics_that_were_not_due(self, db_conn: sqlite3.Connection, capsys) -> None:
+        from app.crud import create_check_result
+
+        due = create_topic(db_conn, Topic(name="DueTopic", description="d", status=TopicStatus.READY))
+        not_due = create_topic(
+            db_conn,
+            Topic(
+                name="NotDueTopic",
+                description="d",
+                status=TopicStatus.READY,
+                check_interval_minutes=10_000,
+            ),
+        )
+        # A very recent check keeps NotDueTopic outside this cycle's due set.
+        create_check_result(db_conn, CheckResult(topic_id=not_due.id))
+        db_conn.commit()
+        assert due.id is not None
+
+        with (
+            patch("app.cli.init_db"),
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=1),
+            ),
+        ):
+            await _cmd_check_all()
+
+        out = capsys.readouterr().out
+        assert "1 due topic(s) checked" in out
+        assert "Not checked: 1 active topic(s) not due yet" in out
+        assert "NotDueTopic" in out
+
+    async def test_failing_check_exits_nonzero(self, db_conn: sqlite3.Connection, capsys) -> None:
+        create_topic(db_conn, Topic(name="Broken", description="d", status=TopicStatus.READY))
+        db_conn.commit()
+
+        with (
+            patch("app.cli.init_db"),
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                side_effect=Exception("boom"),
+            ),
+            pytest.raises(SystemExit, match="1"),
+        ):
+            await _cmd_check_all()
+
+        out = capsys.readouterr().out
+        assert "PIPELINE FAILURE" in out
+        assert "1 of 1 check(s) failed" in out
+
+
+class TestCliHelp:
+    """AUG-077: the cross-process concurrency restriction is visible in --help."""
+
+    def test_top_level_help_carries_the_warning(self, capsys) -> None:
+        import app.cli as cli_mod
+
+        with patch("sys.argv", ["topic-watch", "--help"]), pytest.raises(SystemExit):
+            cli_mod.main()
+
+        out = capsys.readouterr().out
+        assert "server" in out and "stopped" in out
+        assert "duplicate notifications" in out
+
+    def test_check_all_help_no_longer_claims_every_active_topic(self, capsys) -> None:
+        import app.cli as cli_mod
+
+        with patch("sys.argv", ["topic-watch", "check-all", "--help"]), pytest.raises(SystemExit):
+            cli_mod.main()
+
+        out = capsys.readouterr().out
+        assert "due" in out
+        assert "not due yet" in out
 
 
 class TestCmdInit:
@@ -288,14 +489,36 @@ class TestCmdInit:
         return cli_db
 
     async def test_init_nonexistent_topic_exits(self, db_conn: sqlite3.Connection) -> None:
-        settings = _make_settings()
-
         with (
-            patch("app.cli.load_settings", return_value=settings),
             patch("app.cli.init_db"),
             pytest.raises(SystemExit, match="1"),
         ):
             await _cmd_init("Nonexistent")
+
+    async def test_init_uses_the_canonical_initializer(self, db_conn: sqlite3.Connection) -> None:
+        """TW-AUD-027: no second copy of the init workflow lives in the CLI."""
+        import app.cli as cli_mod
+
+        assert not hasattr(cli_mod, "_run_init")
+        assert not hasattr(cli_mod, "_fail_init")
+
+        topic = create_topic(db_conn, Topic(name="Delegate", description="d", status=TopicStatus.NEW))
+        db_conn.commit()
+
+        called: dict[str, object] = {}
+
+        async def _spy(topic_arg, settings_arg, *, db_path=None):
+            called["topic_id"] = topic_arg.id
+            called["db_path"] = db_path
+
+        with (
+            patch("app.cli.init_db"),
+            patch("app.checker.initialize_new_topic", new=_spy),
+        ):
+            await _cmd_init("Delegate")
+
+        assert called["topic_id"] == topic.id
+        assert called["db_path"] is not None
 
     async def test_init_ready_topic_reinitializes(self, db_conn: sqlite3.Connection) -> None:
         """READY topics should be re-initialized, not rejected."""
@@ -313,7 +536,6 @@ class TestCmdInit:
             KnowledgeState(topic_id=topic.id, summary_text="Old knowledge.", token_count=10),
         )
         db_conn.commit()
-        settings = _make_settings()
 
         mock_article = Article(
             topic_id=topic.id,
@@ -327,10 +549,9 @@ class TestCmdInit:
         )
 
         with (
-            patch("app.cli.load_settings", return_value=settings),
             patch("app.cli.init_db"),
             patch(
-                "app.scraping.fetch_new_articles_for_topic",
+                "app.checker.fetch_new_articles_for_topic",
                 new_callable=AsyncMock,
                 return_value=FetchResult(articles=[mock_article], total_feed_entries=1),
             ),
@@ -356,10 +577,7 @@ class TestCmdInit:
             Topic(name="ScrapeErr", description="d", status=TopicStatus.NEW),
         )
         db_conn.commit()
-        settings = _make_settings()
-
         with (
-            patch("app.cli.load_settings", return_value=settings),
             patch("app.cli.init_db"),
             patch(
                 "app.scraping.fetch_feeds_for_topic",
@@ -372,7 +590,7 @@ class TestCmdInit:
 
         updated = get_topic(db_conn, topic.id)
         assert updated.status == TopicStatus.ERROR
-        assert "fetch articles" in updated.error_message.lower()
+        assert "network error" in updated.error_message.lower()
 
     async def test_init_no_articles_sets_error(self, db_conn: sqlite3.Connection) -> None:
         topic = create_topic(
@@ -380,10 +598,7 @@ class TestCmdInit:
             Topic(name="NoArticles", description="d", status=TopicStatus.NEW),
         )
         db_conn.commit()
-        settings = _make_settings()
-
         with (
-            patch("app.cli.load_settings", return_value=settings),
             patch("app.cli.init_db"),
             patch(
                 "app.scraping.fetch_feeds_for_topic",
@@ -396,7 +611,7 @@ class TestCmdInit:
 
         updated = get_topic(db_conn, topic.id)
         assert updated.status == TopicStatus.ERROR
-        assert "no articles" in updated.error_message.lower()
+        assert "no source attempted" in updated.error_message.lower()
         # status_changed_at must be refreshed on the ERROR transition too.
         assert updated.status_changed_at is not None
 
@@ -407,10 +622,7 @@ class TestCmdInit:
             Topic(name="ExaKeyBad", description="d", feed_mode=FeedMode.EXA, feed_urls=[], status=TopicStatus.NEW),
         )
         db_conn.commit()
-        settings = _make_settings()
-
         with (
-            patch("app.cli.load_settings", return_value=settings),
             patch("app.cli.init_db"),
             patch(
                 "app.scraping.fetch_feeds_for_topic",
@@ -436,7 +648,6 @@ class TestCmdInit:
             ),
         )
         db_conn.commit()
-        settings = _make_settings()
 
         mock_article = Article(
             id=1,
@@ -448,10 +659,9 @@ class TestCmdInit:
         )
 
         with (
-            patch("app.cli.load_settings", return_value=settings),
             patch("app.cli.init_db"),
             patch(
-                "app.scraping.fetch_new_articles_for_topic",
+                "app.checker.fetch_new_articles_for_topic",
                 new_callable=AsyncMock,
                 return_value=FetchResult(articles=[mock_article], total_feed_entries=1),
             ),
@@ -490,11 +700,9 @@ class TestCmdInitPersistence:
                 Topic(name="ScrapeErr", description="d", status=TopicStatus.NEW),
             )
 
-        settings = _make_settings()
         with (
-            patch("app.cli.load_settings", return_value=settings),
+            patch("app.cli.load_settings", return_value=_make_settings(db_path=str(db_path))),
             patch("app.cli.init_db"),
-            patch("app.cli.get_db", partial(get_db, db_path=db_path)),
             patch(
                 "app.scraping.fetch_feeds_for_topic",
                 new_callable=AsyncMock,
@@ -512,7 +720,7 @@ class TestCmdInitPersistence:
             verify.close()
         assert updated.status == TopicStatus.ERROR
         assert updated.error_message is not None
-        assert "fetch articles" in updated.error_message.lower()
+        assert "network error" in updated.error_message.lower()
 
     async def test_no_articles_commits_error_status(self, tmp_path: Path) -> None:
         db_path = _real_db(tmp_path)
@@ -522,11 +730,9 @@ class TestCmdInitPersistence:
                 Topic(name="NoArticles", description="d", status=TopicStatus.NEW),
             )
 
-        settings = _make_settings()
         with (
-            patch("app.cli.load_settings", return_value=settings),
+            patch("app.cli.load_settings", return_value=_make_settings(db_path=str(db_path))),
             patch("app.cli.init_db"),
-            patch("app.cli.get_db", partial(get_db, db_path=db_path)),
             patch(
                 "app.scraping.fetch_feeds_for_topic",
                 new_callable=AsyncMock,
@@ -543,7 +749,7 @@ class TestCmdInitPersistence:
             verify.close()
         assert updated.status == TopicStatus.ERROR
         assert updated.error_message is not None
-        assert "no articles" in updated.error_message.lower()
+        assert "no source attempted" in updated.error_message.lower()
 
     async def test_knowledge_failure_commits_error_status(self, tmp_path: Path) -> None:
         db_path = _real_db(tmp_path)
@@ -558,7 +764,6 @@ class TestCmdInitPersistence:
                 ),
             )
 
-        settings = _make_settings()
         mock_article = Article(
             id=1,
             topic_id=topic.id,
@@ -568,11 +773,10 @@ class TestCmdInitPersistence:
             source_feed="f",
         )
         with (
-            patch("app.cli.load_settings", return_value=settings),
+            patch("app.cli.load_settings", return_value=_make_settings(db_path=str(db_path))),
             patch("app.cli.init_db"),
-            patch("app.cli.get_db", partial(get_db, db_path=db_path)),
             patch(
-                "app.scraping.fetch_new_articles_for_topic",
+                "app.checker.fetch_new_articles_for_topic",
                 new_callable=AsyncMock,
                 return_value=FetchResult(articles=[mock_article], total_feed_entries=1),
             ),
@@ -625,12 +829,10 @@ class TestCmdInitResearchingClaim:
                 other.close()
             return FetchResult(articles=[], total_feed_entries=0)
 
-        settings = _make_settings()
         with (
-            patch("app.cli.load_settings", return_value=settings),
+            patch("app.cli.load_settings", return_value=_make_settings(db_path=str(db_path))),
             patch("app.cli.init_db"),
-            patch("app.cli.get_db", partial(get_db, db_path=db_path)),
-            patch("app.scraping.fetch_new_articles_for_topic", new=_fetch_spy),
+            patch("app.checker.fetch_new_articles_for_topic", new=_fetch_spy),
             # No articles -> ERROR exit, but the claim must already be visible.
             pytest.raises(SystemExit, match="1"),
         ):
@@ -647,13 +849,11 @@ class TestCmdInitResearchingClaim:
                 Topic(name="Busy", description="d", status=TopicStatus.RESEARCHING),
             )
 
-        settings = _make_settings()
         fetch_mock = AsyncMock(return_value=FetchResult(articles=[], total_feed_entries=0))
         with (
-            patch("app.cli.load_settings", return_value=settings),
+            patch("app.cli.load_settings", return_value=_make_settings(db_path=str(db_path))),
             patch("app.cli.init_db"),
-            patch("app.cli.get_db", partial(get_db, db_path=db_path)),
-            patch("app.scraping.fetch_new_articles_for_topic", fetch_mock),
+            patch("app.checker.fetch_new_articles_for_topic", fetch_mock),
             pytest.raises(SystemExit, match="1"),
         ):
             await _cmd_init("Busy")

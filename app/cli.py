@@ -23,25 +23,44 @@ import sqlite3
 import sys
 import unicodedata
 from collections import Counter
-from datetime import UTC, datetime
+from pathlib import Path
 from urllib.parse import urlparse
 
 from app.config import Settings, is_api_key_env_sourced, is_exa_key_env_sourced, load_settings, resolve_db_path
 from app.crud import (
+    get_knowledge_state,
+    get_topic,
     get_topic_by_name,
     list_all_feed_health,
     list_topics,
-    update_topic,
 )
 from app.database import get_db, get_schema_version, init_db
 from app.log_redaction import redact_url
 from app.logging_config import setup_logging
-from app.models import Topic, TopicStatus
+from app.models import CheckResult, TopicStatus, is_internal_failure, is_source_failure
 
 logger = logging.getLogger(__name__)
 
 # Width of the Name column in `list`.
 _NAME_COLUMN = 30
+
+# Bound on the per-item detail lists `doctor` and `check-all` print, so one
+# imported OPML file with hundreds of dead feeds can no longer flood a terminal
+# or an issue form and bury the summary above it (AUG-332).
+_MAX_LISTED_ITEMS = 10
+
+# Final per-line cap for a redacted feed URL in the `doctor` report.
+_FEED_URL_WIDTH = 100
+
+# Concurrency restriction, shown in `--help` for the whole CLI and for each
+# command that runs the pipeline. It used to live only in this module's
+# docstring, which no user ever sees (AUG-077).
+CONCURRENCY_WARNING = (
+    "Run 'check', 'check-all' and 'init' only while the server (and its scheduler) "
+    "is stopped, or against a separate database. The in-flight guards are "
+    "process-local, so a CLI run against a live server's database can double-check "
+    "a topic, double-spend the LLM and send duplicate notifications."
+)
 
 # Characters a terminal acts on rather than draws: C0/C1 controls (line breaks,
 # ESC), the bidirectional formatting set, zero-width marks and the BOM. A topic
@@ -101,14 +120,57 @@ def terminal_safe(text: str, *, width: int | None) -> str:
     return "".join(kept) + "…"
 
 
+def _open_database(settings: Settings) -> Path:
+    """Resolve the CONFIGURED database, create/migrate it, and return its path.
+
+    Every command threads this path into ``get_db`` and into the pipeline.
+    Letting them fall through to ``db_path=None`` meant a supported non-default
+    ``db_path`` was honored by the server but ignored by the CLI, which then
+    created and operated on an empty default database (TW-AUD-027).
+    """
+    db_path = resolve_db_path(settings)
+    init_db(db_path)
+    return db_path
+
+
+def summarize_check(result: CheckResult) -> tuple[str, bool]:
+    """Render one finished check as ``(summary, failed)``.
+
+    ``has_new_info`` alone cannot tell a clean quiet check from a check that
+    never saw its sources, failed inside the pipeline, could not be analyzed, or
+    whose alert was never delivered — every one of those leaves ``has_new_info``
+    false. Printing them all as "no change" and exiting 0 let a cron job report a
+    broken monitor as healthy (AUG-075). ``failed`` drives a non-zero exit.
+    """
+    label = "NEW INFO" if result.has_new_info else "no change"
+    problems: list[str] = []
+
+    stage = result.stage_error
+    if stage:
+        if stage.startswith("skipped:"):
+            # Nothing ran at all, so there is no outcome to qualify.
+            return stage, True
+        if is_source_failure(stage):
+            label = "SOURCE FAILURE"
+        elif is_internal_failure(stage):
+            label = "PIPELINE FAILURE"
+        problems.append(stage)
+    if result.notification_error:
+        problems.append(f"delivery failed: {result.notification_error}")
+
+    if problems:
+        return f"{label} — {'; '.join(problems)}", True
+    return label, False
+
+
 async def _cmd_check(topic_name: str) -> None:
     """Check a single topic for new information."""
     from app.checker import check_topic
 
     settings = load_settings()
-    init_db()
+    db_path = _open_database(settings)
 
-    with get_db() as conn:
+    with get_db(db_path) as conn:
         topic = get_topic_by_name(conn, topic_name)
     if topic is None:
         logger.error("Topic not found: '%s'", topic_name)
@@ -116,39 +178,74 @@ async def _cmd_check(topic_name: str) -> None:
 
     # No connection is held across the pipeline: check_topic opens its own per
     # phase (AUG-136).
-    result = await check_topic(topic, settings)
+    result = await check_topic(topic, settings, db_path=db_path)
+    summary, failed = summarize_check(result)
 
     print(f"Check complete for '{terminal_safe(topic_name, width=None)}':")
     print(f"  Articles found: {result.articles_found}")
+    print(f"  New articles: {result.articles_new}")
     print(f"  New info: {result.has_new_info}")
     print(f"  Notification sent: {result.notification_sent}")
+    print(f"  Outcome: {summary}")
+    if failed:
+        sys.exit(1)
 
 
 async def _cmd_check_all() -> None:
-    """Check all active, ready topics."""
+    """Check every active, ready topic whose interval has elapsed."""
     from app.checker import check_all_topics
 
     settings = load_settings()
-    init_db()
+    db_path = _open_database(settings)
 
-    results = await check_all_topics(settings)
+    results = await check_all_topics(settings, db_path)
 
-    print(f"Check cycle complete: {len(results)} topics checked")
+    with get_db(db_path) as conn:
+        active_ready = [t for t in list_topics(conn, is_active=True) if t.status == TopicStatus.READY]
+
+    checked_ids = {r.topic_id for r in results}
+    names = {t.id: t.name for t in active_ready}
+    # The command checks DUE topics, never every active one. Saying so — and
+    # naming the topics it left alone — is the difference between a manual
+    # refresh the user can trust and a silently partial run (AUG-076).
+    skipped = [t for t in active_ready if t.id not in checked_ids]
+
+    print(f"Check cycle complete: {len(results)} due topic(s) checked")
+    failed = 0
     for r in results:
-        status = "NEW INFO" if r.has_new_info else "no change"
-        print(f"  Topic {r.topic_id}: {status}")
+        summary, is_failed = summarize_check(r)
+        failed += is_failed
+        name = names.get(r.topic_id) or f"id={r.topic_id}"
+        print(f"  {terminal_safe(name, width=_NAME_COLUMN)}: {summary}")
+
+    if skipped:
+        print(f"Not checked: {len(skipped)} active topic(s) not due yet")
+        for topic in skipped[:_MAX_LISTED_ITEMS]:
+            print(f"  {terminal_safe(topic.name, width=_NAME_COLUMN)}")
+        if len(skipped) > _MAX_LISTED_ITEMS:
+            print(f"  ... and {len(skipped) - _MAX_LISTED_ITEMS} more")
+
+    if failed:
+        print(f"{failed} of {len(results)} check(s) failed")
+        sys.exit(1)
 
 
 async def _cmd_init(topic_name: str) -> None:
     """Run initial knowledge research for a topic.
 
-    Claims the topic (NEW/READY → RESEARCHING) before the long fetch+LLM work,
-    builds the initial knowledge state, and transitions it to READY (or ERROR).
+    Delegates to ``checker.initialize_new_topic`` — the same initializer the web
+    layer and the scheduler use. The CLI previously carried its own copy of that
+    workflow, which claimed the topic itself, passed the fetch only two of the
+    eight settings the canonical path threads through, and re-implemented the
+    transition commit. Its only real job is turning the outcome into text and an
+    exit code (TW-AUD-027).
     """
-    settings = load_settings()
-    init_db()
+    from app.checker import initialize_new_topic
 
-    with get_db() as conn:
+    settings = load_settings()
+    db_path = _open_database(settings)
+
+    with get_db(db_path) as conn:
         topic = get_topic_by_name(conn, topic_name)
 
     if topic is None:
@@ -163,109 +260,37 @@ async def _cmd_init(topic_name: str) -> None:
         )
         sys.exit(1)
 
-    assert topic.id is not None
-    if topic.status == TopicStatus.READY:
-        print(f"Re-initializing knowledge for '{terminal_safe(topic_name, width=None)}'...")
-    else:
-        print(f"Initializing knowledge for '{terminal_safe(topic_name, width=None)}'...")
+    topic_id = topic.id
+    assert topic_id is not None
+    verb = "Re-initializing" if topic.status == TopicStatus.READY else "Initializing"
+    print(f"{verb} knowledge for '{terminal_safe(topic_name, width=None)}'...")
 
-    # Claim the topic before the long fetch+LLM work so the scheduler's gradual
-    # init (and a second CLI init) are excluded by the same RESEARCHING status
-    # guard (OVH-018). Commit so the claim is durable and visible to concurrent
-    # connections immediately.
-    topic.status = TopicStatus.RESEARCHING
-    topic.status_changed_at = datetime.now(UTC)
-    topic.error_message = None
-    with get_db() as conn:
-        update_topic(conn, topic)
-        conn.commit()
+    await initialize_new_topic(topic, settings, db_path=db_path)
 
-    if await _run_init(topic, topic_name, settings):
+    with get_db(db_path) as conn:
+        final = get_topic(conn, topic_id)
+        knowledge = get_knowledge_state(conn, topic_id) if final is not None else None
+
+    if final is None:
+        logger.error("Topic '%s' disappeared during initialization", topic_name)
         sys.exit(1)
 
+    if final.status == TopicStatus.READY:
+        if knowledge is not None:
+            print(f"  Knowledge state built ({knowledge.token_count} tokens)")
+        print(f"  Topic '{terminal_safe(topic_name, width=None)}' is now READY")
+        return
 
-def _fail_init(topic: Topic, message: str) -> bool:
-    """Persist a terminal ERROR status on its own short connection. Returns True.
+    if final.status == TopicStatus.NEW:
+        # A re-init that found no fresh articles is not a failure: the topic keeps
+        # waiting for a later cycle.
+        print("  No new articles this run — topic stays NEW and will retry.")
+        return
 
-    Committed here rather than left to the caller so the operator/UI see the real
-    reason even though the command exits non-zero straight afterwards (OVH-002).
-    """
-    topic.status = TopicStatus.ERROR
-    topic.status_changed_at = datetime.now(UTC)
-    topic.error_message = message
-    with get_db() as conn:
-        update_topic(conn, topic)
-        conn.commit()
-    return True
-
-
-async def _run_init(topic: Topic, topic_name: str, settings: Settings) -> bool:
-    """Fetch + build knowledge for a claimed (RESEARCHING) topic.
-
-    Holds no connection across the fetch or LLM awaits (AUG-136): each phase
-    opens its own short-lived one. Returns True if the init failed (caller should
-    exit 1).
-    """
-    from app.analysis.knowledge import prepare_initial_knowledge
-    from app.checker import CheckTransitionAborted, _commit_init_transition, _snapshot_topic
-    from app.scraping import all_sources_failed, fetch_new_articles_for_topic
-
-    assert topic.id is not None
-    with get_db() as conn:
-        snapshot = _snapshot_topic(conn, topic.id)
-    if snapshot is None:
-        logger.error("Topic '%s' disappeared before initialization could start", topic_name)
-        return True
-
-    # Fetch articles
-    try:
-        fetch_result = await fetch_new_articles_for_topic(
-            topic, max_articles=settings.max_articles_per_check, exa_settings=settings.exa
-        )
-        articles = fetch_result.articles
-    except Exception:
-        logger.error("Failed to fetch articles for '%s'", topic_name, exc_info=True)
-        return _fail_init(topic, "Failed to fetch articles during initialization")
-
-    if not articles:
-        # Mode-agnostic message: EXA topics have no feed URLs, so don't tell the operator
-        # to "check the feed URLs" — a total source failure (bad key / feeds down) reads
-        # differently from a genuinely empty result.
-        sources_down = all_sources_failed(fetch_result.feeds_total, fetch_result.feeds_failed)
-        logger.error("No articles found for '%s' (check feed sources / credentials; see logs).", topic_name)
-        return _fail_init(
-            topic,
-            "All feed source(s) failed during initialization (check credentials/connectivity; see logs)"
-            if sources_down
-            else "No articles found during initialization",
-        )
-
-    print(f"  Fetched {len(articles)} articles")
-
-    try:
-        plan = await prepare_initial_knowledge(topic, articles, settings)
-    except Exception:
-        logger.error(
-            "Knowledge initialization failed for '%s'",
-            topic_name,
-            exc_info=True,
-        )
-        return _fail_init(topic, "LLM failed during knowledge initialization")
-
-    # Knowledge state, revision, article disposition and READY in one transaction.
-    article_ids = [a.id for a in articles if a.id is not None]
-    try:
-        with get_db() as conn:
-            _commit_init_transition(conn, snapshot, plan, article_ids, settings)
-    except CheckTransitionAborted as exc:
-        logger.error("Initialization for '%s' aborted: %s", topic_name, exc)
-        return True
-
-    topic.status = TopicStatus.READY
-    topic.error_message = None
-    print(f"  Knowledge state built ({plan.token_count} tokens)")
-    print(f"  Topic '{terminal_safe(topic_name, width=None)}' is now READY")
-    return False
+    reason = final.error_message or "unknown error"
+    logger.error("Initialization failed for '%s': %s", topic_name, reason)
+    print(f"  Initialization failed: {reason}")
+    sys.exit(1)
 
 
 def _in_docker() -> bool:
@@ -275,6 +300,20 @@ def _in_docker() -> bool:
 
 # Config keys that carry secrets (or are rendered specially); never dumped raw.
 _SECRET_CONFIG_KEYS = frozenset({"api_key", "base_url", "urls", "webhook_urls"})
+
+
+def _url_scheme(url: str) -> str | None:
+    """Scheme of a configured URL, or ``None`` when it cannot be parsed.
+
+    Notification settings accept arbitrary strings, and some of them (an
+    unmatched IPv6 bracket, say) make ``urlparse`` raise. That raise happened
+    outside ``doctor``'s ``load_settings`` handler, so one malformed entry
+    defeated the very command meant to diagnose it (AUG-328).
+    """
+    try:
+        return urlparse(url).scheme or "?"
+    except ValueError:
+        return None
 
 
 def _render_config(settings: Settings) -> list[str]:
@@ -310,9 +349,13 @@ def _render_config(settings: Settings) -> list[str]:
         ("notifications.webhook_urls", settings.notifications.webhook_urls),
     ):
         if urls:
-            counts = Counter(urlparse(u).scheme or "?" for u in urls)
-            summary = ", ".join(f"{scheme} x{n}" for scheme, n in sorted(counts.items()))
-            lines.append(f"  {label}: {len(urls)} ({summary})")
+            schemes = [_url_scheme(u) for u in urls]
+            counts = Counter(s for s in schemes if s is not None)
+            invalid = sum(1 for s in schemes if s is None)
+            parts = [f"{scheme} x{n}" for scheme, n in sorted(counts.items())]
+            if invalid:
+                parts.append(f"{invalid} unparseable")
+            lines.append(f"  {label}: {len(urls)} ({', '.join(parts)})")
         else:
             lines.append(f"  {label}: none")
 
@@ -353,8 +396,15 @@ def _render_feeds(conn: sqlite3.Connection) -> list[str]:
     failing = [f for f in feeds if f.consecutive_failures > 0]
     ok = len(feeds) - len(failing)
     lines = [f"  feeds: {ok} OK / {len(failing)} failing"]
-    for feed in failing:
-        lines.append(f"    failing: {redact_url(feed.feed_url)} (x{feed.consecutive_failures})")
+    # A bounded sample plus an omitted count: an OPML import admits 500 topics at
+    # a time and feed-health rows are never pruned, so the unbounded loop this
+    # replaces could bury the summary under hundreds of URLs and push far more
+    # feed metadata into a pasted bug report than troubleshooting needs (AUG-332).
+    for feed in failing[:_MAX_LISTED_ITEMS]:
+        url = terminal_safe(redact_url(feed.feed_url), width=_FEED_URL_WIDTH)
+        lines.append(f"    failing: {url} (x{feed.consecutive_failures})")
+    if len(failing) > _MAX_LISTED_ITEMS:
+        lines.append(f"    ... and {len(failing) - _MAX_LISTED_ITEMS} more failing feed(s)")
     return lines
 
 
@@ -416,9 +466,9 @@ def _cmd_doctor() -> None:
 
 def _cmd_list() -> None:
     """List all topics with their status."""
-    init_db()
+    db_path = _open_database(load_settings())
 
-    with get_db() as conn:
+    with get_db(db_path) as conn:
         topics = list_topics(conn)
 
     if not topics:
@@ -446,20 +496,40 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         prog="topic-watch",
-        description="Topic Watch — AI-powered news monitoring",
+        description=f"Topic Watch — AI-powered news monitoring\n\n{CONCURRENCY_WARNING}",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"topic-watch {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # check <topic_name>
-    check_parser = subparsers.add_parser("check", help="Check a single topic for new information")
+    check_parser = subparsers.add_parser(
+        "check",
+        help="Check a single topic for new information",
+        description=CONCURRENCY_WARNING,
+    )
     check_parser.add_argument("topic_name", help="Name of the topic to check")
 
     # check-all
-    subparsers.add_parser("check-all", help="Check all active topics for new information")
+    subparsers.add_parser(
+        "check-all",
+        # The command runs one scheduler cycle: active READY topics whose interval
+        # has elapsed. It never forced every active topic through the pipeline, and
+        # saying it did made a partial run look complete (AUG-076).
+        help="Check every active topic that is due for a check",
+        description=(
+            "Checks every active topic whose check interval has elapsed, and lists the "
+            f"active topics it left alone because they are not due yet.\n\n{CONCURRENCY_WARNING}"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
 
     # init <topic_name>
-    init_parser = subparsers.add_parser("init", help="Run initial knowledge research for a topic")
+    init_parser = subparsers.add_parser(
+        "init",
+        help="Run initial knowledge research for a topic",
+        description=CONCURRENCY_WARNING,
+    )
     init_parser.add_argument("topic_name", help="Name of the topic to initialize")
 
     # list

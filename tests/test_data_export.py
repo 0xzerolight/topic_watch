@@ -534,3 +534,84 @@ async def test_export_all_topics_json_empty(
     data = response.json()
     assert data["topics"] == []
     assert "exported_at" in data
+
+
+async def test_export_topic_json_states_totals_and_truncation(
+    client: httpx.AsyncClient,
+    db_conn: sqlite3.Connection,
+) -> None:
+    """TW-AUD-026: a complete export says so, rather than being assumed."""
+    topic = _make_topic(db_conn)
+    _make_article(db_conn, topic.id, title="A")
+    _make_check_result(db_conn, topic.id)
+
+    response = await client.get(f"/topics/{topic.id}/export/json")
+
+    meta = response.json()["export"]
+    assert meta["articles_total"] == 1
+    assert meta["articles_returned"] == 1
+    assert meta["articles_truncated"] is False
+    assert meta["check_results_total"] == 1
+    assert meta["check_results_truncated"] is False
+    assert meta["row_cap"] > 0
+
+
+async def test_export_topic_json_declares_a_capped_history(
+    client: httpx.AsyncClient,
+    db_conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TW-AUD-026: a capped download must not look like a whole one."""
+    monkeypatch.setattr("app.web.routers.exports._EXPORT_ROW_CAP", 1)
+    topic = _make_topic(db_conn)
+    _make_check_result(db_conn, topic.id)
+    _make_check_result(db_conn, topic.id)
+
+    meta = (await client.get(f"/topics/{topic.id}/export/json")).json()["export"]
+    assert meta["check_results_total"] == 2
+    assert meta["check_results_returned"] == 1
+    assert meta["check_results_truncated"] is True
+
+
+async def test_export_topic_csv_marks_a_capped_history(
+    client: httpx.AsyncClient,
+    db_conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TW-AUD-026: the truncation note is visible in the spreadsheet itself."""
+    monkeypatch.setattr("app.web.routers.exports._EXPORT_ROW_CAP", 1)
+    topic = _make_topic(db_conn)
+    _make_check_result(db_conn, topic.id)
+    _make_check_result(db_conn, topic.id)
+
+    body = (await client.get(f"/topics/{topic.id}/export/csv")).text
+    assert "# truncated: most recent 1 of 2 check results" in body
+
+
+async def test_export_topic_csv_has_no_note_when_complete(
+    client: httpx.AsyncClient,
+    db_conn: sqlite3.Connection,
+) -> None:
+    """An ordinary export keeps its exact shape — no extra row."""
+    topic = _make_topic(db_conn)
+    _make_check_result(db_conn, topic.id)
+
+    body = (await client.get(f"/topics/{topic.id}/export/csv")).text
+    assert "truncated" not in body
+
+
+async def test_export_opml_discloses_topics_it_cannot_represent(
+    client: httpx.AsyncClient,
+    db_conn: sqlite3.Connection,
+) -> None:
+    """TW-AUD-026: AUTO/Exa topics have no feed URL and used to vanish silently."""
+    _make_topic(db_conn, name="Manual Topic")
+    create_topic(
+        db_conn,
+        Topic(name="Auto Topic", description="d", feed_urls=[], feed_mode=FeedMode.AUTO, status=TopicStatus.READY),
+    )
+    db_conn.commit()
+
+    body = (await client.get("/export/opml")).text
+    assert "Manual Topic" in body
+    assert "1 topic(s) omitted" in body
