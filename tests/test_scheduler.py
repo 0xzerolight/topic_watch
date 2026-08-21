@@ -539,8 +539,10 @@ class TestGradualInitIsBounded:
         assert refreshed.status == TopicStatus.ERROR
         assert refreshed.error_message == "Research timed out. Click Retry."
 
-    async def test_timeout_write_spares_a_rowid_reused_replacement(self, tmp_path: Path) -> None:
+    async def test_timeout_write_spares_a_rowid_reused_replacement(self, tmp_path: Path, caplog) -> None:
         """A topic deleted mid-init hands its rowid on; the timeout must not follow it."""
+        import logging
+
         from app.crud import create_topic, delete_topic, get_topic
         from app.database import get_db, init_db
         from app.models import Topic, TopicStatus
@@ -575,6 +577,7 @@ class TestGradualInitIsBounded:
         with (
             patch("app.scheduler._INIT_TIMEOUT_SECONDS", 0.05),
             patch("app.checker.fetch_new_articles_for_topic", side_effect=_replace_then_hang),
+            caplog.at_level(logging.WARNING, logger="app.scheduler"),
         ):
             await _init_new_topics(_make_settings(), db_path)
 
@@ -582,6 +585,8 @@ class TestGradualInitIsBounded:
             survivor = get_topic(conn, topic_id)
         assert survivor.name == "Replacement"
         assert survivor.error_message == "Its own failure."
+        # The refused fence is logged rather than dropped silently.
+        assert any("not recorded" in record.message for record in caplog.records)
 
 
 class TestLifespanShutdown:

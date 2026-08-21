@@ -287,6 +287,27 @@ class TestReinitOwnership:
         assert await _checking_state.is_checking(topic.id) is True
         await _checking_state.finish_check(topic.id, args[3])
 
+    async def test_refused_init_attempts_reset_is_logged(
+        self,
+        client: httpx.AsyncClient,
+        db_conn: sqlite3.Connection,
+        caplog,
+    ) -> None:
+        """A fenced write the handler discards must still be readable in the log."""
+        import logging
+
+        topic = _make_topic(db_conn, status=TopicStatus.ERROR, init_attempts=2)
+
+        with (
+            patch("app.web.routers.topics.update_topic_init_status", return_value=False),
+            patch("app.web.routers.background._run_init", new_callable=AsyncMock),
+            caplog.at_level(logging.WARNING, logger="app.web.routers.topics"),
+        ):
+            response = await client.post(f"/topics/{topic.id}/init", follow_redirects=False)
+
+        assert response.status_code == 303
+        assert any("could not reset init_attempts" in record.message for record in caplog.records)
+
     async def test_lost_claim_releases_the_guard(
         self,
         client: httpx.AsyncClient,

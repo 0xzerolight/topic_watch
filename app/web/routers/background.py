@@ -85,7 +85,7 @@ async def _run_init(
             # re-claimed (AUG-139), and a targeted write means it cannot restore
             # name/feeds/thresholds the user edited while the init ran (AUG-022).
             with get_db(db_path) as conn:
-                update_topic_init_status(
+                landed = update_topic_init_status(
                     conn,
                     topic_id,
                     status=TopicStatus.ERROR,
@@ -96,6 +96,14 @@ async def _run_init(
                     generation=topic.generation,
                 )
                 conn.commit()
+            if not landed:
+                # A refused fence is the normal outcome of a race, not a bug — but
+                # silently dropping a terminal write leaves nothing to read when a
+                # topic ends up with a status nobody can account for.
+                logger.warning(
+                    "Timeout reason for topic %d not recorded: it left ERROR or was replaced",
+                    topic_id,
+                )
     finally:
         await _checking_state.finish_check(topic_id, held)
 

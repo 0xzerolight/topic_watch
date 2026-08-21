@@ -213,13 +213,16 @@ class TestRunInitTimeout:
         settings = _make_settings()
         await _run_init(999_999, settings, db_path)  # non-existent topic id
 
-    async def test_timeout_write_spares_a_rowid_reused_replacement(self, db_path: Path) -> None:
+    async def test_timeout_write_spares_a_rowid_reused_replacement(self, db_path: Path, caplog) -> None:
         """The timeout message never lands on the topic that recycled the rowid.
 
         ``topics.id`` is a plain rowid, so a topic deleted mid-init hands its id to
         the next INSERT. Fenced on status alone, this write replaced the
-        replacement's own error with a timeout it never had.
+        replacement's own error with a timeout it never had. The refusal is logged:
+        a dropped terminal write used to leave nothing to read.
         """
+        import logging
+
         settings = _make_settings()
 
         conn = get_connection(db_path)
@@ -252,6 +255,7 @@ class TestRunInitTimeout:
         with (
             patch("app.web.routers.background._INIT_TIMEOUT_SECONDS", 0.05),
             patch("app.checker.fetch_new_articles_for_topic", side_effect=_replace_then_hang),
+            caplog.at_level(logging.WARNING, logger="app.web.routers.background"),
         ):
             await _run_init(topic_id, settings, db_path, claimed=True)
 
@@ -264,6 +268,7 @@ class TestRunInitTimeout:
         assert survivor is not None
         assert survivor.name == "Replacement"
         assert survivor.error_message == "Its own failure."
+        assert any("not recorded" in record.message for record in caplog.records)
 
 
 class TestRunSingleCheckTimeout:

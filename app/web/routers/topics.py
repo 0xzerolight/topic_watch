@@ -695,7 +695,7 @@ async def reinit_topic(
 
     # An explicit Retry starts from a clean slate (OVH-098): reset the vestigial
     # init_attempts counter, fenced to the claim this handler just won.
-    update_topic_init_status(
+    reset = update_topic_init_status(
         conn,
         topic_id,
         status=TopicStatus.RESEARCHING,
@@ -705,6 +705,10 @@ async def reinit_topic(
         expected_status=TopicStatus.RESEARCHING,
     )
     conn.commit()
+    if not reset:
+        # The claim above committed, so this only misses when something moved the
+        # row again in between. The init still runs; only the counter reset is lost.
+        logger.warning("Retry for topic %d could not reset init_attempts: the claim moved", topic_id)
 
     db_path = getattr(request.app.state, "db_path", None)
     background_tasks.add_task(background._run_init, topic.id, settings, db_path, owner, claimed=True)
