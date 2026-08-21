@@ -248,3 +248,36 @@ class TestInternalFailuresAreNeutral:
         for i in range(5):
             _record(db_conn, topic.id, "pipeline_failed: OperationalError: database is locked", 50 - i * 5)
         assert evaluate_heartbeat(db_conn, topic, threshold=3) is None
+
+
+class TestHeadFenceUsesTheCanonicalOrder:
+    """AUG-258: heartbeat and UI must agree on which check is the latest one."""
+
+    def test_a_backdated_row_does_not_wedge_the_latch(self, db_conn: sqlite3.Connection) -> None:
+        """A newer id with an older timestamp is not the head, so it blocks nothing."""
+        topic = _topic(db_conn)
+        _fail_run(db_conn, topic.id, 3, oldest_minutes=30)
+        # A clock step backwards (or a restored row) writes a high id with an old
+        # timestamp. Fencing on MAX(id) would refuse every future transition for
+        # this topic, silently killing its heartbeat.
+        create_check_result(
+            db_conn,
+            CheckResult(
+                topic_id=topic.id,
+                checked_at=datetime.now(UTC) - timedelta(days=1),
+                stage_error="sources_failed: backdated",
+            ),
+        )
+        db_conn.commit()
+
+        decision = evaluate_heartbeat(db_conn, topic, threshold=3)
+        assert decision is not None and decision.kind == "alert"
+        assert (
+            claim_heartbeat_alert(
+                db_conn,
+                topic.id,
+                datetime.now(UTC),
+                head_check_id=decision.head_check_id,
+            )
+            is True
+        )

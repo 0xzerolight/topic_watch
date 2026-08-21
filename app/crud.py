@@ -1589,9 +1589,15 @@ def claim_new_topic_for_init(conn: sqlite3.Connection, topic_id: int) -> bool:
 # check still holding a deleted topic could otherwise latch its replacement — an
 # alert naming the deleted topic, and a replacement whose real outage is then
 # suppressed (AUG-020/TW-AUD-007). The head-check conjunct is the same idea in time:
-# a decision computed from check N must not land once check N+1 exists.
+# a decision computed from check N must not land once check N+1 exists. It selects
+# the head with the canonical ``checked_at DESC, id DESC`` the heartbeat's own
+# streak query uses (AUG-258), not ``MAX(id)`` — a row carrying a newer id with an
+# older timestamp (a clock step, a restored row) is not the latest check, and
+# treating it as one would refuse every later transition for that topic forever.
 _HEARTBEAT_GENERATION_FENCE = " AND generation = ?"
-_HEARTBEAT_HEAD_FENCE = " AND (SELECT MAX(id) FROM check_results WHERE topic_id = topics.id) = ?"
+_HEARTBEAT_HEAD_FENCE = (
+    " AND (SELECT id FROM check_results WHERE topic_id = topics.id ORDER BY checked_at DESC, id DESC LIMIT 1) = ?"
+)
 
 
 def _heartbeat_fence(sql: str, params: list, generation: str | None, head_check_id: int | None) -> tuple[str, list]:
