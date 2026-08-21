@@ -23,6 +23,18 @@ from app.models import NotificationDelivery
 
 logger = logging.getLogger(__name__)
 
+# Payload bounds, in characters, applied when the message is built (AUG-323).
+# Apprise plugins carry per-service title/body limits and upstream's default
+# overflow policy is to hand the oversized payload to the service anyway, so the
+# ceiling has to be ours. The values sit under the tightest limits among the
+# services the README recommends (Discord's 2000-character message body is the
+# binding one; the rest allow more), and are constants rather than settings: a
+# transport bound is not a preference the user should have to discover.
+NOTIFICATION_TITLE_CHAR_LIMIT = 200
+NOTIFICATION_BODY_CHAR_LIMIT = 1800
+_TRUNCATION_SUFFIX = "..."
+_OMISSION_LINE = "[trimmed to fit the notification channel]"
+
 # Literal placeholder tokens that appear ONLY in documentation/example URLs
 # (config.example.yml, README, the setup UI). A real notification URL carries
 # concrete credentials and never these words, so an unedited example is dropped
@@ -82,43 +94,94 @@ def _is_placeholder_url(url: str) -> bool:
     return any(component.lower() in _PLACEHOLDER_URL_MARKERS for component in components)
 
 
+def _fit(text: str, limit: int) -> str:
+    """Trim ``text`` to ``limit`` characters, marking the cut."""
+    if len(text) <= limit:
+        return text
+    if limit <= len(_TRUNCATION_SUFFIX):
+        return text[:limit]
+    return text[: limit - len(_TRUNCATION_SUFFIX)] + _TRUNCATION_SUFFIX
+
+
 def format_notification(topic_name: str, novelty_result: NoveltyResult) -> tuple[str, str]:
-    """Format a NoveltyResult into a notification title and body.
+    """Format a NoveltyResult into a bounded notification title and body.
+
+    The LLM contract puts no length bound on the summary, the fact list or the
+    source list, so a verbose-but-valid result could exceed a channel's title or
+    body limit — and the channel's own answer to that is either a rejection (which
+    the retry drain then replays unchanged until the alert is abandoned) or a
+    prefix truncation that eats the score footer first (AUG-323).
+
+    The projection is therefore built to a budget here, once, before the intent
+    is persisted, so every attempt sends the same accepted shape:
+
+    * the score footer is reserved first — it is the part prefix truncation loses
+      and the part that makes the alert readable at a glance;
+    * the summary is trimmed with an explicit marker if it alone overruns;
+    * facts and source URLs are added whole while they fit. A URL is never cut in
+      half: it is dropped instead, since a truncated link is worse than a missing
+      one;
+    * anything dropped is announced by a marker line, so a short message is never
+      mistaken for the whole story.
 
     Args:
         topic_name: The name of the topic.
         novelty_result: A NoveltyResult with has_new_info=True.
 
     Returns:
-        Tuple of (title, body) strings.
+        Tuple of (title, body) strings, each within its channel-limit constant.
     """
-    title = f"Topic Watch: {topic_name}"
-
-    parts: list[str] = []
-    if novelty_result.summary:
-        parts.append(novelty_result.summary)
-
-    if novelty_result.key_facts:
-        parts.append("")
-        parts.append("Key facts:")
-        for fact in novelty_result.key_facts:
-            parts.append(f"  - {fact}")
-
-    if novelty_result.source_urls:
-        parts.append("")
-        parts.append("Sources:")
-        for url in novelty_result.source_urls:
-            parts.append(f"  {url}")
+    title = _fit(f"Topic Watch: {topic_name}", NOTIFICATION_TITLE_CHAR_LIMIT)
 
     confidence_pct = int(novelty_result.confidence * 100)
     relevance_pct = int(novelty_result.relevance * 100)
-    parts.append("")
-    parts.append(f"Confidence: {confidence_pct}%")
-    parts.append(f"Relevance: {relevance_pct}%")
-    parts.append(f"Importance: {novelty_result.importance}/5")
+    footer = [
+        "",
+        f"Confidence: {confidence_pct}%",
+        f"Relevance: {relevance_pct}%",
+        f"Importance: {novelty_result.importance}/5",
+    ]
+    # Reserve the footer and the omission marker (each plus the newline that
+    # joins it to what precedes it) so adding either can never push the finished
+    # body past the limit.
+    reserved = len("\n".join(footer)) + 1 + len(_OMISSION_LINE) + 2
+    budget = max(NOTIFICATION_BODY_CHAR_LIMIT - reserved, 0)
 
-    body = "\n".join(parts)
-    return title, body
+    parts: list[str] = []
+    used = 0
+    omitted = False
+
+    if novelty_result.summary:
+        summary = _fit(novelty_result.summary, budget)
+        omitted = summary != novelty_result.summary
+        parts.append(summary)
+        used += len(summary)
+
+    def _add_block(header: str, lines: list[str]) -> None:
+        nonlocal used, omitted
+        if not lines:
+            return
+        cost = len(header) + 2  # the blank separator line plus the header
+        kept: list[str] = []
+        for line in lines:
+            if used + cost + len(line) + 1 > budget:
+                omitted = True
+                continue
+            kept.append(line)
+            cost += len(line) + 1
+        if not kept:
+            return
+        parts.extend(["", header, *kept])
+        used += cost
+
+    _add_block("Key facts:", [f"  - {fact}" for fact in novelty_result.key_facts])
+    _add_block("Sources:", [f"  {url}" for url in novelty_result.source_urls])
+
+    if omitted:
+        parts.extend(["", _OMISSION_LINE])
+    parts.extend(footer)
+
+    return title, "\n".join(parts)
 
 
 def _deliver_one(title: str, body: str, url: str) -> NotificationDelivery:

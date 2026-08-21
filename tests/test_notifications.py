@@ -16,6 +16,8 @@ from app.crud import create_pending_notification, create_topic, list_pending_not
 from app.database import get_connection, init_db
 from app.models import PendingNotification, Topic, TopicStatus
 from app.notifications import (
+    NOTIFICATION_BODY_CHAR_LIMIT,
+    NOTIFICATION_TITLE_CHAR_LIMIT,
     _is_placeholder_url,
     format_notification,
     redact_url,
@@ -160,6 +162,55 @@ class TestFormatNotification:
         title, body = format_notification("Test", novelty)
         assert title == "Topic Watch: Test"
         assert isinstance(body, str)
+
+    def test_long_topic_name_is_capped_in_the_title(self) -> None:
+        novelty = NoveltyResult(has_new_info=True, summary="x", confidence=0.9)
+        title, _ = format_notification("N" * 5000, novelty)
+        assert len(title) <= NOTIFICATION_TITLE_CHAR_LIMIT
+        assert title.endswith("...")
+
+    def test_oversized_body_is_capped_and_keeps_the_score_footer(self) -> None:
+        novelty = NoveltyResult(
+            has_new_info=True,
+            summary="S" * 4000,
+            key_facts=["F" * 500 for _ in range(20)],
+            source_urls=[f"https://example.com/{'p' * 300}/{i}" for i in range(20)],
+            confidence=0.9,
+            relevance=0.8,
+            importance=4,
+        )
+        _, body = format_notification("Test", novelty)
+        assert len(body) <= NOTIFICATION_BODY_CHAR_LIMIT
+        assert "Confidence: 90%" in body
+        assert "Relevance: 80%" in body
+        assert "Importance: 4/5" in body
+        assert "[trimmed to fit the notification channel]" in body
+
+    def test_source_urls_are_dropped_whole_never_cut(self) -> None:
+        long_url = "https://example.com/" + "p" * 4000
+        novelty = NoveltyResult(
+            has_new_info=True,
+            summary="Short summary",
+            source_urls=[long_url],
+            confidence=0.9,
+        )
+        _, body = format_notification("Test", novelty)
+        # Either the whole URL is present or none of it — never a broken prefix.
+        assert long_url not in body
+        assert "https://example.com/pppp" not in body
+        assert "[trimmed to fit the notification channel]" in body
+
+    def test_normal_payload_carries_no_omission_marker(self) -> None:
+        novelty = NoveltyResult(
+            has_new_info=True,
+            summary="Short",
+            key_facts=["One"],
+            source_urls=["https://example.com/a"],
+            confidence=0.9,
+        )
+        _, body = format_notification("Test", novelty)
+        assert "[trimmed to fit the notification channel]" not in body
+        assert "https://example.com/a" in body
 
     def test_body_includes_confidence_percentage(self) -> None:
         novelty = NoveltyResult(
