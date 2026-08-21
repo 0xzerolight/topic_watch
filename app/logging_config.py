@@ -23,6 +23,10 @@ class JSONFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
             "check_id": getattr(record, "check_id", "-"),
+            # The originating web request, kept separate from check_id (AUG-273):
+            # a request-triggered check logs both at once, so the two can be
+            # joined even after the check outlives the request that started it.
+            "request_id": getattr(record, "request_id", "-"),
         }
         # Include extra fields if present
         # Standard LogRecord attributes to exclude from extras
@@ -50,6 +54,7 @@ class JSONFormatter(logging.Formatter):
             "msecs",
             "taskName",
             "check_id",
+            "request_id",
         }
         extras = {k: v for k, v in record.__dict__.items() if k not in standard_attrs and not k.startswith("_")}
         if extras:

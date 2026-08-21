@@ -6,7 +6,7 @@ import logging
 
 import pytest
 
-from app.check_context import check_id_var
+from app.check_context import check_id_var, request_id_var
 from app.logging_config import JSONFormatter, setup_logging
 
 
@@ -37,6 +37,16 @@ def set_check_id():
         yield "abcd1234"
     finally:
         check_id_var.reset(token)
+
+
+@pytest.fixture
+def set_request_id():
+    """Set request_id_var to a sentinel for the test, resetting it afterwards."""
+    token = request_id_var.set("req-9999")
+    try:
+        yield "req-9999"
+    finally:
+        request_id_var.reset(token)
 
 
 class TestSetupLoggingPlainText:
@@ -160,6 +170,34 @@ class TestSetupLoggingJSON:
 
         parsed = json.loads(stream.getvalue().strip())
         assert parsed["check_id"] == "-"
+
+    def test_json_output_emits_request_id_alongside_check_id(self, monkeypatch, set_check_id, set_request_id):
+        """AUG-273: a check running inside a request must show BOTH ids on the
+        same record, not just whichever check_id's fallback preference picks."""
+        monkeypatch.setenv("TOPIC_WATCH_LOG_FORMAT", "json")
+
+        stream = io.StringIO()
+        setup_logging()
+        logging.root.handlers[0].stream = stream
+
+        logging.getLogger("test.json_parent_child").info("child pipeline log line")
+
+        parsed = json.loads(stream.getvalue().strip())
+        assert parsed["check_id"] == set_check_id
+        assert parsed["request_id"] == set_request_id
+        assert parsed["check_id"] != parsed["request_id"]
+
+    def test_json_output_request_id_dash_at_default(self, monkeypatch):
+        monkeypatch.setenv("TOPIC_WATCH_LOG_FORMAT", "json")
+
+        stream = io.StringIO()
+        setup_logging()
+        logging.root.handlers[0].stream = stream
+
+        logging.getLogger("test.json_no_request_id").info("no correlation id")
+
+        parsed = json.loads(stream.getvalue().strip())
+        assert parsed["request_id"] == "-"
 
     def test_json_timestamp_is_iso_format(self, monkeypatch):
         monkeypatch.setenv("TOPIC_WATCH_LOG_FORMAT", "json")
