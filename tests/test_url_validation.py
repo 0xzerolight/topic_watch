@@ -917,6 +917,68 @@ class TestValidateOutboundUrl:
         with pytest.raises(ValueError, match="private"):
             validate_outbound_url("http://127.0.0.1:8080/v1", purpose="the Exa API")
 
+    def test_allows_resolved_private_cleartext(self, monkeypatch) -> None:
+        """A LAN gateway that really resolves private keeps the documented http path."""
+        from app.url_validation import validate_outbound_url
+
+        _stub_resolves_to(monkeypatch, "192.168.1.50")
+        validate_outbound_url(
+            "http://ollama.lan:11434", purpose="the LLM endpoint", allow_private=True, require_https=True
+        )
+
+    def test_unresolvable_host_does_not_waive_require_https(self, monkeypatch) -> None:
+        """An absent DNS answer is not a private-address verdict.
+
+        ``allow_private`` lets an unresolvable host through the SSRF rule, and
+        folding "private" and "unresolvable" into one bool then let it skip the
+        cleartext rule as well: one DNS blip sent the provider key and the whole
+        prompt to a public endpoint over plain http.
+        """
+        from app.url_validation import validate_outbound_url
+
+        def _fails(*_args, **_kwargs):
+            raise socket.gaierror("name resolution failed")
+
+        monkeypatch.setattr(socket, "getaddrinfo", _fails)
+        with pytest.raises(ValueError, match="cleartext"):
+            validate_outbound_url(
+                "http://llm.corp.example:8000/v1",
+                purpose="The LLM base URL",
+                allow_private=True,
+                require_https=True,
+            )
+
+    def test_unresolvable_host_still_allowed_over_https(self, monkeypatch) -> None:
+        """The rule is about the transport, so https is unaffected by a DNS blip."""
+        from app.url_validation import validate_outbound_url
+
+        def _fails(*_args, **_kwargs):
+            raise socket.gaierror("name resolution failed")
+
+        monkeypatch.setattr(socket, "getaddrinfo", _fails)
+        validate_outbound_url(
+            "https://llm.corp.example:8000/v1",
+            purpose="The LLM base URL",
+            allow_private=True,
+            require_https=True,
+        )
+
+    def test_saturated_resolver_does_not_waive_require_https(self, monkeypatch) -> None:
+        """A busy pool is even less of a private-address verdict than a NXDOMAIN."""
+        from app import url_validation as uv
+
+        def _saturated(*_args, **_kwargs):
+            raise uv.ResolverSaturatedError("saturated")
+
+        monkeypatch.setattr(uv, "_getaddrinfo_bounded", _saturated)
+        with pytest.raises(ValueError, match="cleartext"):
+            uv.validate_outbound_url(
+                "http://llm.corp.example:8000/v1",
+                purpose="The LLM base URL",
+                allow_private=True,
+                require_https=True,
+            )
+
 
 class TestIsAbsoluteHttpUrl:
     """Discovered URLs need a real host, not just an http(s) scheme (AUG-182)."""

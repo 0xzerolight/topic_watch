@@ -347,9 +347,15 @@ def validate_outbound_url(
     1. the scheme must be http(s);
     2. a private/reserved/unresolvable destination is refused unless
        ``allow_private``;
-    3. with ``require_https``, a PUBLIC destination must use https — an endpoint
-       that carries our own API key must never be reached in cleartext across
-       the internet.
+    3. with ``require_https``, https is required unless the destination actually
+       RESOLVED to a private address — an endpoint that carries our own API key
+       must never be reached in cleartext across the internet.
+
+    Rule 3 turns on the resolution verdict, not on "rule 2 would have blocked
+    it". An unresolvable host is blocked by rule 2 for want of proof, and with
+    ``allow_private`` that block is waived; letting the same missing proof waive
+    rule 3 as well meant one DNS blip put a public endpoint on plain http, and
+    the caller's cache made it permanent.
 
     The two flags are what the three callers actually differ on, and both cases
     are real: ``allow_private=True`` keeps the documented local LLM path working
@@ -358,17 +364,22 @@ def validate_outbound_url(
     is off for notification targets because the webhook sender already accepts
     plain-http public endpoints and this is the SSRF gate, not a transport policy.
 
-    Performs blocking DNS via :func:`is_private_url` — call it through
+    Performs blocking DNS via :func:`_classify_url` — call it through
     ``asyncio.to_thread`` from async code.
     """
     scheme = urlparse(url).scheme
     if scheme not in ("http", "https"):
         raise ValueError(f"{purpose} must be an http(s) URL, got scheme {scheme!r}")
-    private = is_private_url(url)
-    if private and not allow_private:
+    try:
+        destination = _classify_url(url)
+    except ResolverSaturatedError:
+        # Nothing was asked of DNS, so nothing is known: the same standing as a
+        # host that would not resolve, and refused by the same rules.
+        destination = _Destination.UNRESOLVABLE
+    if destination is not _Destination.PUBLIC and not allow_private:
         raise ValueError(f"{purpose} points to a private/reserved address or could not be resolved")
-    if require_https and scheme != "https" and not private:
-        raise ValueError(f"{purpose} would be sent in cleartext to a public host; use https")
+    if require_https and scheme != "https" and destination is not _Destination.PRIVATE:
+        raise ValueError(f"{purpose} would be sent in cleartext to a host that is not private; use https")
 
 
 class PrivateRedirectError(httpx.HTTPError):
