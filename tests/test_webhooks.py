@@ -969,7 +969,11 @@ class TestWebhookTotalDeadline:
             result = await send_webhook("https://hook.example.com/x", {"key": "value"}, timeout=0.3)
         elapsed = asyncio.get_running_loop().time() - start
 
-        assert result is False
+        assert result.ok is False
+        assert result.error == "deadline exceeded"
+        # A slow endpoint is transient, so the intent is rescheduled rather than
+        # abandoned.
+        assert result.retryable is True
         # Each chunk lands inside httpx's per-operation read timeout, so only a
         # total deadline can stop this: 200 x 20ms would otherwise take 4s.
         assert elapsed < 2.0
