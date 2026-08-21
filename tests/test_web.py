@@ -1,7 +1,9 @@
 """Tests for the web UI: routes, templates, and HTMX interactions."""
 
+import io
 import json
 import logging
+import os
 import re
 import sqlite3
 from collections.abc import AsyncGenerator
@@ -1956,6 +1958,41 @@ class TestGenericExceptionHandler:
         # No traceback / internal detail leaked.
         assert "kaboom" not in response.text
         assert "RuntimeError" not in response.text
+
+    async def test_500_response_carries_x_request_id(self, error_client: httpx.AsyncClient) -> None:
+        """AUG-271: the generated 500 must not lose the correlation header."""
+        response = await error_client.get("/_test/boom", headers={"X-Request-ID": "boom-trace-1"})
+        assert response.headers.get("X-Request-ID") == "boom-trace-1"
+
+    async def test_500_log_line_carries_the_request_id(self, error_client: httpx.AsyncClient) -> None:
+        """AUG-271: the handler's own log line must carry the request id, not '-'.
+
+        request_id_var is already reset by the time ServerErrorMiddleware calls
+        this handler (RequestIdMiddleware sits inside it), so the id has to be
+        recovered from request.state and re-applied just for this log call --
+        exercised here through the real setup_logging() JSON pipeline, not a
+        synthetic LogRecord, so a regression that stops restoring the var is
+        caught for real.
+        """
+        from app.logging_config import setup_logging
+
+        saved_handlers, saved_level = logging.root.handlers[:], logging.root.level
+        try:
+            with patch.dict(os.environ, {"TOPIC_WATCH_LOG_FORMAT": "json"}):
+                setup_logging()
+            stream = io.StringIO()
+            logging.root.handlers[0].stream = stream
+
+            response = await error_client.get("/_test/boom", headers={"X-Request-ID": "boom-trace-2"})
+            assert response.status_code == 500
+
+            lines = [json.loads(line) for line in stream.getvalue().splitlines() if line.strip()]
+            unhandled = [entry for entry in lines if "Unhandled exception" in entry.get("message", "")]
+            assert unhandled, f"no 'Unhandled exception' log line found in: {lines}"
+            assert unhandled[0]["check_id"] == "boom-trace-2"
+        finally:
+            logging.root.handlers = saved_handlers
+            logging.root.setLevel(saved_level)
 
 
 # --- Global HTMX error surfacing (OVH-011) ---

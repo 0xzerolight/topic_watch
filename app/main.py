@@ -14,9 +14,9 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import Headers, MutableHeaders
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
-from starlette.responses import Response
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app import __version__ as _app_version
 from app.check_context import generate_check_id, request_id_var
@@ -55,7 +55,7 @@ REQUEST_ID_HEADER = "X-Request-ID"
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 
-class RequestIdMiddleware(BaseHTTPMiddleware):
+class RequestIdMiddleware:
     """Correlate each inbound request with an id surfaced to logs and echoed back.
 
     Reads the inbound ``X-Request-ID`` header when it matches
@@ -64,18 +64,43 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
     reflected. Sets ``request_id_var`` for the request scope (the logging filter
     surfaces it as ``check_id``) and echoes the id back in the response header
     (OVH-043).
+
+    Pure ASGI, not ``BaseHTTPMiddleware`` (AUG-271): ``BaseHTTPMiddleware``
+    runs the downstream app in a separate task and sends the buffered
+    response only after ``dispatch()`` returns, so resetting the context var
+    in its ``finally`` happened before the response — and Uvicorn's access
+    log line — were actually sent, losing correlation on exactly what this
+    middleware exists to correlate. This middleware also sits *inside*
+    ``ServerErrorMiddleware`` (added last = innermost of the user middleware
+    stack), which unwinds past every inner middleware's own ``finally``
+    before calling its registered handler — no middleware style fixes that by
+    itself, so the id is additionally stashed on ``request.state`` (same
+    ``scope``, so it survives into the ``Request`` that layer reconstructs)
+    for ``unhandled_exception_handler`` to recover.
     """
 
-    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-        inbound = request.headers.get(REQUEST_ID_HEADER, "")
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        inbound = Headers(scope=scope).get(REQUEST_ID_HEADER, "")
         request_id = inbound if REQUEST_ID_PATTERN.match(inbound) else generate_check_id()
+        scope.setdefault("state", {})["request_id"] = request_id
         token = request_id_var.set(request_id)
+
+        async def send_with_request_id(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                MutableHeaders(scope=message).append(REQUEST_ID_HEADER, request_id)
+            await send(message)
+
         try:
-            response = await call_next(request)
+            await self.app(scope, receive, send_with_request_id)
         finally:
             request_id_var.reset(token)
-        response.headers[REQUEST_ID_HEADER] = request_id
-        return response
 
 
 @asynccontextmanager
@@ -167,17 +192,32 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> HTMLR
 
     Logs the full exception server-side but never leaks the traceback or internal
     detail to the client (mirrors the two dual-render handlers above).
+
+    Starlette's ``ServerErrorMiddleware`` calls this handler *outside*
+    ``RequestIdMiddleware`` — after that middleware's own context has already
+    unwound (see its docstring) — so ``request_id_var`` cannot be trusted here.
+    Recover the id from ``request.state`` instead, restore it just for this log
+    line, and attach the response header directly: this is the one handler
+    ``send_with_request_id`` never wraps (AUG-271).
     """
-    logger.exception("Unhandled exception while handling %s %s", request.method, request.url.path)
+    request_id = getattr(request.state, "request_id", None) or "-"
+    token = request_id_var.set(request_id)
+    try:
+        logger.exception("Unhandled exception while handling %s %s", request.method, request.url.path)
+    finally:
+        request_id_var.reset(token)
 
     if _wants_json(request):
-        return JSONResponse({"detail": "Internal server error"}, status_code=500)
+        response: HTMLResponse | JSONResponse = JSONResponse({"detail": "Internal server error"}, status_code=500)
+    else:
+        from app import __version__
 
-    from app import __version__
+        response = templates.TemplateResponse(
+            request,
+            "error.html",
+            {"status_code": 500, "detail": "Something went wrong.", "version": __version__},
+            status_code=500,
+        )
 
-    return templates.TemplateResponse(
-        request,
-        "error.html",
-        {"status_code": 500, "detail": "Something went wrong.", "version": __version__},
-        status_code=500,
-    )
+    response.headers[REQUEST_ID_HEADER] = request_id
+    return response
