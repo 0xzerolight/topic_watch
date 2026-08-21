@@ -117,6 +117,39 @@ def _make_article(**overrides) -> Article:
     return Article(**defaults)
 
 
+# --- _summarize_exc ---
+
+
+class TestSummarizeExc:
+    """AUG-270: the stored stage_error summary must redact embedded URLs, not
+    just strip newlines and truncate — it is exposed via UI/API/exports and
+    copied verbatim into outbound Silence Heartbeat notification text."""
+
+    def test_redacts_url_embedded_in_exception_text(self) -> None:
+        from app.checker import _summarize_exc
+
+        secret_url = "https://user:s3cr3tpass@proxy.example.com/path?token=QUERYSECRET"
+        summary = _summarize_exc(Exception(f"Proxy connect failed: {secret_url}"))
+
+        assert "s3cr3tpass" not in summary
+        assert "QUERYSECRET" not in summary
+        assert "proxy.example.com" in summary
+        assert summary.startswith("Exception:")
+
+    def test_plain_message_without_a_url_is_unaffected(self) -> None:
+        from app.checker import _summarize_exc
+
+        summary = _summarize_exc(ValueError("bad thing happened"))
+        assert summary == "ValueError: bad thing happened"
+
+    def test_still_truncates_and_strips_newlines(self) -> None:
+        from app.checker import _summarize_exc
+
+        summary = _summarize_exc(Exception("line one\nline two" + "x" * 300), limit=50)
+        assert "\n" not in summary
+        assert len(summary) <= 50
+
+
 # --- check_topic ---
 
 
@@ -169,6 +202,55 @@ class TestCheckTopic:
         assert result.id is not None
         mock_update.assert_called_once()
         mock_send.assert_called_once()
+
+    async def test_completion_log_carries_the_check_result_id(
+        self, db_conn: sqlite3.Connection, db_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AUG-273 (judge-narrowed scope): the completion log line names the
+        durable CheckResult row, so a request's X-Request-ID (findable via the
+        check/request id fields on every log line during the check) can be
+        followed all the way to the row it produced, with no migration needed."""
+        import logging
+
+        topic = _make_topic(db_conn)
+        create_knowledge_state(
+            db_conn,
+            KnowledgeState(topic_id=topic.id, summary_text="Old summary.", token_count=20),
+        )
+        db_conn.commit()
+        settings = _make_settings()
+
+        articles = [_make_article(topic_id=topic.id)]
+        novelty = NoveltyResult(
+            has_new_info=True,
+            summary="New release date",
+            key_facts=["June 2025"],
+            source_urls=["https://example.com/article-1"],
+            confidence=0.9,
+            relevance=0.9,
+        )
+
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=articles, total_feed_entries=len(articles)),
+            ),
+            patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
+            patch(
+                "app.checker.prepare_knowledge_update",
+                new_callable=AsyncMock,
+                return_value=_make_write_result(),
+            ),
+            patch("app.checker.deliver_notification_intents", _per_url_mock(ok=True)),
+            caplog.at_level(logging.INFO, logger="app.checker"),
+        ):
+            result = await check_topic(topic, settings, db_path=db_path)
+
+        assert result.id is not None
+        completion = [r for r in caplog.records if "articles" in r.getMessage() and "new_info" in r.getMessage()]
+        assert completion, "expected the completion log line"
+        assert f"check_result_id={result.id}" in completion[0].getMessage()
 
     async def test_no_new_info_no_notification(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         """Articles found but LLM says nothing new."""
@@ -539,6 +621,33 @@ class TestCheckTopic:
         assert result.stage_error.startswith("pipeline_failed")
         row = db_conn.execute("SELECT stage_error FROM check_results WHERE id = ?", (result.id,)).fetchone()
         assert row["stage_error"].startswith("pipeline_failed")
+
+    async def test_scrape_failure_stage_error_redacts_embedded_url(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """AUG-270: stage_error is exposed via UI/API/exports and Silence Heartbeat
+        copies it verbatim into outbound notification text, so a credential-bearing
+        URL embedded in the raw exception text (a misconfigured proxy, say) must
+        not survive into the stored summary."""
+        topic = _make_topic(db_conn, name="ScrapeFailSecret")
+        settings = _make_settings()
+
+        secret_url = "https://user:s3cr3tpass@proxy.example.com/path?token=QUERYSECRET"
+        with patch(
+            "app.checker.fetch_new_articles_for_topic",
+            new_callable=AsyncMock,
+            side_effect=Exception(f"Proxy connect failed: {secret_url}"),
+        ):
+            result = await check_topic(topic, settings, db_path=db_path)
+
+        assert result.stage_error is not None
+        assert result.stage_error.startswith("pipeline_failed")
+        assert "s3cr3tpass" not in result.stage_error
+        assert "QUERYSECRET" not in result.stage_error
+        assert "proxy.example.com" in result.stage_error  # destination still identifiable
+        row = db_conn.execute("SELECT stage_error FROM check_results WHERE id = ?", (result.id,)).fetchone()
+        assert "s3cr3tpass" not in row["stage_error"]
+        assert "QUERYSECRET" not in row["stage_error"]
 
     async def test_analysis_failure_sets_stage_error(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         """An LLM analysis failure (safe-default) records stage_error='analysis_failed'.
@@ -1005,6 +1114,50 @@ class TestInitAndRetryCarryCheckId:
         finally:
             check_id_var.reset(token)
 
+    async def test_initialize_new_topic_restores_outer_check_id_on_claim_phase_failure(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """AUG-266: a raw DB failure during the claim/snapshot phase (before
+        the pipeline's own try/except exists) must still restore the caller's
+        prior check_id, not just the four explicit TopicInitRefused refusals."""
+        from app.check_context import check_id_var
+        from app.checker import initialize_new_topic
+
+        topic = _make_topic(db_conn, name="InitClaimBoom", status=TopicStatus.NEW, status_changed_at=None)
+        settings = _make_settings()
+
+        token = check_id_var.set("outer-sentinel")
+        try:
+            with (
+                patch("app.checker.get_topic", side_effect=sqlite3.OperationalError("database is locked")),
+                pytest.raises(sqlite3.OperationalError),
+            ):
+                await initialize_new_topic(topic, settings, db_path=db_path)
+            # The failure must not leak this init's generated id into whatever
+            # the caller (scheduler tick, web background task) logs next.
+            assert check_id_var.get() == "outer-sentinel"
+        finally:
+            check_id_var.reset(token)
+
+    async def test_initialize_new_topic_refusal_restores_outer_check_id(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """The existing TopicInitRefused paths still reset exactly once (no
+        double-reset RuntimeError) now that they share the claim-phase except."""
+        from app.check_context import check_id_var
+        from app.checker import TopicInitRefused, initialize_new_topic
+
+        topic = _make_topic(db_conn, name="InitRefused", status=TopicStatus.RESEARCHING, status_changed_at=None)
+        settings = _make_settings()
+
+        token = check_id_var.set("outer-sentinel")
+        try:
+            with pytest.raises(TopicInitRefused):
+                await initialize_new_topic(topic, settings, db_path=db_path)
+            assert check_id_var.get() == "outer-sentinel"
+        finally:
+            check_id_var.reset(token)
+
     async def test_initialize_new_topic_logs_carry_check_id(
         self, db_conn: sqlite3.Connection, caplog, db_path: Path
     ) -> None:  # noqa: ANN001
@@ -1087,6 +1240,115 @@ class TestInitAndRetryCarryCheckId:
 
 
 # --- initialize_new_topic ---
+
+
+class TestInitializeRebuildsFromStoredArticles:
+    """AUG-252: initialization is not a routine check and must not depend on the
+    feed having moved since the last one."""
+
+    async def test_retry_after_llm_failure_reuses_the_stored_batch(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """The batch a failed init stored is invisible to the next fetch — same-topic
+        dedup rejects every stored hash — so a Retry used to find nothing and
+        report the same error, permanently."""
+        from app.checker import initialize_new_topic
+        from app.crud import create_article
+
+        topic = _make_topic(db_conn, status=TopicStatus.ERROR)
+        create_article(db_conn, _make_article(id=None, topic_id=topic.id, content_hash="stored-1"))
+        db_conn.commit()
+
+        prepare = AsyncMock(return_value=_make_write_result())
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[], total_feed_entries=0),
+            ),
+            patch("app.checker.prepare_initial_knowledge", new=prepare),
+        ):
+            await initialize_new_topic(topic, _make_settings(), db_path=db_path)
+
+        from app.crud import get_topic
+
+        assert get_topic(db_conn, topic.id).status == TopicStatus.READY
+        passed = prepare.await_args.args[1]
+        assert [a.content_hash for a in passed] == ["stored-1"]
+
+    async def test_reinitialize_rebuilds_from_the_whole_corpus(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """A READY re-init used to replace a mature baseline with one built from
+        whatever handful of entries had appeared since the last check."""
+        from app.checker import initialize_new_topic
+        from app.crud import create_article
+
+        topic = _make_topic(db_conn, status=TopicStatus.READY)
+        for i in range(3):
+            stored = _make_article(id=None, topic_id=topic.id, content_hash=f"old-{i}")
+            stored.processed = True
+            create_article(db_conn, stored)
+        db_conn.commit()
+        fresh = [_make_article(id=None, topic_id=topic.id, content_hash="fresh-1")]
+
+        prepare = AsyncMock(return_value=_make_write_result())
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=fresh, total_feed_entries=1),
+            ),
+            patch("app.checker.prepare_initial_knowledge", new=prepare),
+        ):
+            await initialize_new_topic(topic, _make_settings(), db_path=db_path)
+
+        passed = prepare.await_args.args[1]
+        assert [a.content_hash for a in passed][0] == "fresh-1", "fresh entries lead the prompt"
+        assert {a.content_hash for a in passed} == {"fresh-1", "old-0", "old-1", "old-2"}
+
+    async def test_corpus_is_capped_and_fresh_articles_win(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
+        """An over-budget prompt drops trailing articles, so the stored ones go last."""
+        from app.checker import initialize_new_topic
+        from app.crud import create_article
+
+        topic = _make_topic(db_conn, status=TopicStatus.READY)
+        for i in range(5):
+            create_article(db_conn, _make_article(id=None, topic_id=topic.id, content_hash=f"old-{i}"))
+        db_conn.commit()
+        fresh = [_make_article(id=None, topic_id=topic.id, content_hash="fresh-1")]
+
+        prepare = AsyncMock(return_value=_make_write_result())
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=fresh, total_feed_entries=1),
+            ),
+            patch("app.checker.prepare_initial_knowledge", new=prepare),
+        ):
+            await initialize_new_topic(topic, _make_settings(max_articles_per_check=3), db_path=db_path)
+
+        passed = prepare.await_args.args[1]
+        assert len(passed) == 3
+        assert passed[0].content_hash == "fresh-1"
+
+    async def test_a_topic_with_no_articles_at_all_still_errors(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """Nothing stored and nothing fetched is still a genuine failure."""
+        from app.checker import initialize_new_topic
+        from app.crud import get_topic
+
+        topic = _make_topic(db_conn, status=TopicStatus.NEW)
+        with patch(
+            "app.checker.fetch_new_articles_for_topic",
+            new_callable=AsyncMock,
+            return_value=FetchResult(articles=[], total_feed_entries=0),
+        ):
+            await initialize_new_topic(topic, _make_settings(), db_path=db_path)
+
+        assert get_topic(db_conn, topic.id).status == TopicStatus.ERROR
 
 
 class TestInitializeNewTopicStatusChangedAt:
@@ -1669,6 +1931,93 @@ class TestCheckAllTopics:
 
         # Only the good topic produces a result; crash topic is excluded
         assert len(results) == 1
+
+
+class TestCycleIdSharedAcrossCheckAllTopics:
+    """AUG-275: check_all_topics sets one cycle_id_var for its whole run, so
+    every per-topic check and retry drain it launches can be traced back to
+    the same tick, even though each still gets its own, different check_id."""
+
+    async def test_cycle_id_set_during_per_topic_check(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
+        from app.check_context import cycle_id_var
+
+        _make_topic(db_conn, name="Topic A")
+        settings = _make_settings()
+
+        seen: dict[str, str | None] = {}
+
+        async def _capture(*_args, **_kwargs):
+            seen["cycle"] = cycle_id_var.get()
+            return FetchResult(articles=[], total_feed_entries=0)
+
+        assert cycle_id_var.get() is None
+        with patch("app.checker.fetch_new_articles_for_topic", side_effect=_capture):
+            await check_all_topics(settings, db_path=db_path)
+
+        assert seen["cycle"] is not None
+        assert seen["cycle"] != "-"
+        assert cycle_id_var.get() is None  # restored once the cycle ends
+
+    async def test_cycle_id_is_the_same_across_multiple_topics(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        from app.check_context import check_id_var, cycle_id_var
+
+        _make_topic(db_conn, name="Topic A")
+        _make_topic(db_conn, name="Topic B")
+        settings = _make_settings()
+
+        seen_cycle: list[str | None] = []
+        seen_check: list[str | None] = []
+
+        async def _capture(*_args, **_kwargs):
+            seen_cycle.append(cycle_id_var.get())
+            seen_check.append(check_id_var.get())
+            return FetchResult(articles=[], total_feed_entries=0)
+
+        with patch("app.checker.fetch_new_articles_for_topic", side_effect=_capture):
+            await check_all_topics(settings, db_path=db_path)
+
+        assert len(seen_cycle) == 2
+        # Same cycle for both topics...
+        assert seen_cycle[0] == seen_cycle[1]
+        # ...but each still gets its own, distinct check_id.
+        assert seen_check[0] != seen_check[1]
+
+    async def test_cycle_id_shared_with_notification_retry_drain(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """The retry drain runs BEFORE the per-topic loop but must still share
+        the one cycle id, since both are launched from the same cycle."""
+        from app.check_context import cycle_id_var
+
+        topic = _make_topic(db_conn, name="Topic A")
+        create_pending_notification(
+            db_conn,
+            PendingNotification(topic_id=topic.id, title="T", body="B", url="json://localhost"),
+        )
+        db_conn.commit()
+        settings = _make_settings()
+
+        seen: dict[str, str | None] = {}
+
+        async def _capture_send(title, body, url, timeout_s):  # noqa: ANN001
+            seen["retry_cycle"] = cycle_id_var.get()
+            return NotificationDelivery(url=url, ok=True)
+
+        async def _capture_fetch(*_args, **_kwargs):
+            seen["check_cycle"] = cycle_id_var.get()
+            return FetchResult(articles=[], total_feed_entries=0)
+
+        with (
+            patch("app.checker.send_single_notification", side_effect=_capture_send),
+            patch("app.checker.fetch_new_articles_for_topic", side_effect=_capture_fetch),
+        ):
+            await check_all_topics(settings, db_path=db_path)
+
+        assert seen["retry_cycle"] is not None
+        assert seen["retry_cycle"] != "-"
+        assert seen["retry_cycle"] == seen["check_cycle"]
 
 
 # --- retry_pending_notifications ---

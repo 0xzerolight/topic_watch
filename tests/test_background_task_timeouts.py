@@ -11,7 +11,7 @@ import pytest
 from app.analysis.knowledge import KnowledgeUpdatePlan
 from app.analysis.llm import TokenUsage
 from app.config import LLMSettings, NotificationSettings, Settings
-from app.crud import create_topic, get_topic
+from app.crud import create_topic, delete_topic, get_topic
 from app.database import get_connection, init_db
 from app.models import Article, Topic, TopicStatus
 from app.scraping import FetchResult
@@ -212,6 +212,134 @@ class TestRunInitTimeout:
         """If the topic has been deleted, _run_init returns without crashing."""
         settings = _make_settings()
         await _run_init(999_999, settings, db_path)  # non-existent topic id
+
+    async def test_timeout_write_spares_a_rowid_reused_replacement(self, db_path: Path, caplog) -> None:
+        """The timeout message never lands on the topic that recycled the rowid.
+
+        ``topics.id`` is a plain rowid, so a topic deleted mid-init hands its id to
+        the next INSERT. Fenced on status alone, this write replaced the
+        replacement's own error with a timeout it never had. The refusal is logged:
+        a dropped terminal write used to leave nothing to read.
+        """
+        import logging
+
+        settings = _make_settings()
+
+        conn = get_connection(db_path)
+        try:
+            topic = _make_topic(conn)
+            topic_id = topic.id
+        finally:
+            conn.close()
+
+        async def _replace_then_hang(*args, **kwargs):
+            conn = get_connection(db_path)
+            try:
+                delete_topic(conn, topic_id)
+                conn.commit()
+                replacement = create_topic(
+                    conn,
+                    Topic(
+                        name="Replacement",
+                        description="d",
+                        status=TopicStatus.ERROR,
+                        error_message="Its own failure.",
+                    ),
+                )
+                conn.commit()
+                assert replacement.id == topic_id
+            finally:
+                conn.close()
+            await asyncio.sleep(9999)
+
+        with (
+            patch("app.web.routers.background._INIT_TIMEOUT_SECONDS", 0.05),
+            patch("app.checker.fetch_new_articles_for_topic", side_effect=_replace_then_hang),
+            caplog.at_level(logging.WARNING, logger="app.web.routers.background"),
+        ):
+            await _run_init(topic_id, settings, db_path, claimed=True)
+
+        conn = get_connection(db_path)
+        try:
+            survivor = get_topic(conn, topic_id)
+        finally:
+            conn.close()
+
+        assert survivor is not None
+        assert survivor.name == "Replacement"
+        assert survivor.error_message == "Its own failure."
+        assert any("not recorded" in record.message for record in caplog.records)
+
+
+class TestRunSingleCheckTimeout:
+    """AUG-264: a single check cannot outlive the slot-eviction threshold.
+
+    ``clear_stale`` hands an over-age entry's slot to the next caller, so an
+    unbounded check stayed live with no guard and a second checker committed and
+    delivered the same finding a second time.
+    """
+
+    async def test_bound_is_below_the_handlers_eviction_threshold(self) -> None:
+        from app.web.routers.background import _CHECK_TIMEOUT_SECONDS
+
+        assert _CHECK_TIMEOUT_SECONDS < 600
+
+    async def test_hanging_check_is_cancelled_and_releases_the_guard(self, db_path: Path, caplog) -> None:
+        import logging
+
+        from app.web.routers.background import _run_single_check
+        from app.web.state import _checking_state
+
+        settings = _make_settings()
+
+        conn = get_connection(db_path)
+        try:
+            topic = _make_topic(conn, status=TopicStatus.READY)
+            topic_id = topic.id
+        finally:
+            conn.close()
+
+        async def _hang(*args, **kwargs):
+            await asyncio.sleep(9999)
+
+        _checking_state._topics.clear()
+        try:
+            with (
+                patch("app.web.routers.background._CHECK_TIMEOUT_SECONDS", 0.05),
+                patch("app.web.routers.background.check_topic", side_effect=_hang),
+                caplog.at_level(logging.ERROR, logger="app.web.routers.background"),
+            ):
+                # Outer bound so an unbounded task fails the test instead of hanging it.
+                await asyncio.wait_for(_run_single_check(topic_id, settings, db_path), timeout=5)
+        finally:
+            _checking_state._topics.clear()
+
+        assert any("timed out" in record.message.lower() for record in caplog.records)
+        assert await _checking_state.is_checking(topic_id) is False
+
+    async def test_normal_completion_runs_the_check(self, db_path: Path) -> None:
+        from app.web.routers.background import _run_single_check
+        from app.web.state import _checking_state
+
+        settings = _make_settings()
+
+        conn = get_connection(db_path)
+        try:
+            topic = _make_topic(conn, status=TopicStatus.READY)
+            topic_id = topic.id
+        finally:
+            conn.close()
+
+        _checking_state._topics.clear()
+        try:
+            with patch(
+                "app.web.routers.background.check_topic", new_callable=AsyncMock, return_value=None
+            ) as mock_check:
+                await _run_single_check(topic_id, settings, db_path)
+        finally:
+            _checking_state._topics.clear()
+
+        mock_check.assert_awaited_once()
 
 
 class TestRunCheckAllTimeout:

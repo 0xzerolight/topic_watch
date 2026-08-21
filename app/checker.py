@@ -7,6 +7,7 @@ state, sends notifications for genuine updates, and records the outcome.
 
 import asyncio
 import logging
+import re
 import secrets
 import sqlite3
 from dataclasses import dataclass, field
@@ -21,7 +22,7 @@ from app.analysis.knowledge import (
     reported_article_ids,
 )
 from app.analysis.llm import analyze_articles
-from app.check_context import check_id_var, generate_check_id
+from app.check_context import check_id_var, cycle_id_var, generate_check_id
 from app.config import Settings
 from app.crud import (
     HEARTBEAT_INTENT_KINDS,
@@ -107,9 +108,24 @@ _TERMINAL_DELIVERY_ERRORS = frozenset(
 )
 
 
+# Matches a URL-shaped substring anywhere inside free-form exception text (an
+# httpx client-construction failure against a misconfigured proxy or LLM
+# base_url, say), not just a string that is entirely a URL.
+_URL_IN_TEXT_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s\"')\]]+")
+
+
 def _summarize_exc(exc: BaseException, *, limit: int = 200) -> str:
-    """One-line, length-bounded exception summary for the stored stage_error."""
+    """One-line, length-bounded, secret-redacted exception summary for the stored stage_error.
+
+    ``stage_error`` is exposed through the UI, API and exports, and Silence
+    Heartbeat copies it verbatim into outbound notification text — so a
+    credential-bearing URL embedded in ``str(exc)`` (a scrape/orchestration
+    failure against a misconfigured proxy or LLM base_url, say) reached every
+    one of those surfaces. Redact any URL found in the text before storing it,
+    not just strip newlines and truncate (AUG-270).
+    """
     summary = f"{type(exc).__name__}: {exc}".replace("\n", " ").strip()
+    summary = _URL_IN_TEXT_RE.sub(lambda m: redact_url(m.group()), summary)
     return summary[:limit]
 
 
@@ -706,11 +722,12 @@ async def _check_topic_inner(
     await _run_heartbeat(db_path, topic, result.id, settings)
 
     logger.info(
-        "Topic '%s': %d articles, new_info=%s, notified=%s",
+        "Topic '%s': %d articles, new_info=%s, notified=%s [check_result_id=%s]",
         topic.name,
         len(articles),
         novelty.has_new_info,
         result.notification_sent,
+        result.id,
     )
 
     return result
@@ -1229,6 +1246,23 @@ async def _check_all_topics_inner(
     db_path: Path | None,
 ) -> list[CheckResult]:
     """Run one whole check cycle (caller owns the whole-cycle gate)."""
+    # One id for the whole cycle, left set for its full duration: the retry
+    # drain below and every per-topic check_topic each set their OWN
+    # check_id_var on top of this, but none of them touch cycle_id_var — so
+    # every record any of them logs still carries the tick that launched it,
+    # and a noisy or failed cycle can be reconstructed as one unit (AUG-275).
+    cycle_token = cycle_id_var.set(generate_check_id())
+    try:
+        return await _run_check_cycle(settings, db_path)
+    finally:
+        cycle_id_var.reset(cycle_token)
+
+
+async def _run_check_cycle(
+    settings: Settings,
+    db_path: Path | None,
+) -> list[CheckResult]:
+    """The check-all cycle body (caller has set cycle_id_var)."""
 
     async def _drain_retries() -> None:
         """Retry failed deliveries from previous cycles.
@@ -1300,6 +1334,43 @@ async def _check_all_topics_inner(
         sum(1 for r in results if r.has_new_info),
     )
     return results
+
+
+def _init_corpus(
+    db_path: Path | None,
+    topic_id: int,
+    fetched: list[Article],
+    max_articles: int,
+) -> list[Article]:
+    """The articles a baseline is built from: this fetch plus what is already stored.
+
+    ``fetch_new_articles_for_topic`` returns only entries the topic has never seen
+    — that is what makes a routine check cheap. Initialization is not a routine
+    check. A Retry after the LLM failed re-fetches feeds that have not moved,
+    gets nothing back, and reports the same error again while the batch it failed
+    on sits unprocessed in the database; a Re-initialize on a mature topic
+    rebuilds its whole understanding from whatever handful of entries appeared
+    since the last check and records that as the new baseline (AUG-252).
+
+    Stored rows are appended newest-first behind the fresh ones and the whole
+    batch is capped at ``max_articles``, so an over-budget prompt is fitted by
+    dropping the oldest stored articles, never the new ones. Marking already-
+    processed rows processed again is a no-op.
+    """
+    seen = {article.id for article in fetched if article.id is not None}
+    corpus = list(fetched)
+    if len(corpus) >= max_articles:
+        return corpus[:max_articles]
+
+    with get_db(db_path) as conn:
+        stored = list_articles_for_topic(conn, topic_id, limit=max_articles)
+    for article in stored:
+        if len(corpus) >= max_articles:
+            break
+        if article.id is None or article.id in seen:
+            continue
+        corpus.append(article)
+    return corpus
 
 
 def _commit_init_transition(
@@ -1412,6 +1483,13 @@ async def initialize_new_topic(
                 error_message=error_message,
                 init_attempts=init_attempts,
                 expected_status=TopicStatus.RESEARCHING,
+                # ``topics.id`` is a recyclable rowid and a newly created topic is
+                # already RESEARCHING, so the status fence alone matches the
+                # replacement that took the deleted topic's id: this initializer's
+                # ERROR landed on a stranger, whose own init then lost the fence in
+                # ``_commit_init_transition`` and rolled its knowledge back
+                # (AUG-020/TW-AUD-007). Fence to the incarnation that was claimed.
+                generation=topic.generation,
             )
             conn.commit()
         if not won:
@@ -1430,28 +1508,35 @@ async def initialize_new_topic(
     # (AUG-243). ``None`` when the caller claimed on our behalf and we never saw it.
     prior_status: TopicStatus | None = None
 
-    if not claimed:
-        # One conditional UPDATE decides who initializes. Reading the status and
-        # then writing RESEARCHING let two initializers both pass (AUG-288).
-        with get_db(db_path) as conn:
-            live = get_topic(conn, topic_id)
-            if live is None:
-                check_id_var.reset(token)
-                raise TopicInitRefused(f"Topic id={topic_id} no longer exists")
-            if live.status == TopicStatus.RESEARCHING:
-                check_id_var.reset(token)
-                raise TopicInitRefused(f"Topic '{live.name}' is already being initialized")
-            if not live.is_active:
-                check_id_var.reset(token)
-                raise TopicInitRefused(f"Topic '{live.name}' is paused; enable it before initializing")
-            if not claim_topic_for_init(conn, topic_id, live.status):
-                check_id_var.reset(token)
-                raise TopicInitRefused(f"Topic '{live.name}' was claimed by another initializer")
-            prior_status = live.status
-        topic.status = TopicStatus.RESEARCHING
+    try:
+        if not claimed:
+            # One conditional UPDATE decides who initializes. Reading the status and
+            # then writing RESEARCHING let two initializers both pass (AUG-288).
+            with get_db(db_path) as conn:
+                live = get_topic(conn, topic_id)
+                if live is None:
+                    raise TopicInitRefused(f"Topic id={topic_id} no longer exists")
+                if live.status == TopicStatus.RESEARCHING:
+                    raise TopicInitRefused(f"Topic '{live.name}' is already being initialized")
+                if not live.is_active:
+                    raise TopicInitRefused(f"Topic '{live.name}' is paused; enable it before initializing")
+                if not claim_topic_for_init(conn, topic_id, live.status):
+                    raise TopicInitRefused(f"Topic '{live.name}' was claimed by another initializer")
+                prior_status = live.status
+            topic.status = TopicStatus.RESEARCHING
 
-    with get_db(db_path) as conn:
-        snapshot = _snapshot_topic(conn, topic_id)
+        with get_db(db_path) as conn:
+            snapshot = _snapshot_topic(conn, topic_id)
+    except Exception:
+        # Covers both the explicit TopicInitRefused refusals above and any
+        # unanticipated failure from get_topic/claim_topic_for_init/get_db
+        # itself (a locked DB, say). Previously only the four refusals reset
+        # the token before this try existed; a raw DB error here bypassed it
+        # and leaked this init's id into whatever the caller logs next
+        # (AUG-266).
+        check_id_var.reset(token)
+        raise
+
     if snapshot is None:
         logger.warning("Topic id=%d no longer exists; skipping initialization", topic_id)
         check_id_var.reset(token)
@@ -1472,7 +1557,7 @@ async def initialize_new_topic(
             feed_backoff_cap_hours=settings.feed_backoff_cap_hours,
             exa_settings=settings.exa,
         )
-        articles = fetch_result.articles
+        articles = _init_corpus(db_path, topic_id, fetch_result.articles, settings.max_articles_per_check)
 
         if not articles:
             # OVH-001: during a NEW-topic re-init (init_attempts>0) every prior

@@ -247,6 +247,38 @@ class TestCmdDoctor:
         assert "configuration: unavailable" in out
         assert f"version: {__version__}" in out
 
+    def test_config_load_failure_never_echoes_exception_text(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """AUG-009: str(exc) must never reach this "safe to paste" report — a
+        malformed api_key/URL line can reproduce the secret in the exception text."""
+        sentinel = "sk-SUPER-SECRET-TOKEN-12345"
+        with (
+            patch("app.cli.load_settings", side_effect=RuntimeError(f"invalid value: {sentinel}")),
+            patch("app.cli._in_docker", return_value=False),
+        ):
+            _cmd_doctor()
+        out = capsys.readouterr().out
+        assert sentinel not in out
+        assert "configuration: unavailable" in out
+        assert "RuntimeError" in out
+
+    def test_config_load_failure_reports_yaml_location_not_snippet(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """A YAML syntax error's line/column may print; its source snippet (which
+        can carry a secret straight off the offending line) must not (AUG-009)."""
+        import yaml
+
+        secret_line = "  api_key: sk-LEAKED-IF-SNIPPET-PRINTED"
+        mark = yaml.Mark("data/config.yml", 0, 4, 10, secret_line, 12)
+        err = yaml.scanner.ScannerError(problem="mapping values are not allowed here", problem_mark=mark)
+        with (
+            patch("app.cli.load_settings", side_effect=err),
+            patch("app.cli._in_docker", return_value=False),
+        ):
+            _cmd_doctor()
+        out = capsys.readouterr().out
+        assert "sk-LEAKED-IF-SNIPPET-PRINTED" not in out
+        assert "mapping values are not allowed here" not in out
+        assert "line 5, column 11" in out
+
     def test_database_path_and_schema_version(self, capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
         db_path = _real_db(tmp_path)
         out = self._run(_make_settings(db_path=str(db_path)), capsys)

@@ -6,7 +6,7 @@ import logging
 
 import pytest
 
-from app.check_context import CheckIdFilter, check_id_var, generate_check_id
+from app.check_context import CheckIdFilter, check_id_var, generate_check_id, request_id_var
 
 
 def test_generate_check_id_returns_8_char_hex():
@@ -133,5 +133,59 @@ def test_check_id_appears_in_formatted_log_output():
         # Cleanup handler
         test_logger.removeHandler(handler)
         test_logger.propagate = True
+
+    ctx.run(run)
+
+
+# --- request_id / check_id parent-child edge (AUG-273) ---
+
+
+def test_filter_sets_request_id_independently_of_check_id():
+    """A record carries request_id straight from request_id_var, not folded
+    into check_id's preference order."""
+    ctx = contextvars.copy_context()
+
+    def run():
+        request_id_var.set("req-parent-1")
+        # No check_id_var set: this is a plain request-tier log line.
+        record = logging.LogRecord(
+            name="test", level=logging.INFO, pathname="", lineno=0, msg="m", args=(), exc_info=None
+        )
+        CheckIdFilter().filter(record)
+        assert record.check_id == "req-parent-1"  # falls back, as before
+        assert record.request_id == "req-parent-1"
+
+    ctx.run(run)
+
+
+def test_filter_keeps_both_ids_when_check_runs_inside_a_request():
+    """The parent-child edge: a check triggered synchronously inside a web
+    request has check_id_var set on top of the still-live request_id_var, so
+    every record the child pipeline logs must carry both (AUG-273) — before
+    the fix, check_id's fallback preference meant no record showed both."""
+    ctx = contextvars.copy_context()
+
+    def run():
+        request_id_var.set("req-parent-2")
+        check_id_var.set("check-child-2")
+        record = logging.LogRecord(
+            name="test", level=logging.INFO, pathname="", lineno=0, msg="m", args=(), exc_info=None
+        )
+        CheckIdFilter().filter(record)
+        assert record.check_id == "check-child-2"
+        assert record.request_id == "req-parent-2"
+
+    ctx.run(run)
+
+
+def test_filter_request_id_dash_when_unset():
+    ctx = contextvars.copy_context()
+
+    def run():
+        record = logging.LogRecord(
+            name="test", level=logging.INFO, pathname="", lineno=0, msg="m", args=(), exc_info=None
+        )
+        CheckIdFilter().filter(record)
+        assert record.request_id == "-"
 
     ctx.run(run)

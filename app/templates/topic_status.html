@@ -5,6 +5,15 @@
     <p><a href="/" role="button" class="contrast outline" style="font-size: 0.875rem;">Back to Dashboard</a></p>
 </article>
 
+{% elif topic.status.value == "new" and not topic.is_active %}
+{# The gradual initializer skips paused topics, so there is nothing to wait for:
+   promising an init on the next cycle, and polling for it every 30s, was a
+   promise the scheduler would never keep (AUG-140). #}
+<article>
+    <header>Initialization On Hold</header>
+    <p>Monitoring is disabled for this topic, so it will not be initialized. Enable monitoring to have its initial knowledge state built.</p>
+</article>
+
 {% elif topic.status.value == "new" %}
 {# Slow poll (scheduler inits at most 1 NEW topic per minute). ?since lets the
    endpoint answer with HX-Refresh once the status moves on, so the h1 badge and
@@ -52,6 +61,19 @@
         </small>
     </summary>
     <article>
+        {# The stored summary answers the question this topic asked when it was
+           written. An edit to the name, description, feeds or novelty
+           instruction changes the question and leaves the baseline behind, so
+           say so rather than let novelty be judged against the old scope with
+           nothing on screen (TW-AUD-017). The next check that finds new
+           information rebuilds the state against the current scope. #}
+        {% if knowledge_basis_stale %}
+        <p class="rev-note"><small>
+            This knowledge state was built before the topic's name, description, feeds or
+            novelty instruction were last changed. It is updated against the current
+            settings on the next check that finds new information.
+        </small></p>
+        {% endif %}
         {% set usage_pct = (knowledge.token_count / knowledge_state_max_tokens * 100) | int if knowledge_state_max_tokens > 0 else 0 %}
         <div class="token-meter" style="margin-bottom: 1em;">
             <span class="token-meter-label">

@@ -84,9 +84,13 @@ class CheckingState:
     async def clear_stale(self, timeout_seconds: float) -> list[int]:
         """Remove topic entries older than timeout_seconds. Returns cleared IDs.
 
-        Safe now that releases are token-checked: evicting a still-running owner
-        costs that owner nothing but its slot, and its later release cannot touch
-        whoever took the slot next.
+        Eviction frees the slot for the next caller, so it is only ever correct
+        against an entry whose owner is already gone. Token-checked releases make
+        the abandoned owner's later release harmless, but they say nothing about
+        the second checker the eviction admits alongside a still-running one —
+        two checks of one topic both commit and both send. What keeps this safe is
+        that every task holding a slot is bounded below the thresholds callers
+        pass here (``app.web.routers.background``).
         """
         now = time.monotonic()
         async with self._lock:

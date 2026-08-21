@@ -688,6 +688,83 @@ class TestFetchFeed:
         assert any("entry" in r.getMessage().lower() for r in caplog.records)
 
 
+class TestFeedFetchLogsRedactCredentials:
+    """AUG-181: every failure-path log line must redact the feed URL, not just
+    the already-fixed private-URL branch. A MANUAL feed URL may carry userinfo
+    or a signed query token; none of it may reach a log line verbatim."""
+
+    _SECRET_URL = "https://user:s3cr3tpass@example.com/feed?token=QUERYSECRET"
+
+    async def test_http_error_log_redacted(self, caplog: pytest.LogCaptureFixture) -> None:
+        transport = _mock_transport({"example.com": (500, "Server Error")})
+        with caplog.at_level("WARNING"):
+            async with httpx.AsyncClient(transport=transport) as client:
+                await fetch_feed(self._SECRET_URL, client, max_attempts=1)
+
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "s3cr3tpass" not in joined
+        assert "QUERYSECRET" not in joined
+        assert "example.com" in joined  # still identifies the destination
+
+    async def test_timeout_log_redacted(self, caplog: pytest.LogCaptureFixture) -> None:
+        def timeout_handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("timeout")
+
+        transport = httpx.MockTransport(timeout_handler)
+        with caplog.at_level("WARNING"):
+            async with httpx.AsyncClient(transport=transport) as client:
+                await fetch_feed(self._SECRET_URL, client, max_attempts=1)
+
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "s3cr3tpass" not in joined
+        assert "QUERYSECRET" not in joined
+
+    async def test_network_error_log_redacted(self, caplog: pytest.LogCaptureFixture) -> None:
+        def error_handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("connection refused")
+
+        transport = httpx.MockTransport(error_handler)
+        with caplog.at_level("WARNING"):
+            async with httpx.AsyncClient(transport=transport) as client:
+                await fetch_feed(self._SECRET_URL, client, max_attempts=1)
+
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "s3cr3tpass" not in joined
+        assert "QUERYSECRET" not in joined
+
+    async def test_bozo_parse_error_log_redacted(self, caplog: pytest.LogCaptureFixture) -> None:
+        transport = _mock_transport({"example.com": (200, "not xml at all {{{")})
+        with caplog.at_level("WARNING"):
+            async with httpx.AsyncClient(transport=transport) as client:
+                await fetch_feed(self._SECRET_URL, client)
+
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "s3cr3tpass" not in joined
+        assert "QUERYSECRET" not in joined
+
+    async def test_malformed_entry_log_redacted(self, caplog: pytest.LogCaptureFixture) -> None:
+        from app.scraping import rss
+
+        real_parse_entry = rss._parse_entry
+
+        def flaky_parse_entry(raw_entry: dict, source_feed: str) -> FeedEntry | None:
+            if raw_entry.get("title") == "Article One":
+                raise ValueError("boom: malformed entry")
+            return real_parse_entry(raw_entry, source_feed)
+
+        transport = _mock_transport({"example.com/feed": (200, _SAMPLE_RSS)})
+        with (
+            patch("app.scraping.rss._parse_entry", side_effect=flaky_parse_entry),
+            caplog.at_level("WARNING"),
+        ):
+            async with httpx.AsyncClient(transport=transport) as client:
+                await fetch_feed(self._SECRET_URL, client)
+
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "s3cr3tpass" not in joined
+        assert "QUERYSECRET" not in joined
+
+
 # ============================================================
 # TestFeedParserInputs (TW-AUD-019)
 # ============================================================

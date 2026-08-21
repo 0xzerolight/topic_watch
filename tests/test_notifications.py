@@ -6,6 +6,7 @@ behaviour (OVH-017), which lives in ``app.checker.retry_pending_notifications``.
 
 import asyncio
 import collections
+import logging
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -470,9 +471,20 @@ class TestRedactUrl:
     segment for context while still dropping userinfo/query/long secret segments.
     """
 
-    def test_keeps_scheme_and_host(self) -> None:
+    def test_native_apprise_scheme_fingerprints_not_host(self) -> None:
+        # slack:// is a native Apprise scheme whose authority commonly carries
+        # a token (e.g. slack://TokenA/TokenB/TokenC/Channel); AUG-248 stopped
+        # keeping any non-HTTP scheme's host verbatim.
         red = redact_url("slack://host.example.com/path")
-        assert red.startswith("slack://host.example.com")
+        assert red.startswith("slack://")
+        assert "host.example.com" not in red
+
+    def test_generic_http_alias_still_keeps_host(self) -> None:
+        # json/jsons/form/forms/xml/xmls resolve to a real, SSRF-gated http(s)
+        # request (app.notifications._generic_http_target) — their host is a
+        # genuine server address, not a token, so it stays visible.
+        red = redact_url("json://host.example.com/path")
+        assert red.startswith("json://host.example.com")
 
     def test_strips_userinfo_and_token(self) -> None:
         # tgram://<bot-token>@... — the token must not survive redaction.
@@ -749,3 +761,33 @@ class TestGenericHttpNotifierSsrfGate:
         mock_apprise.return_value = instance
 
         assert _deliver_one("t", "b", "ntfy://192.168.1.5/alerts").ok is True
+
+
+class TestAppriseInternalLoggingSuppressed:
+    """AUG-268: Apprise's own plugin constructors log rejected credentials at
+    WARNING/ERROR through the "apprise" logger before app.notifications ever
+    calls redact_url() — using the REAL Apprise library (no ap.add mock) so its
+    own logging actually fires.
+    """
+
+    def test_malformed_target_secret_never_reaches_root_logger(self, caplog) -> None:  # noqa: ANN001
+        import logging as _logging
+
+        from app.notifications import _deliver_one
+
+        sentinel = "SUPERSECRETBOTTOKENVALUE"
+        # A syntactically-invalid Telegram bot token: Apprise's own plugin
+        # factory rejects it and logs the raw URL (including the token) via
+        # logging.getLogger("apprise") before returning failure to us.
+        with caplog.at_level(_logging.DEBUG):
+            result = _deliver_one("t", "b", f"tgram://{sentinel}/chat_id")
+
+        assert result.ok is False
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert sentinel not in joined
+
+    def test_apprise_logger_has_no_propagating_handler(self) -> None:
+        """Pin the mechanism directly: the "apprise" logger must never hand
+        records to the root logger/handlers app.notifications does not control."""
+        apprise_logger = logging.getLogger("apprise")
+        assert apprise_logger.propagate is False

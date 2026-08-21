@@ -146,6 +146,76 @@ class TestStartStopScheduler:
         finally:
             stop_scheduler()
 
+    async def test_start_does_not_capture_caller_request_id(self, monkeypatch) -> None:
+        """AUG-272: AsyncIOScheduler.start() schedules its first wakeup via the
+        event loop, which copies whatever contextvars.Context is active at that
+        call -- so calling start_scheduler() synchronously from the first-run
+        setup POST leaked that request's id into every later scheduler tick.
+        Spy on the real AsyncIOScheduler.start() to see exactly what
+        request_id_var reads at the moment APScheduler captures its context.
+        """
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+        from app.check_context import request_id_var
+
+        captured: dict[str, str | None] = {}
+        real_start = AsyncIOScheduler.start
+
+        def spy_start(self, *args, **kwargs):
+            captured["request_id"] = request_id_var.get()
+            return real_start(self, *args, **kwargs)
+
+        monkeypatch.setattr(AsyncIOScheduler, "start", spy_start)
+
+        token = request_id_var.set("setup-request-123")
+        try:
+            settings = _make_settings()
+            start_scheduler(settings)
+        finally:
+            stop_scheduler()
+            request_id_var.reset(token)
+
+        assert captured["request_id"] is None
+
+    async def test_start_does_not_capture_caller_check_id(self, monkeypatch) -> None:
+        """Same as above for check_id_var (AUG-272)."""
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+        from app.check_context import check_id_var
+
+        captured: dict[str, str | None] = {}
+        real_start = AsyncIOScheduler.start
+
+        def spy_start(self, *args, **kwargs):
+            captured["check_id"] = check_id_var.get()
+            return real_start(self, *args, **kwargs)
+
+        monkeypatch.setattr(AsyncIOScheduler, "start", spy_start)
+
+        token = check_id_var.set("leftover-check-456")
+        try:
+            settings = _make_settings()
+            start_scheduler(settings)
+        finally:
+            stop_scheduler()
+            check_id_var.reset(token)
+
+        assert captured["check_id"] is None
+
+    async def test_start_restores_callers_request_id_after_returning(self) -> None:
+        """The clear is scoped to scheduler.start() only -- the caller's own
+        context must be intact once start_scheduler() returns."""
+        from app.check_context import request_id_var
+
+        token = request_id_var.set("caller-context-789")
+        try:
+            settings = _make_settings()
+            start_scheduler(settings)
+            assert request_id_var.get() == "caller-context-789"
+        finally:
+            stop_scheduler()
+            request_id_var.reset(token)
+
     async def test_check_job_reads_live_settings_from_app(self) -> None:
         """OVH-015/036: when wired to an app, the tick reads settings from app.state."""
         from types import SimpleNamespace
@@ -538,6 +608,55 @@ class TestGradualInitIsBounded:
             refreshed = get_topic(conn, topic.id)
         assert refreshed.status == TopicStatus.ERROR
         assert refreshed.error_message == "Research timed out. Click Retry."
+
+    async def test_timeout_write_spares_a_rowid_reused_replacement(self, tmp_path: Path, caplog) -> None:
+        """A topic deleted mid-init hands its rowid on; the timeout must not follow it."""
+        import logging
+
+        from app.crud import create_topic, delete_topic, get_topic
+        from app.database import get_db, init_db
+        from app.models import Topic, TopicStatus
+        from app.scheduler import _init_new_topics
+
+        db_path = tmp_path / "bounded_recycled.db"
+        init_db(db_path)
+        with get_db(db_path) as conn:
+            topic = create_topic(conn, Topic(name="Hangs", description="d", status=TopicStatus.NEW))
+            conn.commit()
+        topic_id = topic.id
+
+        async def _replace_then_hang(*args, **kwargs):
+            import asyncio
+
+            with get_db(db_path) as conn:
+                delete_topic(conn, topic_id)
+                conn.commit()
+                replacement = create_topic(
+                    conn,
+                    Topic(
+                        name="Replacement",
+                        description="d",
+                        status=TopicStatus.ERROR,
+                        error_message="Its own failure.",
+                    ),
+                )
+                conn.commit()
+                assert replacement.id == topic_id
+            await asyncio.sleep(9999)
+
+        with (
+            patch("app.scheduler._INIT_TIMEOUT_SECONDS", 0.05),
+            patch("app.checker.fetch_new_articles_for_topic", side_effect=_replace_then_hang),
+            caplog.at_level(logging.WARNING, logger="app.scheduler"),
+        ):
+            await _init_new_topics(_make_settings(), db_path)
+
+        with get_db(db_path) as conn:
+            survivor = get_topic(conn, topic_id)
+        assert survivor.name == "Replacement"
+        assert survivor.error_message == "Its own failure."
+        # The refused fence is logged rather than dropped silently.
+        assert any("not recorded" in record.message for record in caplog.records)
 
 
 class TestLifespanShutdown:

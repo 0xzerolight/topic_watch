@@ -1,0 +1,11 @@
+{# Terminal body for a revision that was pruned between page load and expand.
+
+   The timeline emits one lazy diff URL per retained revision, so a knowledge
+   update at the retention cap can delete the oldest displayed row while the page
+   is still open. Returning 404 here fires the global HTTP-error toast and offers
+   a retry against a URL that will never come back (AUG-318). This says what
+   happened and ends the interaction — no retry button, no further request. #}
+<p><small class="quiet">
+    This revision has since been pruned — only the newest revisions are kept.
+    Reload the page for the current history.
+</small></p>
