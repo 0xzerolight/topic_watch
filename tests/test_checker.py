@@ -2272,36 +2272,80 @@ class TestSourcesFailedSurfacing:
         assert updated.error_message == "No source attempted during initialization (2 feed(s) in backoff)"
 
 
+def _heartbeat_sender(*, ok: bool = True, error: str | None = None, fails: tuple[str, ...] = ()) -> AsyncMock:
+    """AsyncMock for app.checker.send_single_notification, one call per target.
+
+    Patched at the per-target send rather than at ``deliver_notification_intents``
+    so the intent rows reach their real terminal status: the recovery notice is
+    addressed from the ledger of alerts that actually went out, so a stub that
+    leaves every row 'pending' would test nothing.
+    """
+
+    async def _send(title: str, body: str, url: str, timeout_s: float) -> NotificationDelivery:
+        if url in fails:
+            return NotificationDelivery(url=url, ok=False, error=error or "unreachable")
+        return NotificationDelivery(url=url, ok=ok, error=None if ok else (error or "unreachable"))
+
+    return AsyncMock(side_effect=_send)
+
+
+def _titles(send: AsyncMock) -> list[str]:
+    return [call.args[0] for call in send.await_args_list]
+
+
+def _intent_rows(conn: sqlite3.Connection, topic_id: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT kind, status, url, latch_value, title FROM pending_notifications WHERE topic_id = ? ORDER BY id",
+        (topic_id,),
+    ).fetchall()
+
+
 class TestSilenceHeartbeatPipeline:
     """Heartbeat behaviour driven end-to-end through check_topic."""
 
-    async def _failing_check(self, db_conn: sqlite3.Connection, topic: Topic, send, *, threshold: int = 3):
-        settings = _make_settings(silence_heartbeat_checks=threshold)
+    async def _failing_check(
+        self,
+        db_conn: sqlite3.Connection,
+        topic: Topic,
+        send,
+        *,
+        threshold: int = 3,
+        settings: Settings | None = None,
+    ):
+        settings = settings or _make_settings(silence_heartbeat_checks=threshold)
         with (
             patch(
                 "app.checker.fetch_new_articles_for_topic",
                 new_callable=AsyncMock,
                 return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=1, feeds_failed=1),
             ),
-            patch("app.checker.deliver_notification_intents", send),
+            patch("app.checker.send_single_notification", send),
         ):
             return await check_topic(get_topic(db_conn, topic.id), settings, db_path=conn_db_path(db_conn))
 
-    async def _healthy_empty_check(self, db_conn: sqlite3.Connection, topic: Topic, send, *, threshold: int = 3):
-        settings = _make_settings(silence_heartbeat_checks=threshold)
+    async def _healthy_empty_check(
+        self,
+        db_conn: sqlite3.Connection,
+        topic: Topic,
+        send,
+        *,
+        threshold: int = 3,
+        settings: Settings | None = None,
+    ):
+        settings = settings or _make_settings(silence_heartbeat_checks=threshold)
         with (
             patch(
                 "app.checker.fetch_new_articles_for_topic",
                 new_callable=AsyncMock,
                 return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=1, feeds_failed=0),
             ),
-            patch("app.checker.deliver_notification_intents", send),
+            patch("app.checker.send_single_notification", send),
         ):
             return await check_topic(get_topic(db_conn, topic.id), settings, db_path=conn_db_path(db_conn))
 
     async def test_alert_fires_once_at_the_threshold(self, db_conn: sqlite3.Connection) -> None:
         topic = _make_topic(db_conn)
-        send = _per_url_mock(ok=True)
+        send = _heartbeat_sender()
 
         for _ in range(2):
             await self._failing_check(db_conn, topic, send)
@@ -2309,7 +2353,7 @@ class TestSilenceHeartbeatPipeline:
 
         await self._failing_check(db_conn, topic, send)
         assert send.await_count == 1
-        assert "sources failing" in send.await_args.args[0][0].title
+        assert "sources failing" in _titles(send)[0]
         assert get_topic(db_conn, topic.id).heartbeat_alerted_at is not None
 
         for _ in range(3):
@@ -2319,7 +2363,7 @@ class TestSilenceHeartbeatPipeline:
     async def test_fetch_exception_path_never_alerts_on_the_sources(self, db_conn: sqlite3.Connection) -> None:
         """A pipeline crash is recorded, but it is not evidence about the feeds (AUG-133)."""
         topic = _make_topic(db_conn)
-        send = _per_url_mock(ok=True)
+        send = _heartbeat_sender()
         settings = _make_settings(silence_heartbeat_checks=2)
         for _ in range(3):
             with (
@@ -2328,7 +2372,7 @@ class TestSilenceHeartbeatPipeline:
                     new_callable=AsyncMock,
                     side_effect=RuntimeError("boom"),
                 ),
-                patch("app.checker.deliver_notification_intents", send),
+                patch("app.checker.send_single_notification", send),
             ):
                 result = await check_topic(get_topic(db_conn, topic.id), settings, db_path=conn_db_path(db_conn))
         assert result.stage_error.startswith("pipeline_failed")
@@ -2338,7 +2382,7 @@ class TestSilenceHeartbeatPipeline:
     async def test_pipeline_crash_does_not_clear_an_announced_outage(self, db_conn: sqlite3.Connection) -> None:
         """The latch survives a check that never reached the sources."""
         topic = _make_topic(db_conn)
-        send = _per_url_mock(ok=True)
+        send = _heartbeat_sender()
         for _ in range(3):
             await self._failing_check(db_conn, topic, send)
         assert send.await_count == 1
@@ -2349,7 +2393,7 @@ class TestSilenceHeartbeatPipeline:
                 new_callable=AsyncMock,
                 side_effect=RuntimeError("boom"),
             ),
-            patch("app.checker.deliver_notification_intents", send),
+            patch("app.checker.send_single_notification", send),
         ):
             await check_topic(
                 get_topic(db_conn, topic.id),
@@ -2361,14 +2405,14 @@ class TestSilenceHeartbeatPipeline:
 
     async def test_recovery_notice_after_the_outage(self, db_conn: sqlite3.Connection) -> None:
         topic = _make_topic(db_conn)
-        send = _per_url_mock(ok=True)
+        send = _heartbeat_sender()
         for _ in range(3):
             await self._failing_check(db_conn, topic, send)
         assert send.await_count == 1
 
         await self._healthy_empty_check(db_conn, topic, send)
         assert send.await_count == 2
-        assert "recovered" in send.await_args.args[0][0].title
+        assert "recovered" in _titles(send)[1]
         assert get_topic(db_conn, topic.id).heartbeat_alerted_at is None
 
         await self._healthy_empty_check(db_conn, topic, send)
@@ -2377,7 +2421,7 @@ class TestSilenceHeartbeatPipeline:
     async def test_recovery_on_the_main_analysis_path(self, db_conn: sqlite3.Connection) -> None:
         """A check that reaches analysis also clears the outage."""
         topic = _make_topic(db_conn)
-        send = _per_url_mock(ok=True)
+        send = _heartbeat_sender()
         for _ in range(3):
             await self._failing_check(db_conn, topic, send)
         assert send.await_count == 1
@@ -2391,16 +2435,16 @@ class TestSilenceHeartbeatPipeline:
                 return_value=FetchResult(articles=[_make_article()], total_feed_entries=1),
             ),
             patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
-            patch("app.checker.deliver_notification_intents", send),
+            patch("app.checker.send_single_notification", send),
         ):
             await check_topic(get_topic(db_conn, topic.id), settings, db_path=conn_db_path(db_conn))
 
         assert send.await_count == 2
-        assert "recovered" in send.await_args.args[0][0].title
+        assert "recovered" in _titles(send)[1]
 
     async def test_disabled_by_zero(self, db_conn: sqlite3.Connection) -> None:
         topic = _make_topic(db_conn)
-        send = _per_url_mock(ok=True)
+        send = _heartbeat_sender()
         for _ in range(4):
             await self._failing_check(db_conn, topic, send, threshold=0)
         assert send.await_count == 0
@@ -2409,7 +2453,7 @@ class TestSilenceHeartbeatPipeline:
     async def test_disabling_clears_an_outstanding_latch_silently(self, db_conn: sqlite3.Connection) -> None:
         """Turning the feature off must reset state, not park a phantom recovery."""
         topic = _make_topic(db_conn)
-        send = _per_url_mock(ok=True)
+        send = _heartbeat_sender()
         for _ in range(3):
             await self._failing_check(db_conn, topic, send)
         assert send.await_count == 1
@@ -2425,7 +2469,7 @@ class TestSilenceHeartbeatPipeline:
 
     async def test_failed_heartbeat_delivery_is_queued_and_drains(self, db_conn: sqlite3.Connection) -> None:
         topic = _make_topic(db_conn)
-        send = _per_url_mock(ok=False, error="unreachable")
+        send = _heartbeat_sender(ok=False, error="unreachable")
         for _ in range(3):
             await self._failing_check(db_conn, topic, send)
 
@@ -2434,12 +2478,15 @@ class TestSilenceHeartbeatPipeline:
         ).fetchall()
         assert len(rows) == 1
         assert "sources failing" in rows[0]["title"]
-        # The intent carries its heartbeat kind, so A5's revocation can find it.
+        # The intent carries its heartbeat kind, so the revocation can find it.
         assert rows[0]["kind"] == "heartbeat_alert"
         assert rows[0]["status"] == "pending"
-        # The latch is claimed before the send, so a dead channel never re-alerts.
+        # The latch is claimed with the intent, so a dead channel never re-alerts.
         assert get_topic(db_conn, topic.id).heartbeat_alerted_at is not None
 
+        # The failed attempt scheduled a backoff; let that window elapse.
+        db_conn.execute("UPDATE pending_notifications SET next_attempt_at = NULL WHERE topic_id = ?", (topic.id,))
+        db_conn.commit()
         with patch("app.checker.send_single_notification", side_effect=_ok_send):
             await retry_pending_notifications(db_conn, _make_settings(silence_heartbeat_checks=3))
         remaining = db_conn.execute(
@@ -2466,7 +2513,7 @@ class TestSilenceHeartbeatPipeline:
     async def test_non_ready_topic_never_heartbeats(self, db_conn: sqlite3.Connection) -> None:
         """A non-READY check must neither alert nor claim recovery."""
         topic = _make_topic(db_conn)
-        send = _per_url_mock(ok=True)
+        send = _heartbeat_sender()
         for _ in range(3):
             await self._failing_check(db_conn, topic, send)
         assert send.await_count == 1
@@ -2476,10 +2523,188 @@ class TestSilenceHeartbeatPipeline:
         update_topic(db_conn, topic)
         db_conn.commit()
 
-        with patch("app.checker.deliver_notification_intents", send):
+        with patch("app.checker.send_single_notification", send):
             await check_topic(topic, _make_settings(silence_heartbeat_checks=3), db_path=conn_db_path(db_conn))
         assert send.await_count == 1
         assert get_topic(db_conn, topic.id).heartbeat_alerted_at is not None
+
+
+class TestHeartbeatTransitionIsAtomic:
+    """AUG-019/130/131/132: the latch, its intents and its revocations are one commit."""
+
+    def _pipeline(self) -> TestSilenceHeartbeatPipeline:
+        return TestSilenceHeartbeatPipeline()
+
+    async def _outage(self, db_conn: sqlite3.Connection, topic: Topic, send, **kwargs) -> None:
+        for _ in range(3):
+            await self._pipeline()._failing_check(db_conn, topic, send, **kwargs)
+
+    async def test_zero_targets_never_consume_the_latch(self, db_conn: sqlite3.Connection) -> None:
+        """No configured Apprise target means no announcement, so nothing to latch (AUG-130)."""
+        topic = _make_topic(db_conn)
+        send = _heartbeat_sender()
+        settings = _make_settings(silence_heartbeat_checks=3, notifications=NotificationSettings(urls=[]))
+        await self._outage(db_conn, topic, send, settings=settings)
+
+        assert send.await_count == 0
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is None
+        assert _intent_rows(db_conn, topic.id) == []
+
+        # A target configured during the same outage still gets the alert.
+        await self._pipeline()._failing_check(db_conn, topic, send)
+        assert send.await_count == 1
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is not None
+
+    async def test_intent_failure_takes_the_latch_with_it(self, db_conn: sqlite3.Connection) -> None:
+        """A crash between latch and intents must leave neither (AUG-019)."""
+        topic = _make_topic(db_conn)
+        send = _heartbeat_sender()
+        with patch("app.checker.create_notification_intents", side_effect=sqlite3.OperationalError("disk I/O error")):
+            await self._outage(db_conn, topic, send)
+
+        assert send.await_count == 0
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is None
+        assert _intent_rows(db_conn, topic.id) == []
+
+        # The next check re-runs the whole transition cleanly.
+        await self._pipeline()._failing_check(db_conn, topic, send)
+        assert send.await_count == 1
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is not None
+
+    async def test_crash_before_send_leaves_a_deliverable_intent(self, db_conn: sqlite3.Connection) -> None:
+        """The send is outside the commit, so a death mid-send costs no message (AUG-019)."""
+        topic = _make_topic(db_conn)
+        send = _heartbeat_sender()
+        with patch("app.checker.deliver_notification_intents", side_effect=RuntimeError("process died")):
+            await self._outage(db_conn, topic, send)
+
+        rows = _intent_rows(db_conn, topic.id)
+        assert [(r["kind"], r["status"]) for r in rows] == [("heartbeat_alert", "pending")]
+        assert (
+            rows[0]["latch_value"]
+            == db_conn.execute("SELECT heartbeat_alerted_at FROM topics WHERE id = ?", (topic.id,)).fetchone()[0]
+        )
+
+        with patch("app.checker.send_single_notification", send):
+            await retry_pending_notifications(db_conn, _make_settings(silence_heartbeat_checks=3))
+        assert send.await_count == 1
+        assert _intent_rows(db_conn, topic.id)[0]["status"] == "sent"
+
+    async def test_a_newer_check_invalidates_a_stale_decision(self, db_conn: sqlite3.Connection) -> None:
+        """Two interleaved checks: the decision from check N cannot land after N+1 (AUG-131)."""
+        from app.crud import create_check_result
+        from app.heartbeat import evaluate_heartbeat as real_evaluate
+        from app.models import CheckResult
+
+        topic = _make_topic(db_conn)
+        send = _heartbeat_sender()
+        db_path = conn_db_path(db_conn)
+
+        def _evaluate_then_race(conn, topic_arg, threshold):
+            decision = real_evaluate(conn, topic_arg, threshold)
+            if decision is not None:
+                # A concurrent CLI check commits a newer result before we write.
+                create_check_result(
+                    db_conn,
+                    CheckResult(topic_id=topic.id, checked_at=datetime.now(UTC), stage_error=None),
+                )
+                db_conn.commit()
+            return decision
+
+        with patch("app.checker.evaluate_heartbeat", side_effect=_evaluate_then_race):
+            for _ in range(3):
+                with (
+                    patch(
+                        "app.checker.fetch_new_articles_for_topic",
+                        new_callable=AsyncMock,
+                        return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=1, feeds_failed=1),
+                    ),
+                    patch("app.checker.send_single_notification", send),
+                ):
+                    await check_topic(
+                        get_topic(db_conn, topic.id),
+                        _make_settings(silence_heartbeat_checks=3),
+                        db_path=db_path,
+                    )
+
+        assert send.await_count == 0
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is None
+        assert _intent_rows(db_conn, topic.id) == []
+
+    async def test_recovery_only_addresses_targets_that_got_the_alert(self, db_conn: sqlite3.Connection) -> None:
+        """A target that never received the outage notice is not told it ended."""
+        topic = _make_topic(db_conn)
+        settings = _make_settings(
+            silence_heartbeat_checks=3,
+            notifications=NotificationSettings(urls=["json://good.example.com", "json://bad.example.com"]),
+        )
+        send = _heartbeat_sender(fails=("json://bad.example.com",))
+        await self._outage(db_conn, topic, send, settings=settings)
+        assert send.await_count == 2
+
+        await self._pipeline()._healthy_empty_check(db_conn, topic, send, settings=settings)
+
+        recovery = [r for r in _intent_rows(db_conn, topic.id) if r["kind"] == "heartbeat_recovery"]
+        assert [r["url"] for r in recovery] == ["json://good.example.com"]
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is None
+
+    async def test_recovery_revokes_the_superseded_alert(self, db_conn: sqlite3.Connection) -> None:
+        """A queued alert must never arrive after the recovery that contradicts it (AUG-132)."""
+        topic = _make_topic(db_conn)
+        failing = _heartbeat_sender(ok=False, error="unreachable")
+        await self._outage(db_conn, topic, failing)
+        assert [r["status"] for r in _intent_rows(db_conn, topic.id)] == ["pending"]
+
+        send = _heartbeat_sender()
+        await self._pipeline()._healthy_empty_check(db_conn, topic, send)
+
+        rows = _intent_rows(db_conn, topic.id)
+        assert [(r["kind"], r["status"]) for r in rows] == [("heartbeat_alert", "revoked")]
+        # Nobody received the alert, so there is nobody to tell about the recovery —
+        # but the latch is released either way, so the next outage still announces.
+        assert send.await_count == 0
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is None
+
+        with patch("app.checker.send_single_notification", send):
+            await retry_pending_notifications(db_conn, _make_settings(silence_heartbeat_checks=3))
+        assert send.await_count == 0
+
+    async def test_disabling_revokes_queued_heartbeat_messages(self, db_conn: sqlite3.Connection) -> None:
+        """A queued alert cannot arrive after the feature was switched off (AUG-132)."""
+        topic = _make_topic(db_conn)
+        failing = _heartbeat_sender(ok=False, error="unreachable")
+        await self._outage(db_conn, topic, failing)
+        assert [r["status"] for r in _intent_rows(db_conn, topic.id)] == ["pending"]
+
+        send = _heartbeat_sender()
+        await self._pipeline()._failing_check(db_conn, topic, send, threshold=0)
+
+        assert [r["status"] for r in _intent_rows(db_conn, topic.id)] == ["revoked"]
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is None
+        with patch("app.checker.send_single_notification", send):
+            await retry_pending_notifications(db_conn, _make_settings(silence_heartbeat_checks=3))
+        assert send.await_count == 0
+
+    async def test_corrupt_latch_clears_instead_of_wedging(self, db_conn: sqlite3.Connection) -> None:
+        """Unparseable latch text must not suppress both transitions forever (AUG-144)."""
+        topic = _make_topic(db_conn)
+        send = _heartbeat_sender()
+        await self._outage(db_conn, topic, send)
+        db_conn.execute("UPDATE topics SET heartbeat_alerted_at = 'corrupt' WHERE id = ?", (topic.id,))
+        db_conn.commit()
+
+        # Still latched: no second alert while the outage continues.
+        await self._pipeline()._failing_check(db_conn, topic, send)
+        assert send.await_count == 1
+
+        await self._pipeline()._healthy_empty_check(db_conn, topic, send)
+        assert (
+            db_conn.execute("SELECT heartbeat_alerted_at FROM topics WHERE id = ?", (topic.id,)).fetchone()[0] is None
+        )
+
+        # And the topic can announce its next outage normally.
+        await self._outage(db_conn, topic, send)
+        assert "sources failing" in _titles(send)[-1]
 
 
 class TestAnalysisFailureIsResumable:

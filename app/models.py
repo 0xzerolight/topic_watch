@@ -137,13 +137,17 @@ class CorruptTimestampError(ValueError):
     """
 
 
-def _coerce_dt(value: object) -> datetime | None:
+def _coerce_dt(value: object, field: str | None = None) -> datetime | None:
     """Parse a *nullable* DB datetime cell defensively, as aware UTC.
 
     Empty/whitespace-only strings and unparseable values become ``None`` rather
     than reaching Pydantic as a raw string and raising ``ValidationError`` on
     legacy/migrated/corrupt rows — a nullable column already has "no value" as a
-    meaning it can carry, so degrading to it invents nothing.
+    meaning it can carry, so degrading to it invents nothing. Non-empty text that
+    does not parse is logged: it is stored state that reads as unset here while
+    SQL still sees it as set, which is exactly the divergence AUG-144 describes.
+    Code whose write path compares against the stored cell (the heartbeat latch)
+    must read that cell raw rather than trust this value.
 
     Whatever comes back is aware UTC (``to_utc``): rows written before the
     canonical spelling existed hold naive text, and a naive datetime raises
@@ -158,6 +162,7 @@ def _coerce_dt(value: object) -> datetime | None:
         try:
             return to_utc(datetime.fromisoformat(value))
         except (ValueError, TypeError):
+            logger.warning("Unparseable datetime in column %r; reading it as unset", field or "<unknown>")
             return None
     return None
 
@@ -171,7 +176,7 @@ def _coerce_required_dt(value: object, field: str) -> datetime:
     reports — silently, and for good once anything writes the row back. Corruption
     here is a data state to surface, not one to paper over (TW-AUD-013).
     """
-    parsed = _coerce_dt(value)
+    parsed = _coerce_dt(value, field)
     if parsed is None:
         raise CorruptTimestampError(
             f"Required timestamp column {field!r} holds {value!r}, which is not a timestamp. "
@@ -250,7 +255,7 @@ class SQLiteModel(BaseModel):
         for field in cls._required_dt_fields:
             data[field] = _coerce_required_dt(data.get(field), field)
         for field in cls._optional_dt_fields:
-            data[field] = _coerce_dt(data.get(field))
+            data[field] = _coerce_dt(data.get(field), field)
         return data
 
     @classmethod
@@ -727,7 +732,7 @@ class CheckResult(SQLiteModel):
             stage_error=row["cr_stage_error"],
             # Paired with the ``cr.seen_at AS cr_seen_at`` alias in _DASHBOARD_SELECT;
             # one without the other 500s the dashboard.
-            seen_at=_coerce_dt(row["cr_seen_at"]),
+            seen_at=_coerce_dt(row["cr_seen_at"], "seen_at"),
         )
 
     @property
