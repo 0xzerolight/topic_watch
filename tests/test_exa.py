@@ -158,7 +158,7 @@ class TestFetchExaEntries:
 
     async def test_date_mix_flows_through_select_candidates(self) -> None:
         """Mixed publishedDate shapes all normalize so recency sort never raises (load-bearing)."""
-        from app.scraping import _select_candidates
+        from app.scraping import _prepare_entries, _select_candidates
 
         transport = _exa_response(
             [
@@ -171,13 +171,16 @@ class TestFetchExaEntries:
         async with httpx.AsyncClient(transport=transport) as client:
             resp = await fetch_exa_entries(_EXA_TOPIC, _ENABLED, max_results=10, timeout=5.0, client=client)
         assert len(resp.entries) == 4
-        new_entries = [(e, compute_article_hash(e.url, e.title)) for e in resp.entries]
+        prepared = _prepare_entries(resp.entries)
+        new_entries = [(e, compute_article_hash(e.url, e.title)) for e in prepared]
         reuse_batch, fetch_batch = _select_candidates(new_entries, [], 10)  # must not raise
         urls = [e.url for e, _ in fetch_batch]
-        # An undated entry ranks at retrieval time rather than at year 1 (AUG-184),
-        # so it leads; among dated ones the full-Z 2024 entry sorts ahead of 2023.
-        assert urls[0] == "https://x.com/3"
+        # The full-Z 2024 entry is the newest dated one, so it leads; the two
+        # undated entries take the date of the entry they follow (AUG-184), which
+        # keeps them beside it and ahead of the 2023 one.
+        assert urls[0] == "https://x.com/2"
         assert urls.index("https://x.com/2") < urls.index("https://x.com/1")
+        assert urls.index("https://x.com/3") < urls.index("https://x.com/1")
 
     async def test_not_enabled_makes_no_request(self) -> None:
         calls: list[str] = []

@@ -8,7 +8,6 @@ import asyncio
 import logging
 import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -36,11 +35,11 @@ from app.scraping.source import FeedHealthOutcome as FeedHealthOutcome
 from app.scraping.source import FetchStatus as FetchStatus
 from app.scraping.source import (
     article_identity,
-    as_utc,
+    assign_ranking_dates,
     bounded,
     collapse_duplicate_entries,
     compute_article_hash,
-    normalize_published,
+    ranking_date,
     revision_marker,
     story_identity,
 )
@@ -240,11 +239,11 @@ def _prepare_entries(entries: list[FeedEntry]) -> list[FeedEntry]:
     the signal that says an article was revised: a publisher whose clock runs
     hours fast had every entry read as a revision, which bypasses the story rule
     permanently and re-stores the whole feed on every check.
+
+    Ranking is settled here too, while feed order is still intact — it is the
+    only place that knows which entry followed which.
     """
-    now = datetime.now(UTC)
-    for entry in entries:
-        entry.published = normalize_published(entry.published, now=now)
-        entry.updated = normalize_published(entry.updated, now=now)
+    assign_ranking_dates(entries)
     return collapse_duplicate_entries(entries)
 
 
@@ -331,16 +330,14 @@ def _select_candidates(
     this topic's provider later). Returns ``(reuse_batch, fetch_batch)`` after the
     limit, where ``fetch_batch`` is the ``(entry, hash)`` subset still needing a fetch.
 
-    An entry with no usable date ranks at retrieval time, not at year 1 (AUG-184):
-    feeds list newest first, so an undated entry is a story just discovered, and
-    filing it below every dated one let a busy feed starve it out of the cap on
-    every check. Ties keep source order, since the sort is stable.
+    Entries are ranked by the date ``assign_ranking_dates`` settled for them
+    (AUG-184), not by the one they claim. Ties keep source order, since the sort
+    is stable.
     """
-    now = datetime.now(UTC)
     all_candidates: list[tuple[FeedEntry, str, str | None, str | None]] = [
         (e, h, c, p) for e, h, c, p in reuse_entries
     ] + [(e, h, None, None) for e, h in new_entries]
-    all_candidates.sort(key=lambda t: as_utc(t[0].published) or now, reverse=True)
+    all_candidates.sort(key=lambda t: ranking_date(t[0]), reverse=True)
     all_candidates = all_candidates[:max_articles]
 
     reuse_batch: list[tuple[FeedEntry, str, str | None, str | None]] = [

@@ -280,6 +280,12 @@ class FeedEntry(BaseModel):
     """Pre-extracted full text, when the source already provides it (e.g. Exa search).
     ``None`` for RSS entries, whose text is fetched during content extraction. When set
     and non-empty, it short-circuits the network fetch in ``extract_article_content``."""
+    rank_at: datetime | None = None
+    """The timestamp the bounded article cap ranks this entry by (AUG-184).
+
+    Assigned by the pipeline, never by a source: it is what the entry's place in
+    the feed says about its recency, which is not the same as the date it claims.
+    ``None`` until ``assign_ranking_dates`` has run."""
 
 
 # --- Article identity ---------------------------------------------------------
@@ -320,6 +326,60 @@ def normalize_published(value: datetime | None, *, now: datetime | None = None) 
         logger.debug("Discarding impossible publication date %s", stamp.isoformat())
         return None
     return stamp
+
+
+def assign_ranking_dates(entries: list[FeedEntry], *, now: datetime | None = None) -> None:
+    """Normalize every entry's dates and settle where the article cap ranks it.
+
+    Three cases, and the earlier attempt collapsed all of them onto retrieval
+    time, which is what made AUG-184 wrong in both directions:
+
+    - A usable date ranks the entry, as it always did.
+    - A date the source named but we discarded as impossible ranks the entry
+      BELOW every dated one. Falling back to retrieval time handed the bogus
+      entry the top of the ranking a second time, so at a small cap it still
+      displaced the real stories the finding was filed about.
+    - An entry naming no date at all inherits the date of the nearest dated entry
+      of the SAME feed — the one preceding it, since feeds list newest first, and
+      otherwise the one following it. Ranking it at retrieval time instead put a
+      whole dateless archive feed above genuinely breaking news on every check;
+      ranking it at year 1 starved it forever. Taking its neighbour's date keeps
+      it where the feed put it. A feed carrying no dates at all has nothing to
+      inherit, so its entries rank below dated ones rather than above them.
+    """
+    moment = now or datetime.now(UTC)
+    for entry in entries:
+        declared = entry.published
+        entry.published = normalize_published(declared, now=moment)
+        entry.updated = normalize_published(entry.updated, now=moment)
+        if entry.published is not None:
+            entry.rank_at = entry.published
+        else:
+            entry.rank_at = _UNDATED if declared is not None else None
+
+    # Forward: the newest dated entry seen so far in this feed. Backward: the
+    # first one that follows, for entries listed above every dated entry.
+    nearest: dict[str, datetime] = {}
+    for entry in entries:
+        if entry.published is not None:
+            nearest[entry.source_feed] = entry.published
+        elif entry.rank_at is None:
+            entry.rank_at = nearest.get(entry.source_feed)
+    nearest.clear()
+    for entry in reversed(entries):
+        if entry.published is not None:
+            nearest[entry.source_feed] = entry.published
+        elif entry.rank_at is None:
+            entry.rank_at = nearest.get(entry.source_feed, _UNDATED)
+
+
+def ranking_date(entry: FeedEntry) -> datetime:
+    """The timestamp the article cap ranks one candidate by.
+
+    Falls back to the entry's own date for callers that build entries directly
+    without running them through the pipeline's normalization.
+    """
+    return entry.rank_at or as_utc(entry.published) or _UNDATED
 
 
 def _is_tracking_param(name: str) -> bool:
