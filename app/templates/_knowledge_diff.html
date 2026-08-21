@@ -5,9 +5,10 @@
    and token delta would be invented (AUG-222), so they are not rendered.
 
    Segment text renders through Jinja autoescape as PLAIN TEXT, deliberately not
-   the `markdown` filter. That filter is safe (templates.py:113-125 — html=False,
-   images disabled, unsafe schemes rejected) and the Knowledge State panel uses it
-   correctly; the reason to avoid it here is different. A segment is a fragment —
+   the `markdown` filter. That filter is safe (`_markdown` in templates.py —
+   html=False, images disabled, unsafe schemes rejected, links rendered inert) and
+   the Knowledge State panel uses it correctly; the reason to avoid it here is
+   different. A segment is a fragment —
    "- Trial began." — so rendering fragments individually would emit a separate
    list per segment, and a diff should show the source the model actually wrote,
    markers and all. Leading indentation is part of that source (it decides a
