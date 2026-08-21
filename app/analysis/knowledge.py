@@ -4,6 +4,8 @@ Orchestrates LLM calls to build and maintain the rolling knowledge
 summary for each topic, with database persistence.
 """
 
+import hashlib
+import json
 import logging
 import re
 import sqlite3
@@ -56,12 +58,49 @@ class KnowledgeUpdatePlan:
     token_count: int
     usage: TokenUsage = field(default_factory=TokenUsage)
     sufficient_data: bool = True
+    model: str | None = None
+    """The configured LLM that produced this summary and counted its tokens.
+    Recorded on the revision so history knows which unit ``token_count`` is in."""
+    basis_hash: str | None = None
+    """Fingerprint of the topic scope the summary was derived from, captured
+    before the LLM call so it describes the prompt that was actually sent."""
     analyzed_article_ids: list[int] | None = None
     """Which of the input articles the prompt actually carried, when the LLM layer
     reports it. An over-budget request is fitted by dropping trailing articles, so
     a baseline can be built from part of the corpus; the caller marks only these
     articles processed and leaves the rest for a later cycle. ``None`` means the
     layer reported nothing, and the whole input is assumed used."""
+
+
+def topic_basis_hash(topic: Topic) -> str:
+    """Fingerprint the topic scope a knowledge summary is derived from.
+
+    Knowledge is an answer to a question the topic asks, and the question is
+    editable: renaming a topic, rewriting its description, changing feed mode or
+    feed URLs, or adding a novelty instruction all change what the model is asked
+    to track. The stored summary carries no record of which question it answered,
+    so an edited topic keeps measuring novelty against a baseline assembled for
+    the old scope with nothing on screen saying so (TW-AUD-017). Recording this
+    on each revision makes the mismatch detectable.
+
+    Deliberately excludes the numeric thresholds and the check interval: those
+    change how results are filtered and when checks run, not what the knowledge
+    is about. Feed URLs are sorted so reordering them is not a scope change.
+    """
+    basis = json.dumps(
+        {
+            "name": topic.name,
+            "description": topic.description,
+            "feed_mode": topic.feed_mode.value,
+            "feed_urls": sorted(topic.feed_urls),
+            "novelty_instruction": topic.novelty_instruction or "",
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    # Truncated: this is a change detector, not a security boundary. 16 hex chars
+    # is 64 bits, far past any accidental collision across one install's topics.
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
 
 
 def reported_article_ids(result: object) -> list[int] | None:
@@ -264,6 +303,8 @@ async def prepare_initial_knowledge(
             usage.completion_tokens + compress_usage.completion_tokens,
         ),
         sufficient_data=result.sufficient_data,
+        model=settings.llm.model,
+        basis_hash=topic_basis_hash(topic),
         analyzed_article_ids=reported_article_ids(result),
     )
 
@@ -306,6 +347,8 @@ async def prepare_knowledge_update(
             usage.completion_tokens + compress_usage.completion_tokens,
         ),
         sufficient_data=True,
+        model=settings.llm.model,
+        basis_hash=topic_basis_hash(topic),
     )
 
 
@@ -369,6 +412,8 @@ def apply_knowledge_update(
             token_count=plan.token_count,
             source=source,
             change_note=change_note,
+            model=plan.model,
+            basis_hash=plan.basis_hash,
         ),
     )
     prune_knowledge_revisions(conn, topic_id, settings.knowledge_revision_limit)

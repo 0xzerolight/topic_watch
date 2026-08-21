@@ -734,8 +734,9 @@ def create_knowledge_revision(conn: sqlite3.Connection, revision: KnowledgeRevis
     data = revision.to_insert_dict()
     cursor = conn.execute(
         """INSERT INTO knowledge_revisions
-               (topic_id, summary_text, token_count, source, change_note, created_at)
-           VALUES (:topic_id, :summary_text, :token_count, :source, :change_note, :created_at)""",
+               (topic_id, summary_text, token_count, source, change_note, created_at, model, basis_hash)
+           VALUES (:topic_id, :summary_text, :token_count, :source, :change_note, :created_at,
+                   :model, :basis_hash)""",
         data,
     )
     revision.id = cursor.lastrowid
@@ -749,20 +750,25 @@ def list_knowledge_revision_headers(
 ) -> list[KnowledgeRevision]:
     """List a topic's revisions newest-first WITHOUT their summary text.
 
-    The timeline renders four metadata fields per row and lazy-loads each diff,
-    so shipping ``summary_text`` would read up to ~40 KB per revision for text
-    no template shows. ``''`` is selected as a literal rather than dropping the
-    column so the shared ``from_row`` coercion still applies; the returned models
-    carry an empty ``summary_text`` and must never be written back.
+    The timeline lazy-loads each diff, so shipping ``summary_text`` would read up
+    to ~40 KB per revision for text no template shows. ``''`` is selected as a
+    literal rather than dropping the column so the shared ``from_row`` coercion
+    still applies; the returned models carry an empty ``summary_text`` and must
+    never be written back.
+
+    ``change_note`` IS selected (AUG-124). It used to be replaced with NULL for
+    the same width reason, which left a run of Update rows showing nothing but a
+    time and a token count — indistinguishable from each other, so finding one
+    development meant expanding them one at a time. It is the one-line novelty
+    summary that prompted the update, not a second body.
 
     Ordered by ``id DESC`` rather than ``created_at DESC``: two revisions written
     in the same second must still order deterministically, and ``id`` is the
-    insertion order the diff timeline depends on. The column list matches
-    ``idx_knowledge_revisions_topic`` so this is served from the index alone.
+    insertion order the diff timeline depends on.
     """
     rows = conn.execute(
         """SELECT id, topic_id, '' AS summary_text, token_count, source,
-                  NULL AS change_note, created_at
+                  change_note, created_at, model, basis_hash
            FROM knowledge_revisions
            WHERE topic_id = ?
            ORDER BY id DESC
@@ -786,9 +792,14 @@ def get_previous_knowledge_revision(
     """Get the revision immediately preceding ``revision_id`` for this topic.
 
     ``None`` when ``revision_id`` is the topic's oldest retained revision — the
-    diff view then renders the full snapshot. Pruning always removes the oldest
-    rows, so retained revisions stay contiguous and this is never a
-    non-adjacent comparison.
+    diff view then renders the full snapshot.
+
+    "Immediately preceding" is only true because retained revisions are
+    contiguous, which rests on two invariants elsewhere (AUG-146): the revision
+    append is part of the same transaction as the knowledge-state write it
+    records, so a state can never advance without its revision; and pruning only
+    ever deletes from the oldest end. Break either and this query starts
+    presenting a multi-update gap as one adjacent diff.
     """
     row = conn.execute(
         "SELECT * FROM knowledge_revisions WHERE topic_id = ? AND id < ? ORDER BY id DESC LIMIT 1",
@@ -813,6 +824,32 @@ def prune_knowledge_revisions(conn: sqlite3.Connection, topic_id: int, keep: int
                  LIMIT :keep
              )""",
         {"topic_id": topic_id, "keep": keep},
+    )
+    return cursor.rowcount
+
+
+def prune_all_knowledge_revisions(conn: sqlite3.Connection, keep: int) -> int:
+    """Apply the retention cap to every topic at once. Returns rows deleted.
+
+    Write-time pruning only ever touches the topic being written, so lowering
+    ``knowledge_revision_limit`` hid the excess rows of a quiet or finished topic
+    without ever reclaiming them — a topic that never updates again keeps its full
+    snapshots indefinitely, and the configured cap silently does not apply to it
+    (AUG-034). One indexed pass at startup makes the setting mean what it says.
+
+    ``ROW_NUMBER`` partitions by topic and ranks newest-first, so this is one scan
+    of ``idx_knowledge_revisions_topic`` rather than a correlated count per row.
+    """
+    cursor = conn.execute(
+        """DELETE FROM knowledge_revisions
+           WHERE id IN (
+               SELECT id FROM (
+                   SELECT id, ROW_NUMBER() OVER (PARTITION BY topic_id ORDER BY id DESC) AS rank
+                   FROM knowledge_revisions
+               )
+               WHERE rank > :keep
+           )""",
+        {"keep": keep},
     )
     return cursor.rowcount
 

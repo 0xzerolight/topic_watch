@@ -52,6 +52,19 @@
         </small>
     </summary>
     <article>
+        {# The stored summary answers the question this topic asked when it was
+           written. An edit to the name, description, feeds or novelty
+           instruction changes the question and leaves the baseline behind, so
+           say so rather than let novelty be judged against the old scope with
+           nothing on screen (TW-AUD-017). The next check that finds new
+           information rebuilds the state against the current scope. #}
+        {% if knowledge_basis_stale %}
+        <p class="rev-note"><small>
+            This knowledge state was built before the topic's name, description, feeds or
+            novelty instruction were last changed. It is updated against the current
+            settings on the next check that finds new information.
+        </small></p>
+        {% endif %}
         {% set usage_pct = (knowledge.token_count / knowledge_state_max_tokens * 100) | int if knowledge_state_max_tokens > 0 else 0 %}
         <div class="token-meter" style="margin-bottom: 1em;">
             <span class="token-meter-label">

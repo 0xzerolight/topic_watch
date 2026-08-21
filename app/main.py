@@ -21,7 +21,7 @@ from starlette.responses import Response
 from app import __version__ as _app_version
 from app.check_context import generate_check_id, request_id_var
 from app.config import DEFAULT_CONFIG_PATH, load_settings, resolve_db_path
-from app.crud import recover_stuck_topics
+from app.crud import prune_all_knowledge_revisions, recover_stuck_topics
 from app.database import get_db, init_db
 from app.logging_config import setup_logging
 from app.scheduler import start_scheduler, stop_scheduler
@@ -82,6 +82,13 @@ async def lifespan(app: FastAPI):
     if settings.is_configured():
         with get_db(db_path) as conn:
             recover_stuck_topics(conn)
+            # Revision pruning otherwise runs only when a topic is written, so
+            # lowering knowledge_revision_limit left quiet and finished topics
+            # holding their full snapshots forever — the configured cap silently
+            # did not apply to them (AUG-034). One indexed pass here makes it.
+            pruned = prune_all_knowledge_revisions(conn, settings.knowledge_revision_limit)
+            if pruned:
+                logger.info("Knowledge revision retention: pruned %d revision(s) over the limit", pruned)
         # Wire the app so scheduler jobs read live settings from app.state (OVH-015/036).
         start_scheduler(settings, db_path=db_path, app=app)
         logger.info("Topic Watch web UI started")
