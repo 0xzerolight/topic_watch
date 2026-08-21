@@ -205,19 +205,21 @@ document.body.addEventListener("htmx:afterSwap", function (event) {
 {% else %}
 <div class="empty-state">
     <p>No articles fetched yet.</p>
-    <p class="empty-state-hint">Articles appear here after the first feed fetch. New topics are fetched on the next scheduler cycle (~1 minute), or use "Check Now" above.</p>
+    {# AUG-240: guidance names the action that actually exists for this topic's
+       current state — "Check Now" only renders for an active READY topic, so
+       every other state pointed at a button the user could not see. #}
+    {% if not topic.is_active %}
+    <p class="empty-state-hint">This topic is disabled, so it will not fetch articles automatically. Enable it above to resume checks.</p>
+    {% elif topic.status.value == "ready" %}
+    <p class="empty-state-hint">Articles appear after the next scheduled check, or use "Check Now" above.</p>
+    {% elif topic.status.value == "new" %}
+    <p class="empty-state-hint">This topic has not been researched yet. It will be initialized on the next scheduler cycle (~1 minute), or use "Initialize Now" above.</p>
+    {% elif topic.status.value == "researching" %}
+    <p class="empty-state-hint">Research is in progress. Articles will appear here once it completes.</p>
+    {% elif topic.status.value == "error" %}
+    <p class="empty-state-hint">Initial research failed. Use "Retry Research" below to try again.</p>
+    {% endif %}
 </div>
-{% endif %}
-
-{# Sources gone dark: the newest check found nothing to read, so this topic's
-   quiet is not evidence of "nothing new". A SIBLING of #status-area, never
-   nested inside it (see the CRITICAL note above). #}
-{% if page == 1 and checks and checks[0].sources_failing %}
-<p class="row-error">
-    <span class="badge badge--bad"><span class="badge-dot"></span>Sources failing</span>
-    The most recent check found no usable source — this topic's silence may not mean "nothing new".
-    <a href="/feeds">Feed Health</a>
-</p>
 {% endif %}
 
 <h2>Check History</h2>

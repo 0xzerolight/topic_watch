@@ -1409,6 +1409,41 @@ class TestArticleHeadersForTopic:
         assert "SECRET-BODY-TEXT-MARKER" not in response.text
 
 
+class TestEmptyArticlesGuidance:
+    """AUG-240: the zero-article empty state names the action actually available
+    for the topic's current state, instead of always pointing at "Check Now"
+    (which renders only for an active READY topic)."""
+
+    async def test_ready_active_points_at_check_now(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        topic = _make_topic(db_conn, name="Empty Ready", status=TopicStatus.READY)
+        response = await client.get(f"/topics/{topic.id}")
+        assert "Check Now" in response.text
+
+    async def test_disabled_points_at_enable(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn, name="Empty Disabled", status=TopicStatus.READY, is_active=False)
+        response = await client.get(f"/topics/{topic.id}")
+        assert "Enable it above" in response.text
+        assert "Check Now" not in response.text
+
+    async def test_new_points_at_initialize(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn, name="Empty New", status=TopicStatus.NEW)
+        response = await client.get(f"/topics/{topic.id}")
+        assert "Initialize Now" in response.text
+        assert 'Check Now" above' not in response.text
+
+    async def test_researching_points_at_waiting(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn, name="Empty Researching", status=TopicStatus.RESEARCHING)
+        response = await client.get(f"/topics/{topic.id}")
+        assert "Research is in progress" in response.text
+
+    async def test_error_points_at_retry(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        topic = _make_topic(db_conn, name="Empty Error", status=TopicStatus.ERROR, error_message="boom")
+        response = await client.get(f"/topics/{topic.id}")
+        assert 'Retry Research" below' in response.text
+
+
 # --- Topic Status (HTMX partial) ---
 
 
