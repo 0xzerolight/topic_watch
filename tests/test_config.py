@@ -1,6 +1,7 @@
 """Tests for configuration loading and validation."""
 
 import logging
+import os
 from pathlib import Path
 
 import pytest
@@ -553,14 +554,127 @@ class TestStateRoot:
         assert resolve_state_root(package_parent=tmp_path, environ={}) == tmp_path / "data"
         assert resolve_config_file(package_parent=tmp_path, environ={}) == tmp_path / "data" / "config.yml"
 
-    def test_user_state_root_when_no_data_dir(self, tmp_path: Path) -> None:
-        """A wheel install with no data/ beside the package uses a user-level root."""
+    def test_fresh_source_checkout_lands_in_data(self, tmp_path: Path) -> None:
+        """A fresh clone puts state in data/, the location the docs promise (C5-1).
+
+        Nothing exists yet: no data/ directory, no user-level state. The root has to
+        resolve to data/ anyway, or the first start writes to ~/.local/state and the
+        next one — after `docker compose up` or the documented `mkdir -p data` creates
+        data/ — silently switches to an empty database.
+        """
         from app.config import resolve_config_file, resolve_state_root
 
+        checkout = tmp_path / "topic_watch"
+        checkout.mkdir()
         environ = {"XDG_STATE_HOME": str(tmp_path / "state")}
-        root = resolve_state_root(package_parent=tmp_path, environ=environ)
+        assert resolve_state_root(package_parent=checkout, environ=environ) == checkout / "data"
+        assert resolve_config_file(package_parent=checkout, environ=environ) == checkout / "data" / "config.yml"
+
+    def test_first_run_creates_the_data_directory(self, tmp_path: Path) -> None:
+        """The resolved root is a real directory after the first load, not a promise."""
+        from app.config import resolve_config_file
+
+        checkout = tmp_path / "topic_watch"
+        checkout.mkdir()
+        environ = {"XDG_STATE_HOME": str(tmp_path / "state")}
+        config_file = resolve_config_file(package_parent=checkout, environ=environ)
+
+        load_settings(config_path=config_file)
+
+        assert config_file.parent == checkout / "data"
+        assert config_file.exists()
+        assert not (tmp_path / "state" / "topic-watch").exists()
+
+    def test_existing_user_state_config_wins_when_there_is_no_data_dir(self, tmp_path: Path) -> None:
+        """An install that already wrote state elsewhere keeps reading it (C5-1)."""
+        from app.config import resolve_state_root
+
+        checkout = tmp_path / "topic_watch"
+        checkout.mkdir()
+        state = tmp_path / "state" / "topic-watch"
+        state.mkdir(parents=True)
+        (state / "config.yml").write_text("llm:\n  model: openai/gpt-4o-mini\n")
+
+        environ = {"XDG_STATE_HOME": str(tmp_path / "state")}
+        assert resolve_state_root(package_parent=checkout, environ=environ) == state
+
+    def test_a_later_empty_data_dir_does_not_steal_from_populated_state(self, tmp_path: Path) -> None:
+        """`docker compose up` creating ./data must not orphan an existing database.
+
+        The bind-mount source appearing beside the package is exactly the case that
+        handed the user an empty database and the setup wizard again (C5-1).
+        """
+        from app.config import resolve_state_root
+
+        checkout = tmp_path / "topic_watch"
+        (checkout / "data").mkdir(parents=True)
+        state = tmp_path / "state" / "topic-watch"
+        state.mkdir(parents=True)
+        (state / "topic_watch.db").write_bytes(b"SQLite format 3\x00")
+
+        environ = {"XDG_STATE_HOME": str(tmp_path / "state")}
+        assert resolve_state_root(package_parent=checkout, environ=environ) == state
+
+    def test_installed_wheel_uses_the_user_state_root(self, tmp_path: Path) -> None:
+        """A wheel install keeps state out of site-packages, dependency data/ and all.
+
+        State beside an installed package dies with the venv, and the directory is
+        shared with every dependency — one shipping a top-level data/ would otherwise
+        decide where this app keeps its database.
+        """
+        from app.config import resolve_config_file, resolve_state_root
+
+        site_packages = tmp_path / "venv" / "lib" / "python3.13" / "site-packages"
+        (site_packages / "data").mkdir(parents=True)
+        environ = {"XDG_STATE_HOME": str(tmp_path / "state")}
+
+        root = resolve_state_root(package_parent=site_packages, environ=environ)
         assert root == tmp_path / "state" / "topic-watch"
-        assert resolve_config_file(package_parent=tmp_path, environ=environ) == root / "config.yml"
+        assert resolve_config_file(package_parent=site_packages, environ=environ) == root / "config.yml"
+
+    def test_state_already_in_site_packages_is_still_honored(self, tmp_path: Path) -> None:
+        """An install that wrote its config there before keeps it — no orphaning."""
+        from app.config import resolve_state_root
+
+        site_packages = tmp_path / "venv" / "lib" / "python3.13" / "site-packages"
+        legacy = site_packages / "data"
+        legacy.mkdir(parents=True)
+        (legacy / "config.yml").write_text("llm:\n  model: openai/gpt-4o-mini\n")
+
+        environ = {"XDG_STATE_HOME": str(tmp_path / "state")}
+        assert resolve_state_root(package_parent=site_packages, environ=environ) == legacy
+
+    @pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root can write anywhere")
+    def test_read_only_package_parent_falls_back_to_the_user_state_root(self, tmp_path: Path) -> None:
+        """A package directory that cannot be written to must not be the state root."""
+        from app.config import resolve_state_root
+
+        checkout = tmp_path / "topic_watch"
+        checkout.mkdir()
+        checkout.chmod(0o555)
+        try:
+            environ = {"XDG_STATE_HOME": str(tmp_path / "state")}
+            assert resolve_state_root(package_parent=checkout, environ=environ) == tmp_path / "state" / "topic-watch"
+        finally:
+            checkout.chmod(0o755)
+
+    def test_config_and_database_land_together_on_a_fresh_clone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The end state of a fresh clone: both files in the checkout's data/."""
+        import app.config as config_module
+        from app.config import resolve_config_file, resolve_db_path, resolve_state_root
+
+        checkout = tmp_path / "topic_watch"
+        checkout.mkdir()
+        environ = {"XDG_STATE_HOME": str(tmp_path / "state")}
+        root = resolve_state_root(package_parent=checkout, environ=environ)
+        monkeypatch.setattr(config_module, "PROJECT_ROOT", checkout)
+        monkeypatch.setattr(config_module, "STATE_ROOT", root)
+
+        settings = Settings(llm={"model": "openai/gpt-4o-mini", "api_key": "k"})
+        assert resolve_config_file(package_parent=checkout, environ=environ) == checkout / "data" / "config.yml"
+        assert resolve_db_path(settings) == checkout / "data" / "topic_watch.db"
 
     def test_explicit_config_path_is_authoritative(self, tmp_path: Path) -> None:
         """TOPIC_WATCH_CONFIG_PATH outranks an existing data/ directory."""
