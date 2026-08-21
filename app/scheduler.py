@@ -16,8 +16,10 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app.checker import initialize_new_topic
 from app.config import Settings
 from app.crud import (
+    DELIVERY_INTENT_RETENTION_DAYS,
     claim_new_topic_for_init,
     delete_old_articles,
+    delete_old_delivery_intents,
     get_new_topics,
     recover_stuck_researching,
     update_topic_init_status,
@@ -76,6 +78,24 @@ async def _cleanup_old_articles(settings: Settings, db_path: Path | None = None)
                 logger.info("Article cleanup: deleted %d old article(s)", deleted)
     except Exception:
         logger.warning("Article cleanup failed", exc_info=True)
+
+
+async def _cleanup_delivery_intents(db_path: Path | None = None) -> None:
+    """Prune finished delivery intents older than the retention constant.
+
+    Delivered intents are kept as the ledger the dashboard's "last notified"
+    reads (AUG-153), so something has to age them out. It rides the existing
+    daily maintenance tick rather than adding a job, and the window is a
+    constant rather than a setting — nobody tunes how long a delivery receipt
+    lives.
+    """
+    try:
+        with get_db(db_path) as conn:
+            removed = delete_old_delivery_intents(conn, DELIVERY_INTENT_RETENTION_DAYS)
+            if removed:
+                logger.info("Delivery ledger cleanup: removed %d finished intent(s)", removed)
+    except Exception:
+        logger.warning("Delivery ledger cleanup failed", exc_info=True)
 
 
 def _vacuum_db_sync(db_path: Path | None = None) -> None:
@@ -235,7 +255,9 @@ async def _tick_vacuum(db_path: Path | None, app: "FastAPI | None") -> None:
 
 async def _tick_cleanup(settings: Settings, db_path: Path | None, app: "FastAPI | None") -> None:
     """Cleanup job: read live settings (retention) and db_path from app.state at tick time."""
-    await _cleanup_old_articles(_resolve_settings(app, settings), _resolve_db_path(app, db_path))
+    live_db_path = _resolve_db_path(app, db_path)
+    await _cleanup_old_articles(_resolve_settings(app, settings), live_db_path)
+    await _cleanup_delivery_intents(live_db_path)
 
 
 def start_scheduler(

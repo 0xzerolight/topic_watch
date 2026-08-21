@@ -10,12 +10,15 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from app.analysis.knowledge_diff import diff_segments
 from app.analysis.llm import NoveltyResult
+from app.checker import build_notification_intents, deliver_notification_intents
 from app.config import Settings
 from app.crud import (
     claim_topic_for_init,
     count_articles_for_topic,
     count_check_results,
+    create_notification_intents,
     create_topic,
+    create_webhook_intents,
     delete_topic,
     get_check_result,
     get_feed_health,
@@ -33,6 +36,7 @@ from app.crud import (
     update_topic_config,
     update_topic_init_status,
 )
+from app.database import short_conn
 from app.models import (
     NOVELTY_INSTRUCTION_MAX_CHARS,
     FeedMode,
@@ -41,7 +45,7 @@ from app.models import (
     TopicStatus,
     normalize_tags,
 )
-from app.notifications import format_notification, send_notification
+from app.notifications import format_notification
 from app.scraping.routing import router as provider_router
 from app.web.csrf import verify_csrf
 from app.web.dependencies import get_db_conn, get_settings
@@ -55,6 +59,7 @@ from app.web.routers._validation import (
 )
 from app.web.routers.templates import templates
 from app.web.state import _checking_state
+from app.webhooks import build_webhook_intents, deliver_webhook_intents
 
 logger = logging.getLogger(__name__)
 
@@ -858,7 +863,15 @@ async def force_notify(
     conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
     settings: Settings = Depends(get_settings),
 ):
-    """Re-send notification for a specific check result."""
+    """Re-send a specific check result through EVERY configured channel.
+
+    The automatic path sends Apprise notifications AND webhooks; this manual
+    recovery action used to call only Apprise, so a webhook-only configuration was
+    told "Delivery failed" without its one channel ever being attempted (AUG-109).
+
+    The resend goes through the same durable delivery intents as an automatic one,
+    so a target that fails here is retried by the drain rather than lost.
+    """
     topic = get_topic(conn, topic_id)
     if topic is None:
         raise HTTPException(status_code=404, detail="Topic not found")
@@ -873,15 +886,46 @@ async def force_notify(
             status_code=400,
         )
 
+    if not settings.notifications.urls and not settings.notifications.webhook_urls:
+        return HTMLResponse(
+            '<span style="color: var(--pico-del-color, red);">No delivery target configured</span>',
+            status_code=400,
+        )
+
+    db_path = getattr(request.app.state, "db_path", None)
+    # Every write below is a short, await-free block, so reusing the request
+    # connection when the app names no explicit path is safe — and it is the only
+    # way to reach the same database the request is already reading.
+    own_conn = None if db_path is not None else conn
     try:
         novelty = NoveltyResult.model_validate_json(check_result.llm_response)
         title, body = format_notification(topic.name, novelty)
-        sent = await send_notification(title, body, settings)
+        intents = build_notification_intents(title, body, settings, topic_id, check_result_id=check_id)
+        webhook_intents = build_webhook_intents(topic.name, novelty, settings, topic_id, check_id)
 
-        if sent:
-            return HTMLResponse('<span style="color: var(--pico-ins-color, green);">Sent!</span>')
-        else:
-            return HTMLResponse('<span style="color: var(--pico-del-color, red);">Delivery failed</span>')
+        # Persist the intents and commit BEFORE any send, exactly as the automatic
+        # path does: a resend that dies mid-flight is still owed, not lost.
+        with short_conn(own_conn, db_path) as intent_conn:
+            create_notification_intents(intent_conn, intents)
+            create_webhook_intents(intent_conn, webhook_intents)
+            intent_conn.commit()
+
+        deliveries = await deliver_notification_intents(intents, settings, db_path, own_conn)
+        webhooks_sent = await deliver_webhook_intents(webhook_intents, settings, db_path, own_conn)
+
+        parts: list[str] = []
+        if intents:
+            parts.append(f"Apprise {sum(1 for d in deliveries if d.ok)}/{len(intents)}")
+        if webhook_intents:
+            parts.append(f"webhooks {webhooks_sent}/{len(webhook_intents)}")
+        summary = ", ".join(parts)
+
+        all_ok = all(d.ok for d in deliveries) and webhooks_sent == len(webhook_intents)
+        if all_ok:
+            return HTMLResponse(f'<span style="color: var(--pico-ins-color, green);">Sent! ({summary})</span>')
+        return HTMLResponse(
+            f'<span style="color: var(--pico-del-color, red);">Delivery failed ({summary}); queued for retry</span>'
+        )
     except Exception as exc:
         logger.warning("Force notify failed for check %d", check_id, exc_info=True)
         from markupsafe import escape

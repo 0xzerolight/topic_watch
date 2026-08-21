@@ -12,10 +12,16 @@ from app.analysis.llm import NoveltyResult
 from app.config import LLMSettings, NotificationSettings, Settings
 from app.crud import create_check_result, create_topic, get_check_result
 from app.main import app
-from app.models import CheckResult, FeedMode, Topic, TopicStatus
+from app.models import CheckResult, FeedMode, NotificationDelivery, Topic, TopicStatus
 from app.web.dependencies import get_db_conn, get_settings
+from app.webhooks import WebhookOutcome
 
 CSRF_TEST_TOKEN = "test-csrf-token-for-force-notify-tests"
+
+
+async def _ok_send(title: str, body: str, url: str, timeout_s: float) -> NotificationDelivery:
+    """Stub for app.checker.send_single_notification: every target delivers."""
+    return NotificationDelivery(url=url, ok=True)
 
 
 def _make_settings(**overrides) -> Settings:
@@ -127,37 +133,45 @@ async def test_force_notify_success(
     client: httpx.AsyncClient,
     db_conn: sqlite3.Connection,
 ) -> None:
-    """Force notify returns 'Sent!' when send_notification returns True."""
+    """Force notify reports success when every configured channel delivered."""
     topic = _make_topic(db_conn)
     assert topic.id is not None
     check = _make_check_result(db_conn, topic.id, has_new_info=True)
     assert check.id is not None
 
-    with patch("app.web.routers.topics.send_notification", new_callable=AsyncMock) as mock_send:
-        mock_send.return_value = True
+    with patch("app.checker.send_single_notification", side_effect=_ok_send):
         response = await client.post(f"/topics/{topic.id}/checks/{check.id}/notify")
 
     assert response.status_code == 200
     assert "Sent!" in response.text
     assert "var(--pico-ins-color, green)" in response.text
+    # The resend went through a durable intent, now recorded as delivered.
+    row = db_conn.execute("SELECT status, check_result_id FROM pending_notifications").fetchone()
+    assert row["status"] == "sent"
+    assert row["check_result_id"] == check.id
 
 
 async def test_force_notify_calls_send_with_correct_args(
     client: httpx.AsyncClient,
     db_conn: sqlite3.Connection,
 ) -> None:
-    """Force notify calls send_notification with a title derived from topic name."""
+    """The resent message carries a title derived from the topic name."""
     topic = _make_topic(db_conn, name="Climate News")
     assert topic.id is not None
     check = _make_check_result(db_conn, topic.id, has_new_info=True)
     assert check.id is not None
 
-    with patch("app.web.routers.topics.send_notification", new_callable=AsyncMock) as mock_send:
-        mock_send.return_value = True
+    seen: list[tuple[str, str]] = []
+
+    async def record(title, body, url, timeout_s):  # noqa: ANN001
+        seen.append((title, body))
+        return NotificationDelivery(url=url, ok=True)
+
+    with patch("app.checker.send_single_notification", side_effect=record):
         await client.post(f"/topics/{topic.id}/checks/{check.id}/notify")
 
-    mock_send.assert_called_once()
-    title, body = mock_send.call_args.args[0], mock_send.call_args.args[1]
+    assert len(seen) == 1
+    title, body = seen[0]
     assert "Climate News" in title
     assert "Something new happened" in body
 
@@ -169,19 +183,25 @@ async def test_force_notify_delivery_failure(
     client: httpx.AsyncClient,
     db_conn: sqlite3.Connection,
 ) -> None:
-    """Force notify returns 'Delivery failed' when send_notification returns False."""
+    """A failed resend says so and leaves the intent queued for the drain."""
     topic = _make_topic(db_conn)
     assert topic.id is not None
     check = _make_check_result(db_conn, topic.id, has_new_info=True)
     assert check.id is not None
 
-    with patch("app.web.routers.topics.send_notification", new_callable=AsyncMock) as mock_send:
-        mock_send.return_value = False
+    async def fail(title, body, url, timeout_s):  # noqa: ANN001
+        return NotificationDelivery(url=url, ok=False, error="down")
+
+    with patch("app.checker.send_single_notification", side_effect=fail):
         response = await client.post(f"/topics/{topic.id}/checks/{check.id}/notify")
 
     assert response.status_code == 200
     assert "Delivery failed" in response.text
+    assert "queued for retry" in response.text
     assert "var(--pico-del-color, red)" in response.text
+    row = db_conn.execute("SELECT status, retry_count FROM pending_notifications").fetchone()
+    assert row["status"] == "pending"
+    assert row["retry_count"] == 1
 
 
 # --- Force notify: no new info ---
@@ -197,7 +217,7 @@ async def test_force_notify_no_new_info_returns_400(
     check = _make_check_result(db_conn, topic.id, has_new_info=False, llm_response=None)
     assert check.id is not None
 
-    with patch("app.web.routers.topics.send_notification", new_callable=AsyncMock) as mock_send:
+    with patch("app.checker.send_single_notification", side_effect=_ok_send) as mock_send:
         response = await client.post(f"/topics/{topic.id}/checks/{check.id}/notify")
 
     assert response.status_code == 400
@@ -264,13 +284,13 @@ async def test_force_notify_exception_returns_error_message(
     client: httpx.AsyncClient,
     db_conn: sqlite3.Connection,
 ) -> None:
-    """Force notify returns an error message when send_notification raises."""
+    """Force notify returns an error message when the delivery layer raises."""
     topic = _make_topic(db_conn)
     assert topic.id is not None
     check = _make_check_result(db_conn, topic.id, has_new_info=True)
     assert check.id is not None
 
-    with patch("app.web.routers.topics.send_notification", new_callable=AsyncMock) as mock_send:
+    with patch("app.web.routers.topics.deliver_notification_intents", new_callable=AsyncMock) as mock_send:
         mock_send.side_effect = RuntimeError("SMTP connection refused")
         response = await client.post(f"/topics/{topic.id}/checks/{check.id}/notify")
 
@@ -309,5 +329,79 @@ async def test_force_notify_requires_csrf(db_conn: sqlite3.Connection) -> None:
             response = await ac.post(f"/topics/{topic.id}/checks/{check.id}/notify")
 
         assert response.status_code == 403
+    finally:
+        app.dependency_overrides.clear()
+
+
+# --- channel parity (AUG-109) ---
+
+
+async def test_force_notify_sends_webhooks_for_a_webhook_only_setup(
+    db_conn: sqlite3.Connection,
+) -> None:
+    """A webhook-only configuration must be resent through, not reported failed."""
+    settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=["https://hooks.example.com/x"]))
+
+    def override_db():
+        yield db_conn
+
+    app.dependency_overrides[get_db_conn] = override_db
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        topic = _make_topic(db_conn, name="Webhook Only")
+        assert topic.id is not None
+        check = _make_check_result(db_conn, topic.id, has_new_info=True)
+        assert check.id is not None
+
+        posted: list[str] = []
+
+        async def record(url, payload, timeout=10.0):  # noqa: ANN001
+            posted.append(url)
+            return WebhookOutcome(ok=True, status=200)
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+            cookies={"csrf_token": CSRF_TEST_TOKEN},
+            headers={"X-CSRF-Token": CSRF_TEST_TOKEN},
+        ) as ac:
+            with patch("app.webhooks.send_webhook", side_effect=record):
+                response = await ac.post(f"/topics/{topic.id}/checks/{check.id}/notify")
+
+        assert response.status_code == 200
+        assert "Sent!" in response.text
+        assert "webhooks 1/1" in response.text
+        assert posted == ["https://hooks.example.com/x"]
+        row = db_conn.execute("SELECT status, check_result_id FROM pending_webhooks").fetchone()
+        assert row["status"] == "sent"
+        assert row["check_result_id"] == check.id
+    finally:
+        app.dependency_overrides.clear()
+
+
+async def test_force_notify_without_any_target_says_so(db_conn: sqlite3.Connection) -> None:
+    settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=[]))
+
+    def override_db():
+        yield db_conn
+
+    app.dependency_overrides[get_db_conn] = override_db
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        topic = _make_topic(db_conn, name="No Targets")
+        assert topic.id is not None
+        check = _make_check_result(db_conn, topic.id, has_new_info=True)
+        assert check.id is not None
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+            cookies={"csrf_token": CSRF_TEST_TOKEN},
+            headers={"X-CSRF-Token": CSRF_TEST_TOKEN},
+        ) as ac:
+            response = await ac.post(f"/topics/{topic.id}/checks/{check.id}/notify")
+
+        assert response.status_code == 400
+        assert "No delivery target configured" in response.text
     finally:
         app.dependency_overrides.clear()

@@ -2061,6 +2061,34 @@ class TestGetDashboardStats:
         assert stats.new_info_total == 1
         assert stats.last_notification_at is not None
 
+    def test_last_notified_sees_a_heartbeat_delivery(self, db_conn: sqlite3.Connection) -> None:
+        """AUG-153: a heartbeat alert creates no check row, but it was still notified."""
+        from app.crud import get_dashboard_stats
+        from app.models import NotificationKind, to_db_utc
+
+        topic = create_topic(db_conn, Topic(name="Quiet", description="d", status=TopicStatus.READY))
+        # A check that did not notify: the old query would report 'never'.
+        create_check_result(db_conn, CheckResult(topic_id=topic.id, has_new_info=False))
+        delivered = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        intent = create_pending_notification(
+            db_conn,
+            PendingNotification(
+                topic_id=topic.id,
+                title="Sources failing",
+                body="B",
+                url="json://x",
+                kind=NotificationKind.HEARTBEAT_ALERT,
+            ),
+        )
+        db_conn.execute(
+            "UPDATE pending_notifications SET status = 'sent', delivered_at = ? WHERE id = ?",
+            (to_db_utc(delivered), intent.id),
+        )
+        db_conn.commit()
+
+        stats = get_dashboard_stats(db_conn)
+        assert stats.last_notification_at == delivered
+
     def test_24h_window_excludes_25h_old_check(self, db_conn: sqlite3.Connection) -> None:
         """OVH-021: a 25h-old check must be excluded from the 24h window.
 
