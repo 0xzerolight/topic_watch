@@ -1049,6 +1049,62 @@ class TestTopicDetail:
         page = await client.get(f"/topics/{topic.id}")
         assert "Sources failing" not in page.text
 
+    async def test_failing_sources_callout_survives_older_history_pages(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-224: the callout used to read checks[0] from the paginated history
+        and only render on page==1, so it vanished while viewing an older page even
+        though the topic's actual latest check was still failing."""
+        settings = _make_settings(web_page_size=5)
+        app.dependency_overrides[get_settings] = lambda: settings
+        try:
+            topic = _make_topic(db_conn, name="HBPaged")
+            now = datetime.now(UTC)
+            # 6 older, healthy checks fill page 1 (page_size=5); the latest, failing
+            # check lands alone on page 2 once ordered checked_at DESC.
+            for i in range(6):
+                create_check_result(db_conn, CheckResult(topic_id=topic.id, checked_at=now + timedelta(minutes=i)))
+            create_check_result(
+                db_conn,
+                CheckResult(
+                    topic_id=topic.id,
+                    stage_error="sources_failed: x",
+                    checked_at=now + timedelta(hours=1),
+                ),
+            )
+            db_conn.commit()
+
+            page2 = await client.get(f"/topics/{topic.id}?page=2")
+            assert page2.status_code == 200
+            assert "Sources failing" in page2.text
+        finally:
+            app.dependency_overrides[get_settings] = lambda: _make_settings()
+
+    async def test_failing_sources_callout_is_not_line_clamped(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-106: the callout gets its own bordered component, not the two-line
+        clamped .row-error class used for table-cell text."""
+        topic = _make_topic(db_conn, name="HBClamp")
+        create_check_result(db_conn, CheckResult(topic_id=topic.id, stage_error="sources_failed: x"))
+        db_conn.commit()
+
+        page = await client.get(f"/topics/{topic.id}")
+        assert 'class="source-warning"' in page.text
+
+    async def test_failing_sources_callout_appears_in_feed_source_fragment(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-224: living in the Feed Source fragment means it refreshes on that
+        section's own 30s poll, independent of a full page reload."""
+        topic = _make_topic(db_conn, name="HBFragment")
+        create_check_result(db_conn, CheckResult(topic_id=topic.id, stage_error="sources_failed: x"))
+        db_conn.commit()
+
+        fragment = await client.get(f"/topics/{topic.id}/feed-source")
+        assert fragment.status_code == 200
+        assert "Sources failing" in fragment.text
+
     async def test_detail_shows_importance_threshold(
         self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
     ) -> None:

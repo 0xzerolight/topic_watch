@@ -169,12 +169,19 @@ async def create_topic_handler(
     return RedirectResponse(url=f"/topics/{created.id}", status_code=303)
 
 
-def _feed_source_context(conn: sqlite3.Connection, topic: Topic) -> dict:
+def _feed_source_context(conn: sqlite3.Connection, topic: Topic, topic_id: int) -> dict:
     """Feed Source section context, shared by the detail page and its poll endpoint.
 
     Single source for auto_feed_url / auto_feed_urls / feed_health_map so the full-page
     render (topic_detail) and the /feed-source HTMX fragment can never drift. Mirrors the
-    _topic_row_context anti-drift helper (OVH-154).
+    _topic_row_context anti-drift helper (OVH-154). Takes ``topic_id`` explicitly
+    (rather than ``topic.id``, which is Optional) like that helper does.
+
+    Also carries ``latest_check`` (AUG-224): the "sources failing" callout used to
+    read ``checks[0]`` from the paginated, load-time history and only render on
+    page 1, so it vanished on older pages and never updated after a later check
+    failed or recovered while the tab stayed open. Querying it here instead means
+    it renders on every page and refreshes on this fragment's own 30s poll cadence.
     """
     auto_feed_url = None
     auto_feed_urls: list[str] = []
@@ -193,10 +200,13 @@ def _feed_source_context(conn: sqlite3.Connection, topic: Topic) -> dict:
             if health:
                 feed_health_map[url] = health
 
+    latest_checks = list_check_results(conn, topic_id, limit=1)
+
     return {
         "auto_feed_url": auto_feed_url,
         "auto_feed_urls": auto_feed_urls,
         "feed_health_map": feed_health_map,
+        "latest_check": latest_checks[0] if latest_checks else None,
     }
 
 
@@ -264,7 +274,7 @@ async def topic_detail(
             "total_completion_tokens": total_completion_tokens,
             "global_confidence_threshold": settings.min_confidence_threshold,
             "global_relevance_threshold": settings.min_relevance_threshold,
-            **_feed_source_context(conn, topic),
+            **_feed_source_context(conn, topic, topic_id),
         },
     )
 
@@ -388,7 +398,7 @@ async def topic_feed_source(
     return templates.TemplateResponse(
         request,
         "_feed_source.html",
-        {"topic": topic, **_feed_source_context(conn, topic)},
+        {"topic": topic, **_feed_source_context(conn, topic, topic_id)},
     )
 
 
