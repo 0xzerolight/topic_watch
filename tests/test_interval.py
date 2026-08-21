@@ -127,3 +127,37 @@ class TestRoundTrip:
         minutes = parse_interval(input_str)
         formatted = format_interval(minutes)
         assert parse_interval(formatted) == minutes
+
+
+class TestParseIntervalBounds:
+    """Input bounds keep a crafted value off the shared event loop (AUG-244)."""
+
+    def test_long_digit_input_rejected_quickly(self) -> None:
+        import time
+
+        from app.interval import MAX_INTERVAL_CHARS
+
+        payload = "1" * 40000
+        start = time.perf_counter()
+        with pytest.raises(ValueError):
+            parse_interval(payload)
+        elapsed = time.perf_counter() - start
+
+        assert MAX_INTERVAL_CHARS < 40000
+        # The unanchored findall() backtracked from every offset: ~17s at this
+        # length. Anything near a second means the quadratic scan is back.
+        assert elapsed < 1.0
+
+    def test_error_does_not_echo_the_whole_input(self) -> None:
+        payload = "9" * 5000
+        with pytest.raises(ValueError) as exc:
+            parse_interval(payload)
+        assert len(str(exc.value)) < 200
+
+    def test_long_but_valid_looking_token_run_is_linear(self) -> None:
+        import time
+
+        start = time.perf_counter()
+        with pytest.raises(ValueError):
+            parse_interval("1h " * 20000)
+        assert time.perf_counter() - start < 1.0
