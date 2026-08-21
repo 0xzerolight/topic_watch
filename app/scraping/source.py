@@ -12,7 +12,9 @@ the pipeline lives here rather than in any one source's module (TW-AUD-022):
 - ``article_identity`` / ``collapse_duplicate_entries`` — what makes two entries
   the same article. One definition for every source, so dedup does not depend on
   which provider happened to answer.
-- ``FeedHealthCallback`` / ``FeedStateLoader`` — the health side-channel.
+- ``FetchStatus`` / ``FeedHealthOutcome`` / ``FeedHealthCallback`` /
+  ``FeedStateLoader`` — how a fetch went, and the health side-channel that
+  carries it.
 - ``SourceRequest`` — the per-attempt inputs a fetcher needs beyond the topic.
 - ``register_source`` / ``fetch_feeds_for_topic`` — mode-to-fetcher dispatch.
 
@@ -30,6 +32,7 @@ import time
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any, TypeVar
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -47,12 +50,118 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-FeedHealthCallback = Callable[
-    [str, bool, str | None, str | None, str | None], None
-]  # (feed_url, success, error_msg, etag, last_modified)
+
+class FetchStatus(StrEnum):
+    """How one feed fetch went — the single vocabulary every source reports in.
+
+    Streak, cascade and coverage decisions used to be inferred from "did this
+    return entries", which conflated four different outcomes: a feed that
+    answered with news, one the server said had not changed, one that genuinely
+    has nothing today, and one that failed. Each of those wants a different
+    answer from provider health and from the fallback cascade (AUG-172/AUG-173),
+    so each gets its own value and the callers ask the question they mean.
+    """
+
+    OK = "ok"
+    """Fetched and parsed, with usable entries."""
+
+    NOT_MODIFIED = "not_modified"
+    """A conditional request the source answered 304: our copy is current."""
+
+    EMPTY = "empty"
+    """Fetched and parsed fine; the source simply has nothing to offer."""
+
+    FAILED = "failed"
+    """The source itself failed us: blocked, unreachable, HTTP error, unusable body."""
+
+    ABORTED = "aborted"
+    """We gave up, not the source: the topic's whole attempt budget ran out.
+
+    Kept apart from ``FAILED`` because the usual cause is some *other* feed being
+    slow. Charging it to this feed's failure streak would put a healthy feed into
+    exponential backoff — or trip a provider cooldown — for something it did not
+    do. It still counts against the check's own coverage, so a check that ran out
+    of budget never passes for healthy silence.
+    """
+
+    @property
+    def succeeded(self) -> bool:
+        """True when the source answered us, whether or not it had news.
+
+        This is what resets a failure streak: an empty 200 and a 304 are both
+        proof the source is reachable and behaving (AUG-173).
+        """
+        return self in (FetchStatus.OK, FetchStatus.NOT_MODIFIED, FetchStatus.EMPTY)
+
+    @property
+    def is_source_failure(self) -> bool:
+        """True when the streak should advance and backoff should engage."""
+        return self is FetchStatus.FAILED
+
+    @property
+    def counts_as_failed_fetch(self) -> bool:
+        """True when this fetch yielded nothing *and* that is not normal silence.
+
+        Feeds the check's ``feeds_failed`` counter, which is what tells the
+        pipeline the cycle was degraded rather than quiet.
+        """
+        return self in (FetchStatus.FAILED, FetchStatus.ABORTED)
+
+    @property
+    def should_cascade(self) -> bool:
+        """True when AUTO should try the other provider.
+
+        A 304 must not: the provider answered, and its answer was "you already
+        have it", so cascading buys a second provider's articles for a topic that
+        is not missing any (AUG-172).
+        """
+        return self in (FetchStatus.EMPTY, FetchStatus.FAILED)
+
+
+@dataclass(frozen=True)
+class FeedHealthOutcome:
+    """One feed fetch's health verdict, captured in memory during source I/O.
+
+    The fetch layer reports per-feed outcomes through a callback that fires while
+    other feeds are still in flight. Writing them to SQLite from inside that
+    callback opened a WAL write transaction that stayed open across every
+    remaining feed await — in MANUAL mode a fast feed could own the single writer
+    while ``gather`` waited on a slow one, and in AUTO mode the primary's outcome
+    could own it across the fallback fetch. Past the 5-second busy timeout that
+    fails concurrent UI and scheduler writes outright, and a cancellation
+    discarded health outcomes that had already been observed (AUG-171).
+
+    Collecting them as plain values and applying the batch afterwards, in one
+    short no-await phase, removes both failure modes.
+    """
+
+    feed_url: str
+    status: FetchStatus
+    error_msg: str | None = None
+    etag: str | None = None
+    last_modified: str | None = None
+
+    @property
+    def success(self) -> bool:
+        return self.status.succeeded
+
+
+FeedHealthCallback = Callable[[FeedHealthOutcome], None]
+"""Reports one fetch's verdict. One record rather than five positional values,
+so a new distinction (304 vs empty vs aborted) reaches every consumer at once."""
 
 FeedStateLoader = Callable[[str], "FeedHealth | None"]
 """Returns the stored health row for a feed URL, or None when untracked."""
+
+FeedArticleCheck = Callable[[str], bool]
+"""True when the calling topic already stores articles that came from this feed.
+
+Conditional-GET validators are keyed by feed URL alone while articles are owned
+per topic, so a second topic subscribing to a feed another topic already polls
+inherits validators for a representation it has never seen: the server answers
+304, the topic stores nothing, and it stays empty for as long as the feed is
+unchanged (TW-AUD-020). Asking this before sending validators makes them
+replay-safe — a topic holding nothing from a feed asks for the full body."""
 
 
 SOURCE_ATTEMPT_BUDGET_SECONDS = 300.0
@@ -344,6 +453,19 @@ def collapse_duplicate_entries(entries: list[FeedEntry]) -> list[FeedEntry]:
 
 
 @dataclass(frozen=True)
+class FeedFetchResult:
+    """What one feed URL gave us: its entries and how the fetch went.
+
+    Returned instead of ``(entries, ok)`` so callers stop re-deriving the outcome
+    from ``len(entries)`` — the inference that made an unchanged feed look like an
+    empty one (AUG-172) and an empty one look like nothing at all (AUG-173).
+    """
+
+    entries: list[FeedEntry] = field(default_factory=list)
+    status: FetchStatus = FetchStatus.EMPTY
+
+
+@dataclass(frozen=True)
 class SourceIdentity:
     """Which source answered, and what the pipeline must do with its entries.
 
@@ -425,6 +547,7 @@ class SourceRequest:
     max_results: int = 10
     health_callback: FeedHealthCallback | None = None
     feed_state_loader: FeedStateLoader | None = None
+    topic_holds_feed_articles: FeedArticleCheck | None = None
     backoff_base_minutes: int = BACKOFF_BASE_MINUTES
     backoff_cap_hours: int = BACKOFF_CAP_HOURS
     exa_settings: ExaSettings | None = None
@@ -448,6 +571,7 @@ async def fetch_feeds_for_topic(
     health_callback: FeedHealthCallback | None = None,
     router: ProviderRouter | None = None,
     feed_state_loader: FeedStateLoader | None = None,
+    topic_holds_feed_articles: FeedArticleCheck | None = None,
     backoff_base_minutes: int = BACKOFF_BASE_MINUTES,
     backoff_cap_hours: int = BACKOFF_CAP_HOURS,
     exa_settings: ExaSettings | None = None,
@@ -465,6 +589,9 @@ async def fetch_feeds_for_topic(
     ``feed_state_loader`` supplies the stored ``FeedHealth`` per URL — used to
     send conditional-GET validators (both RSS modes) and to skip backed-off feeds
     (MANUAL only; AUTO provider backoff is owned by ``ProviderRouter``).
+    ``topic_holds_feed_articles`` gates those validators on this topic actually
+    holding something from the feed, so a shared 304 cannot leave it empty
+    (TW-AUD-020).
 
     ``deadline`` bounds the whole attempt. Callers that own a larger unit of work
     (a topic check) pass theirs so the budget spans it; otherwise a fresh one is
@@ -477,6 +604,7 @@ async def fetch_feeds_for_topic(
         max_results=max_results,
         health_callback=health_callback,
         feed_state_loader=feed_state_loader,
+        topic_holds_feed_articles=topic_holds_feed_articles,
         backoff_base_minutes=backoff_base_minutes,
         backoff_cap_hours=backoff_cap_hours,
         exa_settings=exa_settings,

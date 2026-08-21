@@ -406,6 +406,22 @@ def list_article_dedup_keys(conn: sqlite3.Connection, topic_id: int) -> list[tup
     return [(row["content_hash"], row["url"], row["title"]) for row in rows]
 
 
+def topic_has_articles_from_feed(conn: sqlite3.Connection, topic_id: int, feed_url: str) -> bool:
+    """True when this topic already stores at least one article from this feed.
+
+    Conditional-GET validators live in ``feed_health``, keyed by feed URL, while
+    articles belong to a topic. A topic subscribing to a feed another topic
+    already polls therefore inherits validators for a representation it has never
+    received: the server answers 304 and it stores nothing (TW-AUD-020). This is
+    the question that makes sending them safe.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM articles WHERE topic_id = ? AND source_feed = ? LIMIT 1",
+        (topic_id, feed_url),
+    ).fetchone()
+    return row is not None
+
+
 def find_article_by_hash(conn: sqlite3.Connection, content_hash: str) -> Article | None:
     """Find any article with this content hash, across all topics.
 
@@ -1013,24 +1029,32 @@ def upsert_feed_health_success(
     feed_url: str,
     etag: str | None = None,
     last_modified: str | None = None,
+    *,
+    replace_validators: bool = False,
 ) -> None:
     """Record a successful feed fetch.
 
     ``etag`` / ``last_modified`` are the response's conditional-GET validators.
-    A 304 (unchanged) passes ``None`` for both; ``COALESCE`` then preserves the
-    previously stored validators instead of wiping them.
+    ``replace_validators`` says whether this response is entitled to speak for
+    them: a 200 body is the feed's current statement of which validators it
+    issues, so an absent header must CLEAR the stored value rather than leave an
+    obsolete one to be sent forever (AUG-152). A 304 says only "unchanged", so it
+    preserves what is stored and merely refreshes a validator it does supply.
     """
     now = datetime.now(UTC).isoformat()
+    if replace_validators:
+        validator_update = "etag = ?, last_modified = ?"
+    else:
+        validator_update = "etag = COALESCE(?, etag), last_modified = COALESCE(?, last_modified)"
     conn.execute(
-        """INSERT INTO feed_health
+        f"""INSERT INTO feed_health
                (feed_url, last_success_at, consecutive_failures, total_fetches, etag, last_modified)
            VALUES (?, ?, 0, 1, ?, ?)
            ON CONFLICT(feed_url) DO UPDATE SET
                last_success_at = ?,
                consecutive_failures = 0,
                total_fetches = total_fetches + 1,
-               etag = COALESCE(?, etag),
-               last_modified = COALESCE(?, last_modified)""",
+               {validator_update}""",  # noqa: S608 - fixed SQL fragment, no interpolated values
         (feed_url, now, etag, last_modified, now, etag, last_modified),
     )
 
@@ -1048,6 +1072,28 @@ def upsert_feed_health_failure(conn: sqlite3.Connection, feed_url: str, error_ms
                consecutive_failures = consecutive_failures + 1,
                total_fetches = total_fetches + 1,
                total_failures = total_failures + 1""",
+        (feed_url, now, error_msg, now, error_msg),
+    )
+
+
+def upsert_feed_health_aborted(conn: sqlite3.Connection, feed_url: str, error_msg: str) -> None:
+    """Record a fetch this process abandoned, without blaming the feed.
+
+    The topic's whole source budget running out is usually some *other* feed being
+    slow, so charging it to this feed's consecutive-failure count would put a
+    healthy feed into exponential backoff for something it did not do. The attempt
+    and its reason are still recorded, because the Feed Health page has to be able
+    to explain why a feed shows no recent success.
+    """
+    now = datetime.now(UTC).isoformat()
+    conn.execute(
+        """INSERT INTO feed_health (feed_url, last_error_at, last_error_message,
+               consecutive_failures, total_fetches, total_failures)
+           VALUES (?, ?, ?, 0, 1, 0)
+           ON CONFLICT(feed_url) DO UPDATE SET
+               last_error_at = ?,
+               last_error_message = ?,
+               total_fetches = total_fetches + 1""",
         (feed_url, now, error_msg, now, error_msg),
     )
 

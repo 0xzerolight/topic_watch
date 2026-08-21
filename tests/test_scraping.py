@@ -30,6 +30,9 @@ from app.scraping.rss import (
 )
 from app.scraping.source import (
     Deadline,
+    FeedFetchResult,
+    FeedHealthOutcome,
+    FetchStatus,
     article_identity,
     collapse_duplicate_entries,
     normalize_published,
@@ -566,22 +569,20 @@ class TestFetchFeed:
         """
         from unittest.mock import MagicMock
 
-        from app.scraping.rss import fetch_feed_with_status
+        from app.scraping.rss import fetch_feed_outcome
 
         callback = MagicMock()
         transport = _mock_transport({"example.com": (200, "not xml at all {{{")})
         async with httpx.AsyncClient(transport=transport) as client:
-            entries, fetch_ok = await fetch_feed_with_status(
-                "https://example.com/feed", client, health_callback=callback
-            )
+            result = await fetch_feed_outcome("https://example.com/feed", client, health_callback=callback)
 
-        assert entries == []
-        assert fetch_ok is False
+        assert result.entries == []
+        assert result.status is FetchStatus.FAILED
         callback.assert_called_once()
-        url_arg, ok_arg, reason_arg = callback.call_args[0][:3]
-        assert url_arg == "https://example.com/feed"
-        assert ok_arg is False
-        assert reason_arg is not None  # carries the bozo exception text
+        outcome = callback.call_args[0][0]
+        assert outcome.feed_url == "https://example.com/feed"
+        assert outcome.status is FetchStatus.FAILED
+        assert outcome.error_msg is not None  # carries the bozo exception text
 
     async def test_one_malformed_entry_keeps_other_entries(self, caplog: pytest.LogCaptureFixture) -> None:
         """OVH-024: a single bad entry must not discard the whole feed."""
@@ -694,35 +695,33 @@ class TestFeedParserInputs:
         """
         from unittest.mock import MagicMock
 
-        from app.scraping.rss import fetch_feed_with_status
+        from app.scraping.rss import fetch_feed_outcome
 
         callback = MagicMock()
         transport = _bytes_transport(_EMPTY_RSS.encode(), "text/plain; charset=utf-8")
         async with httpx.AsyncClient(transport=transport) as client:
-            entries, fetch_ok = await fetch_feed_with_status(
-                "https://example.com/feed.xml", client, health_callback=callback
-            )
+            result = await fetch_feed_outcome("https://example.com/feed.xml", client, health_callback=callback)
 
-        assert entries == []
-        assert fetch_ok is True
-        callback.assert_called_once_with("https://example.com/feed.xml", True, None, None, None)
+        assert result.entries == []
+        assert result.status is FetchStatus.EMPTY
+        callback.assert_called_once_with(
+            FeedHealthOutcome("https://example.com/feed.xml", FetchStatus.EMPTY, None, None, None)
+        )
 
     async def test_html_error_page_is_still_a_failure(self) -> None:
         """An HTML error page served as text/html stays an OVH-044 soft failure."""
         from unittest.mock import MagicMock
 
-        from app.scraping.rss import fetch_feed_with_status
+        from app.scraping.rss import fetch_feed_outcome
 
         callback = MagicMock()
         transport = _bytes_transport(b"<html><body><h1>404</h1></body></html>", "text/html")
         async with httpx.AsyncClient(transport=transport) as client:
-            entries, fetch_ok = await fetch_feed_with_status(
-                "https://example.com/feed.xml", client, health_callback=callback
-            )
+            result = await fetch_feed_outcome("https://example.com/feed.xml", client, health_callback=callback)
 
-        assert entries == []
-        assert fetch_ok is False
-        assert callback.call_args[0][1] is False
+        assert result.entries == []
+        assert result.status is FetchStatus.FAILED
+        assert callback.call_args[0][0].status is FetchStatus.FAILED
 
 
 # ============================================================
@@ -745,39 +744,37 @@ class TestFeedBozoHandling:
         """Bozo + zero entries => fetch_ok=False and a failure health callback."""
         from unittest.mock import MagicMock
 
-        from app.scraping.rss import fetch_feed_with_status
+        from app.scraping.rss import fetch_feed_outcome
 
         callback = MagicMock()
         transport = _mock_transport({"example.com/feed": (200, "not xml at all {{{")})
         async with httpx.AsyncClient(transport=transport) as client:
-            entries, fetch_ok = await fetch_feed_with_status(
-                "https://example.com/feed.xml", client, health_callback=callback
-            )
+            result = await fetch_feed_outcome("https://example.com/feed.xml", client, health_callback=callback)
 
-        assert entries == []
-        assert fetch_ok is False
+        assert result.entries == []
+        assert result.status is FetchStatus.FAILED
         callback.assert_called_once()
-        args = callback.call_args[0]
-        assert args[0] == "https://example.com/feed.xml"
-        assert args[1] is False
-        assert args[2] is not None  # carries the bozo exception text
+        outcome = callback.call_args[0][0]
+        assert outcome.feed_url == "https://example.com/feed.xml"
+        assert outcome.status is FetchStatus.FAILED
+        assert outcome.error_msg is not None  # carries the bozo exception text
 
     async def test_bozo_with_recovered_entries_succeeds(self) -> None:
         """Bozo but entries recovered => proceed as success."""
         from unittest.mock import MagicMock
 
-        from app.scraping.rss import fetch_feed_with_status
+        from app.scraping.rss import fetch_feed_outcome
 
         callback = MagicMock()
         transport = _mock_transport({"example.com/feed": (200, _BOZO_RECOVERED_RSS)})
         async with httpx.AsyncClient(transport=transport) as client:
-            entries, fetch_ok = await fetch_feed_with_status(
-                "https://example.com/feed.xml", client, health_callback=callback
-            )
+            result = await fetch_feed_outcome("https://example.com/feed.xml", client, health_callback=callback)
 
-        assert fetch_ok is True
-        assert [e.title for e in entries] == ["Recovered & Co"]
-        callback.assert_called_once_with("https://example.com/feed.xml", True, None, None, None)
+        assert result.status is FetchStatus.OK
+        assert [e.title for e in result.entries] == ["Recovered & Co"]
+        callback.assert_called_once_with(
+            FeedHealthOutcome("https://example.com/feed.xml", FetchStatus.OK, None, None, None)
+        )
 
 
 # ============================================================
@@ -1031,7 +1028,7 @@ class TestSourceDeadline:
         """A feed whose budget is gone is a typed failure, not a silent empty fetch."""
         from unittest.mock import MagicMock
 
-        from app.scraping.rss import fetch_feed_with_status
+        from app.scraping.rss import fetch_feed_outcome
         from app.scraping.source import DEADLINE_ERROR, Deadline
 
         calls: list[str] = []
@@ -1042,24 +1039,25 @@ class TestSourceDeadline:
 
         callback = MagicMock()
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            entries, fetch_ok = await fetch_feed_with_status(
+            result = await fetch_feed_outcome(
                 "https://example.com/feed.xml",
                 client,
                 health_callback=callback,
                 deadline=Deadline.after(-1.0),
             )
 
-        assert (entries, fetch_ok) == ([], False)
+        assert result.entries == []
+        assert result.status is FetchStatus.ABORTED
         assert calls == []
-        args = callback.call_args[0]
-        assert args[1] is False
-        assert DEADLINE_ERROR in args[2]
+        outcome = callback.call_args[0][0]
+        assert outcome.status is FetchStatus.ABORTED
+        assert DEADLINE_ERROR in outcome.error_msg
 
     async def test_a_hanging_feed_is_cut_off_and_not_retried(self) -> None:
         """The budget, not the per-request timeout, ends a source that never answers."""
         from unittest.mock import MagicMock
 
-        from app.scraping.rss import fetch_feed_with_status
+        from app.scraping.rss import fetch_feed_outcome
         from app.scraping.source import DEADLINE_ERROR, Deadline
 
         calls: list[str] = []
@@ -1071,7 +1069,7 @@ class TestSourceDeadline:
 
         callback = MagicMock()
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            entries, fetch_ok = await fetch_feed_with_status(
+            result = await fetch_feed_outcome(
                 "https://example.com/feed.xml",
                 client,
                 timeout=600.0,
@@ -1080,9 +1078,10 @@ class TestSourceDeadline:
                 deadline=Deadline.after(0.05),
             )
 
-        assert (entries, fetch_ok) == ([], False)
+        assert result.entries == []
+        assert result.status is FetchStatus.ABORTED
         assert len(calls) == 1  # no retry once the budget is gone
-        assert DEADLINE_ERROR in callback.call_args[0][2]
+        assert DEADLINE_ERROR in callback.call_args[0][0].error_msg
 
     async def test_manual_feeds_share_one_budget(self) -> None:
         """Every feed of a topic draws on the same deadline instance."""
@@ -1090,7 +1089,7 @@ class TestSourceDeadline:
 
         async def fake_fetch(url, client, *, deadline=None, **kwargs):
             seen.append(deadline)
-            return ([], True)
+            return FeedFetchResult(status=FetchStatus.EMPTY)
 
         topic = Topic(
             name="T",
@@ -1099,7 +1098,7 @@ class TestSourceDeadline:
             feed_urls=["https://a.example/feed", "https://b.example/feed"],
         )
         budget = Deadline.after(30.0)
-        with patch("app.scraping.rss.fetch_feed_with_status", side_effect=fake_fetch):
+        with patch("app.scraping.rss.fetch_feed_outcome", side_effect=fake_fetch):
             await fetch_feeds_for_topic(topic, deadline=budget)
 
         assert seen == [budget, budget]
@@ -1312,8 +1311,8 @@ class TestFetchFeedsForTopic:
             feed_mode=FeedMode.MANUAL,
             feed_urls=["https://example.com/feed.xml", "https://example.com/feed.xml"],
         )
-        fetch = AsyncMock(return_value=([], True))
-        with patch("app.scraping.rss.fetch_feed_with_status", fetch):
+        fetch = AsyncMock(return_value=FeedFetchResult(status=FetchStatus.EMPTY))
+        with patch("app.scraping.rss.fetch_feed_outcome", fetch):
             response = await fetch_feeds_for_topic(topic)
 
         assert fetch.await_count == 1
@@ -1343,8 +1342,13 @@ class TestFetchFeedsForTopic:
             feed_mode=FeedMode.MANUAL,
             feed_urls=["https://example.com/feed1.xml", "https://example.com/feed2.xml"],
         )
-        fetch = AsyncMock(side_effect=[([stale], True), ([revised], True)])
-        with patch("app.scraping.rss.fetch_feed_with_status", fetch):
+        fetch = AsyncMock(
+            side_effect=[
+                FeedFetchResult(entries=[stale], status=FetchStatus.OK),
+                FeedFetchResult(entries=[revised], status=FetchStatus.OK),
+            ]
+        )
+        with patch("app.scraping.rss.fetch_feed_outcome", fetch):
             response = await fetch_feeds_for_topic(topic)
 
         assert len(response.entries) == 1
@@ -2108,6 +2112,7 @@ class TestFetchNewArticlesForTopic:
             max_attempts,
             health_callback,
             feed_state_loader=None,
+            topic_holds_feed_articles=None,
             backoff_base_minutes=15,
             backoff_cap_hours=24,
             exa_settings=None,
@@ -2116,7 +2121,7 @@ class TestFetchNewArticlesForTopic:
         ):
             # Simulate a successful feed fetch that triggers a health write.
             if health_callback:
-                health_callback("https://example.com/feed.xml", True, None)
+                health_callback(FeedHealthOutcome("https://example.com/feed.xml", FetchStatus.OK))
             return FeedResponse(entries=[])
 
         with (
@@ -2960,7 +2965,7 @@ class TestFeedStateHelpers:
 
         outcomes: list[FeedHealthOutcome] = []
         cb = _make_health_collector(outcomes)
-        cb("https://ex.com/feed", True, None, 'W/"v1"', "LM1")
+        cb(FeedHealthOutcome("https://ex.com/feed", FetchStatus.OK, None, 'W/"v1"', "LM1"))
 
         # The callback fires while other feeds are still in flight, so it must not
         # have opened a write transaction: nothing is stored yet.
@@ -2968,7 +2973,7 @@ class TestFeedStateHelpers:
         assert outcomes == [
             FeedHealthOutcome(
                 feed_url="https://ex.com/feed",
-                success=True,
+                status=FetchStatus.OK,
                 error_msg=None,
                 etag='W/"v1"',
                 last_modified="LM1",
@@ -2981,7 +2986,7 @@ class TestFeedStateHelpers:
 
         apply_feed_health(
             db_conn,
-            [FeedHealthOutcome("https://ex.com/feed", True, None, 'W/"v1"', "LM1")],
+            [FeedHealthOutcome("https://ex.com/feed", FetchStatus.OK, None, 'W/"v1"', "LM1")],
         )
         db_conn.commit()
         h = get_feed_health(db_conn, "https://ex.com/feed")
@@ -2991,7 +2996,7 @@ class TestFeedStateHelpers:
         from app.crud import get_feed_health
         from app.scraping import FeedHealthOutcome, apply_feed_health
 
-        apply_feed_health(db_conn, [FeedHealthOutcome("https://ex.com/feed", False, "boom")])
+        apply_feed_health(db_conn, [FeedHealthOutcome("https://ex.com/feed", FetchStatus.FAILED, "boom")])
         db_conn.commit()
         h = get_feed_health(db_conn, "https://ex.com/feed")
         assert h is not None and h.consecutive_failures == 1 and h.last_error_message == "boom"
@@ -3011,8 +3016,8 @@ class TestFeedStateHelpers:
 class TestConditionalGet:
     """Phase 1: conditional GET (ETag/Last-Modified) + 304 fast-path."""
 
-    async def test_conditional_get_304_is_empty_but_ok(self) -> None:
-        from app.scraping.rss import fetch_feed_with_status
+    async def test_conditional_get_304_is_its_own_outcome(self) -> None:
+        from app.scraping.rss import fetch_feed_outcome
 
         sent: dict[str, str] = {}
 
@@ -3020,25 +3025,23 @@ class TestConditionalGet:
             sent.update(request.headers)
             return httpx.Response(304)
 
-        calls: list[tuple] = []
-
-        def cb(url, success, err, etag=None, lm=None):
-            calls.append((url, success, err, etag, lm))
+        calls: list[FeedHealthOutcome] = []
 
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
-            entries, ok = await fetch_feed_with_status(
-                "https://example.com/feed", client, health_callback=cb, etag='W/"v1"', last_modified="LM1"
+            result = await fetch_feed_outcome(
+                "https://example.com/feed", client, health_callback=calls.append, etag='W/"v1"', last_modified="LM1"
             )
 
-        assert entries == [] and ok is True
+        assert result.entries == []
+        assert result.status is FetchStatus.NOT_MODIFIED
         assert sent.get("if-none-match") == 'W/"v1"'
         assert sent.get("if-modified-since") == "LM1"
-        # success recorded, validators NOT overwritten (None, None preserves them via COALESCE)
-        assert calls == [("https://example.com/feed", True, None, None, None)]
+        # success recorded, validators NOT overwritten (None preserves them via COALESCE)
+        assert calls == [FeedHealthOutcome("https://example.com/feed", FetchStatus.NOT_MODIFIED, None, None, None)]
 
     async def test_conditional_get_200_forwards_validators(self) -> None:
-        from app.scraping.rss import fetch_feed_with_status
+        from app.scraping.rss import fetch_feed_outcome
 
         rss = (
             '<?xml version="1.0"?><rss version="2.0"><channel><title>T</title>'
@@ -3048,17 +3051,14 @@ class TestConditionalGet:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, text=rss, headers={"ETag": 'W/"v2"', "Last-Modified": "LM2"})
 
-        calls: list[tuple] = []
-
-        def cb(url, success, err, etag=None, lm=None):
-            calls.append((url, success, err, etag, lm))
+        calls: list[FeedHealthOutcome] = []
 
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
-            entries, ok = await fetch_feed_with_status("https://example.com/feed", client, health_callback=cb)
+            result = await fetch_feed_outcome("https://example.com/feed", client, health_callback=calls.append)
 
-        assert ok is True and len(entries) == 1
-        assert calls == [("https://example.com/feed", True, None, 'W/"v2"', "LM2")]
+        assert result.status is FetchStatus.OK and len(result.entries) == 1
+        assert calls == [FeedHealthOutcome("https://example.com/feed", FetchStatus.OK, None, 'W/"v2"', "LM2")]
 
 
 def _dead_feed_health(url: str) -> FeedHealth:
@@ -3081,12 +3081,15 @@ class TestManualBackoffAndValidators:
             url, client, *, timeout, max_attempts, health_callback=None, etag=None, last_modified=None, deadline=None
         ):
             attempted.append(url)
-            return ([FeedEntry(title="A", url="https://live.example/a", source_feed=url)], True)
+            return FeedFetchResult(
+                entries=[FeedEntry(title="A", url="https://live.example/a", source_feed=url)],
+                status=FetchStatus.OK,
+            )
 
         def loader(url):
             return _dead_feed_health(url) if url == "https://dead.example/feed" else None
 
-        with patch("app.scraping.rss.fetch_feed_with_status", side_effect=fake_fetch):
+        with patch("app.scraping.rss.fetch_feed_outcome", side_effect=fake_fetch):
             resp = await fetch_feeds_for_topic(
                 topic, feed_state_loader=loader, backoff_base_minutes=15, backoff_cap_hours=24
             )
@@ -3101,7 +3104,7 @@ class TestManualBackoffAndValidators:
         async def fake_fetch(*a, **k):  # must never be called
             raise AssertionError("backed-off feed must not be fetched")
 
-        with patch("app.scraping.rss.fetch_feed_with_status", side_effect=fake_fetch):
+        with patch("app.scraping.rss.fetch_feed_outcome", side_effect=fake_fetch):
             resp = await fetch_feeds_for_topic(
                 topic, feed_state_loader=_dead_feed_health, backoff_base_minutes=15, backoff_cap_hours=24
             )
@@ -3118,12 +3121,14 @@ class TestManualBackoffAndValidators:
             url, client, *, timeout, max_attempts, health_callback=None, etag=None, last_modified=None, deadline=None
         ):
             seen.append((etag, last_modified))
-            return ([FeedEntry(title="A", url="https://x/a", source_feed=url)], True)
+            return FeedFetchResult(
+                entries=[FeedEntry(title="A", url="https://x/a", source_feed=url)], status=FetchStatus.OK
+            )
 
         def loader(url):
             return FeedHealth(feed_url=url, etag='W/"auto"', last_modified="LM")
 
-        with patch("app.scraping.rss.fetch_feed_with_status", side_effect=fake_fetch):
+        with patch("app.scraping.rss.fetch_feed_outcome", side_effect=fake_fetch):
             await fetch_feeds_for_topic(topic, feed_state_loader=loader)
 
         assert seen and seen[0] == ('W/"auto"', "LM")  # AUTO threaded the stored validators
@@ -3141,13 +3146,15 @@ class TestManualBackoffAndValidators:
         ):
             calls.append((url, etag))
             if len(calls) == 1:  # primary: fetch failed, no entries -> cascade
-                return ([], False)
-            return ([FeedEntry(title="A", url="https://x/a", source_feed=url)], True)
+                return FeedFetchResult(status=FetchStatus.FAILED)
+            return FeedFetchResult(
+                entries=[FeedEntry(title="A", url="https://x/a", source_feed=url)], status=FetchStatus.OK
+            )
 
         def loader(url):
             return FeedHealth(feed_url=url, etag=f"etag::{url[:20]}", last_modified="LM")
 
-        with patch("app.scraping.rss.fetch_feed_with_status", side_effect=fake_fetch):
+        with patch("app.scraping.rss.fetch_feed_outcome", side_effect=fake_fetch):
             # Fresh router so global provider-health state is not mutated.
             await fetch_feeds_for_topic(topic, router=ProviderRouter(), feed_state_loader=loader)
 
