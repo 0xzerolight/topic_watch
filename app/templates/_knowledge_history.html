@@ -28,14 +28,28 @@
                 </summary>
                 {# hx-trigger fires on the parent <details> toggle so the fetch happens
                    on first expand. `intersect` is unreliable here: a closed <details>
-                   hides its children, so the observer may never fire. Errors are
-                   handled globally by notifications.js, which toasts and offers a
-                   working retry (htmxRetry re-issues into this same element). #}
+                   hides its children, so the observer may never fire. `once` means
+                   this trigger fires exactly once regardless of outcome (vendored
+                   HTMX 2.0.4 marks it consumed before the request even goes out), so
+                   a failed first load could never be retried by closing/reopening the
+                   disclosure. notifications.js still toasts globally, but that retry
+                   expires after 8s; the button below is the durable one (AUG-233). #}
                 <div class="rev-body"
                      hx-get="/topics/{{ topic.id }}/knowledge-diff/{{ revision.id }}"
                      hx-trigger="toggle once from:closest details"
-                     hx-swap="innerHTML">
-                    <small class="quiet">Loading diff...</small>
+                     hx-swap="innerHTML"
+                     hx-on:htmx:response-error="this.querySelector('.rev-body-loading').hidden = true; this.querySelector('.rev-body-retry').hidden = false"
+                     hx-on:htmx:send-error="this.querySelector('.rev-body-loading').hidden = true; this.querySelector('.rev-body-retry').hidden = false">
+                    <small class="quiet rev-body-loading">Loading diff...</small>
+                    <p class="rev-body-retry" hidden>
+                        <small class="quiet">Could not load this diff.</small>
+                        <button type="button" class="outline btn-sm"
+                                hx-get="/topics/{{ topic.id }}/knowledge-diff/{{ revision.id }}"
+                                hx-target="closest .rev-body"
+                                hx-swap="innerHTML">
+                            Retry
+                        </button>
+                    </p>
                 </div>
             </details>
         </li>

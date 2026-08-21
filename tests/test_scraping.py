@@ -36,6 +36,7 @@ from app.scraping.source import (
     article_identity,
     collapse_duplicate_entries,
     normalize_published,
+    stored_story_keys,
 )
 
 # --- Sample RSS/Atom XML for mocking ---
@@ -152,6 +153,31 @@ class TestComputeArticleHash:
         h = compute_article_hash("url", "title")
         assert len(h) == 64
         assert all(c in "0123456789abcdef" for c in h)
+
+
+class TestStoredStoryKeys:
+    """AUG-180: a stored row answers to the headline it was written with AND to the stripped one."""
+
+    _URL = "https://publisher.example/story"
+
+    def test_a_bare_headline_has_one_key(self) -> None:
+        assert stored_story_keys(self._URL, "Headline") == (compute_article_hash(self._URL, "Headline"),)
+
+    def test_a_suffixed_headline_also_answers_to_the_stripped_one(self) -> None:
+        keys = stored_story_keys(self._URL, "Headline - BBC News")
+
+        assert keys == (
+            compute_article_hash(self._URL, "Headline - BBC News"),
+            compute_article_hash(self._URL, "Headline"),
+        )
+
+    def test_only_the_last_segment_is_removed(self) -> None:
+        keys = stored_story_keys(self._URL, "Headline - Subtitle - BBC News")
+
+        assert keys[1] == compute_article_hash(self._URL, "Headline - Subtitle")
+
+    def test_a_headline_that_is_only_a_suffix_is_not_emptied(self) -> None:
+        assert stored_story_keys(self._URL, " - BBC News") == (compute_article_hash(self._URL, " - BBC News"),)
 
 
 # ============================================================
@@ -1043,10 +1069,7 @@ class TestBingStubRegression:
         # the apiclick URL carries it percent-encoded (%2f), so before the fix the
         # fetch would hit apiclick, miss the mock, and fall back to the short summary.
         transport = _mock_transport({"publisher.example/bing-real-article": (200, _SAMPLE_HTML)})
-        with (
-            patch("app.scraping.content.is_private_url", return_value=False),
-            patch("app.url_validation.is_private_url", return_value=False),
-        ):
+        with patch("app.url_validation.is_private_url", return_value=False):
             async with httpx.AsyncClient(transport=transport) as client:
                 content = await extract_article_content(entry.url, fallback_summary=entry.summary, client=client)
         assert len(content) >= _STUB_CONTENT_MIN_CHARS
@@ -2658,7 +2681,7 @@ class TestSafeSendRedirectEdgeCases:
 
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
-            seen.append((request.method, url, request.content, request.headers.get("content-type")))
+            seen.append((request.method, url, request.content, request.headers.get("content-length")))
             if "final.example.org" in url:
                 return httpx.Response(200, text="done")
             return httpx.Response(303, headers={"location": "https://final.example.org/result"})
@@ -2677,12 +2700,12 @@ class TestSafeSendRedirectEdgeCases:
         # First hop: original POST with body.
         assert seen[0][0] == "POST"
         assert seen[0][2] == b"payload=1"
-        # Second hop: downgraded to GET, body stripped, content-type removed.
-        method, url, body, content_type = seen[1]
+        # Second hop: downgraded to GET, body stripped, framing headers removed.
+        method, url, body, content_length = seen[1]
         assert method == "GET"
         assert "final.example.org" in url
         assert body == b""
-        assert content_type is None
+        assert content_length is None
 
     async def test_redirect_to_non_http_scheme_is_rejected(self) -> None:
         """A redirect to a file:// (or other non-http) scheme is blocked and the
@@ -2773,12 +2796,14 @@ class TestStoryDedup:
         conn.commit()
         return topic
 
-    def _store_publisher_row(self, conn: sqlite3.Connection, topic: Topic, content_hash: str) -> None:
+    def _store_publisher_row(
+        self, conn: sqlite3.Connection, topic: Topic, content_hash: str, title: str = "The Story"
+    ) -> None:
         create_article(
             conn,
             Article(
                 topic_id=topic.id,
-                title="The Story",
+                title=title,
                 url=self._PUBLISHER,
                 content_hash=content_hash,
                 raw_content="Body",
@@ -2852,6 +2877,25 @@ class TestStoryDedup:
 
         assert stored == []
         # Dropped before its content is fetched a second time.
+        extract.assert_not_called()
+
+    async def test_a_stored_row_still_matches_once_the_publisher_suffix_is_stripped(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """AUG-180: rows written before headline stripping keep the aggregator's suffix.
+
+        The story key includes the title, so on upgrade every stored story stopped
+        matching the same feed item's now-stripped headline — an AUTO topic
+        re-fetched, re-analysed and re-stored its whole current window, one LLM
+        call per story.
+        """
+        topic = self._topic(db_conn)
+        self._store_publisher_row(db_conn, topic, "pre-upgrade-key", title="The Story - BBC News")
+
+        extract = AsyncMock(return_value="Body")
+        stored = await self._run_google(topic, db_path, extract, self._resolver({self._WRAPPER: self._PUBLISHER}))
+
+        assert stored == []
         extract.assert_not_called()
 
     async def test_another_providers_copy_of_a_stored_story_is_skipped(
@@ -3039,31 +3083,71 @@ class TestCandidateSelection:
 
         assert [a.url for a in stored] == ["https://e.example/dated"]
 
-    async def test_an_undated_feed_does_not_starve_a_dated_one(
+    async def test_a_wholly_dateless_feed_costs_the_cap_once_not_forever(
         self, db_conn: sqlite3.Connection, db_path: Path
     ) -> None:
-        """AUG-184: an undated archive feed must not own the cap every check.
+        """AUG-184: a dateless archive feed takes the cap, then stops competing.
 
-        Ranking every undated entry at retrieval time put a whole dateless feed
-        above genuinely breaking news, which is the failure the missing-date rule
-        was supposed to prevent, in the other direction.
+        Ranking its entries at year 1 read as fair to breaking news and was not:
+        a busy dated feed sharing the cap kept every slot on every check, so a
+        feed the user configured delivered nothing at all. At retrieval time the
+        archive leads once; those entries are stored on that check and dedup out
+        of the next one, which hands the cap back to the dated feed.
         """
         topic = self._topic(db_conn)
+        archive = [
+            FeedEntry(title=f"Archive {i}", url=f"https://e.example/a{i}", summary="s", source_feed="archive")
+            for i in range(3)
+        ]
+
+        def batch() -> list[FeedEntry]:
+            return [
+                *archive,
+                FeedEntry(
+                    title="Breaking",
+                    url="https://e.example/breaking",
+                    summary="s",
+                    source_feed="news",
+                    published=datetime.now(UTC) - timedelta(minutes=5),
+                ),
+            ]
+
+        first = await self._store(topic, db_path, batch(), max_articles=3)
+        assert sorted(a.url for a in first) == [
+            "https://e.example/a0",
+            "https://e.example/a1",
+            "https://e.example/a2",
+        ]
+
+        second = await self._store(topic, db_path, batch(), max_articles=3)
+        assert [a.url for a in second] == ["https://e.example/breaking"]
+
+    async def test_a_dateless_feed_is_not_starved_by_a_busy_dated_one(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """AUG-184: a feed with no dates anywhere still reaches the cap it shares."""
+        topic = self._topic(db_conn)
+        now = datetime.now(UTC)
         entries = [
             FeedEntry(title=f"Archive {i}", url=f"https://e.example/a{i}", summary="s", source_feed="archive")
             for i in range(3)
         ] + [
             FeedEntry(
-                title="Breaking",
-                url="https://e.example/breaking",
+                title=f"News {i}",
+                url=f"https://e.example/n{i}",
                 summary="s",
                 source_feed="news",
-                published=datetime.now(UTC) - timedelta(minutes=5),
+                published=now - timedelta(minutes=i),
             )
+            for i in range(10)
         ]
-        stored = await self._store(topic, db_path, entries, max_articles=1)
+        stored = await self._store(topic, db_path, entries, max_articles=10)
 
-        assert [a.url for a in stored] == ["https://e.example/breaking"]
+        assert sorted(a.url for a in stored if a.source_feed == "archive") == [
+            "https://e.example/a0",
+            "https://e.example/a1",
+            "https://e.example/a2",
+        ]
 
     async def test_an_impossible_date_is_not_stored(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         topic = self._topic(db_conn)

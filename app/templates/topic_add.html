@@ -47,7 +47,7 @@
                        {{ 'checked' if (feed_mode or 'auto') == 'auto' }}
                        aria-controls="manual-feeds"
                        onchange="document.getElementById('manual-feeds').style.display='none'; document.getElementById('manual-feeds').setAttribute('aria-hidden','true')">
-                Automatic (Google News)
+                Automatic (news search)
             </label>
             <label>
                 <input type="radio" name="feed_mode" value="manual"
@@ -80,9 +80,10 @@
                     hx-include="#feed_urls"
                     hx-target="#feed-validation-results"
                     hx-swap="innerHTML"
+                    hx-disabled-elt="this"
                     class="secondary outline"
                     style="margin-top: 0.5em;">
-                Validate URLs
+                Validate URLs <span class="htmx-indicator spinner"></span>
             </button>
             <div id="feed-validation-results" role="status" aria-live="polite" aria-atomic="true"></div>
         </div>

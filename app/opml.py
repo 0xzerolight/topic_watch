@@ -6,25 +6,37 @@ and exporting topics as OPML for backup/migration.
 
 import json
 import logging
+import re
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from urllib.parse import urlparse
 
 from app.models import normalize_tags
-from app.url_validation import validate_feed_url
+from app.url_validation import (
+    MAX_FEED_URLS_PER_TOPIC,
+    VALIDATION_CONCURRENCY,
+    validate_feed_url,
+    validate_urls_concurrently,
+)
 
 logger = logging.getLogger(__name__)
 
 MAX_IMPORT_TOPICS = 500
 MAX_OUTLINE_DEPTH = 10
 
+# Unique feed URLs one import may validate. The topic cap counts TOPICS, and it
+# was applied after validation, so a sub-1-MiB file of same-named outlines still
+# bought thousands of blocking DNS lookups and one topic that fans out to
+# thousands of fetches per check (AUG-012). This budget is applied to the deduped
+# URL list BEFORE any resolver work.
+MAX_IMPORT_FEED_URLS = 1000
+
 # Feed URLs one imported topic may accumulate. Merging used to be keyed on
 # display text alone, so an arbitrary number of same-named third-party feeds
 # could land in one topic and fan out to that many concurrent fetches per check
-# (AUG-204).
-MAX_FEEDS_PER_TOPIC = 20
+# (AUG-204). Same bound the manual-feed form applies.
+MAX_FEEDS_PER_TOPIC = MAX_FEED_URLS_PER_TOPIC
 
 # Longest imported topic name kept. The name comes from an attribute a third
 # party wrote and is persisted, rendered in every list, and used as a search
@@ -44,7 +56,14 @@ TAGS_ATTR = "topicWatchTags"
 # of slow/unresolvable hosts no longer serialize into a multi-minute import
 # (OVH-053). ``parse_opml`` runs inside ``asyncio.to_thread`` (worker thread, no
 # event loop), so a ThreadPoolExecutor — not asyncio — is the right primitive.
-_VALIDATION_CONCURRENCY = 16
+_VALIDATION_CONCURRENCY = VALIDATION_CONCURRENCY
+
+# OPML has no use for a DTD, and ElementTree expands internal entities regardless
+# of the source-byte cap the route applies — a ~100 KB file expanded into a
+# 9-million-character attribute (AUG-015). Refusing the declaration outright is
+# the deterministic bound; a raw ``<!DOCTYPE`` can otherwise only appear inside a
+# comment or CDATA, neither of which belongs in an OPML export.
+_DOCTYPE_RE = re.compile(r"<!DOCTYPE", re.IGNORECASE)
 
 
 @dataclass
@@ -152,17 +171,10 @@ def _validate_urls_concurrently(urls: list[str]) -> dict[str, str | None]:
     private-address check) in a bounded thread pool so a large import's blocking
     ``getaddrinfo`` calls run in parallel rather than back-to-back (OVH-053).
     The SSRF invariant is preserved: every URL still passes through
-    ``validate_feed_url``. A tiny/empty list skips the pool entirely.
+    ``validate_feed_url``, which is total and reports a malformed candidate as an
+    error rather than raising through the pool (AUG-205).
     """
-    if not urls:
-        return {}
-    if len(urls) == 1:
-        return {urls[0]: validate_feed_url(urls[0])}
-
-    workers = min(_VALIDATION_CONCURRENCY, len(urls))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        results = list(pool.map(validate_feed_url, urls))
-    return dict(zip(urls, results, strict=True))
+    return validate_urls_concurrently(urls, validate_feed_url, _VALIDATION_CONCURRENCY)
 
 
 def parse_opml(
@@ -189,8 +201,14 @@ def parse_opml(
     result = OPMLResult()
     existing_names = existing_topic_names or set()
 
+    if _DOCTYPE_RE.search(content):
+        # Refused BEFORE the tree is built: expat expands internal entities during
+        # parsing, so the route's source-byte cap bounds the file, not the tree.
+        result.warnings.append("OPML file declares a DTD or entities; refused (OPML does not need them).")
+        return result
+
     try:
-        root = ET.fromstring(content)  # noqa: S314 — entity expansion disabled by default in Python 3.11+ expat; 1MB size cap adds defense-in-depth
+        root = ET.fromstring(content)  # noqa: S314 — DTD/entity declarations refused above; 1MB size cap adds defense-in-depth
     except ET.ParseError as exc:
         result.warnings.append(f"Invalid XML: {exc}")
         return result
@@ -216,6 +234,18 @@ def parse_opml(
             continue
         survivors.append(candidate)
         seen_urls.add(candidate.url)
+
+    # 2a-bis. Hard URL budget BEFORE any resolver work (AUG-012). The topic cap
+    # further down counts topics, and same-named outlines merge without limit, so
+    # it never bounded the number of lookups this import performs — or the number
+    # of feeds a single resulting topic fetches on every check.
+    if len(survivors) > MAX_IMPORT_FEED_URLS:
+        result.warnings.append(
+            f"OPML contains {len(survivors)} new feed URLs. "
+            f"Imported the first {MAX_IMPORT_FEED_URLS}. "
+            f"Import again to add more (duplicates will be skipped)."
+        )
+        survivors = survivors[:MAX_IMPORT_FEED_URLS]
 
     # 2b. Concurrent SSRF validation of the deduped URL set — the only network
     # step. Each URL still flows through ``validate_feed_url`` (DNS + private-IP

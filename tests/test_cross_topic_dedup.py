@@ -692,6 +692,56 @@ class TestChurningRevisionStamps:
         assert len(revised) == 1
         assert revised[0].raw_content == "Correction: he did not resign."
 
+    async def test_a_rotating_campaign_parameter_stores_one_row(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """The stored bodies are read by the URLs the topic wrote, not the entry's.
+
+        Identity strips tracking parameters; the ``url`` column keeps whatever the
+        feed served. A feed minting a new campaign parameter every poll therefore
+        matched no stored row by string, so the comparison set was empty and the
+        moved stamp stored another row on every check.
+        """
+        topic = _make_topic(db_conn, "Topic A")
+        base = self._URL
+        assert len(await self._run(topic, db_path, self._entry(url=f"{base}?utm_content=d1"), self._BODY)) == 1
+
+        for index, minutes in enumerate((15, 30, 45), start=2):
+            stamp = self._PUBLISHED + timedelta(minutes=minutes)
+            entry = self._entry(url=f"{base}?utm_content=d{index}", updated=stamp)
+            assert await self._run(topic, db_path, entry, self._BODY) == []
+
+        assert self._stored_count(db_conn, topic.id) == 1
+
+    async def test_a_page_we_can_never_extract_stores_one_row(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
+        """An empty body is no evidence, so it cannot keep refuting nothing.
+
+        A paywalled or 403 page yields no text at all. Its digest is empty and so
+        matched no stored body, which made every moved ``updated`` stamp store
+        another row — and hand novelty analysis an empty article to read.
+        """
+        topic = _make_topic(db_conn, "Topic A")
+        assert len(await self._run(topic, db_path, self._entry(), "")) == 1
+
+        for minutes in (15, 30, 45, 60):
+            stamp = self._PUBLISHED + timedelta(minutes=minutes)
+            assert await self._run(topic, db_path, self._entry(updated=stamp), "") == []
+
+        assert self._stored_count(db_conn, topic.id) == 1
+
+    async def test_a_transient_extraction_failure_stores_no_second_row(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """Losing the body for a check is not the story changing."""
+        topic = _make_topic(db_conn, "Topic A")
+        assert len(await self._run(topic, db_path, self._entry(), self._BODY)) == 1
+
+        for minutes in (15, 30, 45):
+            stamp = self._PUBLISHED + timedelta(minutes=minutes)
+            assert await self._run(topic, db_path, self._entry(updated=stamp), "") == []
+
+        assert self._stored_count(db_conn, topic.id) == 1
+
 
 class TestSearchResultsDedupAgainstFeeds:
     """AUG-180/AUG-320: prefetched text is how a search source delivers, not a claim.
@@ -730,13 +780,39 @@ class TestSearchResultsDedupAgainstFeeds:
         ):
             return (await fetch_new_articles_for_topic(topic, db_path=db_path)).articles
 
-    async def test_a_search_hit_on_a_story_the_feed_stored_is_skipped(
+    def _stored_count(self, conn: sqlite3.Connection, topic_id: int) -> int:
+        return conn.execute("SELECT COUNT(*) FROM articles WHERE topic_id = ?", (topic_id,)).fetchone()[0]
+
+    async def test_a_search_hit_on_a_feed_story_costs_one_row_then_goes_quiet(
         self, db_conn: sqlite3.Connection, db_path: Path
     ) -> None:
+        """The search source needs a body of its own before it can compare anything.
+
+        Its extractor disagrees with ours about boilerplate, so the feed's body
+        cannot settle whether a search hit is new. Dropping the hit outright never
+        gave the source a baseline, because a drop stores nothing — so one row is
+        stored, and it is what every later hit is compared against.
+        """
         topic = _make_topic(db_conn, "Topic A")
         self._store_feed_row(db_conn, topic.id)
+        text = "The search engine's own extraction of that page."
 
-        assert await self._run_exa(topic, db_path, "The search engine's own extraction of that page.") == []
+        assert len(await self._run_exa(topic, db_path, text)) == 1
+        assert await self._run_exa(topic, db_path, text) == []
+        assert self._stored_count(db_conn, topic.id) == 2
+
+    async def test_a_correction_reaches_a_search_topic_holding_a_feed_row(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """AUG-320: the baseline is what makes a later correction visible at all."""
+        topic = _make_topic(db_conn, "Topic A")
+        self._store_feed_row(db_conn, topic.id)
+        assert len(await self._run_exa(topic, db_path, "The search engine's own extraction.")) == 1
+
+        corrected = await self._run_exa(topic, db_path, "Correction: the minister did not resign after all.")
+
+        assert len(corrected) == 1
+        assert corrected[0].raw_content == "Correction: the minister did not resign after all."
 
     async def test_a_rewritten_search_body_is_still_stored(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         """The claim holds against a body the same source produced earlier."""

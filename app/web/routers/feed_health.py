@@ -54,6 +54,18 @@ def _build_feed_health_rows(feeds: list[FeedHealth], topics: list[Topic], exa_en
     return rows
 
 
+def _format_backoff_label(until: datetime, now: datetime) -> str:
+    """Format a retry ETA, minutes below two hours and hours thereafter (AUG-123).
+
+    The default first backoff is 15 minutes; rounding straight to hours and
+    clamping to a minimum of one made every sub-hour retry read as "~1h".
+    """
+    minutes = max(1, round((until - now).total_seconds() / 60))
+    if minutes < 120:
+        return f"next retry ~{minutes}m"
+    return f"next retry ~{round(minutes / 60)}h"
+
+
 @router.get("/feeds", response_class=HTMLResponse)
 async def feed_health_page(
     request: Request,
@@ -65,17 +77,24 @@ async def feed_health_page(
     topics = list_topics(conn)
     rows = _build_feed_health_rows(feeds, topics, exa_search_endpoint(settings.exa))
 
+    # AUG-213: feed_backoff_until() is a MANUAL-feed-only formula (its own module
+    # docstring says so) — AUTO uses separate provider cooldown state and EXA is
+    # attempted without this backoff, so applying it to every row could label an
+    # AUTO/EXA source as "backing off" until a time the runtime never honors.
+    manual_urls = {url for topic in topics if topic.feed_mode == FeedMode.MANUAL for url in topic.feed_urls}
+
     now = datetime.now(UTC)
     backoff_map: dict[str, str] = {}
     for feed in feeds:
+        if feed.feed_url not in manual_urls:
+            continue
         until = feed_backoff_until(
             feed,
             base_minutes=settings.feed_backoff_base_minutes,
             cap_hours=settings.feed_backoff_cap_hours,
         )
         if until is not None and until > now:
-            hours = max(1, round((until - now).total_seconds() / 3600))
-            backoff_map[feed.feed_url] = f"next retry ~{hours}h"
+            backoff_map[feed.feed_url] = _format_backoff_label(until, now)
     return templates.TemplateResponse(
         request,
         "feed_health.html",
@@ -84,6 +103,12 @@ async def feed_health_page(
 
 
 _MAX_VALIDATION_ERROR_CHARS = 150
+
+# Bounds on the Validate Feeds diagnostic. Concurrency keeps a slow feed from
+# hiding every result behind it; the budget keeps the whole request answerable
+# even when several feeds are slow (each fetch is itself two attempts at 10s).
+_VALIDATION_CONCURRENCY = 5
+_VALIDATION_BUDGET_SECONDS = 60.0
 
 
 async def _validate_one(url: str) -> dict:
@@ -127,7 +152,11 @@ async def validate_feed_url(
             status_code=429,
         )
 
-    urls = [u.strip() for u in feed_urls.strip().splitlines() if u.strip()]
+    # Ordered dedup + the same per-topic cap the save path applies: the box used
+    # to accept every nonblank line and fetch them strictly one after another,
+    # so a handful of slow feeds held the request for minutes and hid every
+    # later result behind the earlier ones (AUG-028).
+    urls = list(dict.fromkeys(u.strip() for u in feed_urls.strip().splitlines() if u.strip()))
     if not urls:
         return templates.TemplateResponse(
             request,
@@ -135,14 +164,34 @@ async def validate_feed_url(
             {"results": [{"url": "", "valid": False, "message": "No URLs provided"}]},
         )
 
-    from app.url_validation import is_private_url
+    from app.url_validation import MAX_FEED_URLS_PER_TOPIC
 
-    results = []
-    for url in urls:
-        if await asyncio.to_thread(is_private_url, url):
-            results.append({"url": url, "valid": False, "message": "Private/local URLs are not allowed"})
-            continue
-        results.append(await _validate_one(url))
+    truncated = len(urls) - MAX_FEED_URLS_PER_TOPIC
+    urls = urls[:MAX_FEED_URLS_PER_TOPIC]
+
+    semaphore = asyncio.Semaphore(_VALIDATION_CONCURRENCY)
+
+    async def _check(url: str) -> dict:
+        # No is_private_url() preflight: the fetch below runs the same check and
+        # reports a blocked host in its own words, so preflighting here made this
+        # route resolve every submitted hostname a third time (AUG-035).
+        async with semaphore:
+            return await _validate_one(url)
+
+    try:
+        async with asyncio.timeout(_VALIDATION_BUDGET_SECONDS):
+            results = list(await asyncio.gather(*(_check(url) for url in urls)))
+    except TimeoutError:
+        results = [{"url": url, "valid": False, "message": "Validation timed out — try a shorter list"} for url in urls]
+
+    if truncated > 0:
+        results.append(
+            {
+                "url": "",
+                "valid": False,
+                "message": f"{truncated} more URL(s) not checked (maximum {MAX_FEED_URLS_PER_TOPIC} per run)",
+            }
+        )
 
     return templates.TemplateResponse(
         request,

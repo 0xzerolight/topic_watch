@@ -20,7 +20,7 @@ from urllib.parse import quote, urlparse
 import httpx
 
 from app.scraping.source import Deadline, SourceDeadlineExceeded, bounded, host_matches, url_hostname
-from app.url_validation import safe_get, safe_send
+from app.url_validation import is_absolute_http_url, safe_get, safe_send
 
 logger = logging.getLogger(__name__)
 
@@ -242,7 +242,9 @@ async def _decode_url(
         logger.debug("Failed to parse batchexecute payload: %s", exc)
         raise _DecoderBrokeError(str(exc)) from exc
 
-    if decoded_url and isinstance(decoded_url, str) and decoded_url.startswith("http"):
+    # ``startswith("http")`` also accepted "httpfoo" and scheme-only values with
+    # no host; the decoded target has to be an absolute http(s) URL (AUG-182).
+    if isinstance(decoded_url, str) and is_absolute_http_url(decoded_url):
         return decoded_url
     return None
 

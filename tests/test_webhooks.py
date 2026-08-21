@@ -941,3 +941,35 @@ class TestWebhookDrainBoundedConcurrency:
             assert list_pending_webhooks(verify) == []
         finally:
             verify.close()
+
+
+class TestWebhookTotalDeadline:
+    """The configured timeout bounds total wall time, not just each phase (AUG-247)."""
+
+    async def test_trickling_response_hits_the_total_deadline(self) -> None:
+        import asyncio
+
+        async def _slow_body():
+            for _ in range(200):
+                await asyncio.sleep(0.02)
+                yield b"x" * 16
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=_slow_body())
+
+        transport = httpx.MockTransport(_handler)
+        real_client = httpx.AsyncClient
+
+        def _client_with_transport(*_args, **kwargs):
+            kwargs.pop("transport", None)
+            return real_client(transport=transport, **kwargs)
+
+        start = asyncio.get_running_loop().time()
+        with patch("app.webhooks.httpx.AsyncClient", side_effect=_client_with_transport):
+            result = await send_webhook("https://hook.example.com/x", {"key": "value"}, timeout=0.3)
+        elapsed = asyncio.get_running_loop().time() - start
+
+        assert result is False
+        # Each chunk lands inside httpx's per-operation read timeout, so only a
+        # total deadline can stop this: 200 x 20ms would otherwise take 4s.
+        assert elapsed < 2.0

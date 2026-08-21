@@ -719,6 +719,58 @@ async def update_settings(request: Request):
     return RedirectResponse(url="/settings?saved=1", status_code=303)
 
 
+def _llm_test_result(ok: bool, message: str) -> HTMLResponse:
+    """Render the Test LLM configuration result, styled like the notification test."""
+    color = "var(--pico-ins-color, #2e7d32)" if ok else "var(--pico-del-color, #c62828)"
+    lead = "&#10003; Connection succeeded." if ok else "Connection failed."
+    from markupsafe import escape
+
+    return HTMLResponse(
+        f'<article style="border-left: 4px solid {color}; padding: 1rem;">'
+        f"<strong>{lead}</strong>"
+        f"<p><small>{escape(message)}</small></p>"
+        "</article>",
+        status_code=200,
+    )
+
+
+@router.post("/settings/test-llm", dependencies=[Depends(verify_csrf)])
+async def test_llm_configuration(
+    request: Request,
+    llm_model: str = Form(""),
+    llm_api_key: str = Form(""),
+    llm_base_url: str = Form(""),
+):
+    """Probe the currently EDITED (unsaved) LLM fields via the live analysis call path.
+
+    Ordinary Settings saves model, key, and base URL and reports success with no
+    live check (AUG-111) — a typo or dead endpoint becomes active configuration
+    until a check fails later. This reuses ``verify_llm_credentials`` (AUG-335)
+    rather than a second probe shape, against exactly the values in the form right
+    now, not the last-saved ones. Blank/absent fields resolve the same way Save
+    does: a blank key keeps the current one, an env-owned field (its control
+    renders disabled, so the browser never submits it) keeps the environment's
+    value.
+    """
+    env_locked = env_locked_controls()
+    disk_settings = _disk_settings(request)
+
+    if not llm_model.strip() and "llm_model" not in env_locked:
+        return _llm_test_result(False, "A model is required, in LiteLLM 'provider/model-name' format.")
+
+    effective_model = llm_model.strip() or disk_settings.llm.model
+    effective_api_key = llm_api_key.strip() or disk_settings.llm.api_key
+    effective_base_url = (
+        disk_settings.llm.base_url if "llm_base_url" in env_locked else normalize_base_url(llm_base_url)
+    )
+
+    try:
+        await verify_llm_credentials(model=effective_model, api_key=effective_api_key, base_url=effective_base_url)
+    except LLMValidationError as exc:
+        return _llm_test_result(False, str(exc))
+    return _llm_test_result(True, "The credentials and model work with the same call analysis makes.")
+
+
 @router.post("/notifications/test", dependencies=[Depends(verify_csrf)])
 async def test_notification(
     request: Request,

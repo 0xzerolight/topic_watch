@@ -152,7 +152,7 @@ async def test_validate_private_url(client: httpx.AsyncClient):
     )
 
     assert response.status_code == 200
-    assert "Private/local URLs are not allowed" in response.text
+    assert "Blocked: private, reserved or unresolvable host" in response.text
     assert "&#10008;" in response.text
 
 
@@ -214,3 +214,65 @@ async def test_validate_accepts_a_genuinely_empty_feed(client: httpx.AsyncClient
         )
 
     assert "Valid RSS feed with 0 entries" in response.text
+
+
+class TestManualFeedListBounds:
+    """Manual feed lists are deduped and capped before DNS / fetch fan-out (AUG-193)."""
+
+    async def test_duplicate_lines_are_deduped_before_persisting(self) -> None:
+        from app.web.routers._validation import validate_topic_form
+
+        pasted = "\n".join(["https://a.example.com/feed", " https://a.example.com/feed ", "https://b.example.com/f"])
+        with patch("app.web.routers._validation.validate_feed_urls", return_value=[]):
+            _mode, urls, _interval, errors = await validate_topic_form("manual", pasted, "6h")
+
+        assert errors == []
+        assert urls == ["https://a.example.com/feed", "https://b.example.com/f"]
+
+    async def test_oversized_list_is_rejected(self) -> None:
+        from app.url_validation import MAX_FEED_URLS_PER_TOPIC
+        from app.web.routers._validation import validate_topic_form
+
+        pasted = "\n".join(f"https://e{i}.example.com/feed" for i in range(MAX_FEED_URLS_PER_TOPIC + 5))
+        _mode, _urls, _interval, errors = await validate_topic_form("manual", pasted, "6h")
+
+        assert any(str(MAX_FEED_URLS_PER_TOPIC) in e for e in errors)
+
+
+class TestRateLimiterHardCap:
+    """The tracked-key cap holds even when every key is inside the window (AUG-216)."""
+
+    def test_store_does_not_grow_past_the_cap_when_nothing_is_stale(self) -> None:
+        from app.web.state import _RATE_LIMIT_MAX_IPS, _check_rate_limit, _rate_limit_store
+
+        _rate_limit_store.clear()
+        try:
+            for i in range(_RATE_LIMIT_MAX_IPS + 50):
+                assert _check_rate_limit(f"10.0.{i // 256}.{i % 256}") is True
+            assert len(_rate_limit_store) <= _RATE_LIMIT_MAX_IPS
+        finally:
+            _rate_limit_store.clear()
+
+
+class TestFeedValidationFanOut:
+    """The validate endpoint dedupes, caps and bounds its fetches (AUG-028)."""
+
+    async def test_duplicate_and_oversized_lists_are_bounded(self, client: httpx.AsyncClient) -> None:
+        from app.url_validation import MAX_FEED_URLS_PER_TOPIC
+
+        seen: list[str] = []
+
+        async def _fake_validate(url: str) -> dict:
+            seen.append(url)
+            return {"url": url, "valid": True, "message": "ok"}
+
+        pasted = "\n".join(
+            ["https://a.example.com/f"] * 3
+            + [f"https://e{i}.example.com/f" for i in range(MAX_FEED_URLS_PER_TOPIC + 5)]
+        )
+        with patch("app.web.routers.feed_health._validate_one", side_effect=_fake_validate):
+            response = await client.post("/feeds/validate", data={"feed_urls": pasted})
+
+        assert response.status_code == 200
+        assert len(seen) == len(set(seen))
+        assert len(seen) <= MAX_FEED_URLS_PER_TOPIC

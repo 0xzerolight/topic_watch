@@ -29,7 +29,7 @@ from app.notifications import (
 def _make_settings(**overrides) -> Settings:
     defaults = {
         "llm": LLMSettings(model="openai/gpt-4o-mini", api_key="test-key"),
-        "notifications": NotificationSettings(urls=["json://localhost"]),
+        "notifications": NotificationSettings(urls=["json://hooks.example.com"]),
     }
     defaults.update(overrides)
     return Settings(**defaults)
@@ -43,7 +43,7 @@ class TestPlaceholderGuard:
 
     async def test_placeholder_url_skipped_real_url_delivered(self) -> None:
         settings = _make_settings(
-            notifications=NotificationSettings(urls=["ntfy://your-topic-name", "json://localhost"])
+            notifications=NotificationSettings(urls=["ntfy://your-topic-name", "json://hooks.example.com"])
         )
         with patch("app.notifications.apprise.Apprise") as mock_ap:
             inst = mock_ap.return_value
@@ -54,9 +54,9 @@ class TestPlaceholderGuard:
         by_url = {r.url: r for r in results}
         assert by_url["ntfy://your-topic-name"].ok is False
         assert "placeholder" in (by_url["ntfy://your-topic-name"].error or "")
-        assert by_url["json://localhost"].ok is True
+        assert by_url["json://hooks.example.com"].ok is True
         # The placeholder never reached Apprise; the real URL did.
-        inst.add.assert_called_once_with("json://localhost")
+        inst.add.assert_called_once_with("json://hooks.example.com")
 
     async def test_marker_as_substring_of_a_component_is_delivered(self) -> None:
         """AUG-245: a real topic merely containing a marker must not be refused."""
@@ -278,7 +278,7 @@ class TestSendNotification:
         result = await send_notification("Title", "Body", settings)
 
         assert result is True
-        mock_instance.add.assert_called_once_with("json://localhost")
+        mock_instance.add.assert_called_once_with("json://hooks.example.com")
         mock_instance.notify.assert_called_once_with(title="Title", body="Body")
 
     @patch("app.notifications.apprise.Apprise")
@@ -287,7 +287,7 @@ class TestSendNotification:
         mock_instance.notify.return_value = True
         mock_apprise.return_value = mock_instance
         settings = _make_settings(
-            notifications=NotificationSettings(urls=["json://localhost", "slack://token/channel"])
+            notifications=NotificationSettings(urls=["json://hooks.example.com", "slack://token/channel"])
         )
 
         await send_notification("T", "B", settings)
@@ -498,12 +498,22 @@ class TestSendNotificationPerUrl:
 
     @patch("app.notifications.apprise.Apprise")
     async def test_returns_one_result_per_url(self, mock_apprise: MagicMock) -> None:
-        instances = [MagicMock(), MagicMock()]
-        instances[0].add.return_value = True
-        instances[0].notify.return_value = True
-        instances[1].add.return_value = True
-        instances[1].notify.return_value = False
-        mock_apprise.side_effect = instances
+        # Targets are delivered concurrently, so the stub is keyed by URL rather
+        # than by the order the instances happen to be constructed in.
+        instances: dict[str, MagicMock] = {}
+
+        def make_instance() -> MagicMock:
+            inst = MagicMock()
+
+            def _add(url: str) -> bool:
+                instances[url] = inst
+                inst.notify.return_value = url != "json://b"
+                return True
+
+            inst.add.side_effect = _add
+            return inst
+
+        mock_apprise.side_effect = make_instance
         settings = _make_settings(notifications=NotificationSettings(urls=["json://a", "json://b"]))
 
         results = await send_notification_per_url("T", "B", settings)
@@ -513,11 +523,20 @@ class TestSendNotificationPerUrl:
     @patch("app.notifications.apprise.Apprise")
     async def test_invalid_url_marked_failed_not_dropped(self, mock_apprise: MagicMock) -> None:
         """A URL apprise can't add() is reported as failed (OVH-027), not silently dropped."""
-        good, bad = MagicMock(), MagicMock()
-        good.add.return_value = True
-        good.notify.return_value = True
-        bad.add.return_value = False  # invalid URL
-        mock_apprise.side_effect = [good, bad]
+        instances: dict[str, MagicMock] = {}
+
+        def make_instance() -> MagicMock:
+            inst = MagicMock()
+
+            def _add(url: str) -> bool:
+                instances[url] = inst
+                return url == "json://good"
+
+            inst.add.side_effect = _add
+            inst.notify.return_value = True
+            return inst
+
+        mock_apprise.side_effect = make_instance
         settings = _make_settings(notifications=NotificationSettings(urls=["json://good", "::invalid::"]))
 
         results = await send_notification_per_url("T", "B", settings)
@@ -526,9 +545,9 @@ class TestSendNotificationPerUrl:
         assert by_url["json://good"].ok is True
         assert by_url["::invalid::"].ok is False
         # The valid URL still delivered.
-        good.notify.assert_called_once()
+        instances["json://good"].notify.assert_called_once()
         # The invalid URL was never notify()'d (add failed first).
-        bad.notify.assert_not_called()
+        instances["::invalid::"].notify.assert_not_called()
 
     @patch("app.notifications.apprise.Apprise")
     async def test_only_named_url_sent_when_url_given(self, mock_apprise: MagicMock) -> None:
@@ -658,3 +677,47 @@ class TestRetryOnlyResendsFailedUrls:
             await retry_pending_notifications(settings=_make_settings(), db_path=db_path)
 
         assert sent_urls == ["json://b"]
+
+
+class TestGenericHttpNotifierSsrfGate:
+    """Generic HTTP Apprise notifiers go through the SSRF gate (AUG-004)."""
+
+    @patch("app.notifications.apprise.Apprise")
+    async def test_private_json_target_blocked_before_apprise(self, mock_apprise: MagicMock) -> None:
+        from app.notifications import _deliver_one
+
+        result = _deliver_one("t", "b", "json://127.0.0.1:9000/internal")
+
+        assert result.ok is False
+        assert "blocked" in (result.error or "")
+        mock_apprise.assert_not_called()
+
+    @patch("app.notifications.apprise.Apprise")
+    async def test_private_form_target_blocked(self, mock_apprise: MagicMock) -> None:
+        from app.notifications import _deliver_one
+
+        assert _deliver_one("t", "b", "forms://192.168.1.5/hook").ok is False
+        mock_apprise.assert_not_called()
+
+    @patch("app.notifications.apprise.Apprise")
+    async def test_public_json_target_still_delivers(self, mock_apprise: MagicMock) -> None:
+        from app.notifications import _deliver_one
+
+        instance = MagicMock()
+        instance.add.return_value = True
+        instance.notify.return_value = True
+        mock_apprise.return_value = instance
+
+        assert _deliver_one("t", "b", "json://hooks.example.com/x").ok is True
+
+    @patch("app.notifications.apprise.Apprise")
+    async def test_named_service_on_a_private_host_is_untouched(self, mock_apprise: MagicMock) -> None:
+        """ntfy/gotify/discord keep working: only generic HTTP notifiers are gated."""
+        from app.notifications import _deliver_one
+
+        instance = MagicMock()
+        instance.add.return_value = True
+        instance.notify.return_value = True
+        mock_apprise.return_value = instance
+
+        assert _deliver_one("t", "b", "ntfy://192.168.1.5/alerts").ok is True

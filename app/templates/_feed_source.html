@@ -11,6 +11,18 @@
      hx-trigger="every 30s"
      hx-target="#feed-source-area"
      hx-swap="innerHTML">
+    {# AUG-224/AUG-106: latest_check is queried independently of the check-history
+       page (topics._feed_source_context), so this renders regardless of which
+       history page is open and refreshes on this fragment's own 30s poll — the
+       old version read checks[0] from the paginated history and only showed on
+       page 1. A dedicated bordered component (not .row-error, which clamps to
+       two lines for a table cell) so the repair link can never be clipped. #}
+    {% if latest_check and latest_check.sources_failing %}
+    <div class="source-warning">
+        <span class="badge badge--bad"><span class="badge-dot"></span>Sources failing</span>
+        <p>The most recent check found no usable source — this topic's silence may not mean "nothing new". <a href="/feeds">Feed Health</a></p>
+    </div>
+    {% endif %}
     <h2>Feed Source</h2>
     {% if topic.feed_mode.value == "auto" %}
     {% if auto_feed_urls %}

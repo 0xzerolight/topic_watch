@@ -13,6 +13,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any, TypeVar, cast
 
+import httpx
 import instructor
 import litellm
 from instructor import Mode
@@ -50,8 +51,25 @@ from app.analysis.restatement import (
 )
 from app.config import Settings
 from app.models import Article, Topic
+from app.url_validation import validate_outbound_url
 
 logger = logging.getLogger(__name__)
+
+# Credential-bearing LLM traffic must not follow redirects (AUG-334). LiteLLM and
+# the OpenAI SDK both build clients with follow_redirects=True, and while httpx
+# strips Authorization cross-origin it preserves Anthropic's x-api-key — a 307/308
+# therefore carried the provider key, the method and the whole prompt body to
+# another origin, bypassing every per-hop check the rest of the app applies.
+# ``litellm.aclient_session`` is LiteLLM's supported hook for supplying the async
+# client, so an unexpected redirect surfaces as an endpoint error instead.
+# Coverage note: it is honoured by the OpenAI-compatible path (which is where a
+# custom base_url is used); LiteLLM's provider-native handlers build their own
+# client and expose no override in the pinned version.
+_LLM_SESSION_TIMEOUT = 600.0
+litellm.aclient_session = httpx.AsyncClient(
+    follow_redirects=False,
+    timeout=httpx.Timeout(_LLM_SESSION_TIMEOUT),
+)
 
 
 # --- Token usage ---
@@ -531,6 +549,39 @@ def _effective_base_url(settings: Settings) -> str | None:
     return settings.llm.base_url or None
 
 
+# Base URLs already checked in this process. The endpoint is operator-chosen
+# configuration, not per-request input, so re-resolving it on every LLM call
+# would buy a blocking DNS lookup per analysis for no added protection; the
+# check re-runs when the value changes (a Settings save) or the process restarts.
+_validated_base_urls: set[str] = set()
+
+
+async def _validate_llm_endpoint(settings: Settings) -> None:
+    """Refuse to send the API key and prompt to an unvetted endpoint (AUG-333).
+
+    ``LLMSettings.base_url`` accepts any string and is honoured for every provider
+    (OVH-104 reversal), so before this gate a cloud model could be pointed at
+    cleartext HTTP or an unrelated authority and it would receive the key and the
+    full prompt. HTTPS is required for public endpoints; local/LAN endpoints stay
+    reachable over plain HTTP because that is the documented Ollama and
+    OpenAI-compatible-gateway setup.
+
+    Raises ``ValueError``. ``analyze_articles`` maps that to its settled safe
+    result; the knowledge paths propagate it, matching their contracts.
+    """
+    base_url = _effective_base_url(settings)
+    if base_url is None or base_url in _validated_base_urls:
+        return
+    await asyncio.to_thread(
+        validate_outbound_url,
+        base_url,
+        purpose="The LLM base URL",
+        allow_private=True,
+        require_https=True,
+    )
+    _validated_base_urls.add(base_url)
+
+
 # Internal output-token ceiling. When a call omits ``max_tokens``, litellm's
 # Anthropic path injects the model's FULL max output (64000 for claude-haiku-4-5),
 # which Anthropic rejects for non-streaming requests — the underlying issue #53
@@ -849,6 +900,7 @@ async def _create_structured(
     rewrite the prompt. Response-model contracts are therefore expressed in the
     model itself (see ``NoveltyResponse``), never through a validation context.
     """
+    await _validate_llm_endpoint(settings)
     hint_key = _mode_hint_key(settings, response_model)
     mode: instructor.Mode = _starting_mode(hint_key)
     while True:

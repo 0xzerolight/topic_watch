@@ -341,11 +341,15 @@ def assign_ranking_dates(entries: list[FeedEntry], *, now: datetime | None = Non
       displaced the real stories the finding was filed about.
     - An entry naming no date at all inherits the date of the nearest dated entry
       of the SAME feed — the one preceding it, since feeds list newest first, and
-      otherwise the one following it. Ranking it at retrieval time instead put a
-      whole dateless archive feed above genuinely breaking news on every check;
-      ranking it at year 1 starved it forever. Taking its neighbour's date keeps
-      it where the feed put it. A feed carrying no dates at all has nothing to
-      inherit, so its entries rank below dated ones rather than above them.
+      otherwise the one following it. Taking its neighbour's date keeps it where
+      the feed put it, instead of at year 1 where it starved.
+    - A feed carrying no dates ANYWHERE has no neighbour to inherit from, so its
+      entries rank at retrieval time. Filing them with the date-discarded junk at
+      year 1 read as fair and was not: a busy dated feed sharing the cap kept
+      every slot on every check, so a dateless archive feed the user configured
+      delivered nothing, ever. Retrieval time costs the cap once — those entries
+      are stored and deduplicated on the check that ingests them — where year 1
+      cost it permanently.
     """
     moment = now or datetime.now(UTC)
     for entry in entries:
@@ -358,7 +362,9 @@ def assign_ranking_dates(entries: list[FeedEntry], *, now: datetime | None = Non
             entry.rank_at = _UNDATED if declared is not None else None
 
     # Forward: the newest dated entry seen so far in this feed. Backward: the
-    # first one that follows, for entries listed above every dated entry.
+    # first one that follows, for entries listed above every dated entry. Between
+    # them the two passes reach every undated entry of a feed that has any dated
+    # entry at all, so the backward default is only ever taken by a feed with none.
     nearest: dict[str, datetime] = {}
     for entry in entries:
         if entry.published is not None:
@@ -370,7 +376,7 @@ def assign_ranking_dates(entries: list[FeedEntry], *, now: datetime | None = Non
         if entry.published is not None:
             nearest[entry.source_feed] = entry.published
         elif entry.rank_at is None:
-            entry.rank_at = nearest.get(entry.source_feed, _UNDATED)
+            entry.rank_at = nearest.get(entry.source_feed, moment)
 
 
 def ranking_date(entry: FeedEntry) -> datetime:
@@ -498,6 +504,33 @@ def compute_article_hash(url: str, title: str) -> str:
     Same serialization, no revision marker — one recipe, not a second one.
     """
     return _identity_digest(canonical_url(url), title.casefold(), "")
+
+
+PUBLISHER_SUFFIX_SEPARATOR = " - "
+"""How an aggregator joins the publisher's name onto a syndicated headline."""
+
+
+def stored_story_keys(url: str, title: str) -> tuple[str, ...]:
+    """Every story key a row already in the database should answer to.
+
+    The strict key, plus a tolerant one with a trailing ``" - X"`` segment
+    removed when the title carries one. Rows written before headline stripping
+    arrived hold ``"Headline - BBC News"`` while the same feed item now parses as
+    ``"Headline"``, and the story key includes the title — so without the tolerant
+    key every AUTO topic's stored window stopped matching on upgrade and its whole
+    current set of stories was re-fetched, re-analysed and stored a second time.
+
+    Tolerance is one-directional and applies only to what is already stored, so
+    an incoming entry is still keyed on exactly the title it arrived with. A
+    headline that merely contains a dash gains a second key against its own URL,
+    which costs nothing beyond a wider match on that one URL.
+    """
+    strict = compute_article_hash(url, title)
+    head, separator, _ = title.rpartition(PUBLISHER_SUFFIX_SEPARATOR)
+    stripped = head.strip() if separator else ""
+    if not stripped:
+        return (strict,)
+    return (strict, compute_article_hash(url, stripped))
 
 
 def _representation_rank(entry: FeedEntry) -> tuple[datetime, int]:

@@ -91,9 +91,15 @@ _DELIVERY_CONCURRENCY = 5
 _RETRY_DRAIN_LIMIT = 20
 
 # Delivery failures that will not change on a retry: the target is an unedited
-# example URL or one Apprise cannot even parse. Three more attempts only delay
-# the abandonment (AUG-245).
-_TERMINAL_DELIVERY_ERRORS = frozenset({"placeholder notification URL", "invalid notification URL"})
+# example URL, one Apprise cannot even parse, or one the SSRF gate refuses.
+# Three more attempts only delay the abandonment (AUG-245).
+_TERMINAL_DELIVERY_ERRORS = frozenset(
+    {
+        "placeholder notification URL",
+        "invalid notification URL",
+        "blocked notification target",
+    }
+)
 
 
 def _summarize_exc(exc: BaseException, *, limit: int = 200) -> str:
