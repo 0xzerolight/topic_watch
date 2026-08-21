@@ -379,23 +379,42 @@ def _publish_setup(request: Request, new_settings: Settings) -> None:
     request.app.state.setup_required = False
 
 
+def _setup_provider_ctx(request: Request) -> dict:
+    """Provider lists plus the LLM fields the environment already supplies.
+
+    The wizard writes only what the environment does not own, so a control for an
+    env-owned field is rendered read-only rather than demanding an entry that is
+    discarded on save (C5-4).
+    """
+    owned = env_owned_field_paths()
+    settings: Settings = request.app.state.settings
+    return {
+        "cloud_providers": sorted(CLOUD_PROVIDERS),
+        "local_provider_defaults": LOCAL_PROVIDER_DEFAULTS,
+        "api_key_env_sourced": ("llm", "api_key") in owned,
+        "model_env_sourced": ("llm", "model") in owned,
+        "env_model": settings.llm.model,
+    }
+
+
 @router.get("/setup", response_class=HTMLResponse)
 async def setup_view(request: Request):
     """Display the first-run setup wizard, or redirect to dashboard if already configured."""
     if not getattr(request.app.state, "setup_required", False):
         return RedirectResponse(url="/", status_code=303)
-    _provider_ctx = {"cloud_providers": sorted(CLOUD_PROVIDERS), "local_provider_defaults": LOCAL_PROVIDER_DEFAULTS}
     return _render(
         request,
         "setup.html",
-        {"setup_mode": True, **_provider_ctx},
+        {"setup_mode": True, **_setup_provider_ctx(request)},
     )
 
 
 @router.post("/setup", dependencies=[Depends(verify_csrf)])
 async def complete_setup(
     request: Request,
-    llm_model: str = Form(...),
+    # Optional at the transport level for the same reason as the key below: an
+    # env-owned model renders disabled and is not submitted at all (C5-4).
+    llm_model: str = Form(""),
     # Optional at the transport level: an empty form value reads as "missing" and would
     # 422 with a generic error page before the handler could explain anything. Whether a
     # key is actually required is provider-aware and enforced below (AUG-107).
@@ -423,7 +442,7 @@ async def complete_setup(
         "llm_api_key": "",
         "llm_base_url": llm_base_url,
     }
-    _provider_ctx = {"cloud_providers": sorted(CLOUD_PROVIDERS), "local_provider_defaults": LOCAL_PROVIDER_DEFAULTS}
+    _provider_ctx = _setup_provider_ctx(request)
     try:
         # One setup at a time (AUG-292). The gate above is checked before an awaited
         # credential probe, so two first-run submissions could both pass it and both
@@ -432,9 +451,15 @@ async def complete_setup(
             if not getattr(request.app.state, "setup_required", False):
                 return RedirectResponse(url="/", status_code=303)
 
+            # What the environment supplies is not the user's to type: those fields are
+            # rendered read-only and dropped from the submission, so demanding them here
+            # asked for a value that would be discarded anyway (C5-4).
+            owned = env_owned_field_paths()
+            if not llm_model.strip() and ("llm", "model") not in owned:
+                raise LLMValidationError("A model is required, in LiteLLM 'provider/model-name' format.")
             # Provider-aware key requirement (AUG-107): a hosted provider needs one,
             # a local one never did and the wizard used to demand it anyway.
-            if not llm_api_key.strip() and not is_keyless_llm_provider(llm_model):
+            if not llm_api_key.strip() and ("llm", "api_key") not in owned and not is_keyless_llm_provider(llm_model):
                 raise LLMValidationError(
                     f"An API key is required for '{llm_model}'. Only a local provider "
                     f"({', '.join(sorted(LOCAL_PROVIDER_DEFAULTS))}) can be left blank."
@@ -450,7 +475,14 @@ async def complete_setup(
             # any LLM failure (no crash, no spurious notification). The user fixes it later in
             # Settings, and Feed Health / `doctor` surface the failing checks.
             if skip_validation != "true":
-                await verify_llm_credentials(model=llm_model, api_key=llm_api_key, base_url=effective_base_url)
+                # Probe what will actually be used, not what was typed: an env-owned
+                # field never reaches the saved settings, so validating the submitted
+                # value tested a different credential than the one setup persists (C5-4).
+                await verify_llm_credentials(
+                    model=new_settings.llm.model,
+                    api_key=new_settings.llm.api_key,
+                    base_url=new_settings.llm.base_url,
+                )
                 if not getattr(request.app.state, "setup_required", False):
                     return RedirectResponse(url="/", status_code=303)
             _publish_setup(request, new_settings)

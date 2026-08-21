@@ -27,14 +27,23 @@
 
     <h2>LLM Configuration</h2>
 
+    {# A field the environment supplies is dropped from the submission, so it is shown
+       read-only instead of demanding a value the wizard would discard (C5-4). #}
     <label for="llm_model">
-        Model
-        <input type="text" id="llm_model" name="llm_model" required
-               value="{{ form.llm_model if form else '' }}"
+        Model{% if model_env_sourced %} <small>(set via environment — read-only)</small>{% endif %}
+        <input type="text" id="llm_model" name="llm_model" required{% if model_env_sourced %} disabled{% endif %}
+               value="{{ env_model if model_env_sourced else (form.llm_model if form else '') }}"
                placeholder="e.g., openai/gpt-5.4-nano, anthropic/claude-haiku-4-5, ollama/llama3.3">
-        <small>Use LiteLLM format: <code>provider/model-name</code></small>
+        <small>{% if model_env_sourced %}The model is supplied by <code>TOPIC_WATCH_LLM__MODEL</code> and cannot be changed here.{% else %}Use LiteLLM format: <code>provider/model-name</code>{% endif %}</small>
     </label>
 
+    {% if api_key_env_sourced %}
+    <label for="llm_api_key">
+        API Key <small>(set via environment — read-only)</small>
+        <input type="text" id="llm_api_key" value="(set via environment variable TOPIC_WATCH_LLM__API_KEY)" disabled>
+        <small>The API key is supplied by an environment variable, so there is nothing to enter here. It is never written to the config file.</small>
+    </label>
+    {% else %}
     <label for="llm_api_key">
         API Key <small id="api-key-optional" hidden>(not needed for this provider)</small>
         <input type="password" id="llm_api_key" name="llm_api_key"
@@ -44,6 +53,7 @@
         <small>For security, the API key is not echoed back — re-enter it.</small>
         {% endif %}
     </label>
+    {% endif %}
 
     <div id="base-url-group">
         <label for="llm_base_url">
@@ -97,6 +107,9 @@
     }
 
     function updateKeyRequirement(p) {
+        // Nothing to require when the environment supplies the key: that field is
+        // rendered read-only and carries no hint element to toggle.
+        if (!keyInput || !keyOptional) { return; }
         // A local provider authenticates nothing, so the key is genuinely optional.
         var keyless = Object.prototype.hasOwnProperty.call(LOCAL_DEFAULTS, p);
         keyInput.required = !keyless;
