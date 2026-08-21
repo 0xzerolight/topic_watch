@@ -524,3 +524,52 @@ class TestGradualInitIsBounded:
             refreshed = get_topic(conn, topic.id)
         assert refreshed.status == TopicStatus.ERROR
         assert refreshed.error_message == "Research timed out. Click Retry."
+
+
+class TestLifespanShutdown:
+    """AUG-265: the scheduler stops however the lifespan context ends."""
+
+    async def _run_lifespan(self, monkeypatch, *, boom: bool) -> list[str]:
+        import pytest
+
+        from app.main import app, lifespan
+
+        calls: list[str] = []
+        monkeypatch.setattr("app.main.load_settings", _make_settings)
+        monkeypatch.setattr("app.main.start_scheduler", lambda *a, **k: calls.append("start"))
+        monkeypatch.setattr("app.main.stop_scheduler", lambda: calls.append("stop"))
+
+        if not boom:
+            async with lifespan(app):
+                pass
+            return calls
+
+        with pytest.raises(RuntimeError, match="serving blew up"):
+            async with lifespan(app):
+                raise RuntimeError("serving blew up")
+        return calls
+
+    async def test_clean_exit_stops_the_scheduler(self, monkeypatch) -> None:
+        assert await self._run_lifespan(monkeypatch, boom=False) == ["start", "stop"]
+
+    async def test_exceptional_exit_still_stops_the_scheduler(self, monkeypatch) -> None:
+        """The exception is thrown in at the yield; cleanup after it never ran."""
+        assert await self._run_lifespan(monkeypatch, boom=True) == ["start", "stop"]
+
+    async def test_cancelled_exit_still_stops_the_scheduler(self, monkeypatch) -> None:
+        import pytest
+
+        from app.main import app, lifespan
+
+        calls: list[str] = []
+        monkeypatch.setattr("app.main.load_settings", _make_settings)
+        monkeypatch.setattr("app.main.start_scheduler", lambda *a, **k: calls.append("start"))
+        monkeypatch.setattr("app.main.stop_scheduler", lambda: calls.append("stop"))
+
+        import asyncio
+
+        with pytest.raises(asyncio.CancelledError):
+            async with lifespan(app):
+                raise asyncio.CancelledError()
+
+        assert calls == ["start", "stop"]

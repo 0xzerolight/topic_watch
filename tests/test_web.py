@@ -17,6 +17,7 @@ from app.crud import (
     create_check_result,
     create_knowledge_state,
     create_topic,
+    get_topic_by_name,
 )
 from app.main import REQUEST_ID_PATTERN, app
 from app.models import (
@@ -383,6 +384,85 @@ class TestOpmlImportErrorRedirect:
             )
 
         assert "2 feed URL(s) rejected" in unquote(response.headers["location"])
+
+
+class TestOpmlImportRechecksAfterValidation:
+    """AUG-287: admission is decided against live state, after the DNS work."""
+
+    _OPML = (
+        '<?xml version="1.0"?><opml version="2.0"><body>'
+        '<outline text="Dup" type="rss" xmlUrl="https://feeds.example.com/dup"/>'
+        "</body></opml>"
+    )
+
+    async def test_name_taken_during_validation_is_skipped_not_a_500(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """A concurrent import that wins the name loses this batch, not the request.
+
+        The snapshot of existing names is taken before the DNS-validating parse, so
+        an overlapping import of the same file passed admission twice; the loser hit
+        the UNIQUE constraint uncaught and rolled its whole batch back.
+        """
+        from urllib.parse import unquote
+
+        from app.opml import OPMLResult
+
+        parsed = OPMLResult()
+        parsed.topics.append({"name": "Dup", "feed_urls": ["https://feeds.example.com/dup"], "tags": []})
+        parsed.topics.append({"name": "Fresh", "feed_urls": ["https://feeds.example.com/fresh"], "tags": []})
+
+        def _parse_and_race(*args, **kwargs):
+            # The competing import commits while this one is inside parse_opml.
+            create_topic(db_conn, Topic(name="Dup", description="d", status=TopicStatus.NEW))
+            db_conn.commit()
+            return parsed
+
+        with patch("app.opml.parse_opml", new=_parse_and_race):
+            response = await client.post(
+                "/import/opml",
+                files={"opml_file": ("feeds.opml", self._OPML, "text/xml")},
+                follow_redirects=False,
+            )
+
+        assert response.status_code == 303
+        location = unquote(response.headers["location"])
+        assert "Imported 1 topic(s)" in location
+        assert "skipped 1 duplicate(s)" in location
+        # The topic that was still unique survived the batch.
+        assert get_topic_by_name(db_conn, "Fresh") is not None
+
+    async def test_feed_url_taken_during_validation_is_skipped(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """A URL that became a duplicate during validation does not import twice."""
+        from app.opml import OPMLResult
+
+        parsed = OPMLResult()
+        parsed.topics.append({"name": "Second Name", "feed_urls": ["https://feeds.example.com/dup"], "tags": []})
+
+        def _parse_and_race(*args, **kwargs):
+            create_topic(
+                db_conn,
+                Topic(
+                    name="First Name",
+                    description="d",
+                    status=TopicStatus.NEW,
+                    feed_urls=["https://feeds.example.com/dup"],
+                ),
+            )
+            db_conn.commit()
+            return parsed
+
+        with patch("app.opml.parse_opml", new=_parse_and_race):
+            response = await client.post(
+                "/import/opml",
+                files={"opml_file": ("feeds.opml", self._OPML, "text/xml")},
+                follow_redirects=False,
+            )
+
+        assert response.status_code == 303
+        assert get_topic_by_name(db_conn, "Second Name") is None
 
 
 class TestDashboardStatsFreshness:
