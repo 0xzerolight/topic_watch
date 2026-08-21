@@ -321,10 +321,24 @@ class TestVacuumDb:
         # Should not raise
         await _vacuum_db(db_path)
 
-    async def test_does_not_raise_on_error(self) -> None:
-        """VACUUM failure should be caught, not crash the scheduler."""
-        # Non-existent path will cause an error
-        await _vacuum_db(Path("/nonexistent/path.db"))
+    async def test_does_not_raise_on_error(self, caplog) -> None:
+        """VACUUM failure should be caught, not crash the scheduler.
+
+        AUG-056: ``get_connection`` creates missing parent directories, so
+        ``/nonexistent/path.db`` only fails under an unprivileged runner —
+        under root it succeeds and writes under the filesystem root, and either
+        way the old test asserted neither the warning nor which branch ran.
+        Mock the failure directly so the error path is exercised deterministically.
+        """
+        import logging
+
+        with (
+            patch("app.scheduler._vacuum_db_sync", side_effect=OSError("disk full")),
+            caplog.at_level(logging.WARNING, logger="app.scheduler"),
+        ):
+            await _vacuum_db(Path("unused.db"))  # must not raise
+
+        assert any("VACUUM failed" in r.message for r in caplog.records)
 
     async def test_runs_in_thread(self, tmp_path: Path) -> None:
         """VACUUM must run off the event loop via asyncio.to_thread."""
