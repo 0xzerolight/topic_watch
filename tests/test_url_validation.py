@@ -576,6 +576,53 @@ class TestSafeSendRedirectCredentials:
         assert seen[1].headers.get("authorization") == "Basic dXNlcjpwYXNz"
 
 
+class TestPrivateRedirectErrorRedaction:
+    """AUG-312: PrivateRedirectError's own message must not carry the raw
+    blocked URL — a caller logging it with exc_info=True (a traceback renders
+    the exception's str()) would otherwise reproduce userinfo/query secrets
+    that the warning logged alongside the raise already redacts."""
+
+    async def test_blocked_initial_private_url_message_is_redacted(self) -> None:
+        secret_url = "http://user:s3cr3tpass@127.0.0.1:8080/internal?token=QUERYSECRET"
+        transport = httpx.MockTransport(lambda request: httpx.Response(200))
+        async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+            with pytest.raises(PrivateRedirectError) as exc_info:
+                await safe_get(client, secret_url)
+
+        message = str(exc_info.value)
+        assert "s3cr3tpass" not in message
+        assert "QUERYSECRET" not in message
+
+    async def test_blocked_initial_non_http_scheme_message_is_redacted(self) -> None:
+        transport = httpx.MockTransport(lambda request: httpx.Response(200))
+        async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+            request = client.build_request("GET", "file:///etc/passwd?token=QUERYSECRET")
+            with pytest.raises(PrivateRedirectError) as exc_info:
+                await safe_send(client, request)
+
+        assert "QUERYSECRET" not in str(exc_info.value)
+
+    async def test_blocked_redirect_target_message_is_redacted(self, monkeypatch) -> None:
+        _stub_resolves_to(monkeypatch, "93.184.216.34")
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "feeds.example.com":
+                return httpx.Response(
+                    302,
+                    headers={"location": "http://user:s3cr3tpass@127.0.0.1/internal?token=QUERYSECRET"},
+                )
+            return httpx.Response(200, text="ok")
+
+        transport = httpx.MockTransport(_handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+            with pytest.raises(PrivateRedirectError) as exc_info:
+                await safe_get(client, "https://feeds.example.com/feed.xml")
+
+        message = str(exc_info.value)
+        assert "s3cr3tpass" not in message
+        assert "QUERYSECRET" not in message
+
+
 class TestValidateFeedUrlIsTotal:
     """A malformed URL yields an error string, never an exception (AUG-205)."""
 
