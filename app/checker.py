@@ -24,6 +24,7 @@ from app.analysis.llm import analyze_articles
 from app.check_context import check_id_var, generate_check_id
 from app.config import Settings
 from app.crud import (
+    HEARTBEAT_INTENT_KINDS,
     MAX_ANALYSIS_ATTEMPTS,
     abandon_expired_notifications,
     apply_notification_outcome,
@@ -34,20 +35,23 @@ from app.crud import (
     create_check_result,
     create_notification_intents,
     create_webhook_intents,
+    get_heartbeat_latch_raw,
     get_knowledge_state,
     get_topic,
     get_topics_due_for_check,
     list_articles_for_topic,
     list_due_notification_intents,
+    list_sent_heartbeat_alert_targets,
     mark_articles_processed,
     record_article_analysis_failure,
     release_stale_notification_claims,
+    revoke_heartbeat_intents,
     topic_generation_matches,
     update_check_result_delivery,
     update_topic_init_status,
 )
 from app.database import get_db, short_conn
-from app.heartbeat import evaluate_heartbeat
+from app.heartbeat import HeartbeatDecision, evaluate_heartbeat
 from app.models import (
     Article,
     CheckResult,
@@ -754,11 +758,14 @@ async def _run_heartbeat(
     """Announce (or clear) a source outage for this topic. Never raises.
 
     The heartbeat is an observability guarantee layered on top of the pipeline, so
-    a failure here must not turn a recorded check into a lost one. The latch is
-    claimed and committed BEFORE the send, mirroring the OVH-066 durable-state
-    boundary: a crash mid-send costs one missed message instead of re-alerting on
-    every subsequent check. The conditional UPDATE also makes the send
-    exactly-once when a CLI check-all races the server.
+    a failure here must not turn a recorded check into a lost one.
+
+    The latch transition, the per-target delivery intents that announce it, and
+    the revocation of the messages it supersedes are ONE commit (AUG-019/132).
+    Before that boundary the announcement has not happened and the next check
+    re-decides from scratch; after it, every target owes a delivery whatever
+    happens to this process. The send itself is outside the transaction, so a
+    crash mid-send costs at most a retry rather than re-alerting forever.
 
     Each database interaction runs on its own short connection, so the send below
     never has one open behind it.
@@ -768,48 +775,65 @@ async def _run_heartbeat(
             return
 
         if settings.silence_heartbeat_checks <= 0:
-            # Switching the feature off must also reset the latch, silently.
-            # Otherwise a topic latched during an outage keeps that state parked
-            # and fires a phantom "recovered" whenever the feature is re-enabled.
-            if topic.heartbeat_alerted_at is not None:
-                with get_db(db_path) as conn:
-                    if clear_heartbeat_alert(conn, topic.id, generation=topic.generation):
-                        conn.commit()
+            _disable_heartbeat_for_topic(db_path, topic)
             return
 
         with get_db(db_path) as conn:
-            action = evaluate_heartbeat(conn, topic, settings.silence_heartbeat_checks)
-            if action is None:
+            decision = evaluate_heartbeat(conn, topic, settings.silence_heartbeat_checks)
+            if decision is None:
                 return
 
-            # Fenced to this topic's generation: a check that outlived a delete can
-            # reach a replacement topic that recycled the rowid, and latching it
-            # would suppress the replacement's own outage notice (AUG-020).
-            if action.kind == "alert":
-                won = claim_heartbeat_alert(conn, topic.id, datetime.now(UTC), generation=topic.generation)
+            # Targets are resolved BEFORE the latch is touched: with no configured
+            # Apprise URL the announcement cannot happen at all, and consuming the
+            # one-shot latch for it would suppress the alert a target added during
+            # the same outage should still receive (AUG-130).
+            alerted_at = datetime.now(UTC)
+            intents = _heartbeat_intents(
+                conn,
+                decision,
+                topic.id,
+                settings,
+                check_result_id,
+                alerted_at=alerted_at,
+            )
+            if decision.kind == "alert" and not intents:
+                logger.info(
+                    "Silence Heartbeat: topic '%s' has no notification target; leaving the latch unclaimed",
+                    topic.name,
+                )
+                return
+
+            conn.execute("BEGIN IMMEDIATE")
+            # Fenced to this topic's generation and to the check the decision was
+            # computed from: a check that outlived a delete can reach a replacement
+            # topic that recycled the rowid (AUG-020), and a decision from check N
+            # must not land once check N+1 exists (AUG-131).
+            if decision.kind == "alert":
+                won = claim_heartbeat_alert(
+                    conn,
+                    topic.id,
+                    alerted_at,
+                    generation=topic.generation,
+                    head_check_id=decision.head_check_id,
+                )
             else:
-                won = clear_heartbeat_alert(conn, topic.id, generation=topic.generation)
+                won = clear_heartbeat_alert(
+                    conn,
+                    topic.id,
+                    generation=topic.generation,
+                    head_check_id=decision.head_check_id,
+                )
             if not won:
                 # Another checker (e.g. a CLI run against the live server) already
-                # sent this one. Release the implicit write transaction the UPDATE
-                # opened.
+                # sent this one, or a newer check has superseded the decision.
                 conn.rollback()
                 return
 
-            # The heartbeat's messages are delivery intents like any other, and
-            # they carry their kind so a superseded outage alert can be revoked
-            # rather than delivered after the recovery it contradicts (AUG-019).
-            # A5 moves this insert into the same commit as the latch transition;
-            # today it still commits after it.
-            kind = NotificationKind.HEARTBEAT_ALERT if action.kind == "alert" else NotificationKind.HEARTBEAT_RECOVERY
-            intents = build_notification_intents(
-                action.title,
-                action.body,
-                settings,
-                topic.id,
-                kind=kind,
-                check_result_id=check_result_id,
-            )
+            # Anything still queued belongs to the state this transition replaces,
+            # so it is revoked rather than delivered after the event it
+            # contradicts (AUG-132). Revoked first, so the rows inserted next are
+            # never caught by it.
+            revoke_heartbeat_intents(conn, topic.id, HEARTBEAT_INTENT_KINDS)
             create_notification_intents(conn, intents)
             conn.commit()
 
@@ -823,6 +847,67 @@ async def _run_heartbeat(
             )
     except Exception:
         logger.warning("Silence Heartbeat failed for topic '%s'", topic.name, exc_info=True)
+
+
+def _disable_heartbeat_for_topic(db_path: Path | None, topic: Topic) -> None:
+    """Reset this topic's heartbeat state because the feature is off. One commit.
+
+    Defence in depth beside the global reset the setting's save and startup run
+    (AUG-260): a topic latched during an outage would otherwise keep that state
+    parked and fire a phantom "recovered" whenever the feature came back, and a
+    queued alert would arrive long after the user switched the feature off
+    (AUG-132). The latch is read raw so a corrupt value is cleared rather than
+    read as already-unset (AUG-144).
+    """
+    if topic.id is None:
+        return
+    with get_db(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if get_heartbeat_latch_raw(conn, topic.id) is not None:
+            clear_heartbeat_alert(conn, topic.id, generation=topic.generation)
+        revoke_heartbeat_intents(conn, topic.id, HEARTBEAT_INTENT_KINDS)
+        conn.commit()
+
+
+def _heartbeat_intents(
+    conn: sqlite3.Connection,
+    decision: HeartbeatDecision,
+    topic_id: int,
+    settings: Settings,
+    check_result_id: int | None,
+    *,
+    alerted_at: datetime,
+) -> list[PendingNotification]:
+    """The messages this transition owes.
+
+    An alert goes to every configured target, stamped with the latch value it is
+    about to claim — the same spelling ``claim_heartbeat_alert`` stores, so the
+    recovery can find this outage's deliveries later. A recovery goes only to the
+    targets that actually received that outage's alert: an all-clear to somebody
+    who was never told about the outage is noise, not reassurance.
+    """
+    latch_value: str | None
+    if decision.kind == "alert":
+        latch_value = to_db_utc(alerted_at)
+        kind = NotificationKind.HEARTBEAT_ALERT
+        targets: set[str] | None = None
+    else:
+        latch_value = decision.latch_value
+        kind = NotificationKind.HEARTBEAT_RECOVERY
+        targets = list_sent_heartbeat_alert_targets(conn, topic_id, latch_value)
+
+    intents = build_notification_intents(
+        decision.title,
+        decision.body,
+        settings,
+        topic_id,
+        kind=kind,
+        latch_value=latch_value,
+        check_result_id=check_result_id,
+    )
+    if targets is not None:
+        intents = [intent for intent in intents if intent.url in targets]
+    return intents
 
 
 def _summarize_delivery_failures(failed: list[NotificationDelivery]) -> str:

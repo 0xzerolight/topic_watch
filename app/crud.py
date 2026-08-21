@@ -16,6 +16,7 @@ from app.models import (
     FeedHealth,
     KnowledgeRevision,
     KnowledgeState,
+    NotificationKind,
     PendingNotification,
     PendingWebhook,
     Topic,
@@ -1167,6 +1168,53 @@ def apply_notification_outcome(
         (error, next_attempt_at, intent_id, claim_token),
     )
     return cursor.rowcount == 1
+
+
+# Both heartbeat message kinds: what a latch transition (or the feature being
+# switched off) supersedes.
+HEARTBEAT_INTENT_KINDS: tuple[str, ...] = (
+    NotificationKind.HEARTBEAT_ALERT.value,
+    NotificationKind.HEARTBEAT_RECOVERY.value,
+)
+
+
+def list_sent_heartbeat_alert_targets(conn: sqlite3.Connection, topic_id: int, latch_value: str | None) -> set[str]:
+    """Targets that actually received the outage alert stamped ``latch_value``.
+
+    "Sources recovered" is only meaningful to somebody who was told they were
+    failing: a target whose alert failed, was revoked, or is still queued would
+    otherwise get an unexplained all-clear for an outage it never heard about
+    (AUG-019). The latch value is the outage's identity, so an alert from an
+    earlier outage never addresses this recovery.
+    """
+    if latch_value is None:
+        return set()
+    rows = conn.execute(
+        "SELECT DISTINCT url FROM pending_notifications "
+        "WHERE topic_id = ? AND kind = ? AND latch_value = ? AND status = 'sent' AND url IS NOT NULL",
+        (topic_id, NotificationKind.HEARTBEAT_ALERT.value, latch_value),
+    ).fetchall()
+    return {row["url"] for row in rows}
+
+
+def reset_all_heartbeat_state(conn: sqlite3.Connection) -> int:
+    """Clear every latch and revoke every queued heartbeat message. NO commit.
+
+    ``silence_heartbeat_checks = 0`` is the off switch, but the per-check reset
+    only reaches a topic when that topic next runs. Disabling and re-enabling
+    inside one long interval would otherwise preserve the old latch — which then
+    either suppresses the newly enabled outage alert or fires a recovery for an
+    outage nobody was told about (AUG-260). Returns the number of latches cleared.
+    """
+    cursor = conn.execute("UPDATE topics SET heartbeat_alerted_at = NULL WHERE heartbeat_alerted_at IS NOT NULL")
+    cleared = cursor.rowcount
+    placeholders = ",".join("?" for _ in HEARTBEAT_INTENT_KINDS)
+    conn.execute(
+        "UPDATE pending_notifications SET status = 'revoked', claimed_at = NULL, claim_token = NULL "
+        f"WHERE status = 'pending' AND kind IN ({placeholders})",
+        HEARTBEAT_INTENT_KINDS,
+    )
+    return cleared
 
 
 def revoke_heartbeat_intents(conn: sqlite3.Connection, topic_id: int, kinds: tuple[str, ...]) -> int:
