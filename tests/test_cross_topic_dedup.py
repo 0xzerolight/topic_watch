@@ -692,6 +692,35 @@ class TestChurningRevisionStamps:
         assert len(revised) == 1
         assert revised[0].raw_content == "Correction: he did not resign."
 
+    async def test_a_page_we_can_never_extract_stores_one_row(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
+        """An empty body is no evidence, so it cannot keep refuting nothing.
+
+        A paywalled or 403 page yields no text at all. Its digest is empty and so
+        matched no stored body, which made every moved ``updated`` stamp store
+        another row — and hand novelty analysis an empty article to read.
+        """
+        topic = _make_topic(db_conn, "Topic A")
+        assert len(await self._run(topic, db_path, self._entry(), "")) == 1
+
+        for minutes in (15, 30, 45, 60):
+            stamp = self._PUBLISHED + timedelta(minutes=minutes)
+            assert await self._run(topic, db_path, self._entry(updated=stamp), "") == []
+
+        assert self._stored_count(db_conn, topic.id) == 1
+
+    async def test_a_transient_extraction_failure_stores_no_second_row(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """Losing the body for a check is not the story changing."""
+        topic = _make_topic(db_conn, "Topic A")
+        assert len(await self._run(topic, db_path, self._entry(), self._BODY)) == 1
+
+        for minutes in (15, 30, 45):
+            stamp = self._PUBLISHED + timedelta(minutes=minutes)
+            assert await self._run(topic, db_path, self._entry(updated=stamp), "") == []
+
+        assert self._stored_count(db_conn, topic.id) == 1
+
 
 class TestSearchResultsDedupAgainstFeeds:
     """AUG-180/AUG-320: prefetched text is how a search source delivers, not a claim.

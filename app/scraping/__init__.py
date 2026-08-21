@@ -496,6 +496,13 @@ def _drop_unchanged_representations(
     ``updated`` stamp IS the source's explicit claim, and one that cannot be
     refuted is honoured. That costs at most one row, since the row it stores then
     becomes the body every later poll is compared against.
+
+    An entry that arrived with no body at all is a third case, and the one that
+    reinstated the unbounded ingest this function exists to stop: an empty body
+    has no digest, so it matched nothing and every check stored another row for a
+    page we can never read — a paywall, a 403, a transient extraction failure —
+    and handed novelty analysis an empty article each time. No body is no
+    evidence, so the revision claim goes unrefuted and the entry is held.
     """
     contested = [(index, row) for index, row in enumerate(pending) if story_identity(row[0]) in stored.stories]
     if not contested:
@@ -517,7 +524,9 @@ def _drop_unchanged_representations(
     for index, (entry, _, content, origin_provider) in contested:
         story = story_identity(entry)
         offered = body_digest(content)
-        if _is_prefetched(entry):
+        if not offered:
+            settled = True
+        elif _is_prefetched(entry):
             known = by_source.get((story, origin_provider if origin_provider is not None else provider_name), set())
             settled = not known or offered in known
         else:
