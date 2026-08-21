@@ -1671,6 +1671,93 @@ class TestCheckAllTopics:
         assert len(results) == 1
 
 
+class TestCycleIdSharedAcrossCheckAllTopics:
+    """AUG-275: check_all_topics sets one cycle_id_var for its whole run, so
+    every per-topic check and retry drain it launches can be traced back to
+    the same tick, even though each still gets its own, different check_id."""
+
+    async def test_cycle_id_set_during_per_topic_check(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
+        from app.check_context import cycle_id_var
+
+        _make_topic(db_conn, name="Topic A")
+        settings = _make_settings()
+
+        seen: dict[str, str | None] = {}
+
+        async def _capture(*_args, **_kwargs):
+            seen["cycle"] = cycle_id_var.get()
+            return FetchResult(articles=[], total_feed_entries=0)
+
+        assert cycle_id_var.get() is None
+        with patch("app.checker.fetch_new_articles_for_topic", side_effect=_capture):
+            await check_all_topics(settings, db_path=db_path)
+
+        assert seen["cycle"] is not None
+        assert seen["cycle"] != "-"
+        assert cycle_id_var.get() is None  # restored once the cycle ends
+
+    async def test_cycle_id_is_the_same_across_multiple_topics(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        from app.check_context import check_id_var, cycle_id_var
+
+        _make_topic(db_conn, name="Topic A")
+        _make_topic(db_conn, name="Topic B")
+        settings = _make_settings()
+
+        seen_cycle: list[str | None] = []
+        seen_check: list[str | None] = []
+
+        async def _capture(*_args, **_kwargs):
+            seen_cycle.append(cycle_id_var.get())
+            seen_check.append(check_id_var.get())
+            return FetchResult(articles=[], total_feed_entries=0)
+
+        with patch("app.checker.fetch_new_articles_for_topic", side_effect=_capture):
+            await check_all_topics(settings, db_path=db_path)
+
+        assert len(seen_cycle) == 2
+        # Same cycle for both topics...
+        assert seen_cycle[0] == seen_cycle[1]
+        # ...but each still gets its own, distinct check_id.
+        assert seen_check[0] != seen_check[1]
+
+    async def test_cycle_id_shared_with_notification_retry_drain(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """The retry drain runs BEFORE the per-topic loop but must still share
+        the one cycle id, since both are launched from the same cycle."""
+        from app.check_context import cycle_id_var
+
+        topic = _make_topic(db_conn, name="Topic A")
+        create_pending_notification(
+            db_conn,
+            PendingNotification(topic_id=topic.id, title="T", body="B", url="json://localhost"),
+        )
+        db_conn.commit()
+        settings = _make_settings()
+
+        seen: dict[str, str | None] = {}
+
+        async def _capture_send(title, body, url, timeout_s):  # noqa: ANN001
+            seen["retry_cycle"] = cycle_id_var.get()
+            return NotificationDelivery(url=url, ok=True)
+
+        async def _capture_fetch(*_args, **_kwargs):
+            seen["check_cycle"] = cycle_id_var.get()
+            return FetchResult(articles=[], total_feed_entries=0)
+
+        with (
+            patch("app.checker.send_single_notification", side_effect=_capture_send),
+            patch("app.checker.fetch_new_articles_for_topic", side_effect=_capture_fetch),
+        ):
+            await check_all_topics(settings, db_path=db_path)
+
+        assert seen["retry_cycle"] is not None
+        assert seen["retry_cycle"] != "-"
+        assert seen["retry_cycle"] == seen["check_cycle"]
+
+
 # --- retry_pending_notifications ---
 
 

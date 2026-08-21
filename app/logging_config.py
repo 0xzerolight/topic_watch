@@ -27,6 +27,11 @@ class JSONFormatter(logging.Formatter):
             # a request-triggered check logs both at once, so the two can be
             # joined even after the check outlives the request that started it.
             "request_id": getattr(record, "request_id", "-"),
+            # The scheduler check-all cycle a record's check_id belongs to, if
+            # any (AUG-275): every topic check and retry drain launched from
+            # the same tick shares this, so a noisy or failed cycle can be
+            # reconstructed as one unit.
+            "cycle_id": getattr(record, "cycle_id", "-"),
         }
         # Include extra fields if present
         # Standard LogRecord attributes to exclude from extras
@@ -55,6 +60,7 @@ class JSONFormatter(logging.Formatter):
             "taskName",
             "check_id",
             "request_id",
+            "cycle_id",
         }
         extras = {k: v for k, v in record.__dict__.items() if k not in standard_attrs and not k.startswith("_")}
         if extras:

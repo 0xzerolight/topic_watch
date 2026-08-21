@@ -21,7 +21,7 @@ from app.analysis.knowledge import (
     reported_article_ids,
 )
 from app.analysis.llm import analyze_articles
-from app.check_context import check_id_var, generate_check_id
+from app.check_context import check_id_var, cycle_id_var, generate_check_id
 from app.config import Settings
 from app.crud import (
     MAX_ANALYSIS_ATTEMPTS,
@@ -1113,6 +1113,24 @@ async def _check_all_topics_inner(
     db_path: Path | None,
 ) -> list[CheckResult]:
     """Run one whole check cycle (caller owns the whole-cycle gate)."""
+    # One id for the whole cycle, left set for its full duration: the retry
+    # drains below each generate (or lack) their own check_id_var, and every
+    # per-topic check_topic replaces it with that topic's own id, but none of
+    # them touch cycle_id_var — so every record any of them logs still carries
+    # the tick that launched it, and a noisy or failed cycle can be
+    # reconstructed as one unit (AUG-275).
+    cycle_token = cycle_id_var.set(generate_check_id())
+    try:
+        return await _run_check_cycle(settings, db_path)
+    finally:
+        cycle_id_var.reset(cycle_token)
+
+
+async def _run_check_cycle(
+    settings: Settings,
+    db_path: Path | None,
+) -> list[CheckResult]:
+    """The check-all cycle body (caller has set cycle_id_var)."""
     # Retry any failed deliveries from previous cycles. Each retry function
     # manages its own short-lived connections: it snapshots pending rows,
     # sends with NO connection held, and commits per item.

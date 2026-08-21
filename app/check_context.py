@@ -17,6 +17,15 @@ check_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar("check
 # but the same logging filter surfaces either so all log lines stay correlatable.
 request_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar("request_id", default=None)
 
+# Context variable for the current scheduler check-all cycle. Set once per
+# cycle (check_all_topics) and left in place while its notification-retry,
+# webhook-retry and per-topic child pipelines each set their OWN check_id_var
+# — so every record any of them logs also carries the cycle that launched it,
+# and a noisy or failed tick can be reconstructed as one unit (AUG-275). A
+# scheduler tick has no inbound web request, so this is a separate var from
+# request_id_var rather than overloading it.
+cycle_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar("cycle_id", default=None)
+
 
 def generate_check_id() -> str:
     """Generate a short correlation ID (first 8 chars of UUID4)."""
@@ -41,4 +50,5 @@ class CheckIdFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         record.check_id = check_id_var.get() or request_id_var.get() or "-"  # type: ignore[attr-defined]
         record.request_id = request_id_var.get() or "-"  # type: ignore[attr-defined]
+        record.cycle_id = cycle_id_var.get() or "-"  # type: ignore[attr-defined]
         return True
