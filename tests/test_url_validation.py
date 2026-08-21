@@ -654,3 +654,34 @@ class TestValidateOutboundUrl:
 
         with pytest.raises(ValueError, match="private"):
             validate_outbound_url("http://127.0.0.1:8080/v1", purpose="the Exa API")
+
+
+class TestIsAbsoluteHttpUrl:
+    """Discovered URLs need a real host, not just an http(s) scheme (AUG-182)."""
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https:///path",
+            "http:foo",
+            "http://",
+            "https://",
+            "javascript:alert(1)",
+            "",
+            "//example.com/x",
+            "http://example.com:notaport/x",
+        ],
+    )
+    def test_rejects_non_absolute(self, url: str) -> None:
+        from app.url_validation import is_absolute_http_url
+
+        assert is_absolute_http_url(url) is False
+
+    @pytest.mark.parametrize(
+        "url",
+        ["https://example.com", "http://example.com/a?b=c", "https://example.com:8443/x", "http://[::1]:80/x"],
+    )
+    def test_accepts_absolute(self, url: str) -> None:
+        from app.url_validation import is_absolute_http_url
+
+        assert is_absolute_http_url(url) is True

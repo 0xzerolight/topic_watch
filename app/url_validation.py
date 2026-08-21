@@ -194,6 +194,28 @@ def is_private_url(url: str) -> bool:
     return _resolved_ip_is_private(netloc)
 
 
+def is_absolute_http_url(url: str) -> bool:
+    """True if ``url`` is an absolute http(s) URL with a real host.
+
+    A scheme check alone accepts ``https:///path`` and ``http:foo`` — values with
+    no fetchable authority that were stored as article links, failed extraction
+    on every check, and shipped in notifications as an unusable destination
+    (AUG-182). Purely structural and DNS-free: this is the shape gate that runs
+    before the SSRF gate, not a replacement for it.
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in ("http", "https"):
+        return False
+    try:
+        _ = parsed.port  # a non-numeric or out-of-range port makes this raise
+    except ValueError:
+        return False
+    return bool(parsed.hostname)
+
+
 def validate_feed_url(url: str) -> str | None:
     """Validate a single feed URL.
 

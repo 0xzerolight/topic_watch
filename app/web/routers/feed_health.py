@@ -164,7 +164,7 @@ async def validate_feed_url(
             {"results": [{"url": "", "valid": False, "message": "No URLs provided"}]},
         )
 
-    from app.url_validation import MAX_FEED_URLS_PER_TOPIC, is_private_url
+    from app.url_validation import MAX_FEED_URLS_PER_TOPIC
 
     truncated = len(urls) - MAX_FEED_URLS_PER_TOPIC
     urls = urls[:MAX_FEED_URLS_PER_TOPIC]
@@ -172,9 +172,10 @@ async def validate_feed_url(
     semaphore = asyncio.Semaphore(_VALIDATION_CONCURRENCY)
 
     async def _check(url: str) -> dict:
+        # No is_private_url() preflight: the fetch below runs the same check and
+        # reports a blocked host in its own words, so preflighting here made this
+        # route resolve every submitted hostname a third time (AUG-035).
         async with semaphore:
-            if await asyncio.to_thread(is_private_url, url):
-                return {"url": url, "valid": False, "message": "Private/local URLs are not allowed"}
             return await _validate_one(url)
 
     try:

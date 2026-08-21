@@ -43,7 +43,7 @@ from app.scraping.source import FeedHealthCallback as FeedHealthCallback
 from app.scraping.source import FeedResponse as FeedResponse
 from app.scraping.source import compute_article_hash as compute_article_hash
 from app.scraping.source import fetch_feeds_for_topic as fetch_feeds_for_topic
-from app.url_validation import is_private_url, safe_get
+from app.url_validation import PrivateRedirectError, is_absolute_http_url, safe_get
 
 if TYPE_CHECKING:
     from app.models import FeedHealth
@@ -125,11 +125,7 @@ def _resolve_google_news_url(link: str, description: str) -> str:
         # Defense-in-depth (OVH-014): only adopt an http(s) href from the
         # untrusted description; a javascript:/data: href must fall back to the
         # safe Google redirect link rather than become the article URL.
-        if (
-            real_url
-            and not host_matches(url_hostname(real_url), GOOGLE_NEWS_HOST)
-            and urlparse(real_url).scheme.lower() in ("http", "https")
-        ):
+        if real_url and not host_matches(url_hostname(real_url), GOOGLE_NEWS_HOST) and is_absolute_http_url(real_url):
             return real_url
     return link
 
@@ -165,8 +161,7 @@ def _resolve_bing_news_url(link: str) -> str:
     if not targets:
         return link
     real_url = targets[0]
-    target = urlparse(real_url)
-    if target.scheme.lower() in ("http", "https") and not _is_bing_apiclick(target):
+    if is_absolute_http_url(real_url) and not _is_bing_apiclick(urlparse(real_url)):
         return real_url
     return link
 
@@ -337,9 +332,12 @@ def _parse_entry(raw_entry: dict, source_feed: str) -> FeedEntry | None:
     summary = _strip_html(summary)
 
     # Defense-in-depth (OVH-014): a non-http(s) scheme (javascript:, data:, ...)
-    # must never reach the DB, where it would later render into an href.
-    if urlparse(url).scheme.lower() not in ("http", "https"):
-        logger.warning("Dropping feed entry with non-http(s) link scheme: %s", url)
+    # must never reach the DB, where it would later render into an href. The
+    # check is structural, not scheme-only: ``https:///path`` and ``http:foo``
+    # pass a scheme test yet have no fetchable host, so they were stored, failed
+    # extraction on every check, and notified with a dead link (AUG-182).
+    if not is_absolute_http_url(url):
+        logger.warning("Dropping feed entry with a non-absolute http(s) link: %s", url)
         return None
 
     return FeedEntry(
@@ -461,18 +459,10 @@ async def fetch_feed_outcome(
     if budget.expired():
         _record_out_of_budget(feed_url, health_callback, f"{DEADLINE_ERROR} before the feed fetch")
         return FeedFetchResult(status=FetchStatus.ABORTED)
-    # The SSRF check resolves DNS, which is why it runs once per feed rather than
-    # once per attempt; it carries its own hard resolve cap (OVH-148).
-    if await asyncio.to_thread(is_private_url, feed_url):
-        # A feed that is blocked, unresolvable or whose resolver timed out failed
-        # this fetch as surely as a 404 did. Returning before the callback left it
-        # with no health row and no failure streak, so it was retried on every
-        # single check, never entered backoff, and showed the dashboard whatever
-        # it last showed (AUG-177). The message stays generic — the reason is a
-        # DNS fact about a URL the health row already names.
-        logger.warning("Blocked fetch to private URL: %s", redact_url(feed_url))
-        _report(health_callback, feed_url, FetchStatus.FAILED, "Blocked: private, reserved or unresolvable host")
-        return FeedFetchResult(status=FetchStatus.FAILED)
+    # No is_private_url() preflight here: safe_get() validates the initial URL
+    # with the same check before its first send (OVH-140), so a preflight made
+    # every normal fetch resolve the same hostname twice (AUG-035). The blocked
+    # case is caught below as PrivateRedirectError and reported identically.
     owns_client = client is None
     if owns_client:
         client = httpx.AsyncClient(
@@ -590,6 +580,20 @@ async def fetch_feed_outcome(
                     type(exc).__name__,
                 )
                 _report(health_callback, feed_url, FetchStatus.FAILED, f"Network error: {type(exc).__name__}: {exc}")
+                return FeedFetchResult(status=FetchStatus.FAILED)
+            except PrivateRedirectError:
+                # A feed that is blocked, unresolvable or whose resolver timed out
+                # failed this fetch as surely as a 404 did. Returning without the
+                # callback left it with no health row and no failure streak, so it
+                # was retried on every single check, never entered backoff, and
+                # showed the dashboard whatever it last showed (AUG-177). The
+                # message stays generic: the exception text carries the full URL,
+                # and the health row already names it. Never retried — the verdict
+                # is deterministic, not transient.
+                logger.warning("Blocked fetch to private URL: %s", redact_url(feed_url))
+                _report(
+                    health_callback, feed_url, FetchStatus.FAILED, "Blocked: private, reserved or unresolvable host"
+                )
                 return FeedFetchResult(status=FetchStatus.FAILED)
             except Exception as exc:
                 logger.warning("Error fetching feed: %s", feed_url, exc_info=True)

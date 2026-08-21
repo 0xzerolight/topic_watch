@@ -14,7 +14,6 @@ import asyncio
 import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse
 
 import httpx
 
@@ -33,7 +32,7 @@ from app.scraping.source import (
     bounded,
     register_source,
 )
-from app.url_validation import validate_outbound_url
+from app.url_validation import is_absolute_http_url, validate_outbound_url
 
 if TYPE_CHECKING:
     from app.config import ExaSettings
@@ -92,8 +91,10 @@ def _map_exa_result(raw: dict[str, Any]) -> FeedEntry | None:
     title = (raw.get("title") or "").strip()
     if not url or not title:
         return None
-    # Match the RSS scheme guard: never store a non-http(s) url (OVH-014).
-    if urlparse(url).scheme not in ("http", "https"):
+    # Match the RSS guard: never store a url that is not an absolute http(s) one
+    # (OVH-014, AUG-182). Exa results are prefetched, so a hostless value would
+    # otherwise be stored and notified on without a fetch ever proving it dead.
+    if not is_absolute_http_url(url):
         return None
 
     published: datetime | None = None

@@ -1043,10 +1043,7 @@ class TestBingStubRegression:
         # the apiclick URL carries it percent-encoded (%2f), so before the fix the
         # fetch would hit apiclick, miss the mock, and fall back to the short summary.
         transport = _mock_transport({"publisher.example/bing-real-article": (200, _SAMPLE_HTML)})
-        with (
-            patch("app.scraping.content.is_private_url", return_value=False),
-            patch("app.url_validation.is_private_url", return_value=False),
-        ):
+        with patch("app.url_validation.is_private_url", return_value=False):
             async with httpx.AsyncClient(transport=transport) as client:
                 content = await extract_article_content(entry.url, fallback_summary=entry.summary, client=client)
         assert len(content) >= _STUB_CONTENT_MIN_CHARS

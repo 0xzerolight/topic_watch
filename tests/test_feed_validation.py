@@ -152,7 +152,7 @@ async def test_validate_private_url(client: httpx.AsyncClient):
     )
 
     assert response.status_code == 200
-    assert "Private/local URLs are not allowed" in response.text
+    assert "Blocked: private, reserved or unresolvable host" in response.text
     assert "&#10008;" in response.text
 
 
