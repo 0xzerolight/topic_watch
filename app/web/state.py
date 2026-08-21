@@ -8,6 +8,8 @@ where concurrent access is possible.
 
 import asyncio
 import secrets
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 from app import clock
 
@@ -103,6 +105,43 @@ class CheckingState:
 
 
 _checking_state = CheckingState()
+
+
+# --- Delivery claims this process is actively sending ---
+
+_live_claim_tokens: set[str] = set()
+
+
+@contextmanager
+def live_claim(token: str) -> Iterator[None]:
+    """Mark a delivery claim as held by a live sender in THIS process.
+
+    The stale-claim release is a wall-clock rule — a claim stamped more than ten
+    minutes ago is assumed abandoned — because it must also recover claims left
+    by a process that died, and a monotonic reading means nothing across
+    processes. That rule alone re-armed live claims whenever the host clock
+    stepped forward past the cutoff, and the second drainer then sent the same
+    notification again: the token fence makes the first sender's apply a no-op,
+    but nothing un-sends the duplicate message (AUG-277).
+
+    Liveness of an owner in this process is therefore not inferred from the
+    clock at all: while a send is in flight its token is here, and the release
+    skips it however old its stamp looks. A crashed process leaves nothing
+    behind — the set dies with it, and the wall-clock rule recovers the row as
+    it always did. A send that returns with an unknown outcome (the Apprise
+    timeout, deliberately left ``sending``) leaves the set on the way out, so
+    the release can re-arm it exactly as before.
+    """
+    _live_claim_tokens.add(token)
+    try:
+        yield
+    finally:
+        _live_claim_tokens.discard(token)
+
+
+def live_claim_tokens() -> tuple[str, ...]:
+    """The claim tokens whose sends are still in flight in this process."""
+    return tuple(_live_claim_tokens)
 
 
 # --- Feed-validation rate limiter ---

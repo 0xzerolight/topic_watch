@@ -7,6 +7,7 @@ for explicit dependency injection and testability.
 import logging
 import sqlite3
 import unicodedata
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 
 from app.models import (
@@ -1333,18 +1334,38 @@ def revoke_heartbeat_intents(conn: sqlite3.Connection, topic_id: int, kinds: tup
     return cursor.rowcount
 
 
-def release_stale_notification_claims(conn: sqlite3.Connection, cutoff: str) -> int:
+def _live_claim_exclusion(live_tokens: Sequence[str]) -> tuple[str, list[str]]:
+    """SQL fragment and params keeping a live sender's claim out of a stale release."""
+    if not live_tokens:
+        return "", []
+    placeholders = ",".join("?" for _ in live_tokens)
+    return f" AND (claim_token IS NULL OR claim_token NOT IN ({placeholders}))", list(live_tokens)
+
+
+def release_stale_notification_claims(
+    conn: sqlite3.Connection,
+    cutoff: str,
+    live_tokens: Sequence[str] = (),
+) -> int:
     """Re-arm intents claimed at or before ``cutoff`` (ISO string).
 
     A drainer that claims a row then dies — or whose send timed out with an
     unknown outcome — would otherwise leave it 'sending' forever. Re-arming makes
     the queue self-healing; the claim token makes the original owner's late apply
     harmless if it ever comes back.
+
+    ``cutoff`` is wall clock because a claim from a process that no longer exists
+    has to be recoverable, and no monotonic reading survives that process. A
+    forward clock step therefore makes live claims look stale — so the sends this
+    process still has in flight are named explicitly and excluded, which is the
+    liveness half of AUG-277. The apply fence stops the loser writing; this stops
+    the duplicate message being sent at all.
     """
+    exclusion, params = _live_claim_exclusion(live_tokens)
     cursor = conn.execute(
         "UPDATE pending_notifications SET status = 'pending', claimed_at = NULL, claim_token = NULL "
-        "WHERE status = 'sending' AND claimed_at IS NOT NULL AND claimed_at <= ?",
-        (cutoff,),
+        f"WHERE status = 'sending' AND claimed_at IS NOT NULL AND claimed_at <= ?{exclusion}",  # noqa: S608 - placeholders only
+        [cutoff, *params],
     )
     return cursor.rowcount
 
@@ -1512,12 +1533,21 @@ def apply_webhook_outcome(
     return cursor.rowcount == 1
 
 
-def release_stale_webhook_claims(conn: sqlite3.Connection, cutoff: str) -> int:
-    """Re-arm webhook intents claimed at or before ``cutoff`` (ISO string)."""
+def release_stale_webhook_claims(
+    conn: sqlite3.Connection,
+    cutoff: str,
+    live_tokens: Sequence[str] = (),
+) -> int:
+    """Re-arm webhook intents claimed at or before ``cutoff`` (ISO string).
+
+    ``live_tokens`` excludes this process's in-flight sends from the wall-clock
+    staleness rule, exactly as in the notification twin (AUG-277).
+    """
+    exclusion, params = _live_claim_exclusion(live_tokens)
     cursor = conn.execute(
         "UPDATE pending_webhooks SET status = 'pending', claimed_at = NULL, claim_token = NULL "
-        "WHERE status = 'sending' AND claimed_at IS NOT NULL AND claimed_at <= ?",
-        (cutoff,),
+        f"WHERE status = 'sending' AND claimed_at IS NOT NULL AND claimed_at <= ?{exclusion}",  # noqa: S608 - placeholders only
+        [cutoff, *params],
     )
     return cursor.rowcount
 

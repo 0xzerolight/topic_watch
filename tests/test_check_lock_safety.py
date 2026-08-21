@@ -297,6 +297,66 @@ def test_release_stale_webhook_claim_rearms_row(db_conn: sqlite3.Connection) -> 
     assert claim_webhook_intent(db_conn, webhook_id, "tok", "2025-01-01T00:00:00+00:00") is True
 
 
+def test_a_live_senders_claim_survives_a_forward_clock_step(db_conn: sqlite3.Connection) -> None:
+    """AUG-277: a wall-clock jump must not re-arm a claim whose send is in flight.
+
+    Re-arming it lets a second drainer send the same message again — the token
+    fence stops the duplicate WRITE, but nothing un-sends the duplicate message.
+    """
+    from app.web.state import live_claim, live_claim_tokens
+
+    topic = _make_topic(db_conn)
+    n = create_pending_notification(db_conn, PendingNotification(topic_id=topic.id, title="T", body="B"))
+    db_conn.commit()
+    assert claim_notification_intent(db_conn, n.id, "live-token", "2020-01-01T00:00:00+00:00") is True
+    db_conn.commit()
+
+    with live_claim("live-token"):
+        # The host clock steps a decade forward: every claim now looks stale.
+        released = release_stale_notification_claims(db_conn, "2030-01-01T00:00:00+00:00", live_claim_tokens())
+        db_conn.commit()
+        assert released == 0
+        assert claim_notification_intent(db_conn, n.id, "other", "2030-01-01T00:00:00+00:00") is False
+
+    # Once the send returns — including the timed-out, outcome-unknown case —
+    # the row is recoverable exactly as before.
+    assert release_stale_notification_claims(db_conn, "2030-01-01T00:00:00+00:00", live_claim_tokens()) == 1
+
+
+def test_a_live_senders_webhook_claim_survives_a_forward_clock_step(db_conn: sqlite3.Connection) -> None:
+    from app.web.state import live_claim, live_claim_tokens
+
+    topic = _make_topic(db_conn)
+    webhook_id = create_pending_webhook(db_conn, topic.id, "https://a.com/hook", {"k": "v"})
+    db_conn.commit()
+    assert claim_webhook_intent(db_conn, webhook_id, "live-token", "2020-01-01T00:00:00+00:00") is True
+    db_conn.commit()
+
+    with live_claim("live-token"):
+        assert release_stale_webhook_claims(db_conn, "2030-01-01T00:00:00+00:00", live_claim_tokens()) == 0
+    assert release_stale_webhook_claims(db_conn, "2030-01-01T00:00:00+00:00", live_claim_tokens()) == 1
+
+
+def test_a_dead_processs_claim_is_still_recovered(db_conn: sqlite3.Connection) -> None:
+    """The wall-clock rule stays the recovery path for claims nobody holds."""
+    from app.web.state import live_claim, live_claim_tokens
+
+    topic = _make_topic(db_conn)
+    mine = create_pending_notification(db_conn, PendingNotification(topic_id=topic.id, title="T", body="B"))
+    theirs = create_pending_notification(db_conn, PendingNotification(topic_id=topic.id, title="T2", body="B2"))
+    db_conn.commit()
+    assert claim_notification_intent(db_conn, mine.id, "live-token", "2020-01-01T00:00:00+00:00") is True
+    assert claim_notification_intent(db_conn, theirs.id, "gone-with-the-process", "2020-01-01T00:00:00+00:00") is True
+    db_conn.commit()
+
+    with live_claim("live-token"):
+        released = release_stale_notification_claims(db_conn, "2030-01-01T00:00:00+00:00", live_claim_tokens())
+    assert released == 1
+    db_conn.commit()
+    row = db_conn.execute("SELECT status FROM pending_notifications WHERE id = ?", (theirs.id,)).fetchone()
+    assert row["status"] == "pending"
+
+
 # --- check_topic per-topic guard authoritative across entry points (OVH-096) ---
 
 
