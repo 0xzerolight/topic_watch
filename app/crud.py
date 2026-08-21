@@ -16,6 +16,7 @@ from app.models import (
     FeedHealth,
     KnowledgeRevision,
     KnowledgeState,
+    NotificationKind,
     PendingNotification,
     PendingWebhook,
     Topic,
@@ -978,21 +979,23 @@ def list_recent_check_stage_errors(
     conn: sqlite3.Connection,
     topic_id: int,
     limit: int,
-) -> list[str | None]:
-    """Return the ``stage_error`` of a topic's newest ``limit`` checks, newest first.
+) -> list[tuple[int, str | None]]:
+    """Return ``(id, stage_error)`` for a topic's newest ``limit`` checks, newest first.
 
-    Only the one column is selected, so the Silence Heartbeat never ships the
+    Only the two columns are selected, so the Silence Heartbeat never ships the
     ``llm_response`` blobs that ``list_check_results`` carries, and ties on
-    ``checked_at`` break by ``id`` so back-to-back checks order deterministically.
+    ``checked_at`` break by ``id`` so back-to-back checks order deterministically
+    (AUG-258). The id travels with the streak because the heartbeat's latch write
+    is fenced to the exact check its decision was computed from (AUG-131).
     """
     rows = conn.execute(
-        """SELECT stage_error FROM check_results
+        """SELECT id, stage_error FROM check_results
            WHERE topic_id = ?
            ORDER BY checked_at DESC, id DESC
            LIMIT ?""",
         (topic_id, limit),
     ).fetchall()
-    return [row["stage_error"] for row in rows]
+    return [(int(row["id"]), row["stage_error"]) for row in rows]
 
 
 def sum_check_tokens(conn: sqlite3.Connection, topic_id: int) -> tuple[int, int]:
@@ -1165,6 +1168,53 @@ def apply_notification_outcome(
         (error, next_attempt_at, intent_id, claim_token),
     )
     return cursor.rowcount == 1
+
+
+# Both heartbeat message kinds: what a latch transition (or the feature being
+# switched off) supersedes.
+HEARTBEAT_INTENT_KINDS: tuple[str, ...] = (
+    NotificationKind.HEARTBEAT_ALERT.value,
+    NotificationKind.HEARTBEAT_RECOVERY.value,
+)
+
+
+def list_sent_heartbeat_alert_targets(conn: sqlite3.Connection, topic_id: int, latch_value: str | None) -> set[str]:
+    """Targets that actually received the outage alert stamped ``latch_value``.
+
+    "Sources recovered" is only meaningful to somebody who was told they were
+    failing: a target whose alert failed, was revoked, or is still queued would
+    otherwise get an unexplained all-clear for an outage it never heard about
+    (AUG-019). The latch value is the outage's identity, so an alert from an
+    earlier outage never addresses this recovery.
+    """
+    if latch_value is None:
+        return set()
+    rows = conn.execute(
+        "SELECT DISTINCT url FROM pending_notifications "
+        "WHERE topic_id = ? AND kind = ? AND latch_value = ? AND status = 'sent' AND url IS NOT NULL",
+        (topic_id, NotificationKind.HEARTBEAT_ALERT.value, latch_value),
+    ).fetchall()
+    return {row["url"] for row in rows}
+
+
+def reset_all_heartbeat_state(conn: sqlite3.Connection) -> int:
+    """Clear every latch and revoke every queued heartbeat message. NO commit.
+
+    ``silence_heartbeat_checks = 0`` is the off switch, but the per-check reset
+    only reaches a topic when that topic next runs. Disabling and re-enabling
+    inside one long interval would otherwise preserve the old latch — which then
+    either suppresses the newly enabled outage alert or fires a recovery for an
+    outage nobody was told about (AUG-260). Returns the number of latches cleared.
+    """
+    cursor = conn.execute("UPDATE topics SET heartbeat_alerted_at = NULL WHERE heartbeat_alerted_at IS NOT NULL")
+    cleared = cursor.rowcount
+    placeholders = ",".join("?" for _ in HEARTBEAT_INTENT_KINDS)
+    conn.execute(
+        "UPDATE pending_notifications SET status = 'revoked', claimed_at = NULL, claim_token = NULL "
+        f"WHERE status = 'pending' AND kind IN ({placeholders})",
+        HEARTBEAT_INTENT_KINDS,
+    )
+    return cleared
 
 
 def revoke_heartbeat_intents(conn: sqlite3.Connection, topic_id: int, kinds: tuple[str, ...]) -> int:
@@ -1539,9 +1589,15 @@ def claim_new_topic_for_init(conn: sqlite3.Connection, topic_id: int) -> bool:
 # check still holding a deleted topic could otherwise latch its replacement — an
 # alert naming the deleted topic, and a replacement whose real outage is then
 # suppressed (AUG-020/TW-AUD-007). The head-check conjunct is the same idea in time:
-# a decision computed from check N must not land once check N+1 exists.
+# a decision computed from check N must not land once check N+1 exists. It selects
+# the head with the canonical ``checked_at DESC, id DESC`` the heartbeat's own
+# streak query uses (AUG-258), not ``MAX(id)`` — a row carrying a newer id with an
+# older timestamp (a clock step, a restored row) is not the latest check, and
+# treating it as one would refuse every later transition for that topic forever.
 _HEARTBEAT_GENERATION_FENCE = " AND generation = ?"
-_HEARTBEAT_HEAD_FENCE = " AND (SELECT MAX(id) FROM check_results WHERE topic_id = topics.id) = ?"
+_HEARTBEAT_HEAD_FENCE = (
+    " AND (SELECT id FROM check_results WHERE topic_id = topics.id ORDER BY checked_at DESC, id DESC LIMIT 1) = ?"
+)
 
 
 def _heartbeat_fence(sql: str, params: list, generation: str | None, head_check_id: int | None) -> tuple[str, list]:
@@ -1577,6 +1633,23 @@ def claim_heartbeat_alert(
     sql, params = _heartbeat_fence(sql, params, generation, head_check_id)
     cursor = conn.execute(sql, params)
     return cursor.rowcount == 1
+
+
+def get_heartbeat_latch_raw(conn: sqlite3.Connection, topic_id: int) -> str | None:
+    """Return the stored latch cell verbatim: NULL is None, anything else is text.
+
+    The model hydrates ``heartbeat_alerted_at`` through the permissive optional
+    datetime coercer, which turns corrupt or forward-incompatible text into
+    ``None`` — while the latch SQL compares against the raw cell with ``IS NULL``.
+    A decision made on the hydrated value therefore claims a latch that is already
+    set and never clears the bad one, wedging the topic's heartbeat until someone
+    edits the database by hand (AUG-144). The heartbeat reads the cell itself, so
+    "set" means exactly what the UPDATE guards mean by it.
+    """
+    row = conn.execute("SELECT heartbeat_alerted_at FROM topics WHERE id = ?", (topic_id,)).fetchone()
+    if row is None or row["heartbeat_alerted_at"] is None:
+        return None
+    return str(row["heartbeat_alerted_at"])
 
 
 def clear_heartbeat_alert(

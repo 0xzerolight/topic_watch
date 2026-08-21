@@ -717,3 +717,116 @@ class TestDeliveryLedgerRetention:
             assert titles == {"old-pending", "fresh-sent"}
         finally:
             conn.close()
+
+
+class TestStartupHeartbeatReset:
+    """AUG-260: startup reconciles heartbeat state when the feature is off."""
+
+    async def _latched_topic(self, db_path: Path):
+        from datetime import UTC, datetime
+
+        from app.crud import claim_heartbeat_alert, create_notification_intents
+        from app.database import get_db, init_db
+        from app.models import NotificationKind, PendingNotification, Topic, TopicStatus
+
+        init_db(db_path)
+        with get_db(db_path) as conn:
+            from app.crud import create_topic
+
+            topic = create_topic(conn, Topic(name="Outage", description="d", status=TopicStatus.READY))
+            claim_heartbeat_alert(conn, topic.id, datetime.now(UTC))
+            create_notification_intents(
+                conn,
+                [
+                    PendingNotification(
+                        topic_id=topic.id,
+                        title="Topic Watch: Outage (sources failing)",
+                        body="body",
+                        url="json://localhost",
+                        kind=NotificationKind.HEARTBEAT_ALERT,
+                        latch_value="2026-08-20T10:00:00+00:00",
+                    )
+                ],
+            )
+            conn.commit()
+        return topic
+
+    async def _boot(self, monkeypatch, tmp_path: Path, threshold: int):
+        from app.main import app, lifespan
+
+        db_path = tmp_path / "lifespan.db"
+        topic = await self._latched_topic(db_path)
+        monkeypatch.setattr(
+            "app.main.load_settings", lambda *a, **k: _make_settings(silence_heartbeat_checks=threshold)
+        )
+        monkeypatch.setattr("app.main.start_scheduler", lambda *a, **k: None)
+        monkeypatch.setattr("app.main.stop_scheduler", lambda: None)
+
+        async with lifespan(app):
+            pass
+
+        from app.database import get_db
+
+        with get_db(db_path) as conn:
+            latch = conn.execute("SELECT heartbeat_alerted_at FROM topics WHERE id = ?", (topic.id,)).fetchone()[0]
+            statuses = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT status FROM pending_notifications WHERE topic_id = ?", (topic.id,)
+                ).fetchall()
+            ]
+        return latch, statuses
+
+    async def test_disabled_at_startup_clears_parked_state(self, monkeypatch, tmp_path: Path) -> None:
+        latch, statuses = await self._boot(monkeypatch, tmp_path, threshold=0)
+        assert latch is None
+        assert statuses == ["revoked"]
+
+    async def test_enabled_at_startup_preserves_state(self, monkeypatch, tmp_path: Path) -> None:
+        latch, statuses = await self._boot(monkeypatch, tmp_path, threshold=3)
+        assert latch is not None
+        assert statuses == ["pending"]
+
+
+class TestRetryDrainDoesNotStarveDueTopics:
+    """AUG-027: a queued retry backlog cannot hold every due topic behind it."""
+
+    async def test_due_topics_run_alongside_the_retry_drain(self, db_conn, db_path: Path) -> None:
+        import asyncio
+
+        from app.checker import check_all_topics
+
+        _make_ready_topic(db_conn)
+        drain_started = asyncio.Event()
+        topic_checked = asyncio.Event()
+
+        async def _slow_drain(*args, **kwargs) -> None:
+            drain_started.set()
+            # The backlog only finishes once a due topic has been checked: with the
+            # drain in front of the cycle this never happens and the wait times out.
+            await asyncio.wait_for(topic_checked.wait(), timeout=5)
+
+        async def _fake_check(topic, settings, *, db_path=None, guard=True):
+            await drain_started.wait()
+            topic_checked.set()
+            return None
+
+        with (
+            patch("app.checker.retry_pending_notifications", _slow_drain),
+            patch("app.checker.retry_pending_webhooks", new=AsyncMock()),
+            patch("app.checker.check_topic", _fake_check),
+        ):
+            await asyncio.wait_for(check_all_topics(_make_settings(), db_path), timeout=5)
+
+        assert topic_checked.is_set()
+
+    async def test_the_drain_still_runs_with_no_due_topics(self, db_conn, db_path: Path) -> None:
+        from app.checker import check_all_topics
+
+        drain = AsyncMock()
+        with (
+            patch("app.checker.retry_pending_notifications", drain),
+            patch("app.checker.retry_pending_webhooks", new=AsyncMock()),
+        ):
+            assert await check_all_topics(_make_settings(), db_path) == []
+        drain.assert_awaited_once()

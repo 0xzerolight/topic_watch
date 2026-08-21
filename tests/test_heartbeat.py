@@ -3,7 +3,13 @@
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
-from app.crud import claim_heartbeat_alert, create_check_result, create_topic, get_topic
+from app.crud import (
+    claim_heartbeat_alert,
+    create_check_result,
+    create_topic,
+    get_heartbeat_latch_raw,
+    get_topic,
+)
 from app.heartbeat import evaluate_heartbeat
 from app.models import CheckResult, Topic, TopicStatus
 
@@ -37,6 +43,13 @@ def _latched(conn: sqlite3.Connection, topic: Topic) -> Topic:
     claim_heartbeat_alert(conn, topic.id, datetime.now(UTC))
     conn.commit()
     return get_topic(conn, topic.id)
+
+
+def _corrupt_latch(conn: sqlite3.Connection, topic_id: int, value: str = "not-a-timestamp") -> str:
+    """Store a latch value no datetime parser accepts (AUG-144)."""
+    conn.execute("UPDATE topics SET heartbeat_alerted_at = ? WHERE id = ?", (value, topic_id))
+    conn.commit()
+    return value
 
 
 class TestEvaluateHeartbeat:
@@ -139,6 +152,77 @@ class TestEvaluateHeartbeat:
         assert "several topics" in action.body
 
 
+class TestDecisionIsFencedToItsHeadCheck:
+    """AUG-131/AUG-258: the decision names the exact check it was computed from."""
+
+    def test_alert_reports_the_head_check_id(self, db_conn: sqlite3.Connection) -> None:
+        topic = _topic(db_conn)
+        _fail_run(db_conn, topic.id, 3)
+        head_id = db_conn.execute(
+            "SELECT id FROM check_results WHERE topic_id = ? ORDER BY checked_at DESC, id DESC LIMIT 1",
+            (topic.id,),
+        ).fetchone()[0]
+        decision = evaluate_heartbeat(db_conn, topic, threshold=3)
+        assert decision is not None
+        assert decision.head_check_id == head_id
+
+    def test_tied_timestamps_break_by_id(self, db_conn: sqlite3.Connection) -> None:
+        """Two checks at the same instant: the higher id is the head (AUG-258)."""
+        topic = _topic(db_conn)
+        stamp = datetime.now(UTC) - timedelta(minutes=5)
+        for _ in range(3):
+            create_check_result(
+                db_conn,
+                CheckResult(topic_id=topic.id, checked_at=stamp, stage_error="sources_failed: x"),
+            )
+        db_conn.commit()
+        highest = db_conn.execute("SELECT MAX(id) FROM check_results WHERE topic_id = ?", (topic.id,)).fetchone()[0]
+        decision = evaluate_heartbeat(db_conn, topic, threshold=3)
+        assert decision is not None
+        assert decision.head_check_id == highest
+
+    def test_recovery_carries_the_latch_it_clears(self, db_conn: sqlite3.Connection) -> None:
+        topic = _topic(db_conn)
+        _fail_run(db_conn, topic.id, 4)
+        latched = _latched(db_conn, topic)
+        _record(db_conn, topic.id, None, 1)
+        decision = evaluate_heartbeat(db_conn, latched, threshold=3)
+        assert decision is not None and decision.kind == "recovered"
+        assert decision.latch_value == get_heartbeat_latch_raw(db_conn, topic.id)
+
+
+class TestMalformedLatchStaysClearable:
+    """AUG-144: corrupt latch text must not wedge the topic's heartbeat."""
+
+    def test_raw_latch_survives_hydration(self, db_conn: sqlite3.Connection) -> None:
+        topic = _topic(db_conn)
+        raw = _corrupt_latch(db_conn, topic.id)
+        # The model degrades the unparseable cell to None; the raw read does not.
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is None
+        assert get_heartbeat_latch_raw(db_conn, topic.id) == raw
+
+    def test_raw_latch_is_none_when_unset(self, db_conn: sqlite3.Connection) -> None:
+        topic = _topic(db_conn)
+        assert get_heartbeat_latch_raw(db_conn, topic.id) is None
+        assert get_heartbeat_latch_raw(db_conn, 9999) is None
+
+    def test_corrupt_latch_does_not_re_alert(self, db_conn: sqlite3.Connection) -> None:
+        """An outage is already announced, whatever the stored text says."""
+        topic = _topic(db_conn)
+        _fail_run(db_conn, topic.id, 5)
+        _corrupt_latch(db_conn, topic.id)
+        assert evaluate_heartbeat(db_conn, get_topic(db_conn, topic.id), threshold=3) is None
+
+    def test_corrupt_latch_recovers(self, db_conn: sqlite3.Connection) -> None:
+        topic = _topic(db_conn)
+        _fail_run(db_conn, topic.id, 4)
+        raw = _corrupt_latch(db_conn, topic.id)
+        _record(db_conn, topic.id, None, 1)
+        decision = evaluate_heartbeat(db_conn, get_topic(db_conn, topic.id), threshold=3)
+        assert decision is not None and decision.kind == "recovered"
+        assert decision.latch_value == raw
+
+
 class TestInternalFailuresAreNeutral:
     """A crash inside our own pipeline says nothing about the sources (AUG-133)."""
 
@@ -164,3 +248,36 @@ class TestInternalFailuresAreNeutral:
         for i in range(5):
             _record(db_conn, topic.id, "pipeline_failed: OperationalError: database is locked", 50 - i * 5)
         assert evaluate_heartbeat(db_conn, topic, threshold=3) is None
+
+
+class TestHeadFenceUsesTheCanonicalOrder:
+    """AUG-258: heartbeat and UI must agree on which check is the latest one."""
+
+    def test_a_backdated_row_does_not_wedge_the_latch(self, db_conn: sqlite3.Connection) -> None:
+        """A newer id with an older timestamp is not the head, so it blocks nothing."""
+        topic = _topic(db_conn)
+        _fail_run(db_conn, topic.id, 3, oldest_minutes=30)
+        # A clock step backwards (or a restored row) writes a high id with an old
+        # timestamp. Fencing on MAX(id) would refuse every future transition for
+        # this topic, silently killing its heartbeat.
+        create_check_result(
+            db_conn,
+            CheckResult(
+                topic_id=topic.id,
+                checked_at=datetime.now(UTC) - timedelta(days=1),
+                stage_error="sources_failed: backdated",
+            ),
+        )
+        db_conn.commit()
+
+        decision = evaluate_heartbeat(db_conn, topic, threshold=3)
+        assert decision is not None and decision.kind == "alert"
+        assert (
+            claim_heartbeat_alert(
+                db_conn,
+                topic.id,
+                datetime.now(UTC),
+                head_check_id=decision.head_check_id,
+            )
+            is True
+        )
