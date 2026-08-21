@@ -762,19 +762,49 @@ def list_check_results(
     topic_id: int,
     limit: int = 20,
     offset: int = 0,
+    cutoff_id: int | None = None,
 ) -> list[CheckResult]:
-    """Get recent check results for a topic, newest first."""
-    rows = conn.execute(
-        "SELECT * FROM check_results WHERE topic_id = ? ORDER BY checked_at DESC LIMIT ? OFFSET ?",
-        (topic_id, limit, offset),
-    ).fetchall()
+    """Get recent check results for a topic, newest first.
+
+    ``cutoff_id``, when given, restricts the set to ids at or below it so a
+    multi-page OFFSET traversal stays stable even if a newer check commits
+    between page requests: mint it from ``max_check_result_id`` on the first
+    page and carry it on later ones (AUG-314).
+    """
+    if cutoff_id is not None:
+        rows = conn.execute(
+            "SELECT * FROM check_results WHERE topic_id = ? AND id <= ? ORDER BY checked_at DESC LIMIT ? OFFSET ?",
+            (topic_id, cutoff_id, limit, offset),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM check_results WHERE topic_id = ? ORDER BY checked_at DESC LIMIT ? OFFSET ?",
+            (topic_id, limit, offset),
+        ).fetchall()
     return [CheckResult.from_row(row) for row in rows]
 
 
-def count_check_results(conn: sqlite3.Connection, topic_id: int) -> int:
-    """Count total check results for a topic."""
-    row = conn.execute("SELECT COUNT(*) FROM check_results WHERE topic_id = ?", (topic_id,)).fetchone()
+def count_check_results(conn: sqlite3.Connection, topic_id: int, cutoff_id: int | None = None) -> int:
+    """Count total check results for a topic, optionally capped at cutoff_id (AUG-314)."""
+    if cutoff_id is not None:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM check_results WHERE topic_id = ? AND id <= ?",
+            (topic_id, cutoff_id),
+        ).fetchone()
+    else:
+        row = conn.execute("SELECT COUNT(*) FROM check_results WHERE topic_id = ?", (topic_id,)).fetchone()
     return int(row[0])
+
+
+def max_check_result_id(conn: sqlite3.Connection, topic_id: int) -> int | None:
+    """Highest ``check_results.id`` for a topic, or None if it has none.
+
+    Mints a stable pagination cutoff: the first page of a traversal captures
+    this value and later pages pass it back, so a check committing mid-browse
+    cannot shift rows underneath an OFFSET-based page 2+ (AUG-314).
+    """
+    row = conn.execute("SELECT MAX(id) FROM check_results WHERE topic_id = ?", (topic_id,)).fetchone()
+    return int(row[0]) if row[0] is not None else None
 
 
 def list_recent_check_stage_errors(
