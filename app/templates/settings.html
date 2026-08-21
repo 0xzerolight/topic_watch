@@ -1,5 +1,11 @@
 {% extends "base.html" %}
 {% block title %}Settings - Topic Watch{% endblock %}
+{# A control whose Settings field the environment owns cannot be changed here: the
+   save path strips env-owned paths, so an edit would report success and do nothing.
+   `lock` disables the control and `envnote` says why, the same treatment the LLM API
+   key already had. #}
+{% macro lock(name) %}{% if name in env_locked %} disabled{% endif %}{% endmacro %}
+{% macro envnote(name) %}{% if name in env_locked %} <small>(set via environment — read-only)</small>{% endif %}{% endmacro %}
 {% block content %}
 <div class="page-header masthead">
     <h1>Settings</h1>
@@ -38,8 +44,8 @@
         <span class="card-kicker">LLM</span>
 
         <div class="field-group">
-            <label for="llm_model">Model</label>
-            <input type="text" id="llm_model" name="llm_model" required
+            <label for="llm_model">Model{{ envnote('llm_model') }}</label>
+            <input type="text" id="llm_model" name="llm_model" required{{ lock('llm_model') }}
                    value="{{ form.llm_model if form else settings.llm.model }}"
                    placeholder="e.g., openai/gpt-5.4-nano">
         </div>
@@ -68,8 +74,8 @@
         {% endif %}
 
         <div class="field-group" id="base-url-group">
-            <label for="llm_base_url">Base URL <small>(optional)</small></label>
-            <input type="text" id="llm_base_url" name="llm_base_url"
+            <label for="llm_base_url">Base URL <small>(optional)</small>{{ envnote('llm_base_url') }}</label>
+            <input type="text" id="llm_base_url" name="llm_base_url"{{ lock('llm_base_url') }}
                    value="{{ form.llm_base_url if form else (settings.llm.base_url or '') }}"
                    placeholder="e.g., http://localhost:11434 for Ollama">
             <small class="help" id="base-url-hint">Optional. Set for a self-hosted provider or an OpenAI-compatible gateway.</small>
@@ -80,9 +86,9 @@
         <span class="card-kicker">Exa Search</span>
 
         <label>
-            <input type="checkbox" name="enable_exa" value="true" role="switch"
+            <input type="checkbox" name="enable_exa" value="true" role="switch"{{ lock('enable_exa') }}
                    {% if (form.enable_exa if form is defined and form else settings.exa.enabled) %}checked{% endif %}>
-            Enable Exa AI search source
+            Enable Exa AI search source{{ envnote('enable_exa') }}
         </label>
         <small class="help">Lets a topic use the Exa semantic web-search API instead of RSS. Each check runs one paid Exa search — mind your per-topic check interval.</small>
 
@@ -109,15 +115,15 @@
         <span class="card-kicker">Notifications</span>
 
         <div class="field-group">
-            <label for="notification_urls">Notification URLs <small>(one per line, Apprise format)</small></label>
-            <textarea id="notification_urls" name="notification_urls" rows="4"
+            <label for="notification_urls">Notification URLs <small>(one per line, Apprise format)</small>{{ envnote('notification_urls') }}</label>
+            <textarea id="notification_urls" name="notification_urls" rows="4"{{ lock('notification_urls') }}
                       placeholder="ntfy://my-topic&#10;discord://webhook-id/token">{{ form.notification_urls if form else (masked_notification_urls | join('\n')) }}</textarea>
             <small class="help">Saved URLs are masked because they carry tokens. Leave a masked line alone to keep it, delete it to remove that target, or type a full URL over it to replace it.</small>
         </div>
 
         <div class="field-group">
-            <label for="webhook_urls">Webhook URLs <small>(one per line, JSON POST)</small></label>
-            <textarea id="webhook_urls" name="webhook_urls" rows="3"
+            <label for="webhook_urls">Webhook URLs <small>(one per line, JSON POST)</small>{{ envnote('webhook_urls') }}</label>
+            <textarea id="webhook_urls" name="webhook_urls" rows="3"{{ lock('webhook_urls') }}
                       placeholder="https://example.com/webhook">{{ form.webhook_urls if form else (masked_webhook_urls | join('\n')) }}</textarea>
             <small class="help">Masked the same way — keep, delete or overwrite each line.</small>
         </div>
@@ -128,8 +134,8 @@
 
         <div class="settings-grid">
             <div class="field-group">
-                <label for="check_interval">Default Check Interval</label>
-                <input type="text" id="check_interval" name="check_interval" required
+                <label for="check_interval">Default Check Interval{{ envnote('check_interval') }}</label>
+                <input type="text" id="check_interval" name="check_interval" required{{ lock('check_interval') }}
                        placeholder="e.g., 6h, 1d, 2w, 1M"
                        value="{{ form.check_interval if form else settings.check_interval }}">
                 <small class="help">Units: m (minutes), h (hours), d (days), w (weeks), M (months). Combine: 1w 3d</small>
@@ -139,8 +145,8 @@
             </div>
 
             <div class="field-group">
-                <label for="max_articles_per_check">Max Articles per Check</label>
-                <input type="number" id="max_articles_per_check" name="max_articles_per_check" required
+                <label for="max_articles_per_check">Max Articles per Check{{ envnote('max_articles_per_check') }}</label>
+                <input type="number" id="max_articles_per_check" name="max_articles_per_check" required{{ lock('max_articles_per_check') }}
                        min="1" max="100"
                        value="{{ form.max_articles_per_check if form else settings.max_articles_per_check }}">
             </div>
@@ -154,124 +160,124 @@
             <span class="card-kicker">Tuning</span>
             <div class="settings-grid">
                 <div class="field-group">
-                    <label for="knowledge_state_max_tokens">Knowledge State Max Tokens</label>
-                    <input type="number" id="knowledge_state_max_tokens" name="knowledge_state_max_tokens"
+                    <label for="knowledge_state_max_tokens">Knowledge State Max Tokens{{ envnote('knowledge_state_max_tokens') }}</label>
+                    <input type="number" id="knowledge_state_max_tokens" name="knowledge_state_max_tokens"{{ lock('knowledge_state_max_tokens') }}
                            min="500" max="10000"
                            value="{{ form.knowledge_state_max_tokens if form else settings.knowledge_state_max_tokens }}">
                 </div>
 
                 <div class="field-group">
-                    <label for="article_retention_days">Article Retention Days</label>
-                    <input type="number" id="article_retention_days" name="article_retention_days"
+                    <label for="article_retention_days">Article Retention Days{{ envnote('article_retention_days') }}</label>
+                    <input type="number" id="article_retention_days" name="article_retention_days"{{ lock('article_retention_days') }}
                            min="1" max="3650"
                            value="{{ form.article_retention_days if form else settings.article_retention_days }}">
                 </div>
 
                 <div class="field-group">
-                    <label for="feed_fetch_timeout">Feed Fetch Timeout (seconds)</label>
-                    <input type="number" id="feed_fetch_timeout" name="feed_fetch_timeout"
+                    <label for="feed_fetch_timeout">Feed Fetch Timeout (seconds){{ envnote('feed_fetch_timeout') }}</label>
+                    <input type="number" id="feed_fetch_timeout" name="feed_fetch_timeout"{{ lock('feed_fetch_timeout') }}
                            min="1" step="0.5"
                            value="{{ form.feed_fetch_timeout if form else settings.feed_fetch_timeout }}">
                 </div>
 
                 <div class="field-group">
-                    <label for="article_fetch_timeout">Article Fetch Timeout (seconds)</label>
-                    <input type="number" id="article_fetch_timeout" name="article_fetch_timeout"
+                    <label for="article_fetch_timeout">Article Fetch Timeout (seconds){{ envnote('article_fetch_timeout') }}</label>
+                    <input type="number" id="article_fetch_timeout" name="article_fetch_timeout"{{ lock('article_fetch_timeout') }}
                            min="1" step="0.5"
                            value="{{ form.article_fetch_timeout if form else settings.article_fetch_timeout }}">
                 </div>
 
                 <div class="field-group">
-                    <label for="llm_analysis_timeout">LLM Analysis Timeout (seconds)</label>
-                    <input type="number" id="llm_analysis_timeout" name="llm_analysis_timeout"
+                    <label for="llm_analysis_timeout">LLM Analysis Timeout (seconds){{ envnote('llm_analysis_timeout') }}</label>
+                    <input type="number" id="llm_analysis_timeout" name="llm_analysis_timeout"{{ lock('llm_analysis_timeout') }}
                            min="10"
                            value="{{ form.llm_analysis_timeout if form else settings.llm_analysis_timeout }}">
                 </div>
 
                 <div class="field-group">
-                    <label for="llm_knowledge_timeout">LLM Knowledge Timeout (seconds)</label>
-                    <input type="number" id="llm_knowledge_timeout" name="llm_knowledge_timeout"
+                    <label for="llm_knowledge_timeout">LLM Knowledge Timeout (seconds){{ envnote('llm_knowledge_timeout') }}</label>
+                    <input type="number" id="llm_knowledge_timeout" name="llm_knowledge_timeout"{{ lock('llm_knowledge_timeout') }}
                            min="10"
                            value="{{ form.llm_knowledge_timeout if form else settings.llm_knowledge_timeout }}">
                 </div>
 
                 <div class="field-group">
-                    <label for="web_page_size">Web Page Size</label>
-                    <input type="number" id="web_page_size" name="web_page_size"
+                    <label for="web_page_size">Web Page Size{{ envnote('web_page_size') }}</label>
+                    <input type="number" id="web_page_size" name="web_page_size"{{ lock('web_page_size') }}
                            min="5" max="200"
                            value="{{ form.web_page_size if form else settings.web_page_size }}">
                 </div>
 
                 <div class="field-group">
-                    <label for="min_confidence_threshold">Min Confidence Threshold</label>
-                    <input type="number" id="min_confidence_threshold" name="min_confidence_threshold"
+                    <label for="min_confidence_threshold">Min Confidence Threshold{{ envnote('min_confidence_threshold') }}</label>
+                    <input type="number" id="min_confidence_threshold" name="min_confidence_threshold"{{ lock('min_confidence_threshold') }}
                            min="0" max="1" step="0.05"
                            value="{{ form.min_confidence_threshold if form else settings.min_confidence_threshold }}">
                     <small class="help">Below this confidence, new info is logged but not notified (0.0-1.0)</small>
                 </div>
 
                 <div class="field-group">
-                    <label for="min_relevance_threshold">Min Relevance Threshold</label>
-                    <input type="number" id="min_relevance_threshold" name="min_relevance_threshold"
+                    <label for="min_relevance_threshold">Min Relevance Threshold{{ envnote('min_relevance_threshold') }}</label>
+                    <input type="number" id="min_relevance_threshold" name="min_relevance_threshold"{{ lock('min_relevance_threshold') }}
                            min="0" max="1" step="0.05"
                            value="{{ form.min_relevance_threshold if form else settings.min_relevance_threshold }}">
                     <small class="help">Below this relevance to the topic, new info is logged but not notified (0.0-1.0)</small>
                 </div>
 
                 <div class="field-group">
-                    <label for="silence_heartbeat_checks">Alert when sources fail for (checks)</label>
-                    <input type="number" id="silence_heartbeat_checks" name="silence_heartbeat_checks"
+                    <label for="silence_heartbeat_checks">Alert when sources fail for (checks){{ envnote('silence_heartbeat_checks') }}</label>
+                    <input type="number" id="silence_heartbeat_checks" name="silence_heartbeat_checks"{{ lock('silence_heartbeat_checks') }}
                            min="0" max="50"
                            value="{{ form.silence_heartbeat_checks if form else settings.silence_heartbeat_checks }}">
                     <small class="help">Counted in checks, not hours — 3 checks is about 18 hours at the default 6h interval. 1 alerts on the very first failing check, which is noisy on a flapping feed. 0 turns it off.</small>
                 </div>
 
                 <div class="field-group">
-                    <label for="apprise_timeout_seconds">Apprise Timeout (seconds)</label>
-                    <input type="number" id="apprise_timeout_seconds" name="apprise_timeout_seconds"
+                    <label for="apprise_timeout_seconds">Apprise Timeout (seconds){{ envnote('apprise_timeout_seconds') }}</label>
+                    <input type="number" id="apprise_timeout_seconds" name="apprise_timeout_seconds"{{ lock('apprise_timeout_seconds') }}
                            min="1"
                            value="{{ form.apprise_timeout_seconds if form else settings.apprise_timeout_seconds }}">
                     <small class="help">Max time to wait for a single notification send before giving up.</small>
                 </div>
 
                 <div class="field-group">
-                    <label for="feed_max_retries">Feed Max Retries</label>
-                    <input type="number" id="feed_max_retries" name="feed_max_retries"
+                    <label for="feed_max_retries">Feed Max Retries{{ envnote('feed_max_retries') }}</label>
+                    <input type="number" id="feed_max_retries" name="feed_max_retries"{{ lock('feed_max_retries') }}
                            min="1" max="10"
                            value="{{ form.feed_max_retries if form else settings.feed_max_retries }}">
                 </div>
 
                 <div class="field-group">
-                    <label for="content_fetch_concurrency">Content Fetch Concurrency</label>
-                    <input type="number" id="content_fetch_concurrency" name="content_fetch_concurrency"
+                    <label for="content_fetch_concurrency">Content Fetch Concurrency{{ envnote('content_fetch_concurrency') }}</label>
+                    <input type="number" id="content_fetch_concurrency" name="content_fetch_concurrency"{{ lock('content_fetch_concurrency') }}
                            min="1" max="20"
                            value="{{ form.content_fetch_concurrency if form else settings.content_fetch_concurrency }}">
                 </div>
 
                 <div class="field-group">
-                    <label for="scheduler_misfire_grace_time">Scheduler Misfire Grace Time (seconds)</label>
-                    <input type="number" id="scheduler_misfire_grace_time" name="scheduler_misfire_grace_time"
+                    <label for="scheduler_misfire_grace_time">Scheduler Misfire Grace Time (seconds){{ envnote('scheduler_misfire_grace_time') }}</label>
+                    <input type="number" id="scheduler_misfire_grace_time" name="scheduler_misfire_grace_time"{{ lock('scheduler_misfire_grace_time') }}
                            min="30" max="3600"
                            value="{{ form.scheduler_misfire_grace_time if form else settings.scheduler_misfire_grace_time }}">
                 </div>
 
                 <div class="field-group">
-                    <label for="scheduler_jitter_seconds">Scheduler Jitter (seconds)</label>
-                    <input type="number" id="scheduler_jitter_seconds" name="scheduler_jitter_seconds"
+                    <label for="scheduler_jitter_seconds">Scheduler Jitter (seconds){{ envnote('scheduler_jitter_seconds') }}</label>
+                    <input type="number" id="scheduler_jitter_seconds" name="scheduler_jitter_seconds"{{ lock('scheduler_jitter_seconds') }}
                            min="0" max="120"
                            value="{{ form.scheduler_jitter_seconds if form else settings.scheduler_jitter_seconds }}">
                 </div>
 
                 <div class="field-group">
-                    <label for="llm_max_retries">LLM Max Retries</label>
-                    <input type="number" id="llm_max_retries" name="llm_max_retries"
+                    <label for="llm_max_retries">LLM Max Retries{{ envnote('llm_max_retries') }}</label>
+                    <input type="number" id="llm_max_retries" name="llm_max_retries"{{ lock('llm_max_retries') }}
                            min="0" max="10"
                            value="{{ form.llm_max_retries if form else settings.llm_max_retries }}">
                 </div>
 
                 <div class="field-group">
-                    <label for="llm_temperature">LLM Temperature</label>
-                    <input type="number" id="llm_temperature" name="llm_temperature"
+                    <label for="llm_temperature">LLM Temperature{{ envnote('llm_temperature') }}</label>
+                    <input type="number" id="llm_temperature" name="llm_temperature"{{ lock('llm_temperature') }}
                            min="0" max="2" step="0.05"
                            value="{{ form.llm_temperature if form else settings.llm_temperature }}">
                     <small class="help">Lower is more factual (0.0-2.0)</small>
@@ -282,9 +288,9 @@
             <span class="card-kicker">Security &amp; Storage</span>
 
             <label style="margin-top: 1rem;">
-                <input type="checkbox" name="secure_cookies" value="true" role="switch"
+                <input type="checkbox" name="secure_cookies" value="true" role="switch"{{ lock('secure_cookies') }}
                        {% if (form.secure_cookies if form is defined and form else settings.secure_cookies) %}checked{% endif %}>
-                Secure Cookies
+                Secure Cookies{{ envnote('secure_cookies') }}
             </label>
             <small class="help">Set the Secure flag on cookies. Enable when TLS is terminated at your reverse proxy.</small>
 

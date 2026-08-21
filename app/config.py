@@ -36,6 +36,16 @@ CONFIG_PATH_ENV_VAR = "TOPIC_WATCH_CONFIG_PATH"
 # Directory name used under the user-level state root.
 _APP_STATE_DIR_NAME = "topic-watch"
 
+# Files whose presence marks a directory as a state root this install already uses.
+# The config file is written on the first run and the database sits beside it, so
+# either one means state already lives here.
+_STATE_MARKERS = ("config.yml", "topic_watch.db")
+
+# Directory names an interpreter installs packages into. A wheel install puts the
+# package there, and it is nobody's application directory: what is written beside it
+# dies with the venv, and the directory is shared with every dependency.
+_LIBRARY_DIR_NAMES = frozenset({"site-packages", "dist-packages"})
+
 
 def _user_state_root(environ: Mapping[str, str]) -> Path:
     """Per-user writable state directory, by platform convention."""
@@ -46,6 +56,11 @@ def _user_state_root(environ: Mapping[str, str]) -> Path:
     return Path(base).expanduser() / _APP_STATE_DIR_NAME
 
 
+def _holds_state(directory: Path) -> bool:
+    """True when a directory already holds this application's config or database."""
+    return any((directory / marker).exists() for marker in _STATE_MARKERS)
+
+
 def resolve_state_root(*, package_parent: Path, environ: Mapping[str, str]) -> Path:
     """THE writable-state root: the directory holding config.yml and the database.
 
@@ -54,11 +69,20 @@ def resolve_state_root(*, package_parent: Path, environ: Mapping[str, str]) -> P
 
     1. ``TOPIC_WATCH_CONFIG_PATH`` — an explicitly pinned config file pins the root
        to its parent directory.
-    2. An existing ``data/`` directory beside the package. This keeps every current
-       install working unchanged: a repo checkout, a git worktree with the config
-       copied in, and the container's ``/app/data`` bind mount all land here.
-    3. A user-level state directory, for an installed wheel whose package root is
-       not writable and has no ``data/`` beside it.
+    2. Whichever candidate already holds a ``config.yml`` or a ``topic_watch.db``,
+       ``data/`` beside the package first. This is what makes the root sticky: an
+       install that has ever written state keeps reading that state, and a ``data/``
+       directory appearing later — ``docker compose`` creating the bind-mount source,
+       the documented ``mkdir -p data`` — cannot take over from a populated user-level
+       directory and hand the user an empty database (C5-1).
+    3. An existing ``data/`` beside the package: a repo checkout, a git worktree with
+       the config copied in, the container's ``/app/data`` bind mount.
+    4. ``data/`` beside the package when that directory is writable and is not an
+       interpreter library directory. A source checkout is what the documentation
+       describes, so a fresh clone must land there rather than in a hidden per-user
+       directory; the first write creates it.
+    5. A user-level state directory: an installed wheel, or a package root that
+       cannot be written to.
 
     ``TOPIC_WATCH_DB_PATH`` (the ``db_path`` setting) stays authoritative for the
     database on top of this — see ``resolve_db_path``.
@@ -66,10 +90,16 @@ def resolve_state_root(*, package_parent: Path, environ: Mapping[str, str]) -> P
     pinned = environ.get(CONFIG_PATH_ENV_VAR)
     if pinned:
         return Path(pinned).expanduser().parent
-    legacy = package_parent / "data"
-    if legacy.is_dir():
-        return legacy
-    return _user_state_root(environ)
+    beside_package = package_parent / "data"
+    user_root = _user_state_root(environ)
+    for candidate in (beside_package, user_root):
+        if _holds_state(candidate):
+            return candidate
+    if package_parent.name in _LIBRARY_DIR_NAMES:
+        return user_root
+    if beside_package.is_dir() or os.access(package_parent, os.W_OK):
+        return beside_package
+    return user_root
 
 
 def resolve_config_file(*, package_parent: Path, environ: Mapping[str, str]) -> Path:
@@ -110,8 +140,11 @@ CLOUD_PROVIDERS: frozenset[str] = frozenset(
 )
 
 # Default base URLs for self-hosted providers (used as form auto-fill hints).
+# ``ollama_chat`` is LiteLLM's own recommended prefix for an Ollama server and reaches
+# the same endpoint, so it is keyless on the same terms as ``ollama`` (C5-5).
 LOCAL_PROVIDER_DEFAULTS: dict[str, str] = {
     "ollama": "http://localhost:11434",
+    "ollama_chat": "http://localhost:11434",
 }
 
 
@@ -600,7 +633,13 @@ def _atomic_write(path: Path, render: Callable[[Any], None]) -> None:
     even started, so an error or an interrupt destroyed it (AUG-198). Here the
     destination is only touched by ``os.replace``, which is atomic: a reader sees
     either the old file or the new one, never a half-written one.
+
+    Symlinks are followed to the real file first (C5-3). ``os.replace`` on the link
+    path replaces the LINK, so a ``config.yml`` symlinked into a dotfiles repo lost
+    its link and the tracked file never saw the change. Resolving first also keeps
+    the temp file on the same filesystem as the file it will replace.
     """
+    path = Path(os.path.realpath(path))
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
     temp_path = Path(temp_name)

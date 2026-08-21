@@ -665,6 +665,125 @@ class TestKeylessLocalProvider:
         assert "needs no key" in page.text
 
 
+class TestEnvSuppliedCredentials:
+    """C5-4: setup must not demand a credential the environment already supplies."""
+
+    def _post(self, client: TestClient, **data):
+        csrf_token = client.get("/setup").cookies.get("csrf_token")
+        payload = {
+            "llm_model": "openai/gpt-4o-mini",
+            "llm_api_key": "",
+            "llm_base_url": "",
+            "csrf_token": csrf_token,
+        }
+        payload.update(data)
+        return client.post("/setup", data=payload, follow_redirects=False)
+
+    def test_env_key_satisfies_the_key_requirement(
+        self, unconfigured_app: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A blank key field is correct when TOPIC_WATCH_LLM__API_KEY is set."""
+        monkeypatch.setenv("TOPIC_WATCH_LLM__API_KEY", "sk-from-the-environment")
+        app.state.settings = Settings()  # type: ignore[call-arg]
+
+        with (
+            patch("app.scheduler.start_scheduler"),
+            patch("app.web.routers.settings.verify_llm_credentials", return_value=None),
+        ):
+            response = self._post(unconfigured_app)
+
+        assert response.status_code == 303
+        assert app.state.setup_required is False
+
+    def test_preflight_probes_the_key_that_will_actually_be_used(
+        self, unconfigured_app: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Validating the typed key while saving the env key tests the wrong credential."""
+        monkeypatch.setenv("TOPIC_WATCH_LLM__API_KEY", "sk-from-the-environment")
+        app.state.settings = Settings()  # type: ignore[call-arg]
+
+        with (
+            patch("app.scheduler.start_scheduler"),
+            patch("app.web.routers.settings.verify_llm_credentials", return_value=None) as mock_check,
+        ):
+            self._post(unconfigured_app, llm_api_key="sk-typed-by-the-user")
+
+        bound = mock_check.await_args
+        probed = list(bound.args) + list(bound.kwargs.values())
+        assert "sk-from-the-environment" in probed
+        assert "sk-typed-by-the-user" not in probed
+
+    def test_env_model_is_probed_and_the_typed_one_ignored(
+        self, unconfigured_app: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The typed model is discarded as env-owned, so it must not be validated either."""
+        monkeypatch.setenv("TOPIC_WATCH_LLM__MODEL", "openai/from-the-environment")
+        app.state.settings = Settings()  # type: ignore[call-arg]
+
+        with (
+            patch("app.scheduler.start_scheduler"),
+            patch("app.web.routers.settings.verify_llm_credentials", return_value=None) as mock_check,
+        ):
+            self._post(unconfigured_app, llm_model="openai/typed-by-the-user", llm_api_key="sk-typed")
+
+        bound = mock_check.await_args
+        probed = list(bound.args) + list(bound.kwargs.values())
+        assert "openai/from-the-environment" in probed
+        assert "openai/typed-by-the-user" not in probed
+
+    def test_env_owned_model_does_not_have_to_be_retyped(
+        self, unconfigured_app: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The model control renders disabled, so the browser submits nothing for it."""
+        monkeypatch.setenv("TOPIC_WATCH_LLM__MODEL", "openai/from-the-environment")
+        app.state.settings = Settings()  # type: ignore[call-arg]
+
+        with (
+            patch("app.scheduler.start_scheduler"),
+            patch("app.web.routers.settings.verify_llm_credentials", return_value=None),
+        ):
+            response = self._post(unconfigured_app, llm_model="", llm_api_key="sk-typed")
+
+        assert response.status_code == 303
+        assert app.state.settings.llm.model == "openai/from-the-environment"
+
+    def test_a_blank_model_is_still_refused_when_the_environment_owns_nothing(
+        self, unconfigured_app: TestClient
+    ) -> None:
+        with patch("app.scheduler.start_scheduler") as mock_sched:
+            response = self._post(unconfigured_app, llm_model="")
+
+        assert response.status_code == 422
+        assert "model" in response.text.lower()
+        mock_sched.assert_not_called()
+
+    def test_a_blank_key_is_still_refused_when_the_environment_owns_nothing(self, unconfigured_app: TestClient) -> None:
+        with patch("app.scheduler.start_scheduler") as mock_sched:
+            response = self._post(unconfigured_app)
+
+        assert response.status_code == 422
+        assert "API key is required" in response.text
+        mock_sched.assert_not_called()
+
+    def test_setup_page_marks_an_env_key_read_only(
+        self, unconfigured_app: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TOPIC_WATCH_LLM__API_KEY", "sk-from-the-environment")
+        page = unconfigured_app.get("/setup")
+        assert "set via environment" in page.text.lower()
+        assert 'name="llm_api_key"' not in page.text
+        assert "sk-from-the-environment" not in page.text
+
+    def test_setup_page_marks_an_env_model_read_only(
+        self, unconfigured_app: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TOPIC_WATCH_LLM__MODEL", "openai/from-the-environment")
+        app.state.settings = Settings()  # type: ignore[call-arg]
+        page = unconfigured_app.get("/setup")
+        assert 'id="llm_model" name="llm_model" required disabled' in page.text
+        assert "openai/from-the-environment" in page.text
+
+
 class TestProviderSwitchDropsInjectedBaseUrl:
     """AUG-100: the local default the script injected does not survive a switch."""
 

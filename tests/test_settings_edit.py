@@ -927,6 +927,108 @@ class TestEnvSourcedSecretSafety:
         assert "set via environment" in response.text.lower()
 
 
+class TestEnvOwnedControlsAreReadOnly:
+    """C5-2: a control the environment owns says so instead of silently doing nothing.
+
+    Every Docker install sets TOPIC_WATCH_SECURE_COOKIES, so the Secure Cookies toggle
+    was editable, reported "saved", and changed nothing — forever.
+    """
+
+    async def test_secure_cookies_toggle_is_disabled(
+        self, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TOPIC_WATCH_SECURE_COOKIES", "false")
+        page = await client.get("/settings")
+        assert '<input type="checkbox" name="secure_cookies" value="true" role="switch" disabled' in page.text
+        assert page.text.lower().count("set via environment") >= 1
+
+    async def test_secure_cookies_toggle_is_editable_without_the_variable(
+        self, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("TOPIC_WATCH_SECURE_COOKIES", raising=False)
+        page = await client.get("/settings")
+        assert '<input type="checkbox" name="secure_cookies" value="true" role="switch"' in page.text
+        assert 'name="secure_cookies" value="true" role="switch" disabled' not in page.text
+
+    async def test_env_owned_model_and_base_url_are_disabled(
+        self, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The documented Ollama override file owns both of these."""
+        monkeypatch.setenv("TOPIC_WATCH_LLM__MODEL", "ollama/llama3.3")
+        monkeypatch.setenv("TOPIC_WATCH_LLM__BASE_URL", "http://localhost:11434")
+        page = await client.get("/settings")
+        assert 'id="llm_model" name="llm_model" required disabled' in page.text
+        assert 'id="llm_base_url" name="llm_base_url" disabled' in page.text
+
+    async def test_env_owned_scalar_is_disabled(
+        self, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TOPIC_WATCH_WEB_PAGE_SIZE", "42")
+        page = await client.get("/settings")
+        assert 'id="web_page_size" name="web_page_size"' in page.text
+        assert 'name="web_page_size"' in page.text
+        marker = page.text.index('name="web_page_size"')
+        assert "disabled" in page.text[marker : marker + 200]
+
+    async def test_env_owned_notification_urls_textarea_is_disabled(
+        self, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TOPIC_WATCH_NOTIFICATIONS__URLS", '["ntfy://from-env"]')
+        page = await client.get("/settings")
+        assert 'id="notification_urls" name="notification_urls" rows="4" disabled' in page.text
+
+    async def test_untouched_controls_stay_editable(
+        self, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only the owned control is locked; the rest of the form still works."""
+        monkeypatch.setenv("TOPIC_WATCH_SECURE_COOKIES", "true")
+        page = await client.get("/settings")
+        assert 'id="check_interval" name="check_interval" required disabled' not in page.text
+        assert 'id="web_page_size" name="web_page_size" disabled' not in page.text
+
+    async def test_env_owned_model_does_not_block_a_save(
+        self, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A disabled control submits nothing, which must not read as "field required"."""
+        monkeypatch.setenv("TOPIC_WATCH_LLM__MODEL", "openai/gpt-4o-mini")
+        with patch("app.web.routers.settings.save_settings_to_yaml"):
+            response = await client.post("/settings", data=valid_form_data(llm_model=""), follow_redirects=False)
+        assert response.status_code == 303
+
+    async def test_a_blank_model_is_still_refused_when_yaml_owns_it(self, client: httpx.AsyncClient) -> None:
+        response = await client.post("/settings", data=valid_form_data(llm_model=""), follow_redirects=False)
+        assert response.status_code == 422
+        assert "llm_model" in response.text
+
+    async def test_error_re_render_shows_the_env_value_not_a_blank_box(
+        self, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A 422 caused by another field must not show the locked control as empty."""
+        monkeypatch.setenv("TOPIC_WATCH_WEB_PAGE_SIZE", "42")
+        app.state.settings = _make_settings(web_page_size=42)
+        response = await client.post(
+            "/settings",
+            data=valid_form_data(check_interval="not-an-interval", web_page_size=""),
+            follow_redirects=False,
+        )
+        assert response.status_code == 422
+        assert 'id="web_page_size" name="web_page_size"' in response.text
+        marker = response.text.index('id="web_page_size"')
+        assert 'value="42"' in response.text[marker : marker + 220]
+
+    async def test_a_locked_key_field_is_never_echoed(
+        self, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The read-only treatment must not put the env-supplied secret in the page."""
+        monkeypatch.setenv("TOPIC_WATCH_LLM__API_KEY", "sk-env-secret-keep-out")
+        app.state.settings = _make_settings(llm=LLMSettings(model="openai/m", api_key="sk-env-secret-keep-out"))
+        response = await client.post(
+            "/settings", data=valid_form_data(check_interval="not-an-interval"), follow_redirects=False
+        )
+        assert response.status_code == 422
+        assert "sk-env-secret-keep-out" not in response.text
+
+
 class TestConfigGenerationCheck:
     """AUG-291: a save is applied to the generation the page rendered, or refused."""
 
