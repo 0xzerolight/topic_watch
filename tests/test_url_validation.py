@@ -367,3 +367,281 @@ class TestSafeSendInitialUrl:
             await safe_get(client, "https://example.com/feed.xml", headers={"If-None-Match": 'W/"abc"'})
 
         assert captured.get("if-none-match") == 'W/"abc"'
+
+
+class TestNumericLabelHostnames:
+    """A public hostname whose first label looks like a private IPv4 octet (AUG-189)."""
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://127.example.com/feed.xml",
+            "http://10.example.com/feed.xml",
+            "http://192.168.example.com/feed.xml",
+            "http://172.16.example.com/feed.xml",
+            "http://169.254.example.com/feed.xml",
+            "http://0.0.0.0.example.com/feed.xml",
+        ],
+    )
+    def test_numeric_label_public_host_allowed(self, url: str, monkeypatch) -> None:
+        _stub_resolves_to(monkeypatch, "93.184.216.34")
+        assert is_private_url(url) is False
+
+    def test_complete_ipv4_literal_still_blocked(self) -> None:
+        assert is_private_url("http://127.0.0.1/x") is True
+        assert is_private_url("http://192.168.1.1/x") is True
+
+
+class TestResolverPoolBounded:
+    """Timed-out resolver lookups must not spawn unbounded worker threads (AUG-013)."""
+
+    def test_resolver_threads_are_bounded(self, monkeypatch) -> None:
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        from app import url_validation as uv
+
+        release = threading.Event()
+        worker_threads: set[int] = set()
+        lock = threading.Lock()
+
+        def _blocking(*_args, **_kwargs):
+            with lock:
+                worker_threads.add(threading.get_ident())
+            release.wait(10)
+            return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", 0))]
+
+        monkeypatch.setattr(socket, "getaddrinfo", _blocking)
+
+        callers = uv._RESOLVER_POOL_SIZE + 8
+
+        def _lookup(index: int) -> str:
+            try:
+                uv._getaddrinfo_bounded(f"host{index}.example.com", 0.3)
+            except TimeoutError:
+                return "timeout"
+            return "ok"
+
+        try:
+            with ThreadPoolExecutor(max_workers=callers) as pool:
+                outcomes = list(pool.map(_lookup, range(callers)))
+        finally:
+            release.set()
+
+        assert outcomes.count("timeout") == callers
+        # HEAD spawns one executor per lookup, so every caller gets its own thread.
+        assert len(worker_threads) <= uv._RESOLVER_POOL_SIZE
+
+
+class TestSafeSendByteCap:
+    """safe_send streams and aborts an oversize body mid-transfer (AUG-006)."""
+
+    async def test_oversize_body_aborted_mid_stream(self, monkeypatch) -> None:
+        from app.url_validation import MAX_RESPONSE_BYTES, ResponseTooLargeError
+
+        assert MAX_RESPONSE_BYTES > 0
+        _stub_resolves_to(monkeypatch, "93.184.216.34")
+
+        chunks_produced = 0
+
+        async def _body():
+            nonlocal chunks_produced
+            for _ in range(500):
+                chunks_produced += 1
+                yield b"x" * 1024
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=_body())
+
+        transport = httpx.MockTransport(_handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+            with pytest.raises(ResponseTooLargeError):
+                await safe_get(client, "https://example.com/huge.xml", max_bytes=4096)
+
+        # Aborted mid-stream: only the chunks needed to cross the cap were pulled,
+        # not the whole 500 KiB body.
+        assert chunks_produced <= 8
+
+    async def test_body_under_cap_returned_intact(self, monkeypatch) -> None:
+        _stub_resolves_to(monkeypatch, "93.184.216.34")
+
+        async def _body():
+            yield b"hello "
+            yield b"world"
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=_body(), headers={"etag": 'W/"v1"'})
+
+        transport = httpx.MockTransport(_handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+            response = await safe_get(client, "https://example.com/small.xml", max_bytes=4096)
+
+        assert response.status_code == 200
+        assert response.content == b"hello world"
+        assert response.text == "hello world"
+        assert response.headers.get("etag") == 'W/"v1"'
+
+    async def test_redirect_body_is_not_downloaded(self, monkeypatch) -> None:
+        _stub_resolves_to(monkeypatch, "93.184.216.34")
+
+        redirect_chunks = 0
+
+        async def _redirect_body():
+            nonlocal redirect_chunks
+            for _ in range(200):
+                redirect_chunks += 1
+                yield b"y" * 1024
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/start":
+                return httpx.Response(
+                    302,
+                    headers={"location": "https://example.com/final"},
+                    content=_redirect_body(),
+                )
+            return httpx.Response(200, text="final")
+
+        transport = httpx.MockTransport(_handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+            response = await safe_get(client, "https://example.com/start")
+
+        assert response.text == "final"
+        assert redirect_chunks == 0
+
+
+class TestSafeSendRedirectCredentials:
+    """Cross-origin redirects must not carry origin-bound credentials (AUG-005)."""
+
+    async def test_cross_origin_redirect_drops_credentials(self, monkeypatch) -> None:
+        _stub_resolves_to(monkeypatch, "93.184.216.34")
+        seen: list[httpx.Request] = []
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            if request.url.host == "feeds.example.com":
+                return httpx.Response(302, headers={"location": "https://attacker.example.net/steal"})
+            return httpx.Response(200, text="ok")
+
+        transport = httpx.MockTransport(_handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+            request = client.build_request(
+                "GET",
+                "https://feeds.example.com/private.xml",
+                headers={"Authorization": "Basic dXNlcjpwYXNz", "Cookie": "session=abc"},
+            )
+            response = await safe_send(client, request)
+
+        assert response.status_code == 200
+        assert len(seen) == 2
+        assert "authorization" not in seen[1].headers
+        assert "cookie" not in seen[1].headers
+        assert seen[1].headers["host"] == "attacker.example.net"
+
+    async def test_userinfo_credentials_not_forwarded_cross_origin(self, monkeypatch) -> None:
+        _stub_resolves_to(monkeypatch, "93.184.216.34")
+        seen: list[httpx.Request] = []
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            if request.url.host == "feeds.example.com":
+                return httpx.Response(301, headers={"location": "https://attacker.example.net/steal"})
+            return httpx.Response(200, text="ok")
+
+        transport = httpx.MockTransport(_handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+            await safe_get(client, "https://user:pass@feeds.example.com/private.xml")
+
+        assert "authorization" in seen[0].headers
+        assert "authorization" not in seen[1].headers
+
+    async def test_same_origin_redirect_keeps_credentials(self, monkeypatch) -> None:
+        _stub_resolves_to(monkeypatch, "93.184.216.34")
+        seen: list[httpx.Request] = []
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            if request.url.path == "/old":
+                return httpx.Response(302, headers={"location": "https://feeds.example.com/new"})
+            return httpx.Response(200, text="ok")
+
+        transport = httpx.MockTransport(_handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+            request = client.build_request(
+                "GET",
+                "https://feeds.example.com/old",
+                headers={"Authorization": "Basic dXNlcjpwYXNz"},
+            )
+            await safe_send(client, request)
+
+        assert seen[1].headers.get("authorization") == "Basic dXNlcjpwYXNz"
+
+
+class TestValidateFeedUrlIsTotal:
+    """A malformed URL yields an error string, never an exception (AUG-205)."""
+
+    @pytest.mark.parametrize("url", ["http://[::1", "http://[fe80::1%25]:notaport/", "http://[:::]/x"])
+    def test_malformed_url_returns_error(self, url: str) -> None:
+        error = validate_feed_url(url)
+        assert error is not None
+        assert url in error
+
+
+class TestValidateFeedUrlsBounded:
+    """Manual feed lists are deduped and capped before any DNS work (AUG-193)."""
+
+    def test_duplicate_urls_resolved_once(self, monkeypatch) -> None:
+        from app import url_validation as uv
+
+        calls: list[str] = []
+
+        def _fake(url: str) -> str | None:
+            calls.append(url)
+            return None
+
+        monkeypatch.setattr(uv, "validate_feed_url", _fake)
+        errors = uv.validate_feed_urls(["https://a.example.com/f"] * 5)
+
+        assert errors == []
+        assert calls == ["https://a.example.com/f"]
+
+    def test_list_longer_than_cap_is_rejected(self, monkeypatch) -> None:
+        from app import url_validation as uv
+
+        urls = [f"https://a{i}.example.com/f" for i in range(uv.MAX_FEED_URLS_PER_TOPIC + 3)]
+        errors = uv.validate_feed_urls(urls)
+
+        assert any(str(uv.MAX_FEED_URLS_PER_TOPIC) in e for e in errors)
+
+
+class TestValidateOutboundUrl:
+    """Shared credential-bearing endpoint gate."""
+
+    def test_rejects_non_http_scheme(self) -> None:
+        from app.url_validation import validate_outbound_url
+
+        with pytest.raises(ValueError, match="http"):
+            validate_outbound_url("ftp://example.com/x", purpose="the LLM endpoint")
+
+    def test_rejects_public_cleartext_http(self, monkeypatch) -> None:
+        from app.url_validation import validate_outbound_url
+
+        _stub_resolves_to(monkeypatch, "93.184.216.34")
+        with pytest.raises(ValueError, match="cleartext"):
+            validate_outbound_url("http://gateway.example.com/v1", purpose="the LLM endpoint")
+
+    def test_allows_public_https(self, monkeypatch) -> None:
+        from app.url_validation import validate_outbound_url
+
+        _stub_resolves_to(monkeypatch, "93.184.216.34")
+        validate_outbound_url("https://gateway.example.com/v1", purpose="the LLM endpoint")
+
+    def test_allows_local_cleartext_when_private_permitted(self) -> None:
+        from app.url_validation import validate_outbound_url
+
+        validate_outbound_url("http://localhost:11434", purpose="the LLM endpoint", allow_private=True)
+
+    def test_rejects_private_when_not_permitted(self) -> None:
+        from app.url_validation import validate_outbound_url
+
+        with pytest.raises(ValueError, match="private"):
+            validate_outbound_url("http://127.0.0.1:8080/v1", purpose="the Exa API")

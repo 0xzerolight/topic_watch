@@ -19,16 +19,15 @@ VALID_RSS = """<?xml version="1.0"?>
 </rss>"""
 
 
-def _make_response(text: str, status_code: int = 200) -> MagicMock:
-    response = MagicMock()
-    response.text = text
-    # The parser is fed the raw bytes plus the document's own metadata (TW-AUD-019).
-    response.content = text.encode()
-    response.url = "https://example.com/feed.xml"
-    response.headers = {"content-type": "application/rss+xml"}
-    response.status_code = status_code
-    response.raise_for_status = MagicMock()
-    return response
+def _make_response(text: str, status_code: int = 200) -> httpx.Response:
+    """A real response: safe_send streams the body and reads its redirect state."""
+    return httpx.Response(
+        status_code,
+        # The parser is fed the raw bytes plus the document's own metadata (TW-AUD-019).
+        content=text.encode(),
+        headers={"content-type": "application/rss+xml"},
+        request=httpx.Request("GET", "https://example.com/feed.xml"),
+    )
 
 
 def _make_client(side_effects) -> AsyncMock:

@@ -214,3 +214,26 @@ async def test_validate_accepts_a_genuinely_empty_feed(client: httpx.AsyncClient
         )
 
     assert "Valid RSS feed with 0 entries" in response.text
+
+
+class TestManualFeedListBounds:
+    """Manual feed lists are deduped and capped before DNS / fetch fan-out (AUG-193)."""
+
+    async def test_duplicate_lines_are_deduped_before_persisting(self) -> None:
+        from app.web.routers._validation import validate_topic_form
+
+        pasted = "\n".join(["https://a.example.com/feed", " https://a.example.com/feed ", "https://b.example.com/f"])
+        with patch("app.web.routers._validation.validate_feed_urls", return_value=[]):
+            _mode, urls, _interval, errors = await validate_topic_form("manual", pasted, "6h")
+
+        assert errors == []
+        assert urls == ["https://a.example.com/feed", "https://b.example.com/f"]
+
+    async def test_oversized_list_is_rejected(self) -> None:
+        from app.url_validation import MAX_FEED_URLS_PER_TOPIC
+        from app.web.routers._validation import validate_topic_form
+
+        pasted = "\n".join(f"https://e{i}.example.com/feed" for i in range(MAX_FEED_URLS_PER_TOPIC + 5))
+        _mode, _urls, _interval, errors = await validate_topic_form("manual", pasted, "6h")
+
+        assert any(str(MAX_FEED_URLS_PER_TOPIC) in e for e in errors)
