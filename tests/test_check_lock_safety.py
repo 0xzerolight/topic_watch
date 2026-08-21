@@ -736,3 +736,81 @@ async def test_stale_check_aborts_and_leaves_the_replacement_untouched(tmp_path,
     with get_db(db_path) as conn:
         assert list_check_results(conn, replacement.id) == []
         assert get_topic(conn, replacement.id).heartbeat_alerted_at is None
+
+
+# --- Retry claims recheck eligibility and fence late applies (TW-AUD-006) ---
+
+
+def test_exhausted_notification_cannot_be_claimed(db_conn: sqlite3.Connection) -> None:
+    """A row already at max_retries is rejected by the claim, not just by the list query."""
+    topic = _make_topic(db_conn)
+    n = create_pending_notification(
+        db_conn,
+        PendingNotification(topic_id=topic.id, title="T", body="B", retry_count=3, max_retries=3),
+    )
+    db_conn.commit()
+
+    assert claim_pending_notification(db_conn, n.id, "2026-01-01T00:00:00+00:00") is False
+
+
+def test_exhausted_webhook_cannot_be_claimed(db_conn: sqlite3.Connection) -> None:
+    """Same predicate on the webhook queue."""
+    topic = _make_topic(db_conn)
+    webhook_id = create_pending_webhook(db_conn, topic.id, "https://a.com/hook", {"k": "v"}, max_retries=1)
+    db_conn.commit()
+    db_conn.execute("UPDATE pending_webhooks SET retry_count = 1 WHERE id = ?", (webhook_id,))
+    db_conn.commit()
+
+    assert claim_pending_webhook(db_conn, webhook_id, "2026-01-01T00:00:00+00:00") is False
+
+
+def test_late_notification_apply_with_a_stale_token_is_a_noop(db_conn: sqlite3.Connection) -> None:
+    """A drainer whose claim was released and re-taken cannot consume the new owner's attempt."""
+    from app.crud import delete_pending_notification, increment_notification_retry
+
+    first_owner, second_owner = "owner-a", "owner-b"
+    topic = _make_topic(db_conn)
+    n = create_pending_notification(db_conn, PendingNotification(topic_id=topic.id, title="T", body="B"))
+    db_conn.commit()
+
+    assert claim_pending_notification(db_conn, n.id, "2020-01-01T00:00:00+00:00", claim_token=first_owner) is True
+    db_conn.commit()
+    # The first owner is declared stale and a second drainer takes the row.
+    release_stale_notification_claims(db_conn, "2020-06-01T00:00:00+00:00")
+    db_conn.commit()
+    assert claim_pending_notification(db_conn, n.id, "2026-01-01T00:00:00+00:00", claim_token=second_owner) is True
+    db_conn.commit()
+
+    # The first owner finally comes back with both possible applies.
+    assert increment_notification_retry(db_conn, n.id, "late failure", claim_token=first_owner) is False
+    assert delete_pending_notification(db_conn, n.id, claim_token=first_owner) is False
+    db_conn.commit()
+
+    row = db_conn.execute("SELECT retry_count, claim_token FROM pending_notifications WHERE id = ?", (n.id,)).fetchone()
+    assert row is not None
+    assert row["retry_count"] == 0
+    assert row["claim_token"] == second_owner
+
+
+def test_late_webhook_apply_with_a_stale_token_is_a_noop(db_conn: sqlite3.Connection) -> None:
+    """Same fence on the webhook queue."""
+    from app.crud import delete_pending_webhook, increment_webhook_retry
+
+    first_owner, second_owner = "owner-a", "owner-b"
+    topic = _make_topic(db_conn)
+    webhook_id = create_pending_webhook(db_conn, topic.id, "https://a.com/hook", {"k": "v"})
+    db_conn.commit()
+
+    assert claim_pending_webhook(db_conn, webhook_id, "2020-01-01T00:00:00+00:00", claim_token=first_owner) is True
+    db_conn.commit()
+    release_stale_webhook_claims(db_conn, "2020-06-01T00:00:00+00:00")
+    db_conn.commit()
+    assert claim_pending_webhook(db_conn, webhook_id, "2026-01-01T00:00:00+00:00", claim_token=second_owner) is True
+    db_conn.commit()
+
+    assert increment_webhook_retry(db_conn, webhook_id, claim_token=first_owner) is False
+    assert delete_pending_webhook(db_conn, webhook_id, claim_token=first_owner) is False
+    db_conn.commit()
+
+    row = db_conn.execute("SELECT retry_count FROM pending_webhooks WHERE id = ?", (webhook_id,)).fetchone()
+    assert row is not None and row["retry_count"] == 0

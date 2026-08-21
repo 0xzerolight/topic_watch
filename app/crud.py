@@ -905,43 +905,80 @@ def list_pending_notifications(
     return [PendingNotification.from_row(row) for row in rows]
 
 
-def claim_pending_notification(conn: sqlite3.Connection, notification_id: int, claimed_at: str) -> bool:
+def claim_pending_notification(
+    conn: sqlite3.Connection,
+    notification_id: int,
+    claimed_at: str,
+    *,
+    claim_token: str | None = None,
+) -> bool:
     """Atomically claim a pending notification for sending.
 
     Returns True only if this caller won the claim (the row was unclaimed and
     is now stamped). A concurrent drainer that lost the race gets False and
     must skip the row, preventing double-delivery across processes.
+
+    Eligibility is part of the predicate, not a separate list query: a drainer
+    working from a snapshot taken before another drainer exhausted the row could
+    otherwise claim and physically retry it past ``max_retries`` (TW-AUD-006).
+    ``claim_token`` stamps the winning owner so its apply can be fenced.
     """
     cursor = conn.execute(
-        "UPDATE pending_notifications SET claimed_at = ? WHERE id = ? AND claimed_at IS NULL",
-        (claimed_at, notification_id),
+        "UPDATE pending_notifications SET claimed_at = ?, claim_token = ? "
+        "WHERE id = ? AND claimed_at IS NULL AND retry_count < max_retries",
+        (claimed_at, claim_token, notification_id),
     )
     return cursor.rowcount == 1
 
 
-def increment_notification_retry(conn: sqlite3.Connection, notification_id: int, last_error: str | None = None) -> None:
+def increment_notification_retry(
+    conn: sqlite3.Connection,
+    notification_id: int,
+    last_error: str | None = None,
+    *,
+    claim_token: str | None = None,
+) -> bool:
     """Increment the retry count and release the claim for a pending notification.
 
     Clearing ``claimed_at`` re-arms the row so the next cycle can re-claim and
     retry it. ``last_error`` (when given) records the most recent failure reason
     so a permanently-broken channel is distinguishable from a transient blip.
+    ``claim_token`` fences the write to the owner that actually sent: a drainer
+    whose claim was released as stale and re-taken elsewhere must not consume the
+    new owner's attempt (TW-AUD-006). Returns True when a row was updated.
     """
-    if last_error is not None:
-        conn.execute(
-            "UPDATE pending_notifications "
-            "SET retry_count = retry_count + 1, claimed_at = NULL, last_error = ? WHERE id = ?",
-            (last_error, notification_id),
-        )
-    else:
-        conn.execute(
-            "UPDATE pending_notifications SET retry_count = retry_count + 1, claimed_at = NULL WHERE id = ?",
-            (notification_id,),
-        )
+    sql = (
+        "UPDATE pending_notifications "
+        "SET retry_count = retry_count + 1, claimed_at = NULL, claim_token = NULL, last_error = ? "
+        "WHERE id = ?"
+    )
+    params: list = [last_error, notification_id]
+    if claim_token is not None:
+        sql += " AND claim_token = ?"
+        params.append(claim_token)
+    cursor = conn.execute(sql, params)
+    return cursor.rowcount == 1
 
 
-def delete_pending_notification(conn: sqlite3.Connection, notification_id: int) -> None:
-    """Delete a pending notification (after successful send or max retries)."""
-    conn.execute("DELETE FROM pending_notifications WHERE id = ?", (notification_id,))
+def delete_pending_notification(
+    conn: sqlite3.Connection,
+    notification_id: int,
+    *,
+    claim_token: str | None = None,
+) -> bool:
+    """Delete a pending notification (after successful send or max retries).
+
+    ``claim_token`` fences the delete to the claim that sent it, so a late apply
+    from a superseded owner cannot drop a row another drainer is working on
+    (TW-AUD-006). Returns True when a row was deleted.
+    """
+    sql = "DELETE FROM pending_notifications WHERE id = ?"
+    params: list = [notification_id]
+    if claim_token is not None:
+        sql += " AND claim_token = ?"
+        params.append(claim_token)
+    cursor = conn.execute(sql, params)
+    return cursor.rowcount == 1
 
 
 def release_stale_notification_claims(conn: sqlite3.Connection, cutoff: str) -> int:
@@ -952,7 +989,8 @@ def release_stale_notification_claims(conn: sqlite3.Connection, cutoff: str) -> 
     stale claims at snapshot time makes the queue self-healing.
     """
     cursor = conn.execute(
-        "UPDATE pending_notifications SET claimed_at = NULL WHERE claimed_at IS NOT NULL AND claimed_at <= ?",
+        "UPDATE pending_notifications SET claimed_at = NULL, claim_token = NULL "
+        "WHERE claimed_at IS NOT NULL AND claimed_at <= ?",
         (cutoff,),
     )
     return cursor.rowcount
@@ -1021,35 +1059,68 @@ def list_pending_webhooks(conn: sqlite3.Connection) -> list[PendingWebhook]:
     return [PendingWebhook.from_row(row) for row in rows]
 
 
-def claim_pending_webhook(conn: sqlite3.Connection, webhook_id: int, claimed_at: str) -> bool:
+def claim_pending_webhook(
+    conn: sqlite3.Connection,
+    webhook_id: int,
+    claimed_at: str,
+    *,
+    claim_token: str | None = None,
+) -> bool:
     """Atomically claim a pending webhook for sending.
 
     Returns True only if this caller won the claim (the row was unclaimed and
     is now stamped). A concurrent drainer that lost the race gets False and
-    must skip the row, preventing double-delivery across processes.
+    must skip the row, preventing double-delivery across processes. Mirrors
+    :func:`claim_pending_notification`, eligibility predicate included
+    (TW-AUD-006).
     """
     cursor = conn.execute(
-        "UPDATE pending_webhooks SET claimed_at = ? WHERE id = ? AND claimed_at IS NULL",
-        (claimed_at, webhook_id),
+        "UPDATE pending_webhooks SET claimed_at = ?, claim_token = ? "
+        "WHERE id = ? AND claimed_at IS NULL AND retry_count < max_retries",
+        (claimed_at, claim_token, webhook_id),
     )
     return cursor.rowcount == 1
 
 
-def increment_webhook_retry(conn: sqlite3.Connection, webhook_id: int) -> None:
+def increment_webhook_retry(
+    conn: sqlite3.Connection,
+    webhook_id: int,
+    *,
+    claim_token: str | None = None,
+) -> bool:
     """Increment the retry count and release the claim for a pending webhook.
 
     Clearing ``claimed_at`` re-arms the row so the next cycle can re-claim and
-    retry it.
+    retry it. Fenced by ``claim_token`` like its notification twin (TW-AUD-006).
     """
-    conn.execute(
-        "UPDATE pending_webhooks SET retry_count = retry_count + 1, claimed_at = NULL WHERE id = ?",
-        (webhook_id,),
+    sql = (
+        "UPDATE pending_webhooks SET retry_count = retry_count + 1, claimed_at = NULL, claim_token = NULL WHERE id = ?"
     )
+    params: list = [webhook_id]
+    if claim_token is not None:
+        sql += " AND claim_token = ?"
+        params.append(claim_token)
+    cursor = conn.execute(sql, params)
+    return cursor.rowcount == 1
 
 
-def delete_pending_webhook(conn: sqlite3.Connection, webhook_id: int) -> None:
-    """Delete a pending webhook (after successful send or max retries)."""
-    conn.execute("DELETE FROM pending_webhooks WHERE id = ?", (webhook_id,))
+def delete_pending_webhook(
+    conn: sqlite3.Connection,
+    webhook_id: int,
+    *,
+    claim_token: str | None = None,
+) -> bool:
+    """Delete a pending webhook (after successful send or max retries).
+
+    Fenced by ``claim_token`` like its notification twin (TW-AUD-006).
+    """
+    sql = "DELETE FROM pending_webhooks WHERE id = ?"
+    params: list = [webhook_id]
+    if claim_token is not None:
+        sql += " AND claim_token = ?"
+        params.append(claim_token)
+    cursor = conn.execute(sql, params)
+    return cursor.rowcount == 1
 
 
 def release_stale_webhook_claims(conn: sqlite3.Connection, cutoff: str) -> int:
@@ -1059,7 +1130,8 @@ def release_stale_webhook_claims(conn: sqlite3.Connection, cutoff: str) -> int:
     row then crashes before applying would otherwise strand it claimed forever.
     """
     cursor = conn.execute(
-        "UPDATE pending_webhooks SET claimed_at = NULL WHERE claimed_at IS NOT NULL AND claimed_at <= ?",
+        "UPDATE pending_webhooks SET claimed_at = NULL, claim_token = NULL "
+        "WHERE claimed_at IS NOT NULL AND claimed_at <= ?",
         (cutoff,),
     )
     return cursor.rowcount

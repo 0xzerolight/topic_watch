@@ -7,6 +7,7 @@ state, sends notifications for genuine updates, and records the outcome.
 
 import asyncio
 import logging
+import secrets
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -917,8 +918,13 @@ async def _drain_pending_notifications(
         # already claimed it returns rowcount 0 here, so we skip — only the
         # winner sends, preventing double-delivery (OVH-017).
         claimed_at = datetime.now(UTC).isoformat()
+        # The claim carries an owner token and rechecks eligibility, so a drainer
+        # working from a stale snapshot cannot retry a row another drainer has
+        # since exhausted, and this drainer's apply below cannot land after a
+        # stale-claim release handed the row to someone else (TW-AUD-006).
+        claim_token = secrets.token_hex(8)
         with short_conn(conn, db_path) as claim_conn:
-            won = claim_pending_notification(claim_conn, notification.id, claimed_at)
+            won = claim_pending_notification(claim_conn, notification.id, claimed_at, claim_token=claim_token)
             claim_conn.commit()
         if not won:
             logger.debug("Notification id=%d already claimed by another drain; skipping", notification.id)
@@ -942,12 +948,17 @@ async def _drain_pending_notifications(
         # can re-claim and retry.
         with short_conn(conn, db_path) as apply_conn:
             if sent:
-                delete_pending_notification(apply_conn, notification.id)
+                applied = delete_pending_notification(apply_conn, notification.id, claim_token=claim_token)
                 logger.info("Retry succeeded for notification id=%d", notification.id)
             else:
-                increment_notification_retry(apply_conn, notification.id, last_error)
+                applied = increment_notification_retry(apply_conn, notification.id, last_error, claim_token=claim_token)
                 logger.warning("Retry failed for notification id=%d", notification.id)
             apply_conn.commit()
+        if not applied:
+            logger.warning(
+                "Late apply for notification id=%d ignored: the claim is no longer ours",
+                notification.id,
+            )
 
 
 async def check_all_topics(

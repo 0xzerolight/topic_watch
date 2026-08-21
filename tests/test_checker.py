@@ -1827,11 +1827,11 @@ class TestRetryPendingNotifications:
 
         call_count = {"n": 0}
 
-        def crashing_delete(conn, notification_id):  # noqa: ANN001
+        def crashing_delete(conn, notification_id, *, claim_token=None):  # noqa: ANN001
             call_count["n"] += 1
             if call_count["n"] == 2:
                 raise RuntimeError("simulated crash applying item 2")
-            real_delete(conn, notification_id)
+            return real_delete(conn, notification_id, claim_token=claim_token)
 
         with (
             patch("app.checker.send_notification", new_callable=AsyncMock, return_value=True),
