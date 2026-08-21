@@ -627,18 +627,27 @@ class TestValidateOutboundUrl:
 
         _stub_resolves_to(monkeypatch, "93.184.216.34")
         with pytest.raises(ValueError, match="cleartext"):
-            validate_outbound_url("http://gateway.example.com/v1", purpose="the LLM endpoint")
+            validate_outbound_url("http://gateway.example.com/v1", purpose="the LLM endpoint", require_https=True)
 
     def test_allows_public_https(self, monkeypatch) -> None:
         from app.url_validation import validate_outbound_url
 
         _stub_resolves_to(monkeypatch, "93.184.216.34")
-        validate_outbound_url("https://gateway.example.com/v1", purpose="the LLM endpoint")
+        validate_outbound_url("https://gateway.example.com/v1", purpose="the LLM endpoint", require_https=True)
+
+    def test_allows_public_cleartext_without_require_https(self, monkeypatch) -> None:
+        """Notification targets keep the plain SSRF gate, not a transport policy."""
+        from app.url_validation import validate_outbound_url
+
+        _stub_resolves_to(monkeypatch, "93.184.216.34")
+        validate_outbound_url("http://hooks.example.com/x", purpose="Notification target")
 
     def test_allows_local_cleartext_when_private_permitted(self) -> None:
         from app.url_validation import validate_outbound_url
 
-        validate_outbound_url("http://localhost:11434", purpose="the LLM endpoint", allow_private=True)
+        validate_outbound_url(
+            "http://localhost:11434", purpose="the LLM endpoint", allow_private=True, require_https=True
+        )
 
     def test_rejects_private_when_not_permitted(self) -> None:
         from app.url_validation import validate_outbound_url

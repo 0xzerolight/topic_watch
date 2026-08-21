@@ -248,23 +248,31 @@ def validate_feed_urls(urls: list[str]) -> list[str]:
     return [errors_by_url[url] for url in deduped if errors_by_url[url]]
 
 
-def validate_outbound_url(url: str, *, purpose: str, allow_private: bool = False) -> None:
-    """Gate one operator-configured, credential-bearing outbound endpoint.
+def validate_outbound_url(
+    url: str,
+    *,
+    purpose: str,
+    allow_private: bool = False,
+    require_https: bool = False,
+) -> None:
+    """Gate one operator-configured outbound endpoint. Raises ``ValueError``.
 
-    Shared by the Apprise, LLM and Exa call sites so those three have one policy
-    instead of three bespoke checks (AUG-004 / AUG-333 / AUG-304). Raises
-    ``ValueError`` when:
+    The single policy behind the Apprise, LLM and Exa call sites, which each had
+    their own (or no) check before (AUG-004 / AUG-333 / AUG-304). Rules:
 
-    1. the scheme is not http(s);
-    2. the destination is public but the scheme is plain http — an API key and a
-       full prompt would cross the internet in cleartext;
-    3. the destination is private/reserved/unresolvable and ``allow_private`` is
-       not set.
+    1. the scheme must be http(s);
+    2. a private/reserved/unresolvable destination is refused unless
+       ``allow_private``;
+    3. with ``require_https``, a PUBLIC destination must use https — an endpoint
+       that carries our own API key must never be reached in cleartext across
+       the internet.
 
-    ``allow_private=True`` is for endpoints the project documents as local: the
-    Ollama / OpenAI-compatible gateway base URL (``http://localhost:11434``,
-    ``http://host.docker.internal:11434``). Cleartext on your own machine or LAN
-    is the documented setup; cleartext to the public internet never is.
+    The two flags are what the three callers actually differ on, and both cases
+    are real: ``allow_private=True`` keeps the documented local LLM path working
+    (``http://localhost:11434``, ``http://host.docker.internal:11434``), where
+    cleartext on your own machine is the intended setup, while ``require_https``
+    is off for notification targets because the webhook sender already accepts
+    plain-http public endpoints and this is the SSRF gate, not a transport policy.
 
     Performs blocking DNS via :func:`is_private_url` — call it through
     ``asyncio.to_thread`` from async code.
@@ -275,7 +283,7 @@ def validate_outbound_url(url: str, *, purpose: str, allow_private: bool = False
     private = is_private_url(url)
     if private and not allow_private:
         raise ValueError(f"{purpose} points to a private/reserved address or could not be resolved")
-    if scheme != "https" and not private:
+    if require_https and scheme != "https" and not private:
         raise ValueError(f"{purpose} would be sent in cleartext to a public host; use https")
 
 
