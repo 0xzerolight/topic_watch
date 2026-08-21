@@ -266,6 +266,26 @@ class NotificationSettings(BaseModel):
         description="List of webhook URLs for JSON POST notifications",
     )
 
+    @field_validator("urls", "webhook_urls", mode="after")
+    @classmethod
+    def _dedupe_targets(cls, value: list[str]) -> list[str]:
+        """Drop exact repeats, keeping the first occurrence's position (AUG-246).
+
+        Both delivery paths iterate every entry, so a line pasted twice into the
+        settings form (or a YAML key duplicated across an include) sent every alert
+        twice and queued two retry rows on failure. Only byte-identical repeats are
+        removed — two spellings of the same endpoint stay distinct, because
+        normalizing an Apprise URL is not something this layer can do safely.
+        """
+        seen: set[str] = set()
+        out: list[str] = []
+        for url in value:
+            if url in seen:
+                continue
+            seen.add(url)
+            out.append(url)
+        return out
+
 
 class ExaSettings(BaseModel):
     """Exa AI search-source configuration (optional, opt-in, user-supplied paid key)."""

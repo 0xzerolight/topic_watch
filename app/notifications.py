@@ -6,6 +6,7 @@ come from the application settings (Apprise URL format).
 
 import asyncio
 import logging
+from urllib.parse import urlparse
 
 import apprise
 
@@ -26,29 +27,59 @@ logger = logging.getLogger(__name__)
 # (config.example.yml, README, the setup UI). A real notification URL carries
 # concrete credentials and never these words, so an unedited example is dropped
 # instead of silently delivering — e.g. the shipped ``ntfy://your-topic-name``
-# would otherwise POST to the public ntfy.sh topic "your-topic-name". Kept
-# deliberately narrow (whole placeholder tokens, case-insensitive) so it never
-# drops a real URL (OVH: example-URL leak guard).
-_PLACEHOLDER_URL_MARKERS = (
-    "your-topic-name",
-    "your_ntfy_topic",
-    "webhook_id",
-    "webhook_token",
-    "bot_token",
-    "chat_id",
-    "token_a",
-    "token_b",
-    "token_c",
-    "user_key",
-    "api_token",
-    "your-api-key",
+# would otherwise POST to the public ntfy.sh topic "your-topic-name".
+_PLACEHOLDER_URL_MARKERS = frozenset(
+    {
+        "your-topic-name",
+        "your-topic",
+        "your_ntfy_topic",
+        "webhook_id",
+        "webhook_token",
+        "bot_token",
+        "chat_id",
+        "token_a",
+        "token_b",
+        "token_c",
+        "user_key",
+        "api_token",
+        "your-api-key",
+    }
 )
 
 
+def _url_components(url: str) -> list[str]:
+    """Split an Apprise URL into the components a placeholder can occupy.
+
+    Userinfo, host and each path segment — the places the shipped examples put
+    their fake credentials. Query values are deliberately excluded: Apprise
+    query parameters are options, not identity.
+    """
+    parsed = urlparse(url)
+    components: list[str] = []
+    userinfo, _, hostport = (parsed.netloc or "").rpartition("@")
+    if userinfo:
+        components.extend(userinfo.split(":"))
+    host = hostport.rsplit(":", 1)[0] if hostport.count(":") == 1 else hostport
+    if host:
+        components.append(host)
+    components.extend(segment for segment in (parsed.path or "").split("/") if segment)
+    return components
+
+
 def _is_placeholder_url(url: str) -> bool:
-    """True if ``url`` is an unedited documentation/example placeholder."""
-    lowered = url.lower()
-    return any(marker in lowered for marker in _PLACEHOLDER_URL_MARKERS)
+    """True if ``url`` is an unedited documentation/example placeholder.
+
+    A marker has to be a WHOLE component of the URL, not a substring of one
+    (AUG-245): ``ntfy://api_token-alerts`` is a perfectly good ntfy topic that
+    substring matching refused forever, retrying until the target was abandoned.
+    Parsing failures fall back to "not a placeholder" — the invalid-URL guard in
+    ``_deliver_one`` catches anything Apprise itself cannot use.
+    """
+    try:
+        components = _url_components(url)
+    except ValueError:
+        return False
+    return any(component.lower() in _PLACEHOLDER_URL_MARKERS for component in components)
 
 
 def format_notification(topic_name: str, novelty_result: NoveltyResult) -> tuple[str, str]:

@@ -16,6 +16,7 @@ from app.crud import create_pending_notification, create_topic, list_pending_not
 from app.database import get_connection, init_db
 from app.models import PendingNotification, Topic, TopicStatus
 from app.notifications import (
+    _is_placeholder_url,
     format_notification,
     redact_url,
     send_notification,
@@ -54,6 +55,47 @@ class TestPlaceholderGuard:
         assert by_url["json://localhost"].ok is True
         # The placeholder never reached Apprise; the real URL did.
         inst.add.assert_called_once_with("json://localhost")
+
+    async def test_marker_as_substring_of_a_component_is_delivered(self) -> None:
+        """AUG-245: a real topic merely containing a marker must not be refused."""
+        real = "ntfy://api_token-alerts"
+        settings = _make_settings(notifications=NotificationSettings(urls=[real]))
+        with patch("app.notifications.apprise.Apprise") as mock_ap:
+            inst = mock_ap.return_value
+            inst.add.return_value = True
+            inst.notify.return_value = True
+            results = await send_notification_per_url("T", "B", settings)
+
+        assert results[0].ok is True
+        inst.add.assert_called_once_with(real)
+
+    def test_shipped_example_urls_are_all_refused(self) -> None:
+        for url in (
+            "ntfy://your-topic-name",
+            "discord://webhook_id/webhook_token",
+            "tgram://bot_token/chat_id",
+            "slack://token_a/token_b/token_c/channel",
+        ):
+            assert _is_placeholder_url(url) is True, url
+
+    def test_credential_bearing_path_is_not_a_placeholder(self) -> None:
+        assert _is_placeholder_url("https://hooks.example.com/api_tokens/abc") is False
+
+
+class TestTargetDeduplication:
+    """AUG-246: a repeated target must not double every alert."""
+
+    def test_repeated_notification_url_is_collapsed(self) -> None:
+        settings = NotificationSettings(urls=["json://a", "json://b", "json://a"])
+        assert settings.urls == ["json://a", "json://b"]
+
+    def test_repeated_webhook_url_is_collapsed(self) -> None:
+        settings = NotificationSettings(webhook_urls=["https://a/h", "https://a/h"])
+        assert settings.webhook_urls == ["https://a/h"]
+
+    def test_distinct_spellings_are_preserved(self) -> None:
+        settings = NotificationSettings(webhook_urls=["https://a/h", "https://a/h/"])
+        assert settings.webhook_urls == ["https://a/h", "https://a/h/"]
 
 
 # --- format_notification ---
