@@ -3,6 +3,7 @@
 import asyncio
 import sqlite3
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -628,3 +629,110 @@ async def test_cross_entry_point_check_topic_blocks_api_trigger(
     result = pipeline.result()
     assert result.stage_error != "skipped: already in flight"
     assert await clean_state.is_checking(topic.id) is False
+
+
+# --- Lifecycle fencing across a delete + rowid reuse (AUG-020 / TW-AUD-007) ---
+
+
+def _recreate_reusing_rowid(conn: sqlite3.Connection, original: Topic) -> Topic:
+    """Delete a topic and create a replacement that reuses its freed rowid."""
+    from app.crud import delete_topic
+
+    delete_topic(conn, original.id)
+    conn.commit()
+    replacement = create_topic(conn, Topic(name="Replacement", description="d", status=TopicStatus.READY))
+    conn.commit()
+    assert replacement.id == original.id
+    assert replacement.generation != original.generation
+    return replacement
+
+
+def test_heartbeat_claim_refuses_a_stale_generation(db_conn: sqlite3.Connection) -> None:
+    """A check holding a deleted topic cannot latch the replacement (AUG-020)."""
+    from app.crud import claim_heartbeat_alert
+
+    original = create_topic(db_conn, Topic(name="Doomed", description="d", status=TopicStatus.READY))
+    db_conn.commit()
+    replacement = _recreate_reusing_rowid(db_conn, original)
+
+    won = claim_heartbeat_alert(db_conn, original.id, datetime(2026, 1, 1, tzinfo=UTC), generation=original.generation)
+    db_conn.commit()
+
+    assert won is False
+    assert get_topic(db_conn, replacement.id).heartbeat_alerted_at is None
+
+
+def test_heartbeat_clear_refuses_a_stale_generation(db_conn: sqlite3.Connection) -> None:
+    """Nor can it clear the replacement's own outage latch (AUG-020)."""
+    from app.crud import claim_heartbeat_alert, clear_heartbeat_alert
+
+    original = create_topic(db_conn, Topic(name="Doomed", description="d", status=TopicStatus.READY))
+    db_conn.commit()
+    replacement = _recreate_reusing_rowid(db_conn, original)
+
+    # The replacement has its own, live outage announced.
+    assert claim_heartbeat_alert(
+        db_conn, replacement.id, datetime(2026, 1, 2, tzinfo=UTC), generation=replacement.generation
+    )
+    db_conn.commit()
+
+    assert clear_heartbeat_alert(db_conn, original.id, generation=original.generation) is False
+    db_conn.commit()
+    assert get_topic(db_conn, replacement.id).heartbeat_alerted_at is not None
+
+
+def test_heartbeat_claim_refuses_a_superseded_head_check(db_conn: sqlite3.Connection) -> None:
+    """A decision computed from check N does not land once check N+1 exists."""
+    from app.crud import claim_heartbeat_alert, create_check_result
+    from app.models import CheckResult
+
+    topic = create_topic(db_conn, Topic(name="Streaky", description="d", status=TopicStatus.READY))
+    db_conn.commit()
+    first = create_check_result(db_conn, CheckResult(topic_id=topic.id))
+    second = create_check_result(db_conn, CheckResult(topic_id=topic.id))
+    db_conn.commit()
+
+    stale = claim_heartbeat_alert(db_conn, topic.id, datetime(2026, 1, 1, tzinfo=UTC), head_check_id=first.id)
+    db_conn.commit()
+    assert stale is False
+
+    fresh = claim_heartbeat_alert(db_conn, topic.id, datetime(2026, 1, 1, tzinfo=UTC), head_check_id=second.id)
+    db_conn.commit()
+    assert fresh is True
+
+
+async def test_stale_check_aborts_and_leaves_the_replacement_untouched(tmp_path, monkeypatch, clean_state) -> None:
+    """A check whose topic is deleted mid-flight writes nothing to its successor.
+
+    The rowid is recycled by the next INSERT, so without the generation fence the
+    stale worker files its CheckResult against — and latches the heartbeat of — a
+    topic it never looked at (TW-AUD-007).
+    """
+    from app.checker import check_topic
+    from app.crud import list_check_results
+    from app.database import get_db, init_db
+    from app.scraping import FetchResult
+
+    db_path = tmp_path / "recycled.db"
+    init_db(db_path)
+    with get_db(db_path) as seed:
+        original = create_topic(seed, Topic(name="Doomed", description="d", status=TopicStatus.READY))
+        seed.commit()
+
+    replacement_holder: dict[str, Topic] = {}
+
+    async def _delete_and_recreate(*args, **kwargs):
+        # The user deletes the topic and adds a new one while the fetch is running.
+        with get_db(db_path) as conn:
+            replacement_holder["topic"] = _recreate_reusing_rowid(conn, original)
+        return FetchResult(articles=[], total_feed_entries=0)
+
+    monkeypatch.setattr("app.checker.fetch_new_articles_for_topic", _delete_and_recreate)
+
+    result = await check_topic(original, _make_settings(), db_path=db_path)
+
+    replacement = replacement_holder["topic"]
+    assert result.stage_error is not None and result.stage_error.startswith("transition_aborted:")
+    with get_db(db_path) as conn:
+        assert list_check_results(conn, replacement.id) == []
+        assert get_topic(conn, replacement.id).heartbeat_alerted_at is None

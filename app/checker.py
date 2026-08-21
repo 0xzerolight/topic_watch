@@ -672,9 +672,18 @@ async def _check_topic_inner(
     return result
 
 
-def _record_result(db_path: Path | None, result: CheckResult) -> CheckResult:
-    """Persist a CheckResult on a short connection (the no-send early-return paths)."""
+def _record_result(db_path: Path | None, result: CheckResult, *, generation: str | None) -> CheckResult:
+    """Persist a CheckResult on a short connection (the no-send early-return paths).
+
+    Fenced by the topic's generation for the same reason the full transition is: a
+    rowid freed by a delete is handed to the next topic created, so a check that
+    started before the delete would otherwise file its result against a topic it
+    never looked at (TW-AUD-007).
+    """
     with get_db(db_path) as conn:
+        topic_id = result.topic_id
+        if generation is not None and topic_id is not None and not topic_generation_matches(conn, topic_id, generation):
+            raise CheckTransitionAborted(f"topic_id={topic_id} was deleted or replaced during this check")
         created = create_check_result(conn, result)
         conn.commit()
     return created
@@ -687,7 +696,12 @@ async def _finish_check(
     settings: Settings,
 ) -> CheckResult:
     """Persist a no-send check result, then run the Silence Heartbeat over it."""
-    recorded = _record_result(db_path, result)
+    try:
+        recorded = _record_result(db_path, result, generation=topic.generation)
+    except CheckTransitionAborted as exc:
+        logger.warning("Check for topic '%s' aborted before recording its result: %s", topic.name, exc)
+        result.stage_error = f"transition_aborted: {exc}"
+        return result
     await _run_heartbeat(db_path, topic, recorded.id, settings)
     return recorded
 
@@ -720,7 +734,7 @@ async def _run_heartbeat(
             # and fires a phantom "recovered" whenever the feature is re-enabled.
             if topic.heartbeat_alerted_at is not None:
                 with get_db(db_path) as conn:
-                    if clear_heartbeat_alert(conn, topic.id):
+                    if clear_heartbeat_alert(conn, topic.id, generation=topic.generation):
                         conn.commit()
             return
 
@@ -729,10 +743,13 @@ async def _run_heartbeat(
             if action is None:
                 return
 
+            # Fenced to this topic's generation: a check that outlived a delete can
+            # reach a replacement topic that recycled the rowid, and latching it
+            # would suppress the replacement's own outage notice (AUG-020).
             if action.kind == "alert":
-                won = claim_heartbeat_alert(conn, topic.id, datetime.now(UTC))
+                won = claim_heartbeat_alert(conn, topic.id, datetime.now(UTC), generation=topic.generation)
             else:
-                won = clear_heartbeat_alert(conn, topic.id)
+                won = clear_heartbeat_alert(conn, topic.id, generation=topic.generation)
             if not won:
                 # Another checker (e.g. a CLI run against the live server) already
                 # sent this one. Release the implicit write transaction the UPDATE

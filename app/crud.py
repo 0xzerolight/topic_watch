@@ -1223,32 +1223,68 @@ def claim_new_topic_for_init(conn: sqlite3.Connection, topic_id: int) -> bool:
     return claim_topic_for_init(conn, topic_id, TopicStatus.NEW)
 
 
-def claim_heartbeat_alert(conn: sqlite3.Connection, topic_id: int, alerted_at: datetime) -> bool:
+# Fences a heartbeat latch transition to the exact topic incarnation and the exact
+# check the decision was computed from. ``topics.id`` is a recyclable rowid, so a
+# check still holding a deleted topic could otherwise latch its replacement — an
+# alert naming the deleted topic, and a replacement whose real outage is then
+# suppressed (AUG-020/TW-AUD-007). The head-check conjunct is the same idea in time:
+# a decision computed from check N must not land once check N+1 exists.
+_HEARTBEAT_GENERATION_FENCE = " AND generation = ?"
+_HEARTBEAT_HEAD_FENCE = " AND (SELECT MAX(id) FROM check_results WHERE topic_id = topics.id) = ?"
+
+
+def _heartbeat_fence(sql: str, params: list, generation: str | None, head_check_id: int | None) -> tuple[str, list]:
+    """Append the optional generation / head-check conjuncts to a latch UPDATE."""
+    if generation is not None:
+        sql += _HEARTBEAT_GENERATION_FENCE
+        params.append(generation)
+    if head_check_id is not None:
+        sql += _HEARTBEAT_HEAD_FENCE
+        params.append(head_check_id)
+    return sql, params
+
+
+def claim_heartbeat_alert(
+    conn: sqlite3.Connection,
+    topic_id: int,
+    alerted_at: datetime,
+    *,
+    generation: str | None = None,
+    head_check_id: int | None = None,
+) -> bool:
     """Atomically claim the right to announce a source outage for a topic.
 
     Returns True only for the caller that won (rowcount == 1). The guard is
     ``heartbeat_alerted_at IS NULL``, so an outage already announced — by this
     process, or by a CLI ``check-all`` running against a live server — yields
     False and no second alert. Mirrors ``claim_new_topic_for_init``; the caller
-    commits.
+    commits. ``generation`` and ``head_check_id`` add the lifecycle fences
+    described above.
     """
-    cursor = conn.execute(
-        "UPDATE topics SET heartbeat_alerted_at = ? WHERE id = ? AND heartbeat_alerted_at IS NULL",
-        (alerted_at.isoformat(), topic_id),
-    )
+    sql = "UPDATE topics SET heartbeat_alerted_at = ? WHERE id = ? AND heartbeat_alerted_at IS NULL"
+    params: list = [to_db_utc(alerted_at), topic_id]
+    sql, params = _heartbeat_fence(sql, params, generation, head_check_id)
+    cursor = conn.execute(sql, params)
     return cursor.rowcount == 1
 
 
-def clear_heartbeat_alert(conn: sqlite3.Connection, topic_id: int) -> bool:
+def clear_heartbeat_alert(
+    conn: sqlite3.Connection,
+    topic_id: int,
+    *,
+    generation: str | None = None,
+    head_check_id: int | None = None,
+) -> bool:
     """Clear an outstanding source-outage alert. True only if one was set.
 
     The ``IS NOT NULL`` guard makes the recovery notice exactly-once for the same
-    reason the claim makes the alert exactly-once. The caller commits.
+    reason the claim makes the alert exactly-once. The caller commits. Fenced by
+    the same optional lifecycle conjuncts as :func:`claim_heartbeat_alert`.
     """
-    cursor = conn.execute(
-        "UPDATE topics SET heartbeat_alerted_at = NULL WHERE id = ? AND heartbeat_alerted_at IS NOT NULL",
-        (topic_id,),
-    )
+    sql = "UPDATE topics SET heartbeat_alerted_at = NULL WHERE id = ? AND heartbeat_alerted_at IS NOT NULL"
+    params: list = [topic_id]
+    sql, params = _heartbeat_fence(sql, params, generation, head_check_id)
+    cursor = conn.execute(sql, params)
     return cursor.rowcount == 1
 
 
