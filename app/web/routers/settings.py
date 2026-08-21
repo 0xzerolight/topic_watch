@@ -13,6 +13,7 @@ from app.config import (
     LOCAL_PROVIDER_DEFAULTS,
     Settings,
     config_revision,
+    env_owned_field_paths,
     is_api_key_env_sourced,
     is_exa_key_env_sourced,
     is_keyless_llm_provider,
@@ -62,6 +63,43 @@ _SCALAR_FORM_FIELDS: tuple[str, ...] = (
     "llm_max_retries",
     "llm_temperature",
 )
+
+
+# Form control -> Settings field path, for every control the environment can own.
+# A control whose path is env-owned renders disabled: the value it shows cannot be
+# changed here, and a save that looked like it worked never applied (C5-2). The two
+# API-key controls are deliberately absent — they have their own read-only branch
+# and their value must never reach the page.
+_FORM_FIELD_PATHS: dict[str, tuple[str, ...]] = {
+    "llm_model": ("llm", "model"),
+    "llm_base_url": ("llm", "base_url"),
+    "enable_exa": ("exa", "enabled"),
+    "notification_urls": ("notifications", "urls"),
+    "webhook_urls": ("notifications", "webhook_urls"),
+    "secure_cookies": ("secure_cookies",),
+    **{name: (name,) for name in _SCALAR_FORM_FIELDS},
+}
+
+
+def env_locked_controls() -> set[str]:
+    """Names of the form controls the environment currently owns."""
+    owned = env_owned_field_paths()
+    return {name for name, path in _FORM_FIELD_PATHS.items() if path in owned}
+
+
+def _control_value(settings: object, name: str, ctx: dict) -> object:
+    """What a locked control should display: the value the environment supplies.
+
+    A disabled control submits nothing, so the re-render after a validation error
+    elsewhere on the form would otherwise show it empty.
+    """
+    if name in ("notification_urls", "webhook_urls"):
+        masked = ctx.get(f"masked_{name}", [])
+        return "\n".join(masked) if isinstance(masked, list) else ""
+    value: object = settings
+    for part in _FORM_FIELD_PATHS[name]:
+        value = getattr(value, part, None)
+    return "" if value is None else value
 
 
 def _interval_preview(raw: str) -> str | None:
@@ -151,8 +189,13 @@ def _disk_settings(request: Request) -> Settings:
 
 
 def _settings_template_ctx(request: Request, **extra: object) -> dict:
-    """Shared template context for the settings page (provider lists + env-key state)."""
+    """Shared template context for the settings page (provider lists + env-owned state)."""
+    env_locked = env_locked_controls()
     ctx: dict = {
+        # Controls the environment owns. The template renders each one disabled with
+        # the same note the LLM key already carries, so an unchangeable setting is
+        # never presented as editable (C5-2).
+        "env_locked": env_locked,
         "config_path": str(request.app.state.config_path),
         # The generation this page is editing. Carried in the form so a save against a
         # file that changed underneath it is refused instead of silently winning (AUG-291).
@@ -178,6 +221,13 @@ def _settings_template_ctx(request: Request, **extra: object) -> dict:
         ctx["masked_notification_urls"] = mask_targets(getattr(notifications, "urls", []) or [])
         ctx["masked_webhook_urls"] = mask_targets(getattr(notifications, "webhook_urls", []) or [])
     ctx.update(extra)
+    # A disabled control submits nothing, so a re-render driven by the form dict would
+    # show every locked control empty. Show what the environment supplies instead.
+    if isinstance(ctx.get("form"), dict) and settings is not None:
+        ctx["form"] = {
+            key: _control_value(settings, key, ctx) if key in env_locked else value
+            for key, value in ctx["form"].items()
+        }
     return ctx
 
 
@@ -553,7 +603,9 @@ async def update_settings(request: Request):
     # Enabling Exa without a key is refused the same way: the model would quietly disable
     # it again, and a silent revert on a save the user asked for is worse than an error.
     field_errors = []
-    if not llm_model.strip():
+    # An env-owned model renders disabled, so the browser submits nothing for it —
+    # that is not a missing field, it is a field this form does not own (C5-2).
+    if not llm_model.strip() and "llm_model" not in env_locked_controls():
         field_errors.append("llm_model: Field required")
     if enable_exa and not effective_exa_key.strip():
         field_errors.append(
