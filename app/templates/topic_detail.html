@@ -248,7 +248,9 @@ document.body.addEventListener("htmx:afterSwap", function (event) {
             <td data-label="Articles Found" class="num">{{ check.articles_found }}</td>
             <td data-label="New Articles" class="num">{{ check.articles_new }}</td>
             <td data-label="New Info">{{ "Yes" if check.has_new_info else "No" }}</td>
-            <td data-label="Confidence">{{ check.llm_response | confidence_badge }}</td>
+            {# AUG-037: check.confidence is already decoded once by CheckResult.from_row
+               (OVH-052) — render that scalar instead of re-parsing llm_response here. #}
+            <td data-label="Confidence">{{ check.confidence | confidence_value }}</td>
             <td data-label="Importance" class="num">{% if check_importance is not none %}{{ check_importance }}/5{% else %}-{% endif %}</td>
             <td data-label="Tokens" class="num">
                 {% set check_tokens = check.prompt_tokens + check.completion_tokens %}
