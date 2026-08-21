@@ -677,6 +677,47 @@ class TestSafeSendCompressedBodyCap:
         assert response.content == payload
 
 
+class TestSafeSendOwnsRedirectFollowing:
+    """Per-hop SSRF checks must not depend on how the caller built its client.
+
+    ``client.send()`` inherits ``client.follow_redirects``; when that is True httpx
+    follows the chain internally, ``next_request`` is never populated, and the loop
+    below hands back the final body as an ordinary result. The invariant used to be
+    a docstring line only.
+    """
+
+    async def test_redirect_to_private_blocked_on_a_following_client(self, monkeypatch) -> None:
+        _stub_resolves_to(monkeypatch, "93.184.216.34")
+        private_hits = 0
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            nonlocal private_hits
+            if request.url.host == "127.0.0.1":
+                private_hits += 1
+                return httpx.Response(200, text="INTERNAL-DATA")
+            return httpx.Response(302, headers={"location": "http://127.0.0.1/internal"})
+
+        transport = httpx.MockTransport(_handler)
+        # Deliberately NOT follow_redirects=False: the helper must hold the line
+        # on its own.
+        async with httpx.AsyncClient(transport=transport, follow_redirects=True) as client:
+            with pytest.raises(PrivateRedirectError):
+                await safe_get(client, "https://example.com/start")
+
+        assert private_hits == 0
+
+    async def test_redirect_limit_holds_on_a_following_client(self, monkeypatch) -> None:
+        _stub_resolves_to(monkeypatch, "93.184.216.34")
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(302, headers={"location": "https://example.com/next"})
+
+        transport = httpx.MockTransport(_handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=True) as client:
+            with pytest.raises(PrivateRedirectError, match="maximum of 3 redirects"):
+                await safe_get(client, "https://example.com/start", max_redirects=3)
+
+
 class TestSafeSendRedirectCredentials:
     """Cross-origin redirects must not carry origin-bound credentials (AUG-005)."""
 

@@ -456,10 +456,11 @@ async def safe_send(
 ) -> httpx.Response:
     """Send a request, manually following redirects with per-hop SSRF checks.
 
-    The client MUST be configured with ``follow_redirects=False`` (the default
-    of this helper assumes httpx will not auto-follow). Each redirect target is
-    validated with :func:`is_private_url` BEFORE the next hop is sent, so an
-    attacker-controlled public host cannot 3xx-redirect into loopback/RFC-1918.
+    Every hop is sent with ``follow_redirects=False`` regardless of how the client
+    was configured, so the per-hop checks cannot be lost to a caller's client
+    setting. Each redirect target is validated with :func:`is_private_url` BEFORE
+    the next hop is sent, so an attacker-controlled public host cannot 3xx-redirect
+    into loopback/RFC-1918.
 
     The initial request URL is validated with the SAME scheme + private-host
     checks as every redirect hop BEFORE the first send (OVH-140), so a caller
@@ -490,7 +491,11 @@ async def safe_send(
         raise PrivateRedirectError(f"Request to private/reserved address blocked: {initial_url}")
 
     sent = request
-    response = await client.send(sent, stream=True)
+    # follow_redirects is pinned per send, not left to the client: client.send()
+    # inherits client.follow_redirects, and a caller that built its client without
+    # the flag had httpx follow the chain internally -- next_request stays None and
+    # the loop below returns the final (possibly private) body as a normal result.
+    response = await client.send(sent, stream=True, follow_redirects=False)
     redirects = 0
     while True:
         next_request = response.next_request
@@ -515,7 +520,7 @@ async def safe_send(
         # Nothing of the redirect body is read; closing it here discards it.
         await response.aclose()
         sent = next_request
-        response = await client.send(sent, stream=True)
+        response = await client.send(sent, stream=True, follow_redirects=False)
 
 
 async def safe_get(
