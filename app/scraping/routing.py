@@ -9,6 +9,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 
+from app.models import FeedMode, Topic
 from app.scraping.providers import BingNewsProvider, GoogleNewsProvider, NewsProvider
 
 logger = logging.getLogger(__name__)
@@ -200,3 +201,22 @@ class ProviderRouter:
 # Module-level singleton — all callers import this.
 # The scheduler, CLI, and web layer share the same instance.
 router = ProviderRouter()
+
+
+def topic_owned_feed_urls(topic: Topic, exa_endpoint: str) -> list[str]:
+    """The feed-health keys a topic currently answers for.
+
+    ``feed_health`` is keyed by URL and has no topic column, so a feed a topic
+    stops using — a removed manual URL, a renamed AUTO query, a deleted topic —
+    leaves a row behind that diagnostics kept reporting as a live failing source
+    (AUG-148). Ownership is therefore derived from current topic state wherever
+    those rows are read.
+
+    An AUTO topic owns every provider's URL, not just the one currently serving
+    it, so a standby provider's health still traces back to its topic.
+    """
+    if topic.feed_mode == FeedMode.AUTO:
+        return [provider.build_feed_url(topic) for provider in router.providers]
+    if topic.feed_mode == FeedMode.EXA:
+        return [exa_endpoint]
+    return list(topic.feed_urls)
