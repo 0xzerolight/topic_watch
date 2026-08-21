@@ -395,10 +395,30 @@ class TestNumericLabelHostnames:
         assert is_private_url("http://192.168.1.1/x") is True
 
 
-class TestResolverPoolBounded:
-    """Timed-out resolver lookups must not spawn unbounded worker threads (AUG-013)."""
+def _drain(uv) -> None:
+    """Block until every slot of the process-wide resolver pool is free again."""
+    for _ in range(uv._RESOLVER_POOL_SIZE):
+        assert uv._resolver_slots.acquire(timeout=15)
+    for _ in range(uv._RESOLVER_POOL_SIZE):
+        uv._resolver_slots.release()
 
-    def test_resolver_threads_are_bounded(self, monkeypatch) -> None:
+
+class TestResolverPoolBounded:
+    """Timed-out resolver lookups must not spawn unbounded worker threads (AUG-013).
+
+    Two independent mechanisms, pinned by one test each: a fixed process-wide pool
+    caps how many resolver threads can exist, and an admission semaphore turns
+    away a caller that cannot get a slot instead of letting it queue behind the
+    lookups already stuck. Either one alone leaves the other's failure mode open.
+    """
+
+    @staticmethod
+    def _run_against_a_full_pool(monkeypatch) -> tuple[list[str], set[int], int]:
+        """Run ``pool size + 8`` callers against a resolver that never answers.
+
+        Returns each caller's outcome, the distinct threads ``getaddrinfo`` ran
+        on, and how many lookups reached it at all.
+        """
         import threading
         from concurrent.futures import ThreadPoolExecutor
 
@@ -407,20 +427,30 @@ class TestResolverPoolBounded:
         release = threading.Event()
         worker_threads: set[int] = set()
         lock = threading.Lock()
+        started = 0
 
         def _blocking(*_args, **_kwargs):
+            nonlocal started
             with lock:
+                started += 1
                 worker_threads.add(threading.get_ident())
             release.wait(10)
             return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", 0))]
 
         monkeypatch.setattr(socket, "getaddrinfo", _blocking)
 
+        # The pool is process-wide and an earlier test abandons a slow lookup that
+        # keeps its slot until the OS resolver returns. Start from a full pool so
+        # the counts below are about this test's own callers.
+        _drain(uv)
+
         callers = uv._RESOLVER_POOL_SIZE + 8
 
         def _lookup(index: int) -> str:
             try:
                 uv._getaddrinfo_bounded(f"host{index}.example.com", 0.3)
+            except uv.ResolverSaturatedError:
+                return "saturated"
             except TimeoutError:
                 return "timeout"
             return "ok"
@@ -430,9 +460,32 @@ class TestResolverPoolBounded:
                 outcomes = list(pool.map(_lookup, range(callers)))
         finally:
             release.set()
+            # Hand every slot back before the next test asks for one.
+            _drain(uv)
 
-        assert outcomes.count("timeout") == callers
-        # HEAD spawns one executor per lookup, so every caller gets its own thread.
+        return outcomes, worker_threads, started
+
+    def test_overflow_callers_are_turned_away_not_queued(self, monkeypatch) -> None:
+        from app import url_validation as uv
+
+        outcomes, _threads, started = self._run_against_a_full_pool(monkeypatch)
+
+        # One lookup per slot reached the resolver and nothing else did: without
+        # admission control the extra callers queue behind the stuck lookups and
+        # every one of them reports the ordinary lookup timeout instead. A
+        # per-lookup executor makes this the caller count.
+        assert started == uv._RESOLVER_POOL_SIZE
+        assert outcomes.count("timeout") == uv._RESOLVER_POOL_SIZE
+        assert outcomes.count("saturated") == len(outcomes) - uv._RESOLVER_POOL_SIZE
+        assert outcomes.count("ok") == 0
+
+    def test_resolver_threads_are_bounded(self, monkeypatch) -> None:
+        from app import url_validation as uv
+
+        _outcomes, worker_threads, _started = self._run_against_a_full_pool(monkeypatch)
+
+        # A per-lookup executor gives every caller its own thread, so the count
+        # tracks the callers rather than the pool.
         assert len(worker_threads) <= uv._RESOLVER_POOL_SIZE
 
 

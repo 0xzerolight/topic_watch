@@ -44,7 +44,7 @@ from app.scraping.source import FeedHealthCallback as FeedHealthCallback
 from app.scraping.source import FeedResponse as FeedResponse
 from app.scraping.source import compute_article_hash as compute_article_hash
 from app.scraping.source import fetch_feeds_for_topic as fetch_feeds_for_topic
-from app.url_validation import PrivateRedirectError, is_absolute_http_url, safe_get
+from app.url_validation import PrivateRedirectError, ResolverSaturatedError, is_absolute_http_url, safe_get
 
 if TYPE_CHECKING:
     from app.models import FeedHealth
@@ -581,6 +581,14 @@ async def fetch_feed_outcome(
                 )
                 _report(health_callback, feed_url, FetchStatus.FAILED, f"Network error: {type(exc).__name__}: {exc}")
                 return FeedFetchResult(status=FetchStatus.FAILED)
+            except ResolverSaturatedError:
+                # Nothing was ever asked about this host: the shared resolver pool
+                # was fully occupied by unrelated work (one OPML import holds all
+                # sixteen slots). Blocking is right, but ABORTED charges it to the
+                # check like any other budget exhaustion — FAILED would put an
+                # untouched healthy feed three ticks from a 24-hour backoff.
+                _record_out_of_budget(feed_url, health_callback, "DNS resolver saturated; the host was not checked")
+                return FeedFetchResult(status=FetchStatus.ABORTED)
             except PrivateRedirectError:
                 # A feed that is blocked, unresolvable or whose resolver timed out
                 # failed this fetch as surely as a 404 did. Returning without the

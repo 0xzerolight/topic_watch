@@ -13,6 +13,7 @@ accepted limitation for a single-user self-hosted tool.
 """
 
 import asyncio
+import enum
 import ipaddress
 import logging
 import re
@@ -83,6 +84,35 @@ _LOCALHOST_RE = re.compile(r"^localhost(:\d+)?$", re.IGNORECASE)
 _CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 
 
+class _Destination(enum.Enum):
+    """What resolution actually said about a host.
+
+    ``PRIVATE`` is a verdict about the destination; ``UNRESOLVABLE`` is the
+    absence of one. Both are blocked, so most callers only want the bool that
+    :func:`is_private_url` gives them — but a rule that exists to protect a
+    PUBLIC destination must not be waived by the absence of an answer.
+    """
+
+    PUBLIC = "public"
+    PRIVATE = "private"
+    UNRESOLVABLE = "unresolvable"
+
+
+class ResolverSaturatedError(httpx.HTTPError):
+    """Raised when no resolver slot came free within the caller's deadline.
+
+    Every other blocked outcome is something we learned about the destination;
+    this one is the shared pool being busy with unrelated work — a bulk OPML
+    import holds all sixteen slots for as long as it runs — and says nothing
+    about the host at all. Blocking is still right, but a caller that keeps a
+    per-feed failure streak has to charge this to the run instead, or an
+    untouched healthy feed walks into exponential backoff.
+
+    An ``httpx.HTTPError`` for the same reason as :class:`PrivateRedirectError`:
+    to a call site with no special handling it is an ordinary fetch failure.
+    """
+
+
 def _getaddrinfo_bounded(hostname: str, timeout: float) -> list:
     """Run ``socket.getaddrinfo`` with a wall-clock timeout on the shared pool.
 
@@ -90,15 +120,18 @@ def _getaddrinfo_bounded(hostname: str, timeout: float) -> list:
     slow/non-resolving host could otherwise pin a worker for the OS resolver's
     full default timeout. The whole call — waiting for a resolver slot plus the
     lookup itself — is bounded by ``timeout`` (OVH-148), and the pool bounds how
-    many resolver threads can exist at once (AUG-013). Raises ``TimeoutError`` on
-    either bound; the caller fails closed.
+    many resolver threads can exist at once (AUG-013).
+
+    Raises ``TimeoutError`` when the lookup itself ran out of time and
+    :class:`ResolverSaturatedError` when no slot came free — two different
+    events, because only the first says anything about ``hostname``.
     """
     deadline = time.monotonic() + timeout
     if not _resolver_slots.acquire(timeout=timeout):
         # Every resolver thread is occupied, most likely by earlier abandoned
         # lookups. Spawning another thread is exactly what the bound exists to
         # prevent, so this is unverifiable -> blocked, like any other timeout.
-        raise TimeoutError(f"DNS resolver saturated; {hostname!r} not resolved within {timeout}s")
+        raise ResolverSaturatedError(f"DNS resolver saturated; {hostname!r} not resolved within {timeout}s")
     try:
         future = _resolver_pool.submit(socket.getaddrinfo, hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
     except BaseException:
@@ -154,10 +187,10 @@ def _ip_literal(hostname: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address 
         return None
 
 
-def _resolved_ip_is_private(hostname: str) -> bool:
-    """Resolve a hostname and check if any resulting IP is private/reserved.
+def _classify_hostname(hostname: str) -> _Destination:
+    """Resolve a hostname and say what it points at.
 
-    Returns True on DNS resolution failure (fail-closed): a host we cannot
+    ``UNRESOLVABLE`` on DNS resolution failure (fail-closed): a host we cannot
     resolve cannot be verified as public, so we treat it as blocked rather
     than silently allowing it. This also closes one DNS-rebinding variant
     where resolution fails at check time but later succeeds (to a private
@@ -166,33 +199,61 @@ def _resolved_ip_is_private(hostname: str) -> bool:
 
     DNS resolution is bounded by ``_RESOLVE_TIMEOUT`` (OVH-148): a slow lookup
     times out and is treated as unverifiable (blocked) rather than hanging.
+
+    Raises :class:`ResolverSaturatedError` when the lookup never ran because no
+    resolver slot came free — the one outcome that is not about this host.
     """
     try:
         infos = _getaddrinfo_bounded(hostname, _RESOLVE_TIMEOUT)
-        return any(_addr_or_mapped_is_private(ipaddress.ip_address(sockaddr[0])) for *_head, sockaddr in infos)
+        private = any(_addr_or_mapped_is_private(ipaddress.ip_address(sockaddr[0])) for *_head, sockaddr in infos)
     except (socket.gaierror, ValueError, OSError):
         # Fail closed: an unresolvable host cannot be verified as public.
         # TimeoutError (raised by _getaddrinfo_bounded) is an OSError subclass,
         # so a bounded-out slow resolver also lands here and is treated as blocked.
+        return _Destination.UNRESOLVABLE
+    return _Destination.PRIVATE if private else _Destination.PUBLIC
+
+
+def _resolved_ip_is_private(hostname: str) -> bool:
+    """``_classify_hostname`` as the bool that :func:`is_private_url` needs."""
+    try:
+        return _classify_hostname(hostname) is not _Destination.PUBLIC
+    except ResolverSaturatedError:
         return True
+
+
+def _classify_url(url: str) -> _Destination:
+    """Classify a URL's destination. Raises :class:`ResolverSaturatedError`.
+
+    Three layers, cheapest first: the ``localhost`` name, a complete IP literal
+    classified by ``ipaddress``, and otherwise DNS resolution of the name. A URL
+    with no host at all resolves to nothing and reaches nothing, so it is not
+    treated as private; the shape gate for that is :func:`is_absolute_http_url`.
+    """
+    parsed = urlparse(url)
+    netloc = parsed.hostname or parsed.netloc
+    if not netloc:
+        return _Destination.PUBLIC
+    if _LOCALHOST_RE.match(netloc):
+        return _Destination.PRIVATE
+    literal = _ip_literal(netloc)
+    if literal is not None:
+        return _Destination.PRIVATE if _addr_or_mapped_is_private(literal) else _Destination.PUBLIC
+    return _classify_hostname(netloc)
 
 
 def is_private_url(url: str) -> bool:
     """Check if a URL points to a private/reserved network address.
 
-    Three layers, cheapest first: the ``localhost`` name, a complete IP literal
-    classified by ``ipaddress``, and otherwise DNS resolution of the name.
+    Total: a saturated resolver is unverifiable and therefore blocked, same as an
+    unresolvable host. Call sites that must tell "we could not check" apart from
+    "we checked" use :func:`_classify_url` and handle
+    :class:`ResolverSaturatedError` themselves.
     """
-    parsed = urlparse(url)
-    netloc = parsed.hostname or parsed.netloc
-    if not netloc:
-        return False
-    if _LOCALHOST_RE.match(netloc):
+    try:
+        return _classify_url(url) is not _Destination.PUBLIC
+    except ResolverSaturatedError:
         return True
-    literal = _ip_literal(netloc)
-    if literal is not None:
-        return _addr_or_mapped_is_private(literal)
-    return _resolved_ip_is_private(netloc)
 
 
 def is_absolute_http_url(url: str) -> bool:
@@ -478,15 +539,20 @@ async def safe_send(
     different origin; rebuilding from ``request.headers`` forwarded all three.
 
     Raises :class:`PrivateRedirectError` if the initial URL or any redirect
-    target is private/non-http(s), or if the redirect limit is exceeded, and
-    :class:`ResponseTooLargeError` if the body exceeds ``max_bytes``.
+    target is private/non-http(s), or if the redirect limit is exceeded,
+    :class:`ResponseTooLargeError` if the body exceeds ``max_bytes``, and
+    :class:`ResolverSaturatedError` if no resolver slot came free — kept separate
+    so a caller that keeps a failure streak does not charge it to the host.
     """
     initial_url = str(request.url)
     if urlparse(initial_url).scheme not in ("http", "https"):
         logger.warning("Blocked request to non-http(s) URL: %s", redact_url(initial_url))
         raise PrivateRedirectError(f"Non-http(s) scheme blocked: {initial_url}")
-    # is_private_url does blocking DNS; offload so the event loop is not stalled.
-    if await asyncio.to_thread(is_private_url, initial_url):
+    # Classification does blocking DNS; offload so the event loop is not stalled.
+    # _classify_url rather than is_private_url so a saturated resolver -- which is
+    # about us, not about this host -- leaves as its own error instead of being
+    # flattened into "this URL is private".
+    if await asyncio.to_thread(_classify_url, initial_url) is not _Destination.PUBLIC:
         logger.warning("Blocked request to private/reserved URL: %s", redact_url(initial_url))
         raise PrivateRedirectError(f"Request to private/reserved address blocked: {initial_url}")
 
@@ -509,7 +575,12 @@ async def safe_send(
             await response.aclose()
             logger.warning("Blocked redirect to non-http(s) URL: %s", redact_url(next_url))
             raise PrivateRedirectError(f"Redirect to non-http(s) scheme blocked: {next_url}")
-        if await asyncio.to_thread(is_private_url, next_url):
+        try:
+            hop = await asyncio.to_thread(_classify_url, next_url)
+        except BaseException:
+            await response.aclose()
+            raise
+        if hop is not _Destination.PUBLIC:
             await response.aclose()
             logger.warning("Blocked redirect to private/reserved URL: %s", redact_url(next_url))
             raise PrivateRedirectError(f"Redirect to private/reserved address blocked: {next_url}")
