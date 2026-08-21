@@ -461,6 +461,43 @@ async def test_check_all_guard_false_skips_gate(monkeypatch, clean_state) -> Non
     inner.assert_awaited_once()
 
 
+async def test_check_all_bounds_each_topic_below_the_eviction_threshold(
+    db_conn: sqlite3.Connection, monkeypatch, clean_state, db_path: Path
+) -> None:
+    """AUG-264 residual: a topic checked inside a cycle must not outlive its own guard.
+
+    ``clear_stale`` evicts a slot whose holder passed the callers' threshold and
+    hands it to the next checker, so an unbounded per-topic hold inside check-all
+    admits a second checker of the same topic — two commits, two notifications.
+    """
+    import app.checker as checker_mod
+    from app.checker import check_all_topics
+
+    topic = create_topic(db_conn, Topic(name="Slow", description="d", status=TopicStatus.READY))
+    db_conn.commit()
+    assert topic.id is not None
+
+    started = asyncio.Event()
+
+    async def _hang(*args, **kwargs):
+        started.set()
+        await asyncio.sleep(9999)
+
+    monkeypatch.setattr(checker_mod, "check_topic", _hang)
+    monkeypatch.setattr(checker_mod, "CHECK_TIMEOUT_SECONDS", 0.05)
+
+    # The cycle returns instead of hanging: the per-topic wait_for cancels it.
+    results = await asyncio.wait_for(check_all_topics(_make_settings(), db_path), timeout=5)
+    assert started.is_set()
+    assert results == []
+
+
+async def test_the_per_topic_bound_is_under_the_eviction_threshold() -> None:
+    from app.checker import CHECK_TIMEOUT_SECONDS
+
+    assert CHECK_TIMEOUT_SECONDS < 600
+
+
 # --- Atomic NEW -> RESEARCHING init claim (OVH-032) ---
 
 

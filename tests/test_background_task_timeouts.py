@@ -280,9 +280,9 @@ class TestRunSingleCheckTimeout:
     """
 
     async def test_bound_is_below_the_handlers_eviction_threshold(self) -> None:
-        from app.web.routers.background import _CHECK_TIMEOUT_SECONDS
+        from app.checker import CHECK_TIMEOUT_SECONDS
 
-        assert _CHECK_TIMEOUT_SECONDS < 600
+        assert CHECK_TIMEOUT_SECONDS < 600
 
     async def test_hanging_check_is_cancelled_and_releases_the_guard(self, db_path: Path, caplog) -> None:
         import logging
@@ -305,7 +305,7 @@ class TestRunSingleCheckTimeout:
         _checking_state._topics.clear()
         try:
             with (
-                patch("app.web.routers.background._CHECK_TIMEOUT_SECONDS", 0.05),
+                patch("app.web.routers.background.CHECK_TIMEOUT_SECONDS", 0.05),
                 patch("app.web.routers.background.check_topic", side_effect=_hang),
                 caplog.at_level(logging.ERROR, logger="app.web.routers.background"),
             ):
@@ -415,3 +415,60 @@ class TestRunCheckAllTimeout:
             await _run_check_all(settings, db_path)
 
         assert not caplog.records
+
+
+class TestCheckAllDeadlineScalesWithBacklog:
+    """AUG-211: a count-blind deadline cancelled healthy large backlogs mid-cycle."""
+
+    def test_deadline_grows_one_bounded_wave_at_a_time(self) -> None:
+        from app.checker import CHECK_TIMEOUT_SECONDS
+        from app.web.routers.background import _CHECK_ALL_TIMEOUT_SECONDS, _check_all_deadline_seconds
+
+        assert _check_all_deadline_seconds(0, 3) == _CHECK_ALL_TIMEOUT_SECONDS
+        assert _check_all_deadline_seconds(3, 3) == _CHECK_ALL_TIMEOUT_SECONDS + CHECK_TIMEOUT_SECONDS
+        assert _check_all_deadline_seconds(4, 3) == _CHECK_ALL_TIMEOUT_SECONDS + 2 * CHECK_TIMEOUT_SECONDS
+        # The case the finding is filed against: 500 topics at concurrency 3 no
+        # longer share one 30-minute budget.
+        assert _check_all_deadline_seconds(500, 3) > 10 * _CHECK_ALL_TIMEOUT_SECONDS
+
+    def test_zero_concurrency_does_not_divide_by_zero(self) -> None:
+        from app.web.routers.background import _check_all_deadline_seconds
+
+        assert _check_all_deadline_seconds(5, 0) > 0
+
+    async def test_the_deadline_used_reflects_the_due_backlog(self, db_path: Path) -> None:
+        from app.checker import CHECK_TIMEOUT_SECONDS
+        from app.web.routers.background import _CHECK_ALL_TIMEOUT_SECONDS, _run_check_all
+
+        settings = _make_settings()
+        conn = get_connection(db_path)
+        try:
+            for i in range(4):
+                _make_topic(conn, name=f"Due {i}", status=TopicStatus.READY)
+        finally:
+            conn.close()
+
+        captured: list[float] = []
+
+        async def _capture(coro, timeout=None):
+            captured.append(timeout)
+            coro.close()
+
+        with (
+            patch("app.web.routers.background.asyncio.wait_for", side_effect=_capture),
+            patch("app.web.routers.background.check_all_topics", new_callable=AsyncMock, return_value=[]),
+        ):
+            await _run_check_all(settings, db_path)
+
+        waves = -(-4 // settings.topic_check_concurrency)
+        assert captured == [_CHECK_ALL_TIMEOUT_SECONDS + waves * CHECK_TIMEOUT_SECONDS]
+
+    async def test_a_backlog_query_failure_falls_back_to_the_base(self, db_path: Path) -> None:
+        from app.web.routers.background import _CHECK_ALL_TIMEOUT_SECONDS, _due_topic_count
+
+        settings = _make_settings()
+        with patch("app.web.routers.background.get_topics_due_for_check", side_effect=RuntimeError("boom")):
+            assert _due_topic_count(settings, db_path) == 0
+        from app.web.routers.background import _check_all_deadline_seconds
+
+        assert _check_all_deadline_seconds(0, settings.topic_check_concurrency) == _CHECK_ALL_TIMEOUT_SECONDS

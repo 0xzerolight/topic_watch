@@ -87,6 +87,16 @@ _notification_retry_lock = asyncio.Lock()
 # claim token rather than by elapsed time (AUG-277).
 _CLAIM_STALE_AFTER = timedelta(minutes=10)
 
+# End-to-end bound on ONE topic check, wherever it is driven from: the web
+# background task, the CLI, or a check-all cycle. Deliberately under the
+# 600-second staleness threshold the check handlers pass to ``clear_stale``,
+# because eviction frees the per-topic slot for a second checker — so an entry
+# old enough to be evicted must already have been released by its owner
+# (AUG-264). 540, not 600: ``clear_stale`` compares ``>``, so a bound equal to
+# the threshold leaves a window where the timing-out owner has not yet released
+# when its entry becomes evictable.
+CHECK_TIMEOUT_SECONDS = 540
+
 # Per-batch send fan-out. Matches the webhook drain's bound: enough to stop a
 # backlog serializing at one timeout each, gentle enough not to hammer a channel.
 _DELIVERY_CONCURRENCY = 5
@@ -1299,7 +1309,25 @@ async def _run_check_cycle(
                 # short-lived per-phase connections (AUG-136). Wrapping this call
                 # in one held the handle — and, via the feed-health callback, the
                 # WAL writer — across every fetch/LLM/send await in the pipeline.
-                return await check_topic(topic, settings, db_path=db_path)
+                #
+                # Bounded per topic, not just per cycle: check_topic takes the
+                # per-topic guard, and ``clear_stale`` evicts a slot whose holder
+                # has outlived the callers' threshold — handing the slot to a
+                # second checker of the SAME topic, which then commits and
+                # delivers the same finding twice. Every slot holder must be
+                # bounded below that threshold; the 1800-second whole-cycle bound
+                # is not that bound (AUG-264 residual).
+                return await asyncio.wait_for(
+                    check_topic(topic, settings, db_path=db_path),
+                    timeout=CHECK_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                logger.error(
+                    "Check timed out for topic '%s' after %d seconds",
+                    topic.name,
+                    CHECK_TIMEOUT_SECONDS,
+                )
+                return None
             except Exception:
                 logger.error(
                     "Unexpected error checking topic '%s'",
