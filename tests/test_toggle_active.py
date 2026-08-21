@@ -169,6 +169,18 @@ class TestToggleActive:
         assert after is not None
         assert after.is_active is False
 
+    async def test_rendered_controls_carry_the_target_state(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-290: both the dashboard row and the detail page submit an explicit state."""
+        topic = _make_topic(db_conn, name="Wired Topic", is_active=True)
+
+        dashboard = await client.get("/")
+        assert '"active": "false"' in dashboard.text
+
+        detail = await client.get(f"/topics/{topic.id}")
+        assert '<input type="hidden" name="active" value="false">' in detail.text
+
     async def test_missing_state_is_rejected(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
         """AUG-290: the command carries its target state; there is no implicit flip."""
         topic = _make_topic(db_conn, name="No State Topic", is_active=True)
