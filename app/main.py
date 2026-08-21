@@ -21,7 +21,7 @@ from starlette.responses import Response
 from app import __version__ as _app_version
 from app.check_context import generate_check_id, request_id_var
 from app.config import DEFAULT_CONFIG_PATH, load_settings, resolve_db_path
-from app.crud import recover_stuck_topics
+from app.crud import recover_stuck_topics, reset_all_heartbeat_state
 from app.database import get_db, init_db
 from app.logging_config import setup_logging
 from app.scheduler import start_scheduler, stop_scheduler
@@ -82,6 +82,16 @@ async def lifespan(app: FastAPI):
     if settings.is_configured():
         with get_db(db_path) as conn:
             recover_stuck_topics(conn)
+            if settings.silence_heartbeat_checks <= 0:
+                # The per-check reset only reaches a topic when that topic next
+                # runs, so a latch parked while the feature was on survives being
+                # switched off — and fires a phantom recovery when it comes back
+                # (AUG-260). Reconcile once, here, where the effective setting is
+                # first known.
+                cleared = reset_all_heartbeat_state(conn)
+                if cleared:
+                    logger.info("Silence Heartbeat is off: cleared %d parked outage latch(es)", cleared)
+            conn.commit()
         # Wire the app so scheduler jobs read live settings from app.state (OVH-015/036).
         start_scheduler(settings, db_path=db_path, app=app)
         logger.info("Topic Watch web UI started")
