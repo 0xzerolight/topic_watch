@@ -630,7 +630,13 @@ def _atomic_write(path: Path, render: Callable[[Any], None]) -> None:
     even started, so an error or an interrupt destroyed it (AUG-198). Here the
     destination is only touched by ``os.replace``, which is atomic: a reader sees
     either the old file or the new one, never a half-written one.
+
+    Symlinks are followed to the real file first (C5-3). ``os.replace`` on the link
+    path replaces the LINK, so a ``config.yml`` symlinked into a dotfiles repo lost
+    its link and the tracked file never saw the change. Resolving first also keeps
+    the temp file on the same filesystem as the file it will replace.
     """
+    path = Path(os.path.realpath(path))
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
     temp_path = Path(temp_name)

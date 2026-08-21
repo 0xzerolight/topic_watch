@@ -821,6 +821,55 @@ class TestAtomicPermissionSafeWrite:
         assert config.stat().st_ino != before
 
 
+class TestSymlinkedConfigFile:
+    """C5-3: a config.yml symlinked into a dotfiles repo stays a symlink."""
+
+    def test_save_writes_through_the_link(self, tmp_path: Path) -> None:
+        """The change reaches the tracked file the link points at."""
+        target = tmp_path / "dotfiles" / "topic-watch.yml"
+        target.parent.mkdir()
+        target.write_text('llm:\n  model: "openai/old"\n  api_key: "sk"\n')
+        link = tmp_path / "data" / "config.yml"
+        link.parent.mkdir()
+        link.symlink_to(target)
+
+        save_settings_to_yaml(Settings(llm={"model": "openai/new", "api_key": "sk"}), link)
+
+        assert yaml.safe_load(target.read_text())["llm"]["model"] == "openai/new"
+
+    def test_save_does_not_replace_the_link_with_a_file(self, tmp_path: Path) -> None:
+        """os.replace on the link path used to delete the link and strand the target."""
+        target = tmp_path / "dotfiles" / "topic-watch.yml"
+        target.parent.mkdir()
+        target.write_text('llm:\n  model: "openai/old"\n  api_key: "sk"\n')
+        link = tmp_path / "data" / "config.yml"
+        link.parent.mkdir()
+        link.symlink_to(target)
+
+        save_settings_to_yaml(Settings(llm={"model": "openai/new", "api_key": "sk"}), link)
+
+        assert link.is_symlink()
+        assert link.resolve() == target.resolve()
+
+    def test_the_temp_file_lands_beside_the_target(self, tmp_path: Path) -> None:
+        """A rename across filesystems fails, so the temp file follows the real file."""
+        target = tmp_path / "dotfiles" / "topic-watch.yml"
+        target.parent.mkdir()
+        target.write_text("llm:\n  model: x\n")
+        link = tmp_path / "data" / "config.yml"
+        link.parent.mkdir()
+        link.symlink_to(target)
+
+        from unittest.mock import patch
+
+        with patch("app.config.yaml.dump", side_effect=OSError("disk full")), pytest.raises(OSError):
+            save_settings_to_yaml(Settings(llm={"model": "openai/m", "api_key": "sk"}), link)
+
+        assert [p.name for p in (tmp_path / "dotfiles").iterdir()] == ["topic-watch.yml"]
+        assert [p.name for p in (tmp_path / "data").iterdir()] == ["config.yml"]
+        assert target.read_text() == "llm:\n  model: x\n"
+
+
 class TestExaRequiresAKey:
     """AUG-099: enabled means usable — a keyless Exa source can never fetch."""
 
