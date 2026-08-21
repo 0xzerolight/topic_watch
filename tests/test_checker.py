@@ -2560,6 +2560,45 @@ class TestInsufficientKnowledgeIsRecorded:
         assert result.stage_error is not None
         assert result.stage_error.startswith("knowledge_insufficient")
 
+    async def test_suppressed_check_creates_no_delivery_intent(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """AUG-129: the suppression decision is durable and no channel is owed a send.
+
+        The decision used to live only in memory, so nothing downstream could tell a
+        suppressed result from a delivered one. It is now recorded on the row AND
+        expressed as the absence of any delivery intent — both channels read the
+        same decision because both are driven by the same intents.
+        """
+        topic = _make_topic(db_conn, name="SuppressedNoIntent", importance_threshold=5)
+        create_knowledge_state(
+            db_conn,
+            KnowledgeState(topic_id=topic.id, summary_text="Baseline.", token_count=9, version=1),
+        )
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
+        db_conn.commit()
+        settings = _make_settings(notifications=NotificationSettings(urls=["json://a"], webhook_urls=["https://h/x"]))
+        novelty = NoveltyResult(has_new_info=True, summary="Trivia", confidence=0.9, relevance=0.9, importance=1)
+
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[article], total_feed_entries=1),
+            ),
+            patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
+            patch("app.checker.prepare_knowledge_update", new_callable=AsyncMock, return_value=_make_write_result()),
+        ):
+            result = await check_topic(topic, settings, db_path=db_path)
+
+        assert result.notify_disposition == NotifyDisposition.SUPPRESSED_IMPORTANCE
+        assert result.notification_sent is False
+        assert db_conn.execute("SELECT COUNT(*) FROM pending_notifications").fetchone()[0] == 0
+        assert db_conn.execute("SELECT COUNT(*) FROM pending_webhooks").fetchone()[0] == 0
+        # The stored decision survives a re-read, which is what history must render.
+        stored = db_conn.execute("SELECT notify_disposition FROM check_results WHERE id = ?", (result.id,)).fetchone()
+        assert stored["notify_disposition"] == "suppressed_importance"
+
 
 class TestOnlyAnalyzedArticlesAreProcessed:
     """Articles trimmed out of an over-budget prompt were never evaluated."""
