@@ -10,6 +10,7 @@ import pytest
 from app.config import LLMSettings, NotificationSettings, Settings
 from app.main import app
 from app.web.dependencies import get_db_conn, get_settings
+from app.webhooks import WebhookOutcome
 
 CSRF_TEST_TOKEN = "test-csrf-token-for-notification-tests"
 
@@ -172,3 +173,92 @@ async def test_test_notification_requires_csrf(db_conn: sqlite3.Connection) -> N
         assert response.status_code == 403
     finally:
         app.dependency_overrides.clear()
+
+
+# --- webhook parity (AUG-108) ---
+
+
+@pytest.fixture
+async def client_webhooks_only(
+    db_conn: sqlite3.Connection,
+) -> AsyncGenerator[httpx.AsyncClient, None]:
+    """Test client with a webhook target and no Apprise URLs."""
+    settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=["https://hooks.example.com/x"]))
+
+    def override_db():
+        yield db_conn
+
+    def override_settings():
+        return settings
+
+    app.dependency_overrides[get_db_conn] = override_db
+    app.dependency_overrides[get_settings] = override_settings
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+        cookies={"csrf_token": CSRF_TEST_TOKEN},
+        headers={"X-CSRF-Token": CSRF_TEST_TOKEN},
+    ) as ac:
+        yield ac
+
+    app.dependency_overrides.clear()
+
+
+async def test_webhook_only_setup_is_tested_not_refused(client_webhooks_only: httpx.AsyncClient) -> None:
+    """A webhook-only configuration must be testable, not reported as unconfigured."""
+    with patch("app.web.routers.settings.send_webhook", new_callable=AsyncMock) as mock_hook:
+        mock_hook.return_value = WebhookOutcome(ok=True, status=200)
+        response = await client_webhooks_only.post("/notifications/test")
+
+    assert response.status_code == 200
+    assert "No notification URLs configured" not in response.text
+    assert "Notification sent successfully" in response.text
+    assert "Webhooks: 1/1 delivered" in response.text
+    mock_hook.assert_awaited_once()
+
+
+async def test_webhook_failure_is_reported_per_channel(client_webhooks_only: httpx.AsyncClient) -> None:
+    with patch("app.web.routers.settings.send_webhook", new_callable=AsyncMock) as mock_hook:
+        mock_hook.return_value = WebhookOutcome(ok=False, status=500, error="HTTP 500")
+        response = await client_webhooks_only.post("/notifications/test")
+
+    assert "Notification delivery failed" in response.text
+    assert "Webhooks: 0/1 delivered" in response.text
+
+
+async def test_both_channels_are_exercised(client: httpx.AsyncClient) -> None:
+    """With both configured, each channel is attempted and reported separately."""
+    settings = _make_settings(
+        notifications=NotificationSettings(urls=["json://localhost"], webhook_urls=["https://hooks.example.com/x"])
+    )
+    app.dependency_overrides[get_settings] = lambda: settings
+
+    with (
+        patch("app.web.routers.settings.send_notification", new_callable=AsyncMock, return_value=True),
+        patch(
+            "app.web.routers.settings.send_webhook",
+            new_callable=AsyncMock,
+            return_value=WebhookOutcome(ok=True, status=200),
+        ) as mock_hook,
+    ):
+        response = await client.post("/notifications/test")
+
+    assert "Apprise: delivered" in response.text
+    assert "Webhooks: 1/1 delivered" in response.text
+    mock_hook.assert_awaited_once()
+
+
+async def test_unexpected_error_is_logged(client: httpx.AsyncClient, caplog) -> None:  # noqa: ANN001
+    """The 'check the logs' copy must correspond to a log line that exists."""
+    import logging
+
+    with (
+        caplog.at_level(logging.WARNING, logger="app.web.routers.settings"),
+        patch("app.web.routers.settings.send_notification", new_callable=AsyncMock) as mock_send,
+    ):
+        mock_send.side_effect = RuntimeError("connection refused")
+        response = await client.post("/notifications/test")
+
+    assert "Notification error" in response.text
+    assert any("Test notification failed" in r.getMessage() for r in caplog.records)

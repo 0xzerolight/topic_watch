@@ -11,10 +11,12 @@ import pytest
 
 from app.config import LLMSettings, Settings
 from app.crud import (
+    apply_notification_outcome,
+    apply_webhook_outcome,
     claim_new_topic_for_init,
-    claim_pending_notification,
-    claim_pending_webhook,
+    claim_notification_intent,
     claim_topic_for_init,
+    claim_webhook_intent,
     create_pending_notification,
     create_pending_webhook,
     create_topic,
@@ -248,9 +250,9 @@ def test_notification_claim_succeeds_once_then_fails(db_conn: sqlite3.Connection
     n = create_pending_notification(db_conn, PendingNotification(topic_id=topic.id, title="T", body="B"))
     db_conn.commit()
 
-    assert claim_pending_notification(db_conn, n.id, "2025-01-01T00:00:00+00:00") is True
+    assert claim_notification_intent(db_conn, n.id, "tok", "2025-01-01T00:00:00+00:00") is True
     # Second claim of the now-claimed row loses (would have caused a double-send).
-    assert claim_pending_notification(db_conn, n.id, "2025-01-01T00:00:01+00:00") is False
+    assert claim_notification_intent(db_conn, n.id, "tok", "2025-01-01T00:00:01+00:00") is False
 
 
 def test_webhook_claim_succeeds_once_then_fails(db_conn: sqlite3.Connection) -> None:
@@ -259,8 +261,8 @@ def test_webhook_claim_succeeds_once_then_fails(db_conn: sqlite3.Connection) -> 
     webhook_id = create_pending_webhook(db_conn, topic.id, "https://a.com/hook", {"k": "v"})
     db_conn.commit()
 
-    assert claim_pending_webhook(db_conn, webhook_id, "2025-01-01T00:00:00+00:00") is True
-    assert claim_pending_webhook(db_conn, webhook_id, "2025-01-01T00:00:01+00:00") is False
+    assert claim_webhook_intent(db_conn, webhook_id, "tok", "2025-01-01T00:00:00+00:00") is True
+    assert claim_webhook_intent(db_conn, webhook_id, "tok", "2025-01-01T00:00:01+00:00") is False
 
 
 def test_release_stale_notification_claim_rearms_row(db_conn: sqlite3.Connection) -> None:
@@ -268,7 +270,7 @@ def test_release_stale_notification_claim_rearms_row(db_conn: sqlite3.Connection
     topic = _make_topic(db_conn)
     n = create_pending_notification(db_conn, PendingNotification(topic_id=topic.id, title="T", body="B"))
     db_conn.commit()
-    assert claim_pending_notification(db_conn, n.id, "2020-01-01T00:00:00+00:00") is True
+    assert claim_notification_intent(db_conn, n.id, "tok", "2020-01-01T00:00:00+00:00") is True
     db_conn.commit()
 
     # A fresh claim (newer) is NOT released; an old one is.
@@ -276,7 +278,7 @@ def test_release_stale_notification_claim_rearms_row(db_conn: sqlite3.Connection
     db_conn.commit()
     assert released == 1
     # Re-claimable now.
-    assert claim_pending_notification(db_conn, n.id, "2025-01-01T00:00:00+00:00") is True
+    assert claim_notification_intent(db_conn, n.id, "tok", "2025-01-01T00:00:00+00:00") is True
 
 
 def test_release_stale_webhook_claim_rearms_row(db_conn: sqlite3.Connection) -> None:
@@ -284,7 +286,7 @@ def test_release_stale_webhook_claim_rearms_row(db_conn: sqlite3.Connection) -> 
     topic = _make_topic(db_conn)
     webhook_id = create_pending_webhook(db_conn, topic.id, "https://a.com/hook", {"k": "v"})
     db_conn.commit()
-    assert claim_pending_webhook(db_conn, webhook_id, "2020-01-01T00:00:00+00:00") is True
+    assert claim_webhook_intent(db_conn, webhook_id, "tok", "2020-01-01T00:00:00+00:00") is True
     db_conn.commit()
 
     # Cutoff before the claim time: nothing released.
@@ -292,7 +294,7 @@ def test_release_stale_webhook_claim_rearms_row(db_conn: sqlite3.Connection) -> 
     # Cutoff after the claim time: released and re-claimable.
     assert release_stale_webhook_claims(db_conn, "2020-06-01T00:00:00+00:00") == 1
     db_conn.commit()
-    assert claim_pending_webhook(db_conn, webhook_id, "2025-01-01T00:00:00+00:00") is True
+    assert claim_webhook_intent(db_conn, webhook_id, "tok", "2025-01-01T00:00:00+00:00") is True
 
 
 # --- check_topic per-topic guard authoritative across entry points (OVH-096) ---
@@ -750,7 +752,7 @@ def test_exhausted_notification_cannot_be_claimed(db_conn: sqlite3.Connection) -
     )
     db_conn.commit()
 
-    assert claim_pending_notification(db_conn, n.id, "2026-01-01T00:00:00+00:00") is False
+    assert claim_notification_intent(db_conn, n.id, "tok", "2026-01-01T00:00:00+00:00") is False
 
 
 def test_exhausted_webhook_cannot_be_claimed(db_conn: sqlite3.Connection) -> None:
@@ -761,29 +763,27 @@ def test_exhausted_webhook_cannot_be_claimed(db_conn: sqlite3.Connection) -> Non
     db_conn.execute("UPDATE pending_webhooks SET retry_count = 1 WHERE id = ?", (webhook_id,))
     db_conn.commit()
 
-    assert claim_pending_webhook(db_conn, webhook_id, "2026-01-01T00:00:00+00:00") is False
+    assert claim_webhook_intent(db_conn, webhook_id, "tok", "2026-01-01T00:00:00+00:00") is False
 
 
 def test_late_notification_apply_with_a_stale_token_is_a_noop(db_conn: sqlite3.Connection) -> None:
     """A drainer whose claim was released and re-taken cannot consume the new owner's attempt."""
-    from app.crud import delete_pending_notification, increment_notification_retry
-
     first_owner, second_owner = "owner-a", "owner-b"
     topic = _make_topic(db_conn)
     n = create_pending_notification(db_conn, PendingNotification(topic_id=topic.id, title="T", body="B"))
     db_conn.commit()
 
-    assert claim_pending_notification(db_conn, n.id, "2020-01-01T00:00:00+00:00", claim_token=first_owner) is True
+    assert claim_notification_intent(db_conn, n.id, first_owner, "2020-01-01T00:00:00+00:00") is True
     db_conn.commit()
     # The first owner is declared stale and a second drainer takes the row.
     release_stale_notification_claims(db_conn, "2020-06-01T00:00:00+00:00")
     db_conn.commit()
-    assert claim_pending_notification(db_conn, n.id, "2026-01-01T00:00:00+00:00", claim_token=second_owner) is True
+    assert claim_notification_intent(db_conn, n.id, second_owner, "2026-01-01T00:00:00+00:00") is True
     db_conn.commit()
 
     # The first owner finally comes back with both possible applies.
-    assert increment_notification_retry(db_conn, n.id, "late failure", claim_token=first_owner) is False
-    assert delete_pending_notification(db_conn, n.id, claim_token=first_owner) is False
+    assert apply_notification_outcome(db_conn, n.id, first_owner, sent=False, error="late failure") is False
+    assert apply_notification_outcome(db_conn, n.id, first_owner, sent=True) is False
     db_conn.commit()
 
     row = db_conn.execute("SELECT retry_count, claim_token FROM pending_notifications WHERE id = ?", (n.id,)).fetchone()
@@ -794,22 +794,20 @@ def test_late_notification_apply_with_a_stale_token_is_a_noop(db_conn: sqlite3.C
 
 def test_late_webhook_apply_with_a_stale_token_is_a_noop(db_conn: sqlite3.Connection) -> None:
     """Same fence on the webhook queue."""
-    from app.crud import delete_pending_webhook, increment_webhook_retry
-
     first_owner, second_owner = "owner-a", "owner-b"
     topic = _make_topic(db_conn)
     webhook_id = create_pending_webhook(db_conn, topic.id, "https://a.com/hook", {"k": "v"})
     db_conn.commit()
 
-    assert claim_pending_webhook(db_conn, webhook_id, "2020-01-01T00:00:00+00:00", claim_token=first_owner) is True
+    assert claim_webhook_intent(db_conn, webhook_id, first_owner, "2020-01-01T00:00:00+00:00") is True
     db_conn.commit()
     release_stale_webhook_claims(db_conn, "2020-06-01T00:00:00+00:00")
     db_conn.commit()
-    assert claim_pending_webhook(db_conn, webhook_id, "2026-01-01T00:00:00+00:00", claim_token=second_owner) is True
+    assert claim_webhook_intent(db_conn, webhook_id, second_owner, "2026-01-01T00:00:00+00:00") is True
     db_conn.commit()
 
-    assert increment_webhook_retry(db_conn, webhook_id, claim_token=first_owner) is False
-    assert delete_pending_webhook(db_conn, webhook_id, claim_token=first_owner) is False
+    assert apply_webhook_outcome(db_conn, webhook_id, first_owner, sent=False) is False
+    assert apply_webhook_outcome(db_conn, webhook_id, first_owner, sent=True) is False
     db_conn.commit()
 
     row = db_conn.execute("SELECT retry_count FROM pending_webhooks WHERE id = ?", (webhook_id,)).fetchone()

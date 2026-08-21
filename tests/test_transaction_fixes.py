@@ -51,6 +51,7 @@ from app.models import Article, KnowledgeState, NotificationDelivery, NotifyDisp
 from app.scraping import FetchResult
 from app.scraping.rss import FeedEntry, FeedResponse
 from app.scraping.source import FeedHealthOutcome, FetchStatus
+from app.webhooks import WebhookOutcome
 
 
 def _conn_db_path(conn: sqlite3.Connection) -> Path:
@@ -450,8 +451,8 @@ class TestCommitBeforeSendOrdering:
             ),
             patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
             patch("app.checker.prepare_knowledge_update", new_callable=AsyncMock, return_value=_write_result()),
-            patch("app.checker.send_notification_per_url", side_effect=_record_send),
-            patch("app.checker.send_webhooks", new_callable=AsyncMock, return_value=0),
+            patch("app.checker.deliver_notification_intents", side_effect=_record_send),
+            patch("app.checker.deliver_webhook_intents", new_callable=AsyncMock, return_value=0),
             patch(
                 "app.checker.create_check_result",
                 side_effect=RuntimeError("simulated persist failure"),
@@ -502,8 +503,8 @@ class TestCommitBeforeSendOrdering:
             ),
             patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
             patch("app.checker.prepare_knowledge_update", new_callable=AsyncMock, return_value=_write_result()),
-            patch("app.checker.send_notification_per_url", side_effect=_check_processed_on_send),
-            patch("app.checker.send_webhooks", new_callable=AsyncMock, return_value=0),
+            patch("app.checker.deliver_notification_intents", side_effect=_check_processed_on_send),
+            patch("app.checker.deliver_webhook_intents", new_callable=AsyncMock, return_value=0),
         ):
             result = await check_topic(topic, settings, db_path=db_path)
 
@@ -536,11 +537,11 @@ class TestCommitBeforeSendOrdering:
             patch("app.checker.prepare_knowledge_update", new_callable=AsyncMock, return_value=_write_result()),
             # Delivery fails -> row must record notification_sent=0 + the reason.
             patch(
-                "app.checker.send_notification_per_url",
+                "app.checker.deliver_notification_intents",
                 new_callable=AsyncMock,
                 return_value=[NotificationDelivery(url="json://localhost", ok=False, error="delivery failed")],
             ),
-            patch("app.checker.send_webhooks", new_callable=AsyncMock, return_value=0),
+            patch("app.checker.deliver_webhook_intents", new_callable=AsyncMock, return_value=0),
         ):
             result = await check_topic(topic, settings, db_path=db_path)
 
@@ -581,12 +582,16 @@ class TestWebhookCheckResultId:
             patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
             patch("app.checker.prepare_knowledge_update", new_callable=AsyncMock, return_value=_write_result()),
             patch(
-                "app.checker.send_notification_per_url",
+                "app.checker.deliver_notification_intents",
                 new_callable=AsyncMock,
                 return_value=[NotificationDelivery(url="json://localhost", ok=True)],
             ),
-            # Force the webhook POST to fail so it is enqueued for retry.
-            patch("app.webhooks.send_webhook", new_callable=AsyncMock, return_value=False),
+            # Force the webhook POST to fail so the intent stays queued for retry.
+            patch(
+                "app.webhooks.send_webhook",
+                new_callable=AsyncMock,
+                return_value=WebhookOutcome(ok=False, status=500, error="HTTP 500"),
+            ),
         ):
             result = await check_topic(topic, settings, db_path=db_path)
 
@@ -744,8 +749,8 @@ class TestNoConnectionOpenDuringAwaits:
             patch("app.checker.fetch_new_articles_for_topic", side_effect=_fetch),
             patch("app.checker.analyze_articles", side_effect=_analyze),
             patch("app.checker.prepare_knowledge_update", side_effect=_prepare),
-            patch("app.checker.send_notification_per_url", side_effect=_send),
-            patch("app.checker.send_webhooks", new_callable=AsyncMock, return_value=0),
+            patch("app.checker.deliver_notification_intents", side_effect=_send),
+            patch("app.checker.deliver_webhook_intents", new_callable=AsyncMock, return_value=0),
         ):
             result = await check_topic(topic, settings, db_path=db_path)
 
@@ -806,8 +811,8 @@ class TestNoConnectionOpenDuringAwaits:
             patch("app.checker.fetch_new_articles_for_topic", side_effect=_fetch),
             patch("app.checker.analyze_articles", side_effect=_analyze),
             patch("app.checker.prepare_knowledge_update", side_effect=_prepare),
-            patch("app.checker.send_notification_per_url", side_effect=_send),
-            patch("app.checker.send_webhooks", new_callable=AsyncMock, return_value=0),
+            patch("app.checker.deliver_notification_intents", side_effect=_send),
+            patch("app.checker.deliver_webhook_intents", new_callable=AsyncMock, return_value=0),
         ):
             result = await check_topic(topic, settings, db_path=db_path)
 
@@ -862,8 +867,8 @@ class TestSendPhaseDurability:
                 return_value=NoveltyResult(has_new_info=True, summary="s", confidence=0.9, relevance=0.9, importance=5),
             ),
             patch("app.checker.prepare_knowledge_update", new_callable=AsyncMock, return_value=_write_result()),
-            patch("app.checker.send_notification_per_url", side_effect=send),
-            patch("app.checker.send_webhooks", side_effect=webhooks),
+            patch("app.checker.deliver_notification_intents", side_effect=send),
+            patch("app.checker.deliver_webhook_intents", side_effect=webhooks),
         ):
             return await check_topic(topic, settings, db_path=db_path)
 
@@ -949,7 +954,7 @@ class TestDurableTransitionGuards:
                 return_value=NoveltyResult(has_new_info=True, summary="s", confidence=0.9, relevance=0.9, importance=1),
             ),
             patch("app.checker.prepare_knowledge_update", side_effect=_prepare),
-            patch("app.checker.send_notification_per_url", new_callable=AsyncMock, return_value=[]),
+            patch("app.checker.deliver_notification_intents", new_callable=AsyncMock, return_value=[]),
         ):
             return await check_topic(topic, settings, db_path=db_path)
 
@@ -1041,8 +1046,8 @@ class TestKnowledgeCleanupFailuresAtTheTransition:
                 return_value=NoveltyResult(has_new_info=True, summary="s", confidence=0.9, relevance=0.9, importance=5),
             ),
             patch("app.checker.prepare_knowledge_update", side_effect=_prepare),
-            patch("app.checker.send_notification_per_url", _per_url_ok()),
-            patch("app.checker.send_webhooks", new_callable=AsyncMock, return_value=0),
+            patch("app.checker.deliver_notification_intents", _per_url_ok()),
+            patch("app.checker.deliver_webhook_intents", new_callable=AsyncMock, return_value=0),
         ):
             result = await check_topic(topic, settings, db_path=db_path)
 
@@ -1112,7 +1117,7 @@ class TestKnowledgeCleanupFailuresAtTheTransition:
                 return_value=FetchResult(articles=[article], total_feed_entries=1),
             ),
             patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=safe_default),
-            patch("app.checker.send_notification_per_url", _per_url_ok()),
+            patch("app.checker.deliver_notification_intents", _per_url_ok()),
         ):
             result = await check_topic(topic, settings, db_path=db_path)
 
@@ -1155,7 +1160,7 @@ class TestTransitionIsAllOrNothing:
             ),
             patch("app.checker.prepare_knowledge_update", new_callable=AsyncMock, return_value=_write_result()),
             patch("app.checker.create_check_result", side_effect=sqlite3.OperationalError("disk I/O error")),
-            patch("app.checker.send_notification_per_url", new_callable=AsyncMock, return_value=[]),
+            patch("app.checker.deliver_notification_intents", new_callable=AsyncMock, return_value=[]),
             pytest.raises(sqlite3.OperationalError),
         ):
             await check_topic(topic, settings, db_path=db_path)
