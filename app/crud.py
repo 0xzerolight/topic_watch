@@ -6,6 +6,7 @@ for explicit dependency injection and testability.
 
 import logging
 import sqlite3
+import unicodedata
 from datetime import UTC, datetime, timedelta
 
 from app.models import (
@@ -268,18 +269,30 @@ def get_dashboard_data(conn: sqlite3.Connection) -> list[dict]:
     return _query_dashboard_rows(conn, "", [])
 
 
+def _search_canonical(text: str) -> str:
+    """NFC-normalize and casefold text for literal, Unicode-insensitive search matching.
+
+    Used on both the query and the searched fields so ``%``/``_`` stay plain
+    characters instead of SQL LIKE wildcards, and composed/decomposed or
+    differently-cased Unicode text still matches (AUG-337).
+    """
+    return unicodedata.normalize("NFC", text).casefold()
+
+
 def search_dashboard_data(
     conn: sqlite3.Connection,
     query: str | None = None,
     status: str | None = None,
 ) -> list[dict]:
-    """Get topics with last check and article count, with optional name/status filters."""
+    """Get topics with last check and article count, with optional name/status filters.
+
+    ``query`` matches literally (no LIKE wildcards) against both name and
+    description (AUG-103), NFC-normalized and casefolded on both sides so
+    Unicode-equivalent and differently-cased text still matches, and trimmed
+    of surrounding whitespace (AUG-337).
+    """
     where_clauses = []
     params: list = []
-
-    if query:
-        where_clauses.append("t.name LIKE ?")
-        params.append(f"%{query}%")
 
     if status:
         where_clauses.append("t.status = ?")
@@ -289,7 +302,19 @@ def search_dashboard_data(
     if where_clauses:
         where_sql = " WHERE " + " AND ".join(where_clauses)
 
-    return _query_dashboard_rows(conn, where_sql, params)
+    rows = _query_dashboard_rows(conn, where_sql, params)
+
+    query = query.strip() if query else None
+    if query:
+        needle = _search_canonical(query)
+        rows = [
+            item
+            for item in rows
+            if needle in _search_canonical(item["topic"].name)
+            or (item["topic"].description and needle in _search_canonical(item["topic"].description))
+        ]
+
+    return rows
 
 
 def delete_topic(conn: sqlite3.Connection, topic_id: int) -> bool:
