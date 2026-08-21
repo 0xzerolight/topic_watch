@@ -1865,7 +1865,7 @@ class TestCheckNow:
         baseline = create_check_result(db_conn, CheckResult(topic_id=topic.id))
         from app.web.state import _checking_state
 
-        await _checking_state.start_check(topic.id)
+        owner = await _checking_state.start_check(topic.id)
         try:
             response = await client.get(
                 f"/topics/{topic.id}/row?since_check_id={baseline.id}", headers={"HX-Request": "true"}
@@ -1874,7 +1874,7 @@ class TestCheckNow:
 
             create_check_result(db_conn, CheckResult(topic_id=topic.id, has_new_info=True))
         finally:
-            await _checking_state.finish_check(topic.id)
+            await _checking_state.finish_check(topic.id, owner)
 
         response = await client.get(
             f"/topics/{topic.id}/row?since_check_id={baseline.id}", headers={"HX-Request": "true"}
