@@ -1065,14 +1065,17 @@ class TestMigrations:
 
         db_path = tmp_path / "fail.db"
         init_db(db_path)  # establish an existing DB so a backup is created
+        real = list(migrations_mod.MIGRATIONS)
 
         def _boom(_conn: sqlite3.Connection) -> None:
             raise ValueError("simulated migration failure")
 
-        # Inject a pending migration with a version above any real one.
+        # Append a pending migration with a version above any real one. The real
+        # registry stays in place because the ledger validator (TW-AUD-011)
+        # requires every applied version to be registered.
         # run_migrations imports MIGRATIONS from app.migrations at call time.
         bad_version = 9999
-        monkeypatch.setattr(migrations_mod, "MIGRATIONS", [(bad_version, "intentionally broken", _boom)])
+        monkeypatch.setattr(migrations_mod, "MIGRATIONS", [*real, (bad_version, "intentionally broken", _boom)])
 
         conn = get_connection(db_path)
         try:
@@ -1110,11 +1113,12 @@ class TestMigrations:
 
         db_path = tmp_path / "noclaim.db"
         init_db(db_path)
+        real = list(migrations_mod.MIGRATIONS)
 
         def _boom(_conn: sqlite3.Connection) -> None:
             raise ValueError("simulated migration failure")
 
-        monkeypatch.setattr(migrations_mod, "MIGRATIONS", [(9999, "intentionally broken", _boom)])
+        monkeypatch.setattr(migrations_mod, "MIGRATIONS", [*real, (9999, "intentionally broken", _boom)])
 
         conn = get_connection(db_path)
         try:
@@ -1162,6 +1166,7 @@ class TestMigrations:
 
         db_path = tmp_path / "partial.db"
         init_db(db_path)  # establish an existing DB at the real head version
+        real = list(migrations_mod.MIGRATIONS)
 
         good_version = 9001
         bad_version = 9002
@@ -1180,6 +1185,7 @@ class TestMigrations:
             migrations_mod,
             "MIGRATIONS",
             [
+                *real,
                 (good_version, "good migration", _good),
                 (bad_version, "broken migration", _boom),
             ],
@@ -1225,6 +1231,7 @@ class TestMigrations:
             migrations_mod,
             "MIGRATIONS",
             [
+                *real,
                 (good_version, "good migration", _good),
                 (bad_version, "now fixed migration", _now_fixed),
             ],
@@ -1264,6 +1271,7 @@ class TestMigrations:
 
         db_path = tmp_path / "order.db"
         init_db(db_path)  # establish an existing DB at the real head version
+        real = list(migrations_mod.MIGRATIONS)
 
         applied_order: list[int] = []
 
@@ -1280,6 +1288,7 @@ class TestMigrations:
             migrations_mod,
             "MIGRATIONS",
             [
+                *real,
                 (v_hi, "higher version listed first", _make(v_hi)),
                 (v_lo, "lower version listed second", _make(v_lo)),
             ],
@@ -1307,6 +1316,322 @@ class TestMigrations:
         finally:
             conn_check.close()
         assert recorded == {v_lo, v_hi}
+
+
+class TestMigrationAtomicity:
+    """TW-AUD-010: a migration body and its ledger row are one transaction."""
+
+    def test_ddl_does_not_survive_a_failing_migration_body(self, tmp_path, monkeypatch) -> None:
+        """A migration that ALTERs and then raises must leave no schema change.
+
+        SQLite DDL runs in autocommit unless a transaction is already open, so the
+        ALTER used to persist while its version row never landed — the next start
+        then re-ran the same ALTER against a column that already existed and failed
+        with an unrecorded schema change on disk.
+        """
+        import app.migrations as migrations_mod
+        from app.database import get_connection, init_db
+
+        db_path = tmp_path / "atomic.db"
+        init_db(db_path)
+        real = list(migrations_mod.MIGRATIONS)
+
+        def _ddl_then_boom(conn: sqlite3.Connection) -> None:
+            conn.execute("ALTER TABLE topics ADD COLUMN tw_aud_010_probe TEXT")
+            raise ValueError("simulated failure after DDL")
+
+        monkeypatch.setattr(migrations_mod, "MIGRATIONS", [*real, (9201, "ddl then boom", _ddl_then_boom)])
+
+        conn = get_connection(db_path)
+        try:
+            with pytest.raises(ValueError, match="simulated failure after DDL"):
+                run_migrations(conn, db_path=db_path)
+        finally:
+            conn.close()
+
+        after = get_connection(db_path)
+        try:
+            columns = {row[1] for row in after.execute("PRAGMA table_info(topics)").fetchall()}
+            recorded = after.execute("SELECT version FROM schema_version WHERE version = 9201").fetchone()
+        finally:
+            after.close()
+        assert "tw_aud_010_probe" not in columns, "DDL persisted without its ledger row"
+        assert recorded is None
+
+    def test_ddl_does_not_survive_a_failing_ledger_insert(self, tmp_path, monkeypatch) -> None:
+        """The ledger INSERT failing must roll the migration body back with it."""
+        import app.migrations as migrations_mod
+        from app.database import get_connection, init_db
+
+        db_path = tmp_path / "ledger-fail.db"
+        init_db(db_path)
+        real = list(migrations_mod.MIGRATIONS)
+
+        def _ddl_then_block_ledger(conn: sqlite3.Connection) -> None:
+            conn.execute("ALTER TABLE topics ADD COLUMN tw_aud_010_probe2 TEXT")
+            # Occupy the primary key so the runner's own INSERT collides.
+            conn.execute("INSERT INTO schema_version (version) VALUES (9202)")
+
+        monkeypatch.setattr(migrations_mod, "MIGRATIONS", [*real, (9202, "ledger collision", _ddl_then_block_ledger)])
+
+        conn = get_connection(db_path)
+        try:
+            with pytest.raises(sqlite3.IntegrityError):
+                run_migrations(conn, db_path=db_path)
+        finally:
+            conn.close()
+
+        after = get_connection(db_path)
+        try:
+            columns = {row[1] for row in after.execute("PRAGMA table_info(topics)").fetchall()}
+            recorded = after.execute("SELECT version FROM schema_version WHERE version = 9202").fetchone()
+        finally:
+            after.close()
+        assert "tw_aud_010_probe2" not in columns
+        assert recorded is None
+
+
+class TestSchemaLedgerValidation:
+    """TW-AUD-011: the applied ledger must be a contiguous registered prefix."""
+
+    def test_gapped_ledger_is_rejected(self, tmp_path) -> None:
+        """A missing intermediate version means missing schema — never 'current'."""
+        from app.database import SchemaLedgerError, get_connection, init_db
+
+        db_path = tmp_path / "gap.db"
+        init_db(db_path)
+
+        conn = get_connection(db_path)
+        try:
+            conn.execute("DELETE FROM schema_version WHERE version = 5")
+            conn.commit()
+            with pytest.raises(SchemaLedgerError, match="5"):
+                run_migrations(conn, db_path=db_path)
+        finally:
+            conn.close()
+
+    def test_future_version_is_rejected(self, tmp_path) -> None:
+        """A ledger written by a newer binary must not run against this one."""
+        from app.database import SchemaLedgerError, get_connection, init_db
+
+        db_path = tmp_path / "future.db"
+        init_db(db_path)
+
+        conn = get_connection(db_path)
+        try:
+            conn.execute("INSERT INTO schema_version (version) VALUES (99999)")
+            conn.commit()
+            with pytest.raises(SchemaLedgerError, match="99999"):
+                run_migrations(conn, db_path=db_path)
+        finally:
+            conn.close()
+
+    def test_invalid_version_value_is_rejected(self, tmp_path) -> None:
+        """A non-positive version is not a migration this runner ever wrote."""
+        from app.database import SchemaLedgerError, get_connection, init_db
+
+        db_path = tmp_path / "invalid.db"
+        init_db(db_path)
+
+        conn = get_connection(db_path)
+        try:
+            conn.execute("INSERT INTO schema_version (version) VALUES (0)")
+            conn.commit()
+            with pytest.raises(SchemaLedgerError):
+                run_migrations(conn, db_path=db_path)
+        finally:
+            conn.close()
+
+    def test_clean_ledger_is_accepted(self, tmp_path) -> None:
+        """The normal fully-migrated ledger passes validation and is a no-op."""
+        from app.database import get_connection, get_schema_version, init_db
+
+        db_path = tmp_path / "clean.db"
+        init_db(db_path)
+
+        conn = get_connection(db_path)
+        try:
+            run_migrations(conn, db_path=db_path)
+            from app.migrations import MIGRATIONS
+
+            assert get_schema_version(conn) == max(v for v, _, _ in MIGRATIONS)
+        finally:
+            conn.close()
+
+
+class TestOnlineBackup:
+    """TW-AUD-012 / AUG-149: WAL-safe backups, verified, owner-only."""
+
+    def test_backup_captures_commits_still_in_the_wal(self, tmp_path) -> None:
+        """A committed row that has not been checkpointed must reach the backup."""
+        import shutil
+
+        from app.database import backup_database, get_connection, init_db
+
+        db_path = tmp_path / "live.db"
+        init_db(db_path)
+
+        conn = get_connection(db_path)
+        try:
+            create_topic(conn, Topic(name="WAL Survivor", description="d"))
+            conn.commit()
+
+            # A plain file copy of the main DB misses it: the commit is in the -wal.
+            naive = tmp_path / "naive-copy.db"
+            shutil.copy2(db_path, naive)
+            naive_conn = sqlite3.connect(str(naive))
+            try:
+                copied = naive_conn.execute("SELECT COUNT(*) FROM topics WHERE name = 'WAL Survivor'").fetchone()[0]
+            finally:
+                naive_conn.close()
+            assert copied == 0, "precondition: the commit must still be uncheckpointed"
+
+            dest = tmp_path / "backups" / "online.db"
+            backup_database(conn, dest)
+        finally:
+            conn.close()
+
+        backup_conn = sqlite3.connect(str(dest))
+        try:
+            found = backup_conn.execute("SELECT COUNT(*) FROM topics WHERE name = 'WAL Survivor'").fetchone()[0]
+            integrity = backup_conn.execute("PRAGMA integrity_check").fetchone()[0]
+        finally:
+            backup_conn.close()
+        assert found == 1
+        assert integrity == "ok"
+
+    def test_backup_file_and_directory_are_owner_only(self, tmp_path) -> None:
+        """AUG-149: backups hold the same secrets as the DB."""
+        import stat
+
+        from app.database import backup_database, get_connection, init_db
+
+        db_path = tmp_path / "modes.db"
+        init_db(db_path)
+        dest = tmp_path / "backups" / "modes.backup.db"
+
+        conn = get_connection(db_path)
+        try:
+            backup_database(conn, dest)
+        finally:
+            conn.close()
+
+        assert stat.S_IMODE(dest.stat().st_mode) == 0o600
+        assert stat.S_IMODE(dest.parent.stat().st_mode) == 0o700
+
+    def test_migration_backup_is_readable_and_pruned(self, tmp_path, monkeypatch) -> None:
+        """The pre-migration backup is a real, openable database."""
+        import app.migrations as migrations_mod
+        from app.database import get_connection, init_db
+
+        db_path = tmp_path / "premig.db"
+        init_db(db_path)
+        real = list(migrations_mod.MIGRATIONS)
+
+        conn = get_connection(db_path)
+        try:
+            create_topic(conn, Topic(name="Before Migration", description="d"))
+            conn.commit()
+
+            monkeypatch.setattr(
+                migrations_mod,
+                "MIGRATIONS",
+                [*real, (9203, "marker", lambda c: c.execute("CREATE TABLE IF NOT EXISTS mig_marker (id INTEGER)"))],
+            )
+            run_migrations(conn, db_path=db_path)
+        finally:
+            conn.close()
+
+        backups = sorted((tmp_path / "backups").glob("topic_watch.*.db"))
+        assert backups, "a pre-migration backup must exist"
+        backup_conn = sqlite3.connect(str(backups[-1]))
+        try:
+            found = backup_conn.execute("SELECT COUNT(*) FROM topics WHERE name = 'Before Migration'").fetchone()[0]
+        finally:
+            backup_conn.close()
+        assert found == 1
+
+
+class TestDatabaseFileModes:
+    """AUG-149: the database and its sidecars are owner-only."""
+
+    def test_new_database_and_sidecars_are_owner_only(self, tmp_path) -> None:
+        import stat
+
+        from app.database import get_connection, init_db
+
+        db_path = tmp_path / "perm.db"
+        init_db(db_path)
+        assert stat.S_IMODE(db_path.stat().st_mode) == 0o600
+
+        conn = get_connection(db_path)
+        try:
+            create_topic(conn, Topic(name="Sidecar", description="d"))
+            conn.commit()
+            for suffix in ("-wal", "-shm"):
+                sidecar = db_path.with_name(db_path.name + suffix)
+                assert sidecar.exists(), f"expected {suffix} sidecar"
+                assert stat.S_IMODE(sidecar.stat().st_mode) == 0o600
+        finally:
+            conn.close()
+
+    def test_startup_tightens_a_world_readable_database(self, tmp_path) -> None:
+        """An install that predates this hardening is fixed on the next start."""
+        import stat
+
+        from app.database import init_db
+
+        db_path = tmp_path / "loose.db"
+        init_db(db_path)
+        db_path.chmod(0o644)
+
+        init_db(db_path)
+        assert stat.S_IMODE(db_path.stat().st_mode) == 0o600
+
+
+class TestRealUpgradePath:
+    """AUG-045: a real existing-user v23 -> v24 upgrade, not a no-op re-invoke."""
+
+    def test_v23_database_upgrades_to_head_and_keeps_its_topics(self, tmp_path, monkeypatch) -> None:
+        import app.migrations as migrations_mod
+        from app.database import get_connection, get_schema_version, init_db
+
+        real = list(migrations_mod.MIGRATIONS)
+        db_path = tmp_path / "v23.db"
+
+        # Build a genuine v23 database through the registered runner.
+        monkeypatch.setattr(migrations_mod, "MIGRATIONS", [m for m in real if m[0] <= 23])
+        init_db(db_path)
+
+        conn = get_connection(db_path)
+        try:
+            assert get_schema_version(conn) == 23
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(topics)").fetchall()}
+            assert "heartbeat_alerted_at" not in columns, "precondition: v23 predates the latch column"
+            conn.execute(
+                "INSERT INTO topics (name, description, feed_urls, feed_mode, created_at, status)"
+                " VALUES ('Existing User', 'd', '[]', 'manual', ?, 'ready')",
+                (datetime.now(UTC).isoformat(),),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Now upgrade with the real registry, exactly as an existing install would.
+        monkeypatch.setattr(migrations_mod, "MIGRATIONS", real)
+        init_db(db_path)
+
+        conn = get_connection(db_path)
+        try:
+            assert get_schema_version(conn) == max(v for v, _, _ in real)
+            row = conn.execute("SELECT * FROM topics WHERE name = 'Existing User'").fetchone()
+            assert row is not None, "the existing topic must survive the upgrade"
+            assert row["heartbeat_alerted_at"] is None, "the new latch column defaults to NULL"
+            topic = Topic.from_row(row)
+            assert topic.heartbeat_alerted_at is None
+            assert topic.generation, "m026 backfills a generation for existing rows"
+        finally:
+            conn.close()
 
 
 class TestRecoverStuckTopics:
