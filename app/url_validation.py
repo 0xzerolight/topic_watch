@@ -13,12 +13,14 @@ accepted limitation for a single-user self-hosted tool.
 """
 
 import asyncio
+import enum
 import ipaddress
 import logging
 import re
 import socket
 import threading
 import time
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from urllib.parse import urlparse
@@ -82,6 +84,35 @@ _LOCALHOST_RE = re.compile(r"^localhost(:\d+)?$", re.IGNORECASE)
 _CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 
 
+class _Destination(enum.Enum):
+    """What resolution actually said about a host.
+
+    ``PRIVATE`` is a verdict about the destination; ``UNRESOLVABLE`` is the
+    absence of one. Both are blocked, so most callers only want the bool that
+    :func:`is_private_url` gives them — but a rule that exists to protect a
+    PUBLIC destination must not be waived by the absence of an answer.
+    """
+
+    PUBLIC = "public"
+    PRIVATE = "private"
+    UNRESOLVABLE = "unresolvable"
+
+
+class ResolverSaturatedError(httpx.HTTPError):
+    """Raised when no resolver slot came free within the caller's deadline.
+
+    Every other blocked outcome is something we learned about the destination;
+    this one is the shared pool being busy with unrelated work — a bulk OPML
+    import holds all sixteen slots for as long as it runs — and says nothing
+    about the host at all. Blocking is still right, but a caller that keeps a
+    per-feed failure streak has to charge this to the run instead, or an
+    untouched healthy feed walks into exponential backoff.
+
+    An ``httpx.HTTPError`` for the same reason as :class:`PrivateRedirectError`:
+    to a call site with no special handling it is an ordinary fetch failure.
+    """
+
+
 def _getaddrinfo_bounded(hostname: str, timeout: float) -> list:
     """Run ``socket.getaddrinfo`` with a wall-clock timeout on the shared pool.
 
@@ -89,15 +120,18 @@ def _getaddrinfo_bounded(hostname: str, timeout: float) -> list:
     slow/non-resolving host could otherwise pin a worker for the OS resolver's
     full default timeout. The whole call — waiting for a resolver slot plus the
     lookup itself — is bounded by ``timeout`` (OVH-148), and the pool bounds how
-    many resolver threads can exist at once (AUG-013). Raises ``TimeoutError`` on
-    either bound; the caller fails closed.
+    many resolver threads can exist at once (AUG-013).
+
+    Raises ``TimeoutError`` when the lookup itself ran out of time and
+    :class:`ResolverSaturatedError` when no slot came free — two different
+    events, because only the first says anything about ``hostname``.
     """
     deadline = time.monotonic() + timeout
     if not _resolver_slots.acquire(timeout=timeout):
         # Every resolver thread is occupied, most likely by earlier abandoned
         # lookups. Spawning another thread is exactly what the bound exists to
         # prevent, so this is unverifiable -> blocked, like any other timeout.
-        raise TimeoutError(f"DNS resolver saturated; {hostname!r} not resolved within {timeout}s")
+        raise ResolverSaturatedError(f"DNS resolver saturated; {hostname!r} not resolved within {timeout}s")
     try:
         future = _resolver_pool.submit(socket.getaddrinfo, hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
     except BaseException:
@@ -153,10 +187,10 @@ def _ip_literal(hostname: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address 
         return None
 
 
-def _resolved_ip_is_private(hostname: str) -> bool:
-    """Resolve a hostname and check if any resulting IP is private/reserved.
+def _classify_hostname(hostname: str) -> _Destination:
+    """Resolve a hostname and say what it points at.
 
-    Returns True on DNS resolution failure (fail-closed): a host we cannot
+    ``UNRESOLVABLE`` on DNS resolution failure (fail-closed): a host we cannot
     resolve cannot be verified as public, so we treat it as blocked rather
     than silently allowing it. This also closes one DNS-rebinding variant
     where resolution fails at check time but later succeeds (to a private
@@ -165,33 +199,61 @@ def _resolved_ip_is_private(hostname: str) -> bool:
 
     DNS resolution is bounded by ``_RESOLVE_TIMEOUT`` (OVH-148): a slow lookup
     times out and is treated as unverifiable (blocked) rather than hanging.
+
+    Raises :class:`ResolverSaturatedError` when the lookup never ran because no
+    resolver slot came free — the one outcome that is not about this host.
     """
     try:
         infos = _getaddrinfo_bounded(hostname, _RESOLVE_TIMEOUT)
-        return any(_addr_or_mapped_is_private(ipaddress.ip_address(sockaddr[0])) for *_head, sockaddr in infos)
+        private = any(_addr_or_mapped_is_private(ipaddress.ip_address(sockaddr[0])) for *_head, sockaddr in infos)
     except (socket.gaierror, ValueError, OSError):
         # Fail closed: an unresolvable host cannot be verified as public.
         # TimeoutError (raised by _getaddrinfo_bounded) is an OSError subclass,
         # so a bounded-out slow resolver also lands here and is treated as blocked.
+        return _Destination.UNRESOLVABLE
+    return _Destination.PRIVATE if private else _Destination.PUBLIC
+
+
+def _resolved_ip_is_private(hostname: str) -> bool:
+    """``_classify_hostname`` as the bool that :func:`is_private_url` needs."""
+    try:
+        return _classify_hostname(hostname) is not _Destination.PUBLIC
+    except ResolverSaturatedError:
         return True
+
+
+def _classify_url(url: str) -> _Destination:
+    """Classify a URL's destination. Raises :class:`ResolverSaturatedError`.
+
+    Three layers, cheapest first: the ``localhost`` name, a complete IP literal
+    classified by ``ipaddress``, and otherwise DNS resolution of the name. A URL
+    with no host at all resolves to nothing and reaches nothing, so it is not
+    treated as private; the shape gate for that is :func:`is_absolute_http_url`.
+    """
+    parsed = urlparse(url)
+    netloc = parsed.hostname or parsed.netloc
+    if not netloc:
+        return _Destination.PUBLIC
+    if _LOCALHOST_RE.match(netloc):
+        return _Destination.PRIVATE
+    literal = _ip_literal(netloc)
+    if literal is not None:
+        return _Destination.PRIVATE if _addr_or_mapped_is_private(literal) else _Destination.PUBLIC
+    return _classify_hostname(netloc)
 
 
 def is_private_url(url: str) -> bool:
     """Check if a URL points to a private/reserved network address.
 
-    Three layers, cheapest first: the ``localhost`` name, a complete IP literal
-    classified by ``ipaddress``, and otherwise DNS resolution of the name.
+    Total: a saturated resolver is unverifiable and therefore blocked, same as an
+    unresolvable host. Call sites that must tell "we could not check" apart from
+    "we checked" use :func:`_classify_url` and handle
+    :class:`ResolverSaturatedError` themselves.
     """
-    parsed = urlparse(url)
-    netloc = parsed.hostname or parsed.netloc
-    if not netloc:
-        return False
-    if _LOCALHOST_RE.match(netloc):
+    try:
+        return _classify_url(url) is not _Destination.PUBLIC
+    except ResolverSaturatedError:
         return True
-    literal = _ip_literal(netloc)
-    if literal is not None:
-        return _addr_or_mapped_is_private(literal)
-    return _resolved_ip_is_private(netloc)
 
 
 def is_absolute_http_url(url: str) -> bool:
@@ -285,9 +347,15 @@ def validate_outbound_url(
     1. the scheme must be http(s);
     2. a private/reserved/unresolvable destination is refused unless
        ``allow_private``;
-    3. with ``require_https``, a PUBLIC destination must use https — an endpoint
-       that carries our own API key must never be reached in cleartext across
-       the internet.
+    3. with ``require_https``, https is required unless the destination actually
+       RESOLVED to a private address — an endpoint that carries our own API key
+       must never be reached in cleartext across the internet.
+
+    Rule 3 turns on the resolution verdict, not on "rule 2 would have blocked
+    it". An unresolvable host is blocked by rule 2 for want of proof, and with
+    ``allow_private`` that block is waived; letting the same missing proof waive
+    rule 3 as well meant one DNS blip put a public endpoint on plain http, and
+    the caller's cache made it permanent.
 
     The two flags are what the three callers actually differ on, and both cases
     are real: ``allow_private=True`` keeps the documented local LLM path working
@@ -296,17 +364,22 @@ def validate_outbound_url(
     is off for notification targets because the webhook sender already accepts
     plain-http public endpoints and this is the SSRF gate, not a transport policy.
 
-    Performs blocking DNS via :func:`is_private_url` — call it through
+    Performs blocking DNS via :func:`_classify_url` — call it through
     ``asyncio.to_thread`` from async code.
     """
     scheme = urlparse(url).scheme
     if scheme not in ("http", "https"):
         raise ValueError(f"{purpose} must be an http(s) URL, got scheme {scheme!r}")
-    private = is_private_url(url)
-    if private and not allow_private:
+    try:
+        destination = _classify_url(url)
+    except ResolverSaturatedError:
+        # Nothing was asked of DNS, so nothing is known: the same standing as a
+        # host that would not resolve, and refused by the same rules.
+        destination = _Destination.UNRESOLVABLE
+    if destination is not _Destination.PUBLIC and not allow_private:
         raise ValueError(f"{purpose} points to a private/reserved address or could not be resolved")
-    if require_https and scheme != "https" and not private:
-        raise ValueError(f"{purpose} would be sent in cleartext to a public host; use https")
+    if require_https and scheme != "https" and destination is not _Destination.PRIVATE:
+        raise ValueError(f"{purpose} would be sent in cleartext to a host that is not private; use https")
 
 
 class PrivateRedirectError(httpx.HTTPError):
@@ -337,27 +410,106 @@ class ResponseTooLargeError(httpx.HTTPError):
 # decompress already-decompressed bytes; the lengths are recomputed from the body.
 _BODY_FRAMING_HEADERS = frozenset({"content-encoding", "content-length", "transfer-encoding"})
 
+# Content codecs we can decode under a hard output bound. ``zlib`` is the only
+# incremental decompressor whose API takes a ``max_length``; anything else httpx
+# would hand a whole raw chunk to an unbounded ``decompress()``. ``deflate`` is
+# zlib-wrapped or raw in the wild, so both window sizes are tried in httpx's own
+# order. Any other codec is passed through undecoded -- which is what httpx itself
+# does with an encoding it has no decoder for, and what our own Accept-Encoding
+# means we should never be sent.
+_BOUNDED_CODECS: dict[str, tuple[int, ...]] = {
+    "gzip": (zlib.MAX_WBITS | 16,),
+    "deflate": (zlib.MAX_WBITS, -zlib.MAX_WBITS),
+}
+
+
+class _BoundedZlibDecoder:
+    """Incremental gzip/deflate decoder that cannot allocate past a budget.
+
+    httpx decodes with ``zlib.decompressobj().decompress(data)`` -- no
+    ``max_length`` -- so the entire expansion of one 64 KiB raw chunk is
+    materialised inside a single iteration step, before any caller-side counter
+    can run. Passing ``max_length`` makes the caller's remaining budget the real
+    ceiling on every allocation. Output past the budget is simply not produced;
+    the caller raises rather than resuming, so the dropped ``unconsumed_tail`` is
+    never wanted.
+    """
+
+    def __init__(self, wbits: tuple[int, ...]) -> None:
+        self._decompressor = zlib.decompressobj(wbits[0])
+        self._fallback = wbits[1:]
+
+    def decompress(self, data: bytes, max_length: int) -> bytes:
+        # The alternate window size is only ever tried on the first chunk, as in
+        # httpx: retrying mid-stream would decode from a reset dictionary.
+        fallback, self._fallback = self._fallback, ()
+        try:
+            return self._decompressor.decompress(data, max_length)
+        except zlib.error as exc:
+            if not fallback:
+                raise httpx.DecodingError(str(exc)) from exc
+            try:
+                self._decompressor = zlib.decompressobj(fallback[0])
+                return self._decompressor.decompress(data, max_length)
+            except zlib.error as retry_exc:
+                raise httpx.DecodingError(str(retry_exc)) from retry_exc
+
 
 async def _read_capped(response: httpx.Response, request: httpx.Request, max_bytes: int) -> httpx.Response:
     """Buffer a streamed response body, aborting once it exceeds ``max_bytes``.
 
-    Counts DECODED bytes, so a small compressed body that expands to gigabytes is
-    stopped at the same budget as a plainly large one. The connection is closed as
-    soon as the budget is crossed, so the rest of a hostile body is never pulled.
+    Bounds the bytes on the wire AND the DECODED bytes at ``max_bytes``, so a
+    small compressed body that would expand to gigabytes is stopped at the same
+    budget as a plainly large one -- and stopped INSIDE the decoder rather than
+    after it, because counting between chunks cannot bound a decompressor that is
+    itself unbounded. The wire bound also stops a stream that decodes to nothing
+    (empty deflate blocks) from being read forever. The connection is closed as
+    soon as either budget is crossed, so the rest of a hostile body is never
+    pulled.
+
+    Stacked ``Content-Encoding`` (``gzip, gzip, gzip``) is refused outright: httpx
+    answers it with a MultiDecoder whose layers multiply -- 298 bytes on the wire
+    reached gigabytes -- and no legitimate publisher nests compression.
 
     Returns an equivalent non-streaming response, because every caller reads
     ``.text`` / ``.content`` after the fact.
     """
+    codecs = [value.strip().lower() for value in response.headers.get_list("content-encoding", split_commas=True)]
+    codecs = [value for value in codecs if value and value != "identity"]
+    if len(codecs) > 1:
+        await response.aclose()
+        raise ResponseTooLargeError(f"Stacked content-encoding refused: {redact_url(str(request.url))}")
+    wbits = _BOUNDED_CODECS.get(codecs[0]) if codecs else None
+    decoder = _BoundedZlibDecoder(wbits) if wbits is not None else None
+
+    oversize = f"Response body exceeded the {max_bytes}-byte limit: {redact_url(str(request.url))}"
     chunks: list[bytes] = []
     total = 0
+    wire_total = 0
     try:
-        async for chunk in response.aiter_bytes():
-            total += len(chunk)
+        if response.is_stream_consumed:
+            # The transport handed back a body httpx had already buffered and
+            # decoded -- it does that for any response built from in-memory
+            # content. There is no stream left to bound, so the size check is all
+            # that remains. A live transport always streams here.
+            chunks.append(response.content)
+            total = len(response.content)
             if total > max_bytes:
-                raise ResponseTooLargeError(
-                    f"Response body exceeded the {max_bytes}-byte limit: {redact_url(str(request.url))}"
-                )
-            chunks.append(chunk)
+                raise ResponseTooLargeError(oversize)
+        else:
+            async for raw in response.aiter_raw():
+                wire_total += len(raw)
+                if wire_total > max_bytes:
+                    raise ResponseTooLargeError(oversize)
+                # ``total <= max_bytes`` here, so max_length is >= 1 -- a zlib
+                # max_length of 0 would mean "unbounded". The extra byte is what
+                # makes crossing the budget observable.
+                decoded = decoder.decompress(raw, max_bytes - total + 1) if decoder is not None else raw
+                total += len(decoded)
+                if total > max_bytes:
+                    raise ResponseTooLargeError(oversize)
+                if decoded:
+                    chunks.append(decoded)
     finally:
         await response.aclose()
 
@@ -382,10 +534,11 @@ async def safe_send(
 ) -> httpx.Response:
     """Send a request, manually following redirects with per-hop SSRF checks.
 
-    The client MUST be configured with ``follow_redirects=False`` (the default
-    of this helper assumes httpx will not auto-follow). Each redirect target is
-    validated with :func:`is_private_url` BEFORE the next hop is sent, so an
-    attacker-controlled public host cannot 3xx-redirect into loopback/RFC-1918.
+    Every hop is sent with ``follow_redirects=False`` regardless of how the client
+    was configured, so the per-hop checks cannot be lost to a caller's client
+    setting. Each redirect target is validated with :func:`is_private_url` BEFORE
+    the next hop is sent, so an attacker-controlled public host cannot 3xx-redirect
+    into loopback/RFC-1918.
 
     The initial request URL is validated with the SAME scheme + private-host
     checks as every redirect hop BEFORE the first send (OVH-140), so a caller
@@ -403,20 +556,29 @@ async def safe_send(
     different origin; rebuilding from ``request.headers`` forwarded all three.
 
     Raises :class:`PrivateRedirectError` if the initial URL or any redirect
-    target is private/non-http(s), or if the redirect limit is exceeded, and
-    :class:`ResponseTooLargeError` if the body exceeds ``max_bytes``.
+    target is private/non-http(s), or if the redirect limit is exceeded,
+    :class:`ResponseTooLargeError` if the body exceeds ``max_bytes``, and
+    :class:`ResolverSaturatedError` if no resolver slot came free — kept separate
+    so a caller that keeps a failure streak does not charge it to the host.
     """
     initial_url = str(request.url)
     if urlparse(initial_url).scheme not in ("http", "https"):
         logger.warning("Blocked request to non-http(s) URL: %s", redact_url(initial_url))
         raise PrivateRedirectError(f"Non-http(s) scheme blocked: {redact_url(initial_url)}")
-    # is_private_url does blocking DNS; offload so the event loop is not stalled.
-    if await asyncio.to_thread(is_private_url, initial_url):
+    # Classification does blocking DNS; offload so the event loop is not stalled.
+    # _classify_url rather than is_private_url so a saturated resolver -- which is
+    # about us, not about this host -- leaves as its own error instead of being
+    # flattened into "this URL is private".
+    if await asyncio.to_thread(_classify_url, initial_url) is not _Destination.PUBLIC:
         logger.warning("Blocked request to private/reserved URL: %s", redact_url(initial_url))
         raise PrivateRedirectError(f"Request to private/reserved address blocked: {redact_url(initial_url)}")
 
     sent = request
-    response = await client.send(sent, stream=True)
+    # follow_redirects is pinned per send, not left to the client: client.send()
+    # inherits client.follow_redirects, and a caller that built its client without
+    # the flag had httpx follow the chain internally -- next_request stays None and
+    # the loop below returns the final (possibly private) body as a normal result.
+    response = await client.send(sent, stream=True, follow_redirects=False)
     redirects = 0
     while True:
         next_request = response.next_request
@@ -430,7 +592,12 @@ async def safe_send(
             await response.aclose()
             logger.warning("Blocked redirect to non-http(s) URL: %s", redact_url(next_url))
             raise PrivateRedirectError(f"Redirect to non-http(s) scheme blocked: {redact_url(next_url)}")
-        if await asyncio.to_thread(is_private_url, next_url):
+        try:
+            hop = await asyncio.to_thread(_classify_url, next_url)
+        except BaseException:
+            await response.aclose()
+            raise
+        if hop is not _Destination.PUBLIC:
             await response.aclose()
             logger.warning("Blocked redirect to private/reserved URL: %s", redact_url(next_url))
             raise PrivateRedirectError(f"Redirect to private/reserved address blocked: {redact_url(next_url)}")
@@ -441,7 +608,7 @@ async def safe_send(
         # Nothing of the redirect body is read; closing it here discards it.
         await response.aclose()
         sent = next_request
-        response = await client.send(sent, stream=True)
+        response = await client.send(sent, stream=True, follow_redirects=False)
 
 
 async def safe_get(
