@@ -9,7 +9,7 @@ Verifies that:
 
 import logging
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -626,6 +626,135 @@ class TestRevisionsSurviveDedup:
 
         assert len(stored) == 1
         assert stored[0].content_hash != article_identity(original)
+
+
+class TestChurningRevisionStamps:
+    """AUG-320: a revision claim costs a row only when the body actually changed.
+
+    Putting the source's ``updated`` stamp in the article identity made every
+    distinct value a distinct article, so ``UNIQUE(topic_id, content_hash)``
+    stopped collapsing repeats of one story. A feed that advances the stamp on
+    every poll — an Atom generator writing feed build time, a CMS touching the
+    modification date on republish — then stored the same article again on every
+    check and ran a novelty analysis for it, forever.
+    """
+
+    _URL = "https://publisher.example/live-story"
+    _TITLE = "Minister resigns"
+    _BODY = "The minister resigned this morning."
+    _PUBLISHED = datetime(2025, 1, 1, 9, 0, tzinfo=UTC)
+
+    def _entry(self, **kwargs) -> FeedEntry:
+        fields = {
+            "title": self._TITLE,
+            "url": self._URL,
+            "summary": "Summary text",
+            "source_feed": "https://publisher.example/rss",
+            "published": self._PUBLISHED,
+        }
+        fields.update(kwargs)
+        return FeedEntry(**fields)
+
+    async def _run(self, topic: Topic, db_path: Path, entry: FeedEntry, body: str) -> list[Article]:
+        with (
+            patch(
+                "app.scraping.fetch_feeds_for_topic",
+                return_value=FeedResponse(entries=[entry], provider_name="bing_news"),
+            ),
+            patch("app.scraping.extract_article_content", AsyncMock(return_value=body)),
+        ):
+            return (await fetch_new_articles_for_topic(topic, db_path=db_path)).articles
+
+    def _stored_count(self, conn: sqlite3.Connection, topic_id: int) -> int:
+        return conn.execute("SELECT COUNT(*) FROM articles WHERE topic_id = ?", (topic_id,)).fetchone()[0]
+
+    async def test_a_stamp_that_advances_every_poll_stores_one_row(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        topic = _make_topic(db_conn, "Topic A")
+        assert len(await self._run(topic, db_path, self._entry(), self._BODY)) == 1
+
+        for minutes in (15, 30, 45):
+            stamp = self._PUBLISHED + timedelta(minutes=minutes)
+            assert await self._run(topic, db_path, self._entry(updated=stamp), self._BODY) == []
+
+        assert self._stored_count(db_conn, topic.id) == 1
+
+    async def test_a_changed_body_under_a_moving_stamp_still_reaches_analysis(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        topic = _make_topic(db_conn, "Topic A")
+        assert len(await self._run(topic, db_path, self._entry(), self._BODY)) == 1
+
+        stamp = self._PUBLISHED + timedelta(hours=5)
+        revised = await self._run(topic, db_path, self._entry(updated=stamp), "Correction: he did not resign.")
+
+        assert len(revised) == 1
+        assert revised[0].raw_content == "Correction: he did not resign."
+
+
+class TestSearchResultsDedupAgainstFeeds:
+    """AUG-180/AUG-320: prefetched text is how a search source delivers, not a claim.
+
+    Every Exa result carries the page text, so treating that text as evidence of a
+    revision left the story rule dead for Exa: a topic switching between feed and
+    search modes re-stored, re-analysed and re-notified on stories it already had.
+    """
+
+    _URL = "https://publisher.example/the-story"
+    _TITLE = "The Story"
+
+    def _store_feed_row(self, conn: sqlite3.Connection, topic_id: int) -> None:
+        create_article(
+            conn,
+            Article(
+                topic_id=topic_id,
+                title=self._TITLE,
+                url=self._URL,
+                content_hash=compute_article_hash(self._URL, self._TITLE),
+                raw_content="The body as the publisher page extracted.",
+                source_feed="https://www.bing.com/news/search?q=x&format=rss",
+                source_provider="bing_news",
+            ),
+        )
+        conn.commit()
+
+    async def _run_exa(self, topic: Topic, db_path: Path, text: str) -> list[Article]:
+        entry = FeedEntry(title=self._TITLE, url=self._URL, summary="", source_feed="exa", content=text)
+        with (
+            patch(
+                "app.scraping.fetch_feeds_for_topic",
+                return_value=FeedResponse(entries=[entry], provider_name="exa"),
+            ),
+            patch("app.scraping.extract_article_content", AsyncMock(return_value=text)),
+        ):
+            return (await fetch_new_articles_for_topic(topic, db_path=db_path)).articles
+
+    async def test_a_search_hit_on_a_story_the_feed_stored_is_skipped(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        topic = _make_topic(db_conn, "Topic A")
+        self._store_feed_row(db_conn, topic.id)
+
+        assert await self._run_exa(topic, db_path, "The search engine's own extraction of that page.") == []
+
+    async def test_a_rewritten_search_body_is_still_stored(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
+        """The claim holds against a body the same source produced earlier."""
+        topic = _make_topic(db_conn, "Topic A")
+        assert len(await self._run_exa(topic, db_path, "First account of the story.")) == 1
+
+        rewritten = await self._run_exa(topic, db_path, "Correction: no resignation took place.")
+
+        assert len(rewritten) == 1
+        assert rewritten[0].raw_content == "Correction: no resignation took place."
+
+    async def test_a_repeated_search_hit_stores_nothing_further(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        topic = _make_topic(db_conn, "Topic A")
+        text = "First account of the story."
+        assert len(await self._run_exa(topic, db_path, text)) == 1
+        assert await self._run_exa(topic, db_path, text) == []
 
 
 # ============================================================

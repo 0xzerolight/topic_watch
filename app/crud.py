@@ -432,6 +432,29 @@ def list_article_dedup_keys(conn: sqlite3.Connection, topic_id: int) -> list[tup
     return [(row["content_hash"], row["url"], row["title"]) for row in rows]
 
 
+def list_article_bodies_for_urls(
+    conn: sqlite3.Connection, topic_id: int, urls: list[str]
+) -> list[tuple[str, str, str | None, str | None]]:
+    """Return ``(url, title, raw_content, source_provider)`` for a topic's rows at these URLs.
+
+    The bodies a topic already holds are what tells a genuine revision from a
+    source that merely moved its ``updated`` stamp again, so dedup reads them for
+    the handful of URLs actually under contest rather than for the whole
+    retention window. ``source_provider`` comes along because a body a source
+    handed over pre-extracted is only comparable with bodies from that same
+    source.
+    """
+    unique = list(dict.fromkeys(urls))
+    if not unique:
+        return []
+    placeholders = ",".join("?" * len(unique))
+    rows = conn.execute(
+        f"SELECT url, title, raw_content, source_provider FROM articles WHERE topic_id = ? AND url IN ({placeholders})",  # noqa: S608 - placeholders only, values are bound
+        [topic_id, *unique],
+    ).fetchall()
+    return [(row["url"], row["title"], row["raw_content"], row["source_provider"]) for row in rows]
+
+
 def topic_has_articles_from_feed(conn: sqlite3.Connection, topic_id: int, feed_url: str) -> bool:
     """True when this topic already stores at least one article from this feed.
 
