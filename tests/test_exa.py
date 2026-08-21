@@ -156,6 +156,44 @@ class TestFetchExaEntries:
         assert resp.entries == []
         assert resp.feeds_total == 1 and resp.feeds_failed == 0
 
+    async def test_a_batch_with_no_usable_result_is_a_failure(self) -> None:
+        """AUG-307: rows that all fail to map are a protocol failure, not quiet news.
+
+        Recorded as success it reset the source's failure state and told the
+        silence heartbeat this was a healthy empty check, while monitoring
+        received nothing at all.
+        """
+        recorder = _Recorder()
+        transport = _exa_response([{"title": "no url"}, "not-a-dict"])
+        async with httpx.AsyncClient(transport=transport) as client:
+            resp = await fetch_exa_entries(
+                _EXA_TOPIC, _ENABLED, max_results=5, timeout=5.0, client=client, health_callback=recorder
+            )
+        assert resp.entries == []
+        assert resp.feeds_total == 1 and resp.feeds_failed == 1
+        assert [c.status for c in recorder.calls] == [FetchStatus.FAILED]
+
+    async def test_a_malformed_envelope_is_one_failed_fetch(self) -> None:
+        """AUG-174: schema drift is recorded, never raised out of a never-raises call.
+
+        ``results: null`` used to raise during iteration and take the whole check
+        down; a non-object envelope or a non-list ``results`` was accepted and
+        cleared the source's failure state with no articles to show for it.
+        """
+        for payload in ({"results": None}, ["not", "an", "object"], {"results": "rows"}, {"results": {"a": 1}}):
+            recorder = _Recorder()
+
+            def handler(request: httpx.Request, body: object = payload) -> httpx.Response:
+                return httpx.Response(200, json=body)
+
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                resp = await fetch_exa_entries(
+                    _EXA_TOPIC, _ENABLED, max_results=5, timeout=5.0, client=client, health_callback=recorder
+                )
+            assert resp.entries == [], payload
+            assert resp.feeds_failed == 1, payload
+            assert [c.status for c in recorder.calls] == [FetchStatus.FAILED], payload
+
     async def test_date_mix_flows_through_select_candidates(self) -> None:
         """Mixed publishedDate shapes all normalize so recency sort never raises (load-bearing)."""
         from app.scraping import _prepare_entries, _select_candidates
