@@ -460,6 +460,36 @@ def list_articles_for_topic(
     return [Article.from_row(row) for row in rows]
 
 
+def list_article_headers_for_topic(
+    conn: sqlite3.Connection,
+    topic_id: int,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[Article]:
+    """List articles for a topic without hydrating ``raw_content`` (AUG-038).
+
+    Topic detail renders only title/url/source/provider/timestamps, but the
+    full-row ``list_articles_for_topic`` (``SELECT *``) hydrates every capped
+    ``raw_content`` body regardless — up to ~1MB of text the page discards
+    immediately at the supported 200-row page size. This is that path's
+    metadata-only counterpart; ``list_articles_for_topic`` stays exclusively for
+    exports and the analysis pipeline, which need the body text. Returned
+    ``Article`` objects carry ``raw_content=None`` (the model's default) — never
+    render it from this path.
+    """
+    query = (
+        "SELECT id, topic_id, title, url, content_hash, source_feed, source_provider, "
+        "published_at, fetched_at, processed, analysis_attempts "
+        "FROM articles WHERE topic_id = ? ORDER BY fetched_at DESC"
+    )
+    params: list = [topic_id]
+    if limit is not None:
+        query += " LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+    rows = conn.execute(query, params).fetchall()
+    return [Article.from_row(row) for row in rows]
+
+
 def count_articles_for_topic(conn: sqlite3.Connection, topic_id: int) -> int:
     """Count total articles for a topic."""
     row = conn.execute("SELECT COUNT(*) FROM articles WHERE topic_id = ?", (topic_id,)).fetchone()
@@ -855,6 +885,36 @@ def mark_latest_check_seen(conn: sqlite3.Connection, topic_id: int) -> None:
           AND seen_at IS NULL
         """,
         (datetime.now(UTC).isoformat(), topic_id),
+    )
+
+
+def mark_check_seen(conn: sqlite3.Connection, topic_id: int, check_id: int) -> None:
+    """Stamp ``seen_at`` on one specific check result (TW-AUD-024).
+
+    Companion to :func:`mark_latest_check_seen`, keyed to an explicit ``check_id``
+    instead of "whichever row is latest right now". The detail GET route no
+    longer mutates on read (a prefetch, retry, or failed render used to clear the
+    dashboard badge before the user ever saw the detail); this is called instead,
+    once the page has actually rendered, acknowledging the exact check it
+    displayed. The extra ``id =`` subquery guard means a check that lands after
+    render is never silently marked seen by a late-arriving ack for a stale page.
+    Same ``has_new_info`` / ``seen_at IS NULL`` guards as the sibling function
+    keep re-acks a no-op. The caller commits.
+    """
+    conn.execute(
+        """
+        UPDATE check_results SET seen_at = ?
+        WHERE id = ?
+          AND topic_id = ?
+          AND has_new_info = 1
+          AND seen_at IS NULL
+          AND id = (
+              SELECT id FROM check_results
+              WHERE topic_id = ?
+              ORDER BY checked_at DESC LIMIT 1
+          )
+        """,
+        (datetime.now(UTC).isoformat(), check_id, topic_id, topic_id),
     )
 
 

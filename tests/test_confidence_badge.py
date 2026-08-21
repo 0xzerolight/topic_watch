@@ -66,6 +66,37 @@ def test_json_missing_confidence_key_returns_dash():
     assert result == "-"
 
 
+# AUG-215: json.loads() accepts arrays, scalars, booleans, and null, not just
+# objects. .get() on any of those raises AttributeError instead of degrading to
+# "-" like _importance_score() already does; a legacy/corrupt llm_response row
+# could turn the check-history page into a 500.
+
+
+def test_json_array_returns_dash():
+    result = _confidence_badge(json.dumps([0.9, 0.5]))
+    assert result == "-"
+
+
+def test_json_string_returns_dash():
+    result = _confidence_badge(json.dumps("not an object"))
+    assert result == "-"
+
+
+def test_json_number_returns_dash():
+    result = _confidence_badge(json.dumps(0.9))
+    assert result == "-"
+
+
+def test_json_bool_returns_dash():
+    result = _confidence_badge(json.dumps(True))
+    assert result == "-"
+
+
+def test_json_null_returns_dash():
+    result = _confidence_badge(json.dumps(None))
+    assert result == "-"
+
+
 def test_html_structure_span_tag():
     data = {"confidence": 0.75}
     result = _confidence_badge(json.dumps(data))

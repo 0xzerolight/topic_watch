@@ -24,10 +24,10 @@ from app.crud import (
     get_previous_knowledge_revision,
     get_topic,
     get_topic_by_name,
-    list_articles_for_topic,
+    list_article_headers_for_topic,
     list_check_results,
     list_knowledge_revision_headers,
-    mark_latest_check_seen,
+    mark_check_seen,
     sum_check_tokens,
     update_topic,
     update_topic_config,
@@ -174,12 +174,19 @@ async def create_topic_handler(
     return RedirectResponse(url=f"/topics/{created.id}", status_code=303)
 
 
-def _feed_source_context(conn: sqlite3.Connection, topic: Topic) -> dict:
+def _feed_source_context(conn: sqlite3.Connection, topic: Topic, topic_id: int) -> dict:
     """Feed Source section context, shared by the detail page and its poll endpoint.
 
     Single source for auto_feed_url / auto_feed_urls / feed_health_map so the full-page
     render (topic_detail) and the /feed-source HTMX fragment can never drift. Mirrors the
-    _topic_row_context anti-drift helper (OVH-154).
+    _topic_row_context anti-drift helper (OVH-154). Takes ``topic_id`` explicitly
+    (rather than ``topic.id``, which is Optional) like that helper does.
+
+    Also carries ``latest_check`` (AUG-224): the "sources failing" callout used to
+    read ``checks[0]`` from the paginated, load-time history and only render on
+    page 1, so it vanished on older pages and never updated after a later check
+    failed or recovered while the tab stayed open. Querying it here instead means
+    it renders on every page and refreshes on this fragment's own 30s poll cadence.
     """
     auto_feed_url = None
     auto_feed_urls: list[str] = []
@@ -198,10 +205,13 @@ def _feed_source_context(conn: sqlite3.Connection, topic: Topic) -> dict:
             if health:
                 feed_health_map[url] = health
 
+    latest_checks = list_check_results(conn, topic_id, limit=1)
+
     return {
         "auto_feed_url": auto_feed_url,
         "auto_feed_urls": auto_feed_urls,
         "feed_health_map": feed_health_map,
+        "latest_check": latest_checks[0] if latest_checks else None,
     }
 
 
@@ -220,12 +230,12 @@ async def topic_detail(
     if topic is None:
         raise HTTPException(status_code=404, detail="Topic not found")
 
-    # Reading the detail page acknowledges the latest check's new info: clear the
-    # dashboard "new info" badge. No-op unless the latest check has unseen new info
-    # (guarded in the query). A GET side-effect is accepted here — single-user, no
-    # auth — and matches "clicking the topic and reading it clears the badge".
-    mark_latest_check_seen(conn, topic_id)
-    conn.commit()
+    # TW-AUD-024: no mutation on GET. This used to stamp seen_at (clearing the
+    # dashboard "new info" badge) here, before the reads/render below that can
+    # still fail — a prefetch, retry, or render failure could clear the badge
+    # without the user ever seeing the detail. The page instead fires an
+    # idempotent POST to /checks/{check_id}/seen once it has actually rendered
+    # (see the hidden trigger near Check History), keyed to the displayed check.
 
     per_page = settings.web_page_size
     total_checks = count_check_results(conn, topic_id)
@@ -244,7 +254,9 @@ async def topic_detail(
     revisions = list_knowledge_revision_headers(conn, topic_id, limit=settings.knowledge_revision_limit)
     checks = list_check_results(conn, topic_id, limit=per_page, offset=offset)
     total_prompt_tokens, total_completion_tokens = sum_check_tokens(conn, topic_id)
-    articles = list_articles_for_topic(conn, topic_id, limit=per_page)
+    # AUG-038: metadata only — the template never renders raw_content, so this
+    # path stops hydrating it (list_articles_for_topic stays for exports/analysis).
+    articles = list_article_headers_for_topic(conn, topic_id, limit=per_page)
     article_count = count_articles_for_topic(conn, topic_id)
 
     formatted = format_interval(topic.check_interval_minutes) if topic.check_interval_minutes else ""
@@ -267,9 +279,27 @@ async def topic_detail(
             "total_completion_tokens": total_completion_tokens,
             "global_confidence_threshold": settings.min_confidence_threshold,
             "global_relevance_threshold": settings.min_relevance_threshold,
-            **_feed_source_context(conn, topic),
+            **_feed_source_context(conn, topic, topic_id),
         },
     )
+
+
+@router.post("/topics/{topic_id}/checks/{check_id}/seen", dependencies=[Depends(verify_csrf)])
+async def mark_check_seen_handler(
+    topic_id: int,
+    check_id: int,
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
+) -> Response:
+    """Acknowledge one displayed check result (TW-AUD-024).
+
+    Fired by the detail page itself once its content has rendered (see the
+    hidden ``hx-trigger="load"`` element near Check History) instead of the old
+    GET-time mutation. Idempotent and keyed to ``check_id``: a stale page (a
+    newer check has since landed) is a no-op rather than acking the wrong row.
+    """
+    mark_check_seen(conn, topic_id, check_id)
+    conn.commit()
+    return Response(status_code=204)
 
 
 @router.get("/topics/{topic_id}/status", response_class=HTMLResponse)
@@ -391,7 +421,7 @@ async def topic_feed_source(
     return templates.TemplateResponse(
         request,
         "_feed_source.html",
-        {"topic": topic, **_feed_source_context(conn, topic)},
+        {"topic": topic, **_feed_source_context(conn, topic, topic_id)},
     )
 
 
