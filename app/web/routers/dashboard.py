@@ -11,6 +11,7 @@ from app.crud import (
     search_dashboard_data,
 )
 from app.models import normalize_tag
+from app.scheduler import scheduler_health
 from app.web.dependencies import get_db_conn
 from app.web.routers.templates import templates
 
@@ -23,9 +24,18 @@ _MAX_DASHBOARD_MSG_LEN = 300
 
 @router.get("/health")
 async def health_check(conn: sqlite3.Connection = Depends(get_db_conn, scope="function")):
-    """Health check endpoint for load balancers and container orchestrators."""
+    """Health check endpoint for load balancers and container orchestrators.
+
+    ``status`` stays liveness — this process answered, and its database is
+    reachable. The ``scheduler`` block reports whether background monitoring is
+    actually happening: a process whose check cycle had been failing every
+    minute for days used to report a bare ``ok``, because every scheduled
+    callback catches its own failures and returns normally (TW-AUD-008). The
+    status code is deliberately unchanged by it, so a container healthcheck
+    never restarts a serviceable web process over a feed outage.
+    """
     topic_count = conn.execute("SELECT COUNT(*) FROM topics").fetchone()[0]
-    return {"status": "ok", "topics": topic_count}
+    return {"status": "ok", "topics": topic_count, "scheduler": scheduler_health()}
 
 
 @router.get("/", response_class=HTMLResponse)
