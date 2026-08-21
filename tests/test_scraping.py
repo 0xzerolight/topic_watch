@@ -3086,31 +3086,71 @@ class TestCandidateSelection:
 
         assert [a.url for a in stored] == ["https://e.example/dated"]
 
-    async def test_an_undated_feed_does_not_starve_a_dated_one(
+    async def test_a_wholly_dateless_feed_costs_the_cap_once_not_forever(
         self, db_conn: sqlite3.Connection, db_path: Path
     ) -> None:
-        """AUG-184: an undated archive feed must not own the cap every check.
+        """AUG-184: a dateless archive feed takes the cap, then stops competing.
 
-        Ranking every undated entry at retrieval time put a whole dateless feed
-        above genuinely breaking news, which is the failure the missing-date rule
-        was supposed to prevent, in the other direction.
+        Ranking its entries at year 1 read as fair to breaking news and was not:
+        a busy dated feed sharing the cap kept every slot on every check, so a
+        feed the user configured delivered nothing at all. At retrieval time the
+        archive leads once; those entries are stored on that check and dedup out
+        of the next one, which hands the cap back to the dated feed.
         """
         topic = self._topic(db_conn)
+        archive = [
+            FeedEntry(title=f"Archive {i}", url=f"https://e.example/a{i}", summary="s", source_feed="archive")
+            for i in range(3)
+        ]
+
+        def batch() -> list[FeedEntry]:
+            return [
+                *archive,
+                FeedEntry(
+                    title="Breaking",
+                    url="https://e.example/breaking",
+                    summary="s",
+                    source_feed="news",
+                    published=datetime.now(UTC) - timedelta(minutes=5),
+                ),
+            ]
+
+        first = await self._store(topic, db_path, batch(), max_articles=3)
+        assert sorted(a.url for a in first) == [
+            "https://e.example/a0",
+            "https://e.example/a1",
+            "https://e.example/a2",
+        ]
+
+        second = await self._store(topic, db_path, batch(), max_articles=3)
+        assert [a.url for a in second] == ["https://e.example/breaking"]
+
+    async def test_a_dateless_feed_is_not_starved_by_a_busy_dated_one(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """AUG-184: a feed with no dates anywhere still reaches the cap it shares."""
+        topic = self._topic(db_conn)
+        now = datetime.now(UTC)
         entries = [
             FeedEntry(title=f"Archive {i}", url=f"https://e.example/a{i}", summary="s", source_feed="archive")
             for i in range(3)
         ] + [
             FeedEntry(
-                title="Breaking",
-                url="https://e.example/breaking",
+                title=f"News {i}",
+                url=f"https://e.example/n{i}",
                 summary="s",
                 source_feed="news",
-                published=datetime.now(UTC) - timedelta(minutes=5),
+                published=now - timedelta(minutes=i),
             )
+            for i in range(10)
         ]
-        stored = await self._store(topic, db_path, entries, max_articles=1)
+        stored = await self._store(topic, db_path, entries, max_articles=10)
 
-        assert [a.url for a in stored] == ["https://e.example/breaking"]
+        assert sorted(a.url for a in stored if a.source_feed == "archive") == [
+            "https://e.example/a0",
+            "https://e.example/a1",
+            "https://e.example/a2",
+        ]
 
     async def test_an_impossible_date_is_not_stored(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         topic = self._topic(db_conn)
