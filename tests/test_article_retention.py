@@ -143,6 +143,37 @@ class TestDeleteOldArticles:
         assert len(remaining) == 1
         assert remaining[0].content_hash == "hash_boundary_new"
 
+    def test_article_exactly_at_the_cutoff_is_preserved(self, db_conn: sqlite3.Connection, monkeypatch) -> None:
+        """AUG-285: the contract is ``fetched_at < cutoff`` (strict), so a row whose
+        ``fetched_at`` exactly equals the cutoff is kept, not deleted. The test
+        above claims to cover "exactly at cutoff" but only ever inserts at 91/89
+        days, never at equality — freeze the clock so an exact cutoff instant is
+        actually reachable.
+        """
+        import app.crud as crud_mod
+
+        frozen_now = datetime(2025, 6, 15, 12, 0, 0, 500000, tzinfo=UTC)
+
+        class _FrozenClock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return frozen_now
+
+        monkeypatch.setattr(crud_mod, "datetime", _FrozenClock)
+
+        topic = self._make_topic(db_conn)
+        cutoff = frozen_now - timedelta(days=90)
+        _insert_article(db_conn, topic.id, "just_older", cutoff - timedelta(microseconds=1))
+        _insert_article(db_conn, topic.id, "at_cutoff", cutoff)
+        _insert_article(db_conn, topic.id, "just_newer", cutoff + timedelta(microseconds=1))
+
+        deleted = delete_old_articles(db_conn, retention_days=90)
+        db_conn.commit()
+
+        assert deleted == 1  # only the row strictly older than the cutoff
+        remaining = {a.content_hash for a in list_articles_for_topic(db_conn, topic.id)}
+        assert remaining == {"hash_at_cutoff", "hash_just_newer"}
+
     def test_boundary_offset_iso_timestamps(self, db_conn: sqlite3.Connection) -> None:
         """OVH-022/050: tz-aware ISO timestamps compare correctly at sub-day grain.
 

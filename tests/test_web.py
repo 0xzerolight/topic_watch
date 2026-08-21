@@ -284,6 +284,22 @@ class TestDashboard:
         assert "tag: detailTarget.id" in response.text
         assert 'tag: "topic-watch"' not in response.text
 
+    async def test_dashboard_shows_msg_banner(self, client: httpx.AsyncClient) -> None:
+        """AUG-197: a successful/partial OPML import summary (redirected to
+        /?msg=...) must actually render — the dashboard used to accept and
+        render only ?error=, discarding every non-error import outcome."""
+        response = await client.get("/?msg=Imported+3+topic(s).")
+        assert response.status_code == 200
+        assert "Imported 3 topic(s)." in response.text
+
+    async def test_search_trigger_reacts_to_paste(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
+        """AUG-226: the search box listens for `input` (fires on a context-menu
+        paste), not just `keyup`/`search`, which paste does not trigger."""
+        _make_topic(db_conn)
+
+        response = await client.get("/")
+        assert "input changed delay:300ms, search" in response.text
+
     async def test_dashboard_opml_file_input_has_accessible_name(self, client: httpx.AsyncClient) -> None:
         """AUG-238: the OPML file picker has a programmatically associated label."""
         response = await client.get("/")
@@ -1817,12 +1833,16 @@ class TestCheckNow:
         assert response.status_code == 200
         assert f'id="topic-{topic.id}"' in response.text
 
-    async def test_check_htmx_row_marks_just_checked(
+    async def test_check_htmx_row_defers_just_checked_until_fresh_result(
         self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
     ) -> None:
-        """OVH-119: a fresh /check HTMX response marks the row data-just-checked so the
-        dashboard notification fires for this swap (but not for unrelated re-renders)."""
+        """AUG-217: the queuing response has not actually re-checked anything yet — the
+        background task hasn't run — so it must not claim data-just-checked. Marking a
+        stale pre-check row as fresh could re-fire a notification for old unseen info
+        while the real completion produced no swap at all. Instead it renders a checking
+        row that polls toward completion."""
         topic = _make_topic(db_conn)
+        create_check_result(db_conn, CheckResult(topic_id=topic.id, has_new_info=True))
 
         with patch("app.web.routers.background._run_single_check", new_callable=AsyncMock):
             response = await client.post(
@@ -1832,7 +1852,52 @@ class TestCheckNow:
             )
 
         assert response.status_code == 200
+        assert 'data-just-checked="true"' not in response.text
+        assert f"/topics/{topic.id}/row?since_check_id=" in response.text
+
+    async def test_check_completion_poll_marks_just_checked_on_new_result(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-217: the checking row's completion poll only marks data-just-checked once
+        a newer check_results row actually exists, and keeps polling (204, no swap)
+        while the background task is still running with no new row yet."""
+        topic = _make_topic(db_conn)
+        baseline = create_check_result(db_conn, CheckResult(topic_id=topic.id))
+        from app.web.state import _checking_state
+
+        await _checking_state.start_check(topic.id)
+        try:
+            response = await client.get(
+                f"/topics/{topic.id}/row?since_check_id={baseline.id}", headers={"HX-Request": "true"}
+            )
+            assert response.status_code == 204
+
+            create_check_result(db_conn, CheckResult(topic_id=topic.id, has_new_info=True))
+        finally:
+            await _checking_state.finish_check(topic.id)
+
+        response = await client.get(
+            f"/topics/{topic.id}/row?since_check_id={baseline.id}", headers={"HX-Request": "true"}
+        )
+        assert response.status_code == 200
         assert 'data-just-checked="true"' in response.text
+
+    async def test_check_completion_poll_stops_without_spinning_forever(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """AUG-217: if the background task is no longer running and produced no newer
+        check (e.g. it crashed before check_topic's transaction committed), the poll
+        must not spin forever — render the row as-is, with no marker and no further
+        poll trigger."""
+        topic = _make_topic(db_conn)
+        baseline = create_check_result(db_conn, CheckResult(topic_id=topic.id))
+
+        response = await client.get(
+            f"/topics/{topic.id}/row?since_check_id={baseline.id}", headers={"HX-Request": "true"}
+        )
+        assert response.status_code == 200
+        assert 'data-just-checked="true"' not in response.text
+        assert "hx-trigger" not in response.text
 
     async def test_check_non_htmx_redirects(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
         """OVH-005: a plain-form /check redirects to the topic detail page (no orphan <tr>)."""

@@ -1,12 +1,18 @@
 """Defensive-loading tests for ``Model.from_row`` methods.
 
-A single malformed/empty cell (from a migration bug, a manual DB edit, or a
-future code bug) must NOT crash the route that loads the row. Each ``from_row``
-must coerce bad JSON/datetime cells to a safe default instead of raising.
+A single malformed/empty *optional* cell (from a migration bug, a manual DB edit,
+or a future code bug) must NOT crash the route that loads the row: bad JSON and
+bad nullable datetimes coerce to a safe default.
+
+A corrupt *required* timestamp is the exception (TW-AUD-013). There is no safe
+default for it — substituting ``now()`` invents a checked_at/created_at the row
+never had, which then drives scheduling, ordering and the UI. Those raise
+``CorruptTimestampError`` instead. Every hydrated datetime is aware UTC, so a
+naive stored value can never reach aware timestamp arithmetic.
 """
 
 import logging
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
@@ -14,6 +20,8 @@ from pydantic import ValidationError
 from app.models import (
     Article,
     CheckResult,
+    CorruptTimestampError,
+    FeedHealth,
     FeedMode,
     KnowledgeRevision,
     KnowledgeRevisionSource,
@@ -71,18 +79,17 @@ class TestTopicFromRow:
         topic = Topic.from_row(row)
         assert topic.tags == []
 
-    def test_empty_created_at_does_not_raise(self) -> None:
+    def test_empty_created_at_raises(self) -> None:
         row = self._base_row()
         row["created_at"] = ""
-        topic = Topic.from_row(row)
-        # created_at is required; corrupt -> default-now rather than crash.
-        assert isinstance(topic.created_at, datetime)
+        with pytest.raises(CorruptTimestampError, match="created_at"):
+            Topic.from_row(row)
 
-    def test_malformed_created_at_does_not_raise(self) -> None:
+    def test_malformed_created_at_raises(self) -> None:
         row = self._base_row()
         row["created_at"] = "not-a-date"
-        topic = Topic.from_row(row)
-        assert isinstance(topic.created_at, datetime)
+        with pytest.raises(CorruptTimestampError, match="created_at"):
+            Topic.from_row(row)
 
     def test_empty_status_changed_at_becomes_none(self) -> None:
         row = self._base_row()
@@ -229,17 +236,17 @@ class TestArticleFromRow:
         assert article.fetched_at.year == 2026
         assert article.processed is False
 
-    def test_empty_fetched_at_does_not_raise(self) -> None:
+    def test_empty_fetched_at_raises(self) -> None:
         row = self._base_row()
         row["fetched_at"] = ""
-        article = Article.from_row(row)
-        assert isinstance(article.fetched_at, datetime)
+        with pytest.raises(CorruptTimestampError, match="fetched_at"):
+            Article.from_row(row)
 
-    def test_malformed_fetched_at_does_not_raise(self) -> None:
+    def test_malformed_fetched_at_raises(self) -> None:
         row = self._base_row()
         row["fetched_at"] = "nope"
-        article = Article.from_row(row)
-        assert isinstance(article.fetched_at, datetime)
+        with pytest.raises(CorruptTimestampError, match="fetched_at"):
+            Article.from_row(row)
 
     def test_published_at_iso_string_round_trips(self) -> None:
         """published_at ISO string deserializes and re-serializes correctly."""
@@ -299,17 +306,17 @@ class TestCheckResultFromRow:
         assert result.has_new_info is True
         assert result.notification_sent is False
 
-    def test_empty_checked_at_does_not_raise(self) -> None:
+    def test_empty_checked_at_raises(self) -> None:
         row = self._base_row()
         row["checked_at"] = ""
-        result = CheckResult.from_row(row)
-        assert isinstance(result.checked_at, datetime)
+        with pytest.raises(CorruptTimestampError, match="checked_at"):
+            CheckResult.from_row(row)
 
-    def test_malformed_checked_at_does_not_raise(self) -> None:
+    def test_malformed_checked_at_raises(self) -> None:
         row = self._base_row()
         row["checked_at"] = "bad"
-        result = CheckResult.from_row(row)
-        assert isinstance(result.checked_at, datetime)
+        with pytest.raises(CorruptTimestampError, match="checked_at"):
+            CheckResult.from_row(row)
 
 
 class TestKnowledgeStateFromRow:
@@ -329,17 +336,17 @@ class TestKnowledgeStateFromRow:
         assert state.updated_at.year == 2026
         assert state.summary_text == "summary"
 
-    def test_empty_updated_at_does_not_raise(self) -> None:
+    def test_empty_updated_at_raises(self) -> None:
         row = self._base_row()
         row["updated_at"] = ""
-        state = KnowledgeState.from_row(row)
-        assert isinstance(state.updated_at, datetime)
+        with pytest.raises(CorruptTimestampError, match="updated_at"):
+            KnowledgeState.from_row(row)
 
-    def test_malformed_updated_at_does_not_raise(self) -> None:
+    def test_malformed_updated_at_raises(self) -> None:
         row = self._base_row()
         row["updated_at"] = "xyz"
-        state = KnowledgeState.from_row(row)
-        assert isinstance(state.updated_at, datetime)
+        with pytest.raises(CorruptTimestampError, match="updated_at"):
+            KnowledgeState.from_row(row)
 
 
 class TestKnowledgeRevisionFromRow:
@@ -361,10 +368,11 @@ class TestKnowledgeRevisionFromRow:
         assert revision.source == KnowledgeRevisionSource.INIT
         assert revision.created_at.year == 2026
 
-    def test_empty_created_at_does_not_raise(self) -> None:
+    def test_empty_created_at_raises(self) -> None:
         row = self._base_row()
         row["created_at"] = ""
-        assert isinstance(KnowledgeRevision.from_row(row).created_at, datetime)
+        with pytest.raises(CorruptTimestampError, match="created_at"):
+            KnowledgeRevision.from_row(row)
 
     def test_unknown_source_degrades_to_update(self, caplog: pytest.LogCaptureFixture) -> None:
         """A value written by a future version must not 500 the detail page."""
@@ -401,17 +409,17 @@ class TestPendingNotificationFromRow:
         assert notif.created_at.year == 2026
         assert notif.title == "title"
 
-    def test_empty_created_at_does_not_raise(self) -> None:
+    def test_empty_created_at_raises(self) -> None:
         row = self._base_row()
         row["created_at"] = ""
-        notif = PendingNotification.from_row(row)
-        assert isinstance(notif.created_at, datetime)
+        with pytest.raises(CorruptTimestampError, match="created_at"):
+            PendingNotification.from_row(row)
 
-    def test_malformed_created_at_does_not_raise(self) -> None:
+    def test_malformed_created_at_raises(self) -> None:
         row = self._base_row()
         row["created_at"] = "???"
-        notif = PendingNotification.from_row(row)
-        assert isinstance(notif.created_at, datetime)
+        with pytest.raises(CorruptTimestampError, match="created_at"):
+            PendingNotification.from_row(row)
 
 
 class TestPendingWebhookFromRow:
@@ -471,11 +479,11 @@ class TestPendingWebhookFromRow:
         assert hook.payload == {}
         assert any("payload" in r.message for r in caplog.records)
 
-    def test_empty_created_at_does_not_raise(self) -> None:
+    def test_empty_created_at_raises(self) -> None:
         row = self._base_row()
         row["created_at"] = ""
-        hook = PendingWebhook.from_row(row)
-        assert isinstance(hook.created_at, datetime)
+        with pytest.raises(CorruptTimestampError, match="created_at"):
+            PendingWebhook.from_row(row)
 
     def test_round_trip_from_row_to_insert_dict(self) -> None:
         hook = PendingWebhook.from_row(self._base_row())
@@ -492,8 +500,15 @@ class TestPendingWebhookFromRow:
         assert reloaded.max_retries == hook.max_retries
 
 
-class TestRequiredDatetimeWarnings:
-    """_coerce_required_dt must log a WARNING for every corrupt/empty/None value."""
+class TestRequiredDatetimeFailsLoud:
+    """TW-AUD-013: a required timestamp cell is never replaced with now(UTC).
+
+    The old behaviour warned and substituted the current time, which is a value
+    the row never held: a check_results row then claims to have run just now, a
+    topic claims to have been created just now, and the scheduler, the ordering
+    and the UI all act on the invented value. The error names the column so the
+    operator can find the row.
+    """
 
     def _topic_row(self, created_at_value: object) -> dict:
         return {
@@ -511,26 +526,90 @@ class TestRequiredDatetimeWarnings:
             "tags": "[]",
         }
 
-    def test_empty_string_required_datetime_emits_warning(self, caplog: pytest.LogCaptureFixture) -> None:
-        """Empty-string in a required datetime column must log a WARNING."""
-        with caplog.at_level(logging.WARNING, logger="app.models"):
-            topic = Topic.from_row(self._topic_row(""))
-        assert isinstance(topic.created_at, datetime)
-        assert any("empty string" in r.message for r in caplog.records)
+    def test_empty_string_required_datetime_raises(self) -> None:
+        with pytest.raises(CorruptTimestampError) as excinfo:
+            Topic.from_row(self._topic_row(""))
+        assert "created_at" in str(excinfo.value)
 
-    def test_none_required_datetime_emits_warning(self, caplog: pytest.LogCaptureFixture) -> None:
-        """None in a required datetime column must log a WARNING."""
-        with caplog.at_level(logging.WARNING, logger="app.models"):
-            topic = Topic.from_row(self._topic_row(None))
-        assert isinstance(topic.created_at, datetime)
-        assert any("NULL" in r.message for r in caplog.records)
+    def test_null_required_datetime_raises(self) -> None:
+        with pytest.raises(CorruptTimestampError) as excinfo:
+            Topic.from_row(self._topic_row(None))
+        assert "created_at" in str(excinfo.value)
 
-    def test_malformed_required_datetime_emits_warning(self, caplog: pytest.LogCaptureFixture) -> None:
-        """An unparseable string in a required datetime column must log a WARNING."""
-        with caplog.at_level(logging.WARNING, logger="app.models"):
-            topic = Topic.from_row(self._topic_row("not-a-date"))
-        assert isinstance(topic.created_at, datetime)
-        assert any("Corrupt required datetime" in r.message for r in caplog.records)
+    def test_malformed_required_datetime_raises(self) -> None:
+        with pytest.raises(CorruptTimestampError) as excinfo:
+            Topic.from_row(self._topic_row("not-a-date"))
+        assert "not-a-date" in str(excinfo.value)
+
+    def test_valid_required_datetime_still_loads(self) -> None:
+        topic = Topic.from_row(self._topic_row("2026-06-13T12:00:00+00:00"))
+        assert topic.created_at == datetime(2026, 6, 13, 12, 0, tzinfo=UTC)
+
+
+class TestTimestampsHydrateAsAwareUtc:
+    """TW-AUD-013: hydration never yields a naive or non-UTC datetime.
+
+    Timestamp columns are compared and ordered as TEXT, and compared in Python
+    against ``datetime.now(UTC)``. A naive value hydrated as-is raises
+    ``TypeError`` the moment it meets an aware one (feed backoff did exactly
+    that), and a value carrying a local offset sorts wrong against its ``+00:00``
+    siblings even though it names the same instant.
+    """
+
+    def _topic_row(self, created_at: str, status_changed_at: object = None) -> dict:
+        return {
+            "id": 1,
+            "name": "Topic",
+            "description": "desc",
+            "feed_urls": "[]",
+            "feed_mode": "auto",
+            "created_at": created_at,
+            "status_changed_at": status_changed_at,
+            "is_active": 1,
+            "status": "ready",
+            "error_message": None,
+            "check_interval_minutes": 60,
+            "tags": "[]",
+        }
+
+    def test_naive_required_timestamp_becomes_aware_utc(self) -> None:
+        topic = Topic.from_row(self._topic_row("2026-06-13T12:00:00"))
+        assert topic.created_at == datetime(2026, 6, 13, 12, 0, tzinfo=UTC)
+        assert topic.created_at.tzinfo is not None
+
+    def test_naive_optional_timestamp_becomes_aware_utc(self) -> None:
+        topic = Topic.from_row(self._topic_row("2026-06-13T12:00:00+00:00", "2026-06-13T13:00:00"))
+        assert topic.status_changed_at == datetime(2026, 6, 13, 13, 0, tzinfo=UTC)
+
+    def test_offset_timestamp_is_converted_to_utc(self) -> None:
+        """A row written with a local offset must hydrate as the same instant in UTC."""
+        topic = Topic.from_row(self._topic_row("2026-06-13T14:00:00+02:00"))
+        assert topic.created_at == datetime(2026, 6, 13, 12, 0, tzinfo=UTC)
+        assert topic.created_at.utcoffset() == timedelta(0)
+        # And it re-serializes in the canonical +00:00 spelling the columns sort on.
+        assert topic.to_insert_dict()["created_at"] == "2026-06-13T12:00:00+00:00"
+
+    def test_naive_feed_health_timestamp_survives_backoff_arithmetic(self) -> None:
+        """The concrete break: naive last_error_at + aware now() raised TypeError."""
+        from app.feed_backoff import feed_backoff_until
+
+        health = FeedHealth.from_row(
+            {
+                "id": 1,
+                "feed_url": "https://example.com/feed.xml",
+                "last_success_at": None,
+                "last_error_at": datetime.now(UTC).replace(tzinfo=None).isoformat(),
+                "last_error_message": "boom",
+                "consecutive_failures": 4,
+                "total_fetches": 10,
+                "total_failures": 4,
+                "etag": None,
+                "last_modified": None,
+            }
+        )
+        until = feed_backoff_until(health)
+        assert until is not None
+        assert until > datetime.now(UTC)
 
 
 class TestSafeJsonWarnings:
@@ -696,9 +775,10 @@ class TestCheckResultFromDashboardRow:
         assert cr.confidence == 0.75
         assert cr.llm_response is None
 
-    def test_corrupt_checked_at_degrades_to_now(self) -> None:
-        cr = CheckResult.from_dashboard_row(self._dash_row(cr_checked_at="garbage"), topic_id=1)
-        assert isinstance(cr.checked_at, datetime)
+    def test_corrupt_checked_at_raises(self) -> None:
+        """The dashboard path uses the same required-timestamp contract (TW-AUD-013)."""
+        with pytest.raises(CorruptTimestampError, match="checked_at"):
+            CheckResult.from_dashboard_row(self._dash_row(cr_checked_at="garbage"), topic_id=1)
 
     def test_null_confidence_stays_none(self) -> None:
         cr = CheckResult.from_dashboard_row(self._dash_row(cr_confidence=None), topic_id=1)

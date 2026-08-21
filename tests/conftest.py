@@ -12,15 +12,38 @@ import pytest
 # lifespan marks the app setup-required and the SetupRedirectMiddleware 307s every
 # /api request to /setup, so tests relying on a configured app fail when run in
 # isolation or in an order that does not happen to leak a configured state.
-os.environ.setdefault("TOPIC_WATCH_LLM__MODEL", "openai/gpt-4o-mini")
-os.environ.setdefault("TOPIC_WATCH_LLM__API_KEY", "test-key-not-real")
-# Test clients address the app as "test"/"testserver", which the Host allowlist
-# (AUG-002) rejects. Disable the check for the module-global app; the allowlist's
-# own behavior is covered against purpose-built apps in tests/test_host_allowlist.py.
-os.environ.setdefault("TOPIC_WATCH_ALLOWED_HOSTS", "*")
+_TEST_ENV_DEFAULTS = {
+    "TOPIC_WATCH_LLM__MODEL": "openai/gpt-4o-mini",
+    "TOPIC_WATCH_LLM__API_KEY": "test-key-not-real",
+    # Test clients address the app as "test"/"testserver", which the Host
+    # allowlist (AUG-002) rejects. Disable the check for the module-global app;
+    # the allowlist's own behavior is covered against purpose-built apps in
+    # tests/test_host_allowlist.py.
+    "TOPIC_WATCH_ALLOWED_HOSTS": "*",
+}
 
-from app.database import get_connection, init_db
-from app.main import app
+
+def _scrub_ambient_env(environ: dict) -> None:
+    """Remove every ambient ``TOPIC_WATCH_*`` var, then seed exact test values.
+
+    ``Settings`` gives every ``TOPIC_WATCH_*`` env var precedence over YAML and
+    defaults (env > YAML > defaults), so a developer's configured shell — a real
+    LLM key, a non-default check interval, Exa settings — otherwise leaks into
+    every bare ``Settings()`` built in-process, running the suite against
+    different config than CI (AUG-039). ``os.environ.setdefault`` does not fix
+    this: it only supplies a value when one is absent, so an ambient value for
+    one of these three keys still wins. Tests that want a specific env value
+    opt it back in with ``monkeypatch.setenv``.
+    """
+    for key in [k for k in environ if k.startswith("TOPIC_WATCH_")]:
+        del environ[key]
+    environ.update(_TEST_ENV_DEFAULTS)
+
+
+_scrub_ambient_env(os.environ)
+
+from app.database import get_connection, init_db  # noqa: E402 -- must follow the env scrub above
+from app.main import app  # noqa: E402 -- must follow the env scrub above
 
 
 @pytest.fixture(autouse=True)

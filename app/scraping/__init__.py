@@ -8,7 +8,6 @@ import asyncio
 import logging
 import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -18,6 +17,7 @@ from app.crud import (
     create_article,
     find_article_by_hash,
     get_feed_health,
+    list_article_bodies_for_urls,
     list_article_dedup_keys,
     topic_has_articles_from_feed,
     upsert_feed_health_aborted,
@@ -36,11 +36,12 @@ from app.scraping.source import FeedHealthOutcome as FeedHealthOutcome
 from app.scraping.source import FetchStatus as FetchStatus
 from app.scraping.source import (
     article_identity,
-    as_utc,
+    assign_ranking_dates,
+    body_digest,
     bounded,
     collapse_duplicate_entries,
     compute_article_hash,
-    normalize_published,
+    ranking_date,
     revision_marker,
     story_identity,
 )
@@ -231,14 +232,20 @@ def _prepare_entries(entries: list[FeedEntry]) -> list[FeedEntry]:
     """Normalize what the source returned before anything spends budget on it.
 
     Two source-agnostic corrections, applied once for every provider rather than
-    per fetcher: impossible publication dates are discarded so they cannot own
-    the top of the recency ranking (AUG-184), and entries describing one article
-    collapse to their best copy so repeats stop consuming article slots and
-    content fetches (AUG-179).
+    per fetcher: impossible dates are discarded so they cannot own the top of the
+    recency ranking (AUG-184), and entries describing one article collapse to
+    their best copy so repeats stop consuming article slots and content fetches
+    (AUG-179).
+
+    ``updated`` goes through the same skew guard as ``published``, because it is
+    the signal that says an article was revised: a publisher whose clock runs
+    hours fast had every entry read as a revision, which bypasses the story rule
+    permanently and re-stores the whole feed on every check.
+
+    Ranking is settled here too, while feed order is still intact — it is the
+    only place that knows which entry followed which.
     """
-    now = datetime.now(UTC)
-    for entry in entries:
-        entry.published = normalize_published(entry.published, now=now)
+    assign_ranking_dates(entries)
     return collapse_duplicate_entries(entries)
 
 
@@ -325,16 +332,14 @@ def _select_candidates(
     this topic's provider later). Returns ``(reuse_batch, fetch_batch)`` after the
     limit, where ``fetch_batch`` is the ``(entry, hash)`` subset still needing a fetch.
 
-    An entry with no usable date ranks at retrieval time, not at year 1 (AUG-184):
-    feeds list newest first, so an undated entry is a story just discovered, and
-    filing it below every dated one let a busy feed starve it out of the cap on
-    every check. Ties keep source order, since the sort is stable.
+    Entries are ranked by the date ``assign_ranking_dates`` settled for them
+    (AUG-184), not by the one they claim. Ties keep source order, since the sort
+    is stable.
     """
-    now = datetime.now(UTC)
     all_candidates: list[tuple[FeedEntry, str, str | None, str | None]] = [
         (e, h, c, p) for e, h, c, p in reuse_entries
     ] + [(e, h, None, None) for e, h in new_entries]
-    all_candidates.sort(key=lambda t: as_utc(t[0].published) or now, reverse=True)
+    all_candidates.sort(key=lambda t: ranking_date(t[0]), reverse=True)
     all_candidates = all_candidates[:max_articles]
 
     reuse_batch: list[tuple[FeedEntry, str, str | None, str | None]] = [
@@ -453,6 +458,76 @@ async def _extract_contents(
         return list(await asyncio.gather(*content_tasks, return_exceptions=True))
 
 
+def _is_prefetched(entry: FeedEntry) -> bool:
+    """True when the source handed the body over instead of us fetching it.
+
+    A search source does that for every result, so its text says nothing about
+    whether the article changed — only a comparison against a body the same
+    source produced earlier does.
+    """
+    return bool((entry.content or "").strip())
+
+
+def _drop_unchanged_representations(
+    pending: list[tuple[FeedEntry, str, str | None, str | None]],
+    topic_id: int,
+    provider_name: str | None,
+    stored: "_StoredArticles",
+    conn: sqlite3.Connection,
+) -> list[tuple[FeedEntry, str, str | None, str | None]]:
+    """Drop candidates that turned out to be the representation already stored.
+
+    A revision marker only buys an entry a second look: it is the body that
+    arrives afterwards which settles whether the story actually changed. Without
+    this the marker WAS the answer, so a source moving its ``updated`` stamp on
+    every poll minted a new identity every check — the topic stored the same
+    article again and ran a novelty analysis for it, forever (AUG-320).
+
+    Which stored bodies an entry is compared against depends on where its own
+    body came from. A body we extracted is comparable with every body this topic
+    holds for the story, whichever provider carried it. A body the source handed
+    over pre-extracted is comparable only with bodies from that same source,
+    because two extractors reading one page disagree about boilerplate — treating
+    that disagreement as a revision is what left the story rule dead for Exa and
+    re-stored a topic's whole history on a mode switch.
+
+    When there is nothing comparable, the two cases differ because the evidence
+    does: prefetched text on its own is not a claim, so the entry is held; an
+    ``updated`` stamp IS the source's explicit claim, and one that cannot be
+    refuted is honoured. That costs at most one row, since the row it stores then
+    becomes the body every later poll is compared against.
+    """
+    contested = [(index, row) for index, row in enumerate(pending) if story_identity(row[0]) in stored.stories]
+    if not contested:
+        return pending
+
+    by_story: dict[str, set[str]] = {}
+    by_source: dict[tuple[str, str | None], set[str]] = {}
+    for url, title, raw_content, source_provider in list_article_bodies_for_urls(
+        conn, topic_id, [row[0].url for _, row in contested]
+    ):
+        digest = body_digest(raw_content)
+        if not digest:
+            continue
+        story = compute_article_hash(url, title)
+        by_story.setdefault(story, set()).add(digest)
+        by_source.setdefault((story, source_provider), set()).add(digest)
+
+    unchanged: set[int] = set()
+    for index, (entry, _, content, origin_provider) in contested:
+        story = story_identity(entry)
+        offered = body_digest(content)
+        if _is_prefetched(entry):
+            known = by_source.get((story, origin_provider if origin_provider is not None else provider_name), set())
+            settled = not known or offered in known
+        else:
+            settled = bool(by_story.get(story)) and offered in by_story[story]
+        if settled:
+            logger.info("Story unchanged since it was stored; not re-storing: %s", entry.url)
+            unchanged.add(index)
+    return [row for index, row in enumerate(pending) if index not in unchanged]
+
+
 def _store_articles(
     reuse_batch: list[tuple[FeedEntry, str, str | None, str | None]],
     fetch_batch: list[tuple[FeedEntry, str]],
@@ -460,6 +535,7 @@ def _store_articles(
     topic: Topic,
     provider_name: str | None,
     conn: sqlite3.Connection,
+    already_held: "_StoredArticles",
 ) -> tuple[list[Article], int]:
     """Normalize both batches and run a single insert loop.
 
@@ -477,6 +553,8 @@ def _store_articles(
             content = entry.summary
         resolved_content = content if isinstance(content, str) and content else None
         pending.append((entry, content_hash, resolved_content, None))
+
+    pending = _drop_unchanged_representations(pending, topic.id, provider_name, already_held, conn)
 
     stored: list[Article] = []
     dropped_duplicates = 0
@@ -609,7 +687,7 @@ async def fetch_new_articles_for_topic(
     # --- C2: one short connection normalizes both batches and inserts.
     with get_db(db_path) as conn:
         stored, dropped_duplicates = _store_articles(
-            reuse_batch, fetch_batch, contents, topic, response.provider_name, conn
+            reuse_batch, fetch_batch, contents, topic, response.provider_name, conn, already_held
         )
         conn.commit()
 

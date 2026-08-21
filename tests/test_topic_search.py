@@ -135,6 +135,70 @@ def test_search_no_match_returns_empty(db_conn):
     assert result == []
 
 
+def test_search_matches_description(db_conn):
+    """AUG-103: the dashboard search label promises name-or-description; the
+    query must actually cover description text, not just the topic name."""
+    create_topic(
+        db_conn,
+        Topic(
+            name="Alpha",
+            description="Coverage of the semiconductor industry",
+            feed_urls=["https://example.com/feed.xml"],
+            feed_mode=FeedMode.MANUAL,
+            status=TopicStatus.READY,
+        ),
+    )
+    db_conn.commit()
+    _make_topic(db_conn, "Beta")
+
+    result = search_dashboard_data(db_conn, query="semiconductor")
+    names = [r["topic"].name for r in result]
+    assert names == ["Alpha"]
+
+
+def test_search_percent_is_literal(db_conn):
+    """AUG-337: '%' must not act as a SQL LIKE wildcard."""
+    _make_topic(db_conn, "100% News")
+    _make_topic(db_conn, "100x News")
+
+    result = search_dashboard_data(db_conn, query="100%")
+    names = [r["topic"].name for r in result]
+    assert names == ["100% News"]
+
+
+def test_search_underscore_is_literal(db_conn):
+    """AUG-337: '_' must not act as a SQL LIKE single-character wildcard."""
+    _make_topic(db_conn, "Foo_Bar")
+    _make_topic(db_conn, "FooXBar")
+
+    result = search_dashboard_data(db_conn, query="Foo_Bar")
+    names = [r["topic"].name for r in result]
+    assert names == ["Foo_Bar"]
+
+
+def test_search_unicode_case_and_form_insensitive(db_conn):
+    """AUG-337: NFC-normalized casefold matching, so composed/decomposed forms
+    and non-ASCII case variants of the same text still match."""
+    composed_upper = "\u00c9clair"  # E-acute as one precomposed codepoint (NFC), uppercase
+    decomposed_lower = "e\u0301clair"  # "e" + U+0301 combining acute accent, lowercase (NFD)
+    assert composed_upper != decomposed_lower  # sanity: genuinely different byte forms
+
+    _make_topic(db_conn, f"{composed_upper} Bakery")
+
+    result = search_dashboard_data(db_conn, query=decomposed_lower)
+    names = [r["topic"].name for r in result]
+    assert names == [f"{composed_upper} Bakery"]
+
+
+def test_search_trims_surrounding_whitespace(db_conn):
+    """AUG-337: surrounding whitespace on the query must not cause false misses."""
+    _make_topic(db_conn, "Alpha News")
+
+    result = search_dashboard_data(db_conn, query="  Alpha  ")
+    names = [r["topic"].name for r in result]
+    assert names == ["Alpha News"]
+
+
 def test_search_result_has_expected_keys(db_conn):
     _make_topic(db_conn, "Test Topic")
 

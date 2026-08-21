@@ -17,6 +17,7 @@ from app.crud import (
     get_topic,
     list_check_results,
     list_topics,
+    max_check_result_id,
 )
 from app.database import get_db
 from app.models import KnowledgeState, Topic, TopicStatus, normalize_tag
@@ -86,15 +87,26 @@ async def api_list_checks(
     topic_id: int,
     page: int = 1,
     per_page: int = 20,
+    cutoff_id: int | None = None,
     conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
 ) -> dict:
-    """Get check history for a topic with pagination."""
+    """Get check history for a topic with pagination.
+
+    ``cutoff_id`` pins the traversal to the check set as of the first page: it
+    is minted from the current max id when omitted and returned in the
+    response so callers carry it on later requests. Without it, a check
+    committing between page requests shifts every row underneath the
+    OFFSET-based traversal — page 2 can repeat page 1's last row or skip a
+    tail row, and totals can change mid-browse (AUG-314).
+    """
     topic = get_topic(conn, topic_id)
     if topic is None:
         raise HTTPException(status_code=404, detail="Topic not found")
 
     per_page = max(1, min(per_page, 100))
-    total = count_check_results(conn, topic_id)
+    if cutoff_id is None:
+        cutoff_id = max_check_result_id(conn, topic_id)
+    total = count_check_results(conn, topic_id, cutoff_id=cutoff_id)
     pages = max(1, (total + per_page - 1) // per_page)
     # Clamp into range before deriving the offset: an out-of-range page returned an
     # empty list indistinguishable from "no history", and a very large one produced
@@ -102,7 +114,7 @@ async def api_list_checks(
     page = min(max(1, page), pages)
     offset = (page - 1) * per_page
 
-    checks = list_check_results(conn, topic_id, limit=per_page, offset=offset)
+    checks = list_check_results(conn, topic_id, limit=per_page, offset=offset, cutoff_id=cutoff_id)
 
     return {
         "checks": checks,
@@ -110,6 +122,7 @@ async def api_list_checks(
         "page": page,
         "per_page": per_page,
         "pages": pages,
+        "cutoff_id": cutoff_id,
     }
 
 

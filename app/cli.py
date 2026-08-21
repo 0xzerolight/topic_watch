@@ -388,15 +388,30 @@ def _render_topics(conn: sqlite3.Connection) -> list[str]:
     return [f"  topics: {summary}"]
 
 
-def _render_feeds(conn: sqlite3.Connection) -> list[str]:
-    """Feed-health summary with redacted failing-feed URLs; degrades cleanly."""
+def _render_feeds(conn: sqlite3.Connection, settings: Settings) -> list[str]:
+    """Feed-health summary with redacted failing-feed URLs; degrades cleanly.
+
+    Only feeds a topic currently monitors are counted and listed. ``feed_health``
+    has no topic column, so a removed manual feed, a renamed AUTO query or a
+    deleted topic leaves its row behind, and reporting those as live failures
+    told the user sources they no longer monitor are breaking (AUG-148). They are
+    kept as history and named as such rather than dropped silently.
+    """
+    from app.scraping.exa import exa_search_endpoint
+    from app.scraping.routing import topic_owned_feed_urls
+
     try:
         feeds = list_all_feed_health(conn)
+        endpoint = exa_search_endpoint(settings.exa)
+        owned = {url for topic in list_topics(conn) for url in topic_owned_feed_urls(topic, endpoint)}
     except sqlite3.Error:
         return ["  feeds: unavailable"]
-    failing = [f for f in feeds if f.consecutive_failures > 0]
-    ok = len(feeds) - len(failing)
-    lines = [f"  feeds: {ok} OK / {len(failing)} failing"]
+    monitored = [f for f in feeds if f.feed_url in owned]
+    failing = [f for f in monitored if f.consecutive_failures > 0]
+    ok = len(monitored) - len(failing)
+    retired = len(feeds) - len(monitored)
+    summary = f"  feeds: {ok} OK / {len(failing)} failing"
+    lines = [f"{summary} ({retired} no longer monitored)" if retired else summary]
     # A bounded sample plus an omitted count: an OPML import admits 500 topics at
     # a time and feed-health rows are never pruned, so the unbounded loop this
     # replaces could bury the summary under hundreds of URLs and push far more
@@ -429,7 +444,7 @@ def _render_database(settings: Settings) -> list[str]:
         conn.row_factory = sqlite3.Row
         lines.append(f"  schema: {get_schema_version(conn)}")
         lines.extend(_render_topics(conn))
-        lines.extend(_render_feeds(conn))
+        lines.extend(_render_feeds(conn, settings))
     except sqlite3.Error as exc:
         lines.append(f"  unavailable ({exc})")
     finally:

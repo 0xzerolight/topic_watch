@@ -6,6 +6,7 @@ for explicit dependency injection and testability.
 
 import logging
 import sqlite3
+import unicodedata
 from datetime import UTC, datetime, timedelta
 
 from app.models import (
@@ -20,6 +21,7 @@ from app.models import (
     Topic,
     TopicStatus,
     to_db_utc,
+    to_utc,
 )
 
 logger = logging.getLogger(__name__)
@@ -326,18 +328,30 @@ def get_dashboard_data(conn: sqlite3.Connection) -> list[dict]:
     return _query_dashboard_rows(conn, "", [])
 
 
+def _search_canonical(text: str) -> str:
+    """NFC-normalize and casefold text for literal, Unicode-insensitive search matching.
+
+    Used on both the query and the searched fields so ``%``/``_`` stay plain
+    characters instead of SQL LIKE wildcards, and composed/decomposed or
+    differently-cased Unicode text still matches (AUG-337).
+    """
+    return unicodedata.normalize("NFC", text).casefold()
+
+
 def search_dashboard_data(
     conn: sqlite3.Connection,
     query: str | None = None,
     status: str | None = None,
 ) -> list[dict]:
-    """Get topics with last check and article count, with optional name/status filters."""
+    """Get topics with last check and article count, with optional name/status filters.
+
+    ``query`` matches literally (no LIKE wildcards) against both name and
+    description (AUG-103), NFC-normalized and casefolded on both sides so
+    Unicode-equivalent and differently-cased text still matches, and trimmed
+    of surrounding whitespace (AUG-337).
+    """
     where_clauses = []
     params: list = []
-
-    if query:
-        where_clauses.append("t.name LIKE ?")
-        params.append(f"%{query}%")
 
     if status:
         where_clauses.append("t.status = ?")
@@ -347,7 +361,19 @@ def search_dashboard_data(
     if where_clauses:
         where_sql = " WHERE " + " AND ".join(where_clauses)
 
-    return _query_dashboard_rows(conn, where_sql, params)
+    rows = _query_dashboard_rows(conn, where_sql, params)
+
+    query = query.strip() if query else None
+    if query:
+        needle = _search_canonical(query)
+        rows = [
+            item
+            for item in rows
+            if needle in _search_canonical(item["topic"].name)
+            or (item["topic"].description and needle in _search_canonical(item["topic"].description))
+        ]
+
+    return rows
 
 
 def delete_topic(conn: sqlite3.Connection, topic_id: int) -> bool:
@@ -462,6 +488,29 @@ def list_article_dedup_keys(conn: sqlite3.Connection, topic_id: int) -> list[tup
         (topic_id,),
     ).fetchall()
     return [(row["content_hash"], row["url"], row["title"]) for row in rows]
+
+
+def list_article_bodies_for_urls(
+    conn: sqlite3.Connection, topic_id: int, urls: list[str]
+) -> list[tuple[str, str, str | None, str | None]]:
+    """Return ``(url, title, raw_content, source_provider)`` for a topic's rows at these URLs.
+
+    The bodies a topic already holds are what tells a genuine revision from a
+    source that merely moved its ``updated`` stamp again, so dedup reads them for
+    the handful of URLs actually under contest rather than for the whole
+    retention window. ``source_provider`` comes along because a body a source
+    handed over pre-extracted is only comparable with bodies from that same
+    source.
+    """
+    unique = list(dict.fromkeys(urls))
+    if not unique:
+        return []
+    placeholders = ",".join("?" * len(unique))
+    rows = conn.execute(
+        f"SELECT url, title, raw_content, source_provider FROM articles WHERE topic_id = ? AND url IN ({placeholders})",  # noqa: S608 - placeholders only, values are bound
+        [topic_id, *unique],
+    ).fetchall()
+    return [(row["url"], row["title"], row["raw_content"], row["source_provider"]) for row in rows]
 
 
 def topic_has_articles_from_feed(conn: sqlite3.Connection, topic_id: int, feed_url: str) -> bool:
@@ -820,19 +869,49 @@ def list_check_results(
     topic_id: int,
     limit: int = 20,
     offset: int = 0,
+    cutoff_id: int | None = None,
 ) -> list[CheckResult]:
-    """Get recent check results for a topic, newest first."""
-    rows = conn.execute(
-        "SELECT * FROM check_results WHERE topic_id = ? ORDER BY checked_at DESC LIMIT ? OFFSET ?",
-        (topic_id, limit, offset),
-    ).fetchall()
+    """Get recent check results for a topic, newest first.
+
+    ``cutoff_id``, when given, restricts the set to ids at or below it so a
+    multi-page OFFSET traversal stays stable even if a newer check commits
+    between page requests: mint it from ``max_check_result_id`` on the first
+    page and carry it on later ones (AUG-314).
+    """
+    if cutoff_id is not None:
+        rows = conn.execute(
+            "SELECT * FROM check_results WHERE topic_id = ? AND id <= ? ORDER BY checked_at DESC LIMIT ? OFFSET ?",
+            (topic_id, cutoff_id, limit, offset),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM check_results WHERE topic_id = ? ORDER BY checked_at DESC LIMIT ? OFFSET ?",
+            (topic_id, limit, offset),
+        ).fetchall()
     return [CheckResult.from_row(row) for row in rows]
 
 
-def count_check_results(conn: sqlite3.Connection, topic_id: int) -> int:
-    """Count total check results for a topic."""
-    row = conn.execute("SELECT COUNT(*) FROM check_results WHERE topic_id = ?", (topic_id,)).fetchone()
+def count_check_results(conn: sqlite3.Connection, topic_id: int, cutoff_id: int | None = None) -> int:
+    """Count total check results for a topic, optionally capped at cutoff_id (AUG-314)."""
+    if cutoff_id is not None:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM check_results WHERE topic_id = ? AND id <= ?",
+            (topic_id, cutoff_id),
+        ).fetchone()
+    else:
+        row = conn.execute("SELECT COUNT(*) FROM check_results WHERE topic_id = ?", (topic_id,)).fetchone()
     return int(row[0])
+
+
+def max_check_result_id(conn: sqlite3.Connection, topic_id: int) -> int | None:
+    """Highest ``check_results.id`` for a topic, or None if it has none.
+
+    Mints a stable pagination cutoff: the first page of a traversal captures
+    this value and later pages pass it back, so a check committing mid-browse
+    cannot shift rows underneath an OFFSET-based page 2+ (AUG-314).
+    """
+    row = conn.execute("SELECT MAX(id) FROM check_results WHERE topic_id = ?", (topic_id,)).fetchone()
+    return int(row[0]) if row[0] is not None else None
 
 
 def list_recent_check_stage_errors(
@@ -1397,7 +1476,9 @@ def get_dashboard_stats(conn: sqlite3.Connection) -> DashboardStats:
         import contextlib
 
         with contextlib.suppress(ValueError, TypeError):
-            last_notif = datetime.fromisoformat(row["last_notification_at"])
+            # Aware UTC like every other hydrated timestamp, so the template's
+            # relative-time arithmetic cannot meet a naive value (TW-AUD-013).
+            last_notif = to_utc(datetime.fromisoformat(row["last_notification_at"]))
     return DashboardStats(
         total_topics=row["total_topics"],
         active_topics=row["active_topics"],

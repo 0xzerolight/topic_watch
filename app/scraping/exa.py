@@ -48,6 +48,15 @@ EXA_SOURCE = SourceIdentity(name="exa")
 """Exa returns publisher URLs directly, so no async URL resolution is needed."""
 
 
+def exa_search_endpoint(exa_settings: ExaSettings) -> str:
+    """The URL every EXA-mode topic's feed-health row is keyed on.
+
+    One definition, because both the fetch that writes those rows and the
+    diagnostics that read them have to agree on the key.
+    """
+    return f"{(exa_settings.base_url or _DEFAULT_EXA_BASE_URL).rstrip('/')}/search"
+
+
 def _report(
     health_callback: FeedHealthCallback | None,
     endpoint: str,
@@ -180,7 +189,7 @@ async def fetch_exa_entries(
         logger.warning("Exa source requested for topic '%s' but Exa is disabled or has no API key", topic.name)
         return FeedResponse.from_source(EXA_SOURCE, feeds_total=0, feeds_failed=0)
 
-    endpoint = f"{(exa_settings.base_url or _DEFAULT_EXA_BASE_URL).rstrip('/')}/search"
+    endpoint = exa_search_endpoint(exa_settings)
 
     # base_url is user-configurable, so validate the effective endpoint (SSRF).
     try:

@@ -167,6 +167,64 @@ class TestAPIChecksClamp:
             app.dependency_overrides.pop(get_db_conn, None)
 
 
+class TestAPIChecksCutoff:
+    """AUG-314: OFFSET pagination stays stable across a moving check-history set."""
+
+    def test_cutoff_stabilizes_traversal_across_new_checks(self, db_conn: sqlite3.Connection):
+        topic = _seed_topic(db_conn)
+        for _ in range(3):
+            _seed_check(db_conn, topic.id)
+        db_conn.commit()
+
+        from app.web.dependencies import get_db_conn
+
+        app.dependency_overrides[get_db_conn] = lambda: db_conn
+        try:
+            with TestClient(app) as client:
+                page1 = client.get(f"/api/v1/topics/{topic.id}/checks?per_page=2&page=1")
+                assert page1.status_code == 200
+                data1 = page1.json()
+                assert len(data1["checks"]) == 2
+                assert data1["total"] == 3
+                cutoff_id = data1["cutoff_id"]
+                assert cutoff_id is not None
+
+                # A new check commits between page requests.
+                _seed_check(db_conn, topic.id)
+                db_conn.commit()
+
+                # Carrying the page-1 cutoff keeps the traversal stable: same
+                # total as page 1 saw, and page 2 is exactly the tail page 1
+                # didn't cover (no repeat, no gap from the new row shifting it).
+                page2 = client.get(f"/api/v1/topics/{topic.id}/checks?per_page=2&page=2&cutoff_id={cutoff_id}")
+                assert page2.status_code == 200
+                data2 = page2.json()
+                assert data2["total"] == 3
+                assert data2["cutoff_id"] == cutoff_id
+                ids_page1 = {c["id"] for c in data1["checks"]}
+                ids_page2 = {c["id"] for c in data2["checks"]}
+                assert ids_page1.isdisjoint(ids_page2)
+                assert len(ids_page2) == 1
+        finally:
+            app.dependency_overrides.pop(get_db_conn, None)
+
+    def test_omitted_cutoff_is_minted_and_returned(self, db_conn: sqlite3.Connection):
+        topic = _seed_topic(db_conn)
+        check = _seed_check(db_conn, topic.id)
+        db_conn.commit()
+
+        from app.web.dependencies import get_db_conn
+
+        app.dependency_overrides[get_db_conn] = lambda: db_conn
+        try:
+            with TestClient(app) as client:
+                resp = client.get(f"/api/v1/topics/{topic.id}/checks")
+                assert resp.status_code == 200
+                assert resp.json()["cutoff_id"] == check.id
+        finally:
+            app.dependency_overrides.pop(get_db_conn, None)
+
+
 class TestAPITagFilterNormalization:
     """AUG-338: a tag query differing only in spacing/Unicode form still matches."""
 
