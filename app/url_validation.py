@@ -19,6 +19,7 @@ import re
 import socket
 import threading
 import time
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from urllib.parse import urlparse
@@ -331,27 +332,106 @@ class ResponseTooLargeError(httpx.HTTPError):
 # decompress already-decompressed bytes; the lengths are recomputed from the body.
 _BODY_FRAMING_HEADERS = frozenset({"content-encoding", "content-length", "transfer-encoding"})
 
+# Content codecs we can decode under a hard output bound. ``zlib`` is the only
+# incremental decompressor whose API takes a ``max_length``; anything else httpx
+# would hand a whole raw chunk to an unbounded ``decompress()``. ``deflate`` is
+# zlib-wrapped or raw in the wild, so both window sizes are tried in httpx's own
+# order. Any other codec is passed through undecoded -- which is what httpx itself
+# does with an encoding it has no decoder for, and what our own Accept-Encoding
+# means we should never be sent.
+_BOUNDED_CODECS: dict[str, tuple[int, ...]] = {
+    "gzip": (zlib.MAX_WBITS | 16,),
+    "deflate": (zlib.MAX_WBITS, -zlib.MAX_WBITS),
+}
+
+
+class _BoundedZlibDecoder:
+    """Incremental gzip/deflate decoder that cannot allocate past a budget.
+
+    httpx decodes with ``zlib.decompressobj().decompress(data)`` -- no
+    ``max_length`` -- so the entire expansion of one 64 KiB raw chunk is
+    materialised inside a single iteration step, before any caller-side counter
+    can run. Passing ``max_length`` makes the caller's remaining budget the real
+    ceiling on every allocation. Output past the budget is simply not produced;
+    the caller raises rather than resuming, so the dropped ``unconsumed_tail`` is
+    never wanted.
+    """
+
+    def __init__(self, wbits: tuple[int, ...]) -> None:
+        self._decompressor = zlib.decompressobj(wbits[0])
+        self._fallback = wbits[1:]
+
+    def decompress(self, data: bytes, max_length: int) -> bytes:
+        # The alternate window size is only ever tried on the first chunk, as in
+        # httpx: retrying mid-stream would decode from a reset dictionary.
+        fallback, self._fallback = self._fallback, ()
+        try:
+            return self._decompressor.decompress(data, max_length)
+        except zlib.error as exc:
+            if not fallback:
+                raise httpx.DecodingError(str(exc)) from exc
+            try:
+                self._decompressor = zlib.decompressobj(fallback[0])
+                return self._decompressor.decompress(data, max_length)
+            except zlib.error as retry_exc:
+                raise httpx.DecodingError(str(retry_exc)) from retry_exc
+
 
 async def _read_capped(response: httpx.Response, request: httpx.Request, max_bytes: int) -> httpx.Response:
     """Buffer a streamed response body, aborting once it exceeds ``max_bytes``.
 
-    Counts DECODED bytes, so a small compressed body that expands to gigabytes is
-    stopped at the same budget as a plainly large one. The connection is closed as
-    soon as the budget is crossed, so the rest of a hostile body is never pulled.
+    Bounds the bytes on the wire AND the DECODED bytes at ``max_bytes``, so a
+    small compressed body that would expand to gigabytes is stopped at the same
+    budget as a plainly large one -- and stopped INSIDE the decoder rather than
+    after it, because counting between chunks cannot bound a decompressor that is
+    itself unbounded. The wire bound also stops a stream that decodes to nothing
+    (empty deflate blocks) from being read forever. The connection is closed as
+    soon as either budget is crossed, so the rest of a hostile body is never
+    pulled.
+
+    Stacked ``Content-Encoding`` (``gzip, gzip, gzip``) is refused outright: httpx
+    answers it with a MultiDecoder whose layers multiply -- 298 bytes on the wire
+    reached gigabytes -- and no legitimate publisher nests compression.
 
     Returns an equivalent non-streaming response, because every caller reads
     ``.text`` / ``.content`` after the fact.
     """
+    codecs = [value.strip().lower() for value in response.headers.get_list("content-encoding", split_commas=True)]
+    codecs = [value for value in codecs if value and value != "identity"]
+    if len(codecs) > 1:
+        await response.aclose()
+        raise ResponseTooLargeError(f"Stacked content-encoding refused: {redact_url(str(request.url))}")
+    wbits = _BOUNDED_CODECS.get(codecs[0]) if codecs else None
+    decoder = _BoundedZlibDecoder(wbits) if wbits is not None else None
+
+    oversize = f"Response body exceeded the {max_bytes}-byte limit: {redact_url(str(request.url))}"
     chunks: list[bytes] = []
     total = 0
+    wire_total = 0
     try:
-        async for chunk in response.aiter_bytes():
-            total += len(chunk)
+        if response.is_stream_consumed:
+            # The transport handed back a body httpx had already buffered and
+            # decoded -- it does that for any response built from in-memory
+            # content. There is no stream left to bound, so the size check is all
+            # that remains. A live transport always streams here.
+            chunks.append(response.content)
+            total = len(response.content)
             if total > max_bytes:
-                raise ResponseTooLargeError(
-                    f"Response body exceeded the {max_bytes}-byte limit: {redact_url(str(request.url))}"
-                )
-            chunks.append(chunk)
+                raise ResponseTooLargeError(oversize)
+        else:
+            async for raw in response.aiter_raw():
+                wire_total += len(raw)
+                if wire_total > max_bytes:
+                    raise ResponseTooLargeError(oversize)
+                # ``total <= max_bytes`` here, so max_length is >= 1 -- a zlib
+                # max_length of 0 would mean "unbounded". The extra byte is what
+                # makes crossing the budget observable.
+                decoded = decoder.decompress(raw, max_bytes - total + 1) if decoder is not None else raw
+                total += len(decoded)
+                if total > max_bytes:
+                    raise ResponseTooLargeError(oversize)
+                if decoded:
+                    chunks.append(decoded)
     finally:
         await response.aclose()
 

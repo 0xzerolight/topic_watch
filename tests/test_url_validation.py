@@ -1,6 +1,9 @@
 """Tests for SSRF protection in URL validation."""
 
+import gzip
 import socket
+import tracemalloc
+import zlib
 
 import httpx
 import pytest
@@ -507,6 +510,171 @@ class TestSafeSendByteCap:
 
         assert response.text == "final"
         assert redirect_chunks == 0
+
+
+def _gzip_expanding_to(total_bytes: int) -> bytes:
+    """A gzip stream that decodes to ``total_bytes`` of zeros, built incrementally.
+
+    Built a megabyte at a time so the fixture itself never holds the expansion it
+    describes.
+    """
+    compressor = zlib.compressobj(9, zlib.DEFLATED, zlib.MAX_WBITS | 16)
+    block = b"\0" * (1024 * 1024)
+    parts = []
+    remaining = total_bytes
+    while remaining > 0:
+        take = min(len(block), remaining)
+        remaining -= take
+        parts.append(compressor.compress(block[:take]))
+    parts.append(compressor.flush())
+    return b"".join(parts)
+
+
+class TestSafeSendCompressedBodyCap:
+    """The byte budget bounds the DECODER, not just what it hands back (AUG-006).
+
+    Counting decoded bytes *between* chunks cannot bound a decoder that is itself
+    unbounded: httpx decodes a whole raw chunk in one unbounded ``decompress()``
+    call, and a stacked ``Content-Encoding`` multiplies that per layer.
+    """
+
+    async def test_stacked_content_encoding_refused(self, monkeypatch) -> None:
+        """A tiny body naming three gzip layers must never reach a decoder."""
+        from app.url_validation import ResponseTooLargeError
+
+        _stub_resolves_to(monkeypatch, "93.184.216.34")
+        nested = gzip.compress(gzip.compress(_gzip_expanding_to(64 * 1024 * 1024), 9), 9)
+        assert len(nested) < 64 * 1024
+        pulled = 0
+
+        async def _body():
+            nonlocal pulled
+            pulled += 1
+            yield nested
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, headers={"content-encoding": "gzip, gzip, gzip"}, content=_body())
+
+        transport = httpx.MockTransport(_handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+            with pytest.raises(ResponseTooLargeError, match="[Ss]tacked"):
+                await safe_get(client, "https://example.com/feed.xml", max_bytes=65536)
+
+        # Refused on the headers alone: not one byte was pulled or decoded.
+        assert pulled == 0
+
+    async def test_single_layer_bomb_peaks_near_the_budget(self, monkeypatch) -> None:
+        """One raw chunk expanding far past the budget must not be materialised."""
+        from app.url_validation import ResponseTooLargeError
+
+        _stub_resolves_to(monkeypatch, "93.184.216.34")
+        bomb = _gzip_expanding_to(64 * 1024 * 1024)
+
+        async def _body():
+            yield bomb
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, headers={"content-encoding": "gzip"}, content=_body())
+
+        transport = httpx.MockTransport(_handler)
+        tracemalloc.start()
+        try:
+            async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+                with pytest.raises(ResponseTooLargeError):
+                    await safe_get(client, "https://example.com/feed.xml", max_bytes=65536)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        # An unbounded decompress() puts the whole 64 MiB expansion in one bytes
+        # object before any counter runs. A bounded one never allocates past the
+        # budget, so the peak stays within a small multiple of it.
+        assert peak < 4 * 1024 * 1024, f"peak {peak} bytes for a 65536-byte budget"
+
+    async def test_wire_bytes_are_bounded_even_when_nothing_decodes(self, monkeypatch) -> None:
+        """A stream of empty deflate blocks decodes to ~0, so only a wire bound stops it."""
+        from app.url_validation import ResponseTooLargeError
+
+        _stub_resolves_to(monkeypatch, "93.184.216.34")
+        compressor = zlib.compressobj(9, zlib.DEFLATED, zlib.MAX_WBITS | 16)
+        head = compressor.compress(b"hello") + compressor.flush(zlib.Z_SYNC_FLUSH)
+        # A byte-aligned stored block with LEN=0: valid deflate, zero output.
+        empty_block = b"\x00\x00\x00\xff\xff"
+        chunks_produced = 0
+
+        async def _body():
+            nonlocal chunks_produced
+            yield head
+            for _ in range(500):
+                chunks_produced += 1
+                yield empty_block * 1024
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, headers={"content-encoding": "gzip"}, content=_body())
+
+        transport = httpx.MockTransport(_handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+            with pytest.raises(ResponseTooLargeError):
+                await safe_get(client, "https://example.com/feed.xml", max_bytes=65536)
+
+        assert chunks_produced <= 16
+
+    async def test_gzip_body_under_cap_decoded_intact(self, monkeypatch) -> None:
+        _stub_resolves_to(monkeypatch, "93.184.216.34")
+        payload = b"<rss><channel><title>ok</title></channel></rss>" * 100
+        body = gzip.compress(payload)
+
+        async def _stream():
+            # Split so the decoder is driven across chunk boundaries, as a real
+            # transport does at 64 KiB.
+            yield body[: len(body) // 2]
+            yield body[len(body) // 2 :]
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, headers={"content-encoding": "gzip"}, content=_stream())
+
+        transport = httpx.MockTransport(_handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+            response = await safe_get(client, "https://example.com/feed.xml", max_bytes=65536)
+
+        assert response.content == payload
+        assert "content-encoding" not in response.headers
+
+    @pytest.mark.parametrize("wbits", [zlib.MAX_WBITS, -zlib.MAX_WBITS])
+    async def test_deflate_body_decoded_in_both_framings(self, monkeypatch, wbits: int) -> None:
+        """``deflate`` is zlib-wrapped or raw in the wild; both must still decode."""
+        _stub_resolves_to(monkeypatch, "93.184.216.34")
+        payload = b"<rss>deflate</rss>" * 50
+        compressor = zlib.compressobj(9, zlib.DEFLATED, wbits)
+        body = compressor.compress(payload) + compressor.flush()
+
+        async def _stream():
+            yield body
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, headers={"content-encoding": "deflate"}, content=_stream())
+
+        transport = httpx.MockTransport(_handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+            response = await safe_get(client, "https://example.com/feed.xml", max_bytes=65536)
+
+        assert response.content == payload
+
+    async def test_identity_alongside_one_codec_is_not_stacking(self, monkeypatch) -> None:
+        _stub_resolves_to(monkeypatch, "93.184.216.34")
+        payload = b"<rss>ok</rss>"
+
+        async def _stream():
+            yield gzip.compress(payload)
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, headers={"content-encoding": "identity, gzip"}, content=_stream())
+
+        transport = httpx.MockTransport(_handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+            response = await safe_get(client, "https://example.com/feed.xml", max_bytes=65536)
+
+        assert response.content == payload
 
 
 class TestSafeSendRedirectCredentials:
