@@ -117,6 +117,39 @@ def _make_article(**overrides) -> Article:
     return Article(**defaults)
 
 
+# --- _summarize_exc ---
+
+
+class TestSummarizeExc:
+    """AUG-270: the stored stage_error summary must redact embedded URLs, not
+    just strip newlines and truncate — it is exposed via UI/API/exports and
+    copied verbatim into outbound Silence Heartbeat notification text."""
+
+    def test_redacts_url_embedded_in_exception_text(self) -> None:
+        from app.checker import _summarize_exc
+
+        secret_url = "https://user:s3cr3tpass@proxy.example.com/path?token=QUERYSECRET"
+        summary = _summarize_exc(Exception(f"Proxy connect failed: {secret_url}"))
+
+        assert "s3cr3tpass" not in summary
+        assert "QUERYSECRET" not in summary
+        assert "proxy.example.com" in summary
+        assert summary.startswith("Exception:")
+
+    def test_plain_message_without_a_url_is_unaffected(self) -> None:
+        from app.checker import _summarize_exc
+
+        summary = _summarize_exc(ValueError("bad thing happened"))
+        assert summary == "ValueError: bad thing happened"
+
+    def test_still_truncates_and_strips_newlines(self) -> None:
+        from app.checker import _summarize_exc
+
+        summary = _summarize_exc(Exception("line one\nline two" + "x" * 300), limit=50)
+        assert "\n" not in summary
+        assert len(summary) <= 50
+
+
 # --- check_topic ---
 
 
@@ -169,6 +202,55 @@ class TestCheckTopic:
         assert result.id is not None
         mock_update.assert_called_once()
         mock_send.assert_called_once()
+
+    async def test_completion_log_carries_the_check_result_id(
+        self, db_conn: sqlite3.Connection, db_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AUG-273 (judge-narrowed scope): the completion log line names the
+        durable CheckResult row, so a request's X-Request-ID (findable via the
+        check/request id fields on every log line during the check) can be
+        followed all the way to the row it produced, with no migration needed."""
+        import logging
+
+        topic = _make_topic(db_conn)
+        create_knowledge_state(
+            db_conn,
+            KnowledgeState(topic_id=topic.id, summary_text="Old summary.", token_count=20),
+        )
+        db_conn.commit()
+        settings = _make_settings()
+
+        articles = [_make_article(topic_id=topic.id)]
+        novelty = NoveltyResult(
+            has_new_info=True,
+            summary="New release date",
+            key_facts=["June 2025"],
+            source_urls=["https://example.com/article-1"],
+            confidence=0.9,
+            relevance=0.9,
+        )
+
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=articles, total_feed_entries=len(articles)),
+            ),
+            patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
+            patch(
+                "app.checker.prepare_knowledge_update",
+                new_callable=AsyncMock,
+                return_value=_make_write_result(),
+            ),
+            patch("app.checker.deliver_notification_intents", _per_url_mock(ok=True)),
+            caplog.at_level(logging.INFO, logger="app.checker"),
+        ):
+            result = await check_topic(topic, settings, db_path=db_path)
+
+        assert result.id is not None
+        completion = [r for r in caplog.records if "articles" in r.getMessage() and "new_info" in r.getMessage()]
+        assert completion, "expected the completion log line"
+        assert f"check_result_id={result.id}" in completion[0].getMessage()
 
     async def test_no_new_info_no_notification(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         """Articles found but LLM says nothing new."""
@@ -539,6 +621,33 @@ class TestCheckTopic:
         assert result.stage_error.startswith("pipeline_failed")
         row = db_conn.execute("SELECT stage_error FROM check_results WHERE id = ?", (result.id,)).fetchone()
         assert row["stage_error"].startswith("pipeline_failed")
+
+    async def test_scrape_failure_stage_error_redacts_embedded_url(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """AUG-270: stage_error is exposed via UI/API/exports and Silence Heartbeat
+        copies it verbatim into outbound notification text, so a credential-bearing
+        URL embedded in the raw exception text (a misconfigured proxy, say) must
+        not survive into the stored summary."""
+        topic = _make_topic(db_conn, name="ScrapeFailSecret")
+        settings = _make_settings()
+
+        secret_url = "https://user:s3cr3tpass@proxy.example.com/path?token=QUERYSECRET"
+        with patch(
+            "app.checker.fetch_new_articles_for_topic",
+            new_callable=AsyncMock,
+            side_effect=Exception(f"Proxy connect failed: {secret_url}"),
+        ):
+            result = await check_topic(topic, settings, db_path=db_path)
+
+        assert result.stage_error is not None
+        assert result.stage_error.startswith("pipeline_failed")
+        assert "s3cr3tpass" not in result.stage_error
+        assert "QUERYSECRET" not in result.stage_error
+        assert "proxy.example.com" in result.stage_error  # destination still identifiable
+        row = db_conn.execute("SELECT stage_error FROM check_results WHERE id = ?", (result.id,)).fetchone()
+        assert "s3cr3tpass" not in row["stage_error"]
+        assert "QUERYSECRET" not in row["stage_error"]
 
     async def test_analysis_failure_sets_stage_error(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         """An LLM analysis failure (safe-default) records stage_error='analysis_failed'.
@@ -1005,6 +1114,50 @@ class TestInitAndRetryCarryCheckId:
         finally:
             check_id_var.reset(token)
 
+    async def test_initialize_new_topic_restores_outer_check_id_on_claim_phase_failure(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """AUG-266: a raw DB failure during the claim/snapshot phase (before
+        the pipeline's own try/except exists) must still restore the caller's
+        prior check_id, not just the four explicit TopicInitRefused refusals."""
+        from app.check_context import check_id_var
+        from app.checker import initialize_new_topic
+
+        topic = _make_topic(db_conn, name="InitClaimBoom", status=TopicStatus.NEW, status_changed_at=None)
+        settings = _make_settings()
+
+        token = check_id_var.set("outer-sentinel")
+        try:
+            with (
+                patch("app.checker.get_topic", side_effect=sqlite3.OperationalError("database is locked")),
+                pytest.raises(sqlite3.OperationalError),
+            ):
+                await initialize_new_topic(topic, settings, db_path=db_path)
+            # The failure must not leak this init's generated id into whatever
+            # the caller (scheduler tick, web background task) logs next.
+            assert check_id_var.get() == "outer-sentinel"
+        finally:
+            check_id_var.reset(token)
+
+    async def test_initialize_new_topic_refusal_restores_outer_check_id(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """The existing TopicInitRefused paths still reset exactly once (no
+        double-reset RuntimeError) now that they share the claim-phase except."""
+        from app.check_context import check_id_var
+        from app.checker import TopicInitRefused, initialize_new_topic
+
+        topic = _make_topic(db_conn, name="InitRefused", status=TopicStatus.RESEARCHING, status_changed_at=None)
+        settings = _make_settings()
+
+        token = check_id_var.set("outer-sentinel")
+        try:
+            with pytest.raises(TopicInitRefused):
+                await initialize_new_topic(topic, settings, db_path=db_path)
+            assert check_id_var.get() == "outer-sentinel"
+        finally:
+            check_id_var.reset(token)
+
     async def test_initialize_new_topic_logs_carry_check_id(
         self, db_conn: sqlite3.Connection, caplog, db_path: Path
     ) -> None:  # noqa: ANN001
@@ -1087,6 +1240,115 @@ class TestInitAndRetryCarryCheckId:
 
 
 # --- initialize_new_topic ---
+
+
+class TestInitializeRebuildsFromStoredArticles:
+    """AUG-252: initialization is not a routine check and must not depend on the
+    feed having moved since the last one."""
+
+    async def test_retry_after_llm_failure_reuses_the_stored_batch(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """The batch a failed init stored is invisible to the next fetch — same-topic
+        dedup rejects every stored hash — so a Retry used to find nothing and
+        report the same error, permanently."""
+        from app.checker import initialize_new_topic
+        from app.crud import create_article
+
+        topic = _make_topic(db_conn, status=TopicStatus.ERROR)
+        create_article(db_conn, _make_article(id=None, topic_id=topic.id, content_hash="stored-1"))
+        db_conn.commit()
+
+        prepare = AsyncMock(return_value=_make_write_result())
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[], total_feed_entries=0),
+            ),
+            patch("app.checker.prepare_initial_knowledge", new=prepare),
+        ):
+            await initialize_new_topic(topic, _make_settings(), db_path=db_path)
+
+        from app.crud import get_topic
+
+        assert get_topic(db_conn, topic.id).status == TopicStatus.READY
+        passed = prepare.await_args.args[1]
+        assert [a.content_hash for a in passed] == ["stored-1"]
+
+    async def test_reinitialize_rebuilds_from_the_whole_corpus(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """A READY re-init used to replace a mature baseline with one built from
+        whatever handful of entries had appeared since the last check."""
+        from app.checker import initialize_new_topic
+        from app.crud import create_article
+
+        topic = _make_topic(db_conn, status=TopicStatus.READY)
+        for i in range(3):
+            stored = _make_article(id=None, topic_id=topic.id, content_hash=f"old-{i}")
+            stored.processed = True
+            create_article(db_conn, stored)
+        db_conn.commit()
+        fresh = [_make_article(id=None, topic_id=topic.id, content_hash="fresh-1")]
+
+        prepare = AsyncMock(return_value=_make_write_result())
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=fresh, total_feed_entries=1),
+            ),
+            patch("app.checker.prepare_initial_knowledge", new=prepare),
+        ):
+            await initialize_new_topic(topic, _make_settings(), db_path=db_path)
+
+        passed = prepare.await_args.args[1]
+        assert [a.content_hash for a in passed][0] == "fresh-1", "fresh entries lead the prompt"
+        assert {a.content_hash for a in passed} == {"fresh-1", "old-0", "old-1", "old-2"}
+
+    async def test_corpus_is_capped_and_fresh_articles_win(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
+        """An over-budget prompt drops trailing articles, so the stored ones go last."""
+        from app.checker import initialize_new_topic
+        from app.crud import create_article
+
+        topic = _make_topic(db_conn, status=TopicStatus.READY)
+        for i in range(5):
+            create_article(db_conn, _make_article(id=None, topic_id=topic.id, content_hash=f"old-{i}"))
+        db_conn.commit()
+        fresh = [_make_article(id=None, topic_id=topic.id, content_hash="fresh-1")]
+
+        prepare = AsyncMock(return_value=_make_write_result())
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=fresh, total_feed_entries=1),
+            ),
+            patch("app.checker.prepare_initial_knowledge", new=prepare),
+        ):
+            await initialize_new_topic(topic, _make_settings(max_articles_per_check=3), db_path=db_path)
+
+        passed = prepare.await_args.args[1]
+        assert len(passed) == 3
+        assert passed[0].content_hash == "fresh-1"
+
+    async def test_a_topic_with_no_articles_at_all_still_errors(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """Nothing stored and nothing fetched is still a genuine failure."""
+        from app.checker import initialize_new_topic
+        from app.crud import get_topic
+
+        topic = _make_topic(db_conn, status=TopicStatus.NEW)
+        with patch(
+            "app.checker.fetch_new_articles_for_topic",
+            new_callable=AsyncMock,
+            return_value=FetchResult(articles=[], total_feed_entries=0),
+        ):
+            await initialize_new_topic(topic, _make_settings(), db_path=db_path)
+
+        assert get_topic(db_conn, topic.id).status == TopicStatus.ERROR
 
 
 class TestInitializeNewTopicStatusChangedAt:
@@ -1671,6 +1933,93 @@ class TestCheckAllTopics:
         assert len(results) == 1
 
 
+class TestCycleIdSharedAcrossCheckAllTopics:
+    """AUG-275: check_all_topics sets one cycle_id_var for its whole run, so
+    every per-topic check and retry drain it launches can be traced back to
+    the same tick, even though each still gets its own, different check_id."""
+
+    async def test_cycle_id_set_during_per_topic_check(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
+        from app.check_context import cycle_id_var
+
+        _make_topic(db_conn, name="Topic A")
+        settings = _make_settings()
+
+        seen: dict[str, str | None] = {}
+
+        async def _capture(*_args, **_kwargs):
+            seen["cycle"] = cycle_id_var.get()
+            return FetchResult(articles=[], total_feed_entries=0)
+
+        assert cycle_id_var.get() is None
+        with patch("app.checker.fetch_new_articles_for_topic", side_effect=_capture):
+            await check_all_topics(settings, db_path=db_path)
+
+        assert seen["cycle"] is not None
+        assert seen["cycle"] != "-"
+        assert cycle_id_var.get() is None  # restored once the cycle ends
+
+    async def test_cycle_id_is_the_same_across_multiple_topics(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        from app.check_context import check_id_var, cycle_id_var
+
+        _make_topic(db_conn, name="Topic A")
+        _make_topic(db_conn, name="Topic B")
+        settings = _make_settings()
+
+        seen_cycle: list[str | None] = []
+        seen_check: list[str | None] = []
+
+        async def _capture(*_args, **_kwargs):
+            seen_cycle.append(cycle_id_var.get())
+            seen_check.append(check_id_var.get())
+            return FetchResult(articles=[], total_feed_entries=0)
+
+        with patch("app.checker.fetch_new_articles_for_topic", side_effect=_capture):
+            await check_all_topics(settings, db_path=db_path)
+
+        assert len(seen_cycle) == 2
+        # Same cycle for both topics...
+        assert seen_cycle[0] == seen_cycle[1]
+        # ...but each still gets its own, distinct check_id.
+        assert seen_check[0] != seen_check[1]
+
+    async def test_cycle_id_shared_with_notification_retry_drain(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """The retry drain runs BEFORE the per-topic loop but must still share
+        the one cycle id, since both are launched from the same cycle."""
+        from app.check_context import cycle_id_var
+
+        topic = _make_topic(db_conn, name="Topic A")
+        create_pending_notification(
+            db_conn,
+            PendingNotification(topic_id=topic.id, title="T", body="B", url="json://localhost"),
+        )
+        db_conn.commit()
+        settings = _make_settings()
+
+        seen: dict[str, str | None] = {}
+
+        async def _capture_send(title, body, url, timeout_s):  # noqa: ANN001
+            seen["retry_cycle"] = cycle_id_var.get()
+            return NotificationDelivery(url=url, ok=True)
+
+        async def _capture_fetch(*_args, **_kwargs):
+            seen["check_cycle"] = cycle_id_var.get()
+            return FetchResult(articles=[], total_feed_entries=0)
+
+        with (
+            patch("app.checker.send_single_notification", side_effect=_capture_send),
+            patch("app.checker.fetch_new_articles_for_topic", side_effect=_capture_fetch),
+        ):
+            await check_all_topics(settings, db_path=db_path)
+
+        assert seen["retry_cycle"] is not None
+        assert seen["retry_cycle"] != "-"
+        assert seen["retry_cycle"] == seen["check_cycle"]
+
+
 # --- retry_pending_notifications ---
 
 
@@ -1719,24 +2068,6 @@ class TestRetryPendingNotifications:
         assert row["next_attempt_at"] is not None
         # ...and the drain honours it: this row is no longer due.
         assert list_due_notification_intents(db_conn, to_db_utc(datetime.now(UTC)), 10) == []
-
-    async def test_unexpected_send_error_leaves_the_intent_claimed(self, db_conn: sqlite3.Connection) -> None:
-        """An exception mid-send is an unknown outcome, not a failed one."""
-        topic = _make_topic(db_conn)
-        create_pending_notification(
-            db_conn,
-            PendingNotification(topic_id=topic.id, title="T", body="B", url="json://localhost"),
-        )
-        db_conn.commit()
-
-        settings = _make_settings()
-
-        with patch("app.checker.send_single_notification", side_effect=RuntimeError("SMTP error")):
-            await retry_pending_notifications(db_conn, settings)
-
-        row = db_conn.execute("SELECT status, retry_count FROM pending_notifications").fetchone()
-        assert row["status"] == "sending"
-        assert row["retry_count"] == 0
 
     async def test_expired_notifications_are_abandoned(self, db_conn: sqlite3.Connection) -> None:
         """Out-of-attempts intents become 'abandoned', keeping the record."""
@@ -1838,15 +2169,14 @@ class TestRetryPendingNotifications:
 
         pending = list_pending_notifications(db_conn)
         assert len(pending) == 2
-        first_id = pending[0].id
+        first_id, second_id = pending[0].id, pending[1].id
 
         from app.crud import apply_notification_outcome as real_apply
 
-        call_count = {"n": 0}
-
+        # Every apply for the second row crashes — the recovery apply included, as
+        # a genuinely unwritable database would.
         def crashing_apply(conn, intent_id, claim_token, **kwargs):  # noqa: ANN001
-            call_count["n"] += 1
-            if call_count["n"] == 2:
+            if intent_id == second_id:
                 raise RuntimeError("simulated crash applying item 2")
             return real_apply(conn, intent_id, claim_token, **kwargs)
 
@@ -1999,6 +2329,116 @@ class TestDeliveryIntentDurability:
         db_conn.commit()
         assert released == 1
         assert len(list_pending_notifications(db_conn)) == 1
+
+    @pytest.mark.parametrize(
+        ("error", "status"),
+        [
+            ("placeholder notification URL", "abandoned"),
+            ("invalid notification URL", "abandoned"),
+            # The SSRF gate fails closed on resolution failure, so "blocked" also
+            # means "the resolver could not answer" — which a later attempt can.
+            ("blocked notification target", "pending"),
+        ],
+    )
+    async def test_only_a_permanently_unusable_target_skips_the_retry_budget(
+        self, db_conn: sqlite3.Connection, error: str, status: str
+    ) -> None:
+        topic = _make_topic(db_conn)
+        create_pending_notification(
+            db_conn, PendingNotification(topic_id=topic.id, title="T", body="B", url="json://x")
+        )
+        db_conn.commit()
+        settings = _make_settings()
+
+        async def blocked(title, body, url, timeout_s):  # noqa: ANN001
+            return NotificationDelivery(url=url, ok=False, error=error)
+
+        with patch("app.checker.send_single_notification", side_effect=blocked):
+            await retry_pending_notifications(db_conn, settings)
+
+        row = db_conn.execute("SELECT status, retry_count, next_attempt_at FROM pending_notifications").fetchone()
+        assert row["status"] == status
+        assert row["retry_count"] == 1
+        assert (row["next_attempt_at"] is not None) is (status == "pending")
+
+    async def test_an_escaping_send_error_still_records_a_retryable_failure(self, db_conn: sqlite3.Connection) -> None:
+        """An exception must land an outcome, or the row is stuck 'sending' for good.
+
+        Nothing else can free it: retry_count never moves so it is never
+        abandoned, retention prunes only terminal rows, and the UI queue hides
+        'sending'. Every later drain re-sends it.
+        """
+        topic = _make_topic(db_conn)
+        create_pending_notification(
+            db_conn, PendingNotification(topic_id=topic.id, title="T", body="B", url="json://x", max_retries=3)
+        )
+        db_conn.commit()
+        settings = _make_settings()
+
+        async def boom(title, body, url, timeout_s):  # noqa: ANN001
+            raise ValueError("Invalid IPv6 URL")
+
+        with patch("app.checker.send_single_notification", side_effect=boom):
+            await retry_pending_notifications(db_conn, settings)
+
+            row = db_conn.execute("SELECT * FROM pending_notifications").fetchone()
+            assert row["status"] == "pending"
+            assert row["retry_count"] == 1
+            assert row["last_error"] == "ValueError"
+            assert row["next_attempt_at"] is not None
+
+            # The budget is spent like any other failure, so the row leaves the queue.
+            for _ in range(2):
+                db_conn.execute("UPDATE pending_notifications SET next_attempt_at = NULL")
+                db_conn.commit()
+                await retry_pending_notifications(db_conn, settings)
+
+        row = db_conn.execute("SELECT status, retry_count FROM pending_notifications").fetchone()
+        assert row["status"] == "abandoned"
+        assert row["retry_count"] == 3
+
+    async def test_a_failed_apply_after_a_delivered_send_is_not_re_sent(self, db_conn: sqlite3.Connection) -> None:
+        """Exactly-once holds when the apply write fails, not just when the send does.
+
+        A locked database (the daily VACUUM outliving busy_timeout) after a send
+        that did deliver must not re-arm the row: the user would get the alert
+        twice. The claim fence makes re-applying the delivered outcome a no-op if
+        the first apply landed after all.
+        """
+        topic = _make_topic(db_conn)
+        create_pending_notification(
+            db_conn, PendingNotification(topic_id=topic.id, title="T", body="B", url="json://x")
+        )
+        db_conn.commit()
+        settings = _make_settings()
+
+        sends: list[str] = []
+
+        async def record(title, body, url, timeout_s):  # noqa: ANN001
+            sends.append(url)
+            return NotificationDelivery(url=url, ok=True)
+
+        applies = {"n": 0}
+
+        def flaky_apply(*args, **kwargs):  # noqa: ANN002, ANN003
+            applies["n"] += 1
+            if applies["n"] == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return apply_notification_outcome(*args, **kwargs)
+
+        with (
+            patch("app.checker.send_single_notification", side_effect=record),
+            patch("app.checker.apply_notification_outcome", side_effect=flaky_apply),
+        ):
+            await retry_pending_notifications(db_conn, settings)
+            # The stale-claim window elapses; a re-armed row would send again.
+            release_stale_notification_claims(db_conn, to_db_utc(datetime.now(UTC) + timedelta(hours=1)))
+            db_conn.commit()
+            await retry_pending_notifications(db_conn, settings)
+
+        assert sends == ["json://x"]
+        row = db_conn.execute("SELECT status FROM pending_notifications").fetchone()
+        assert row["status"] == "sent"
 
     async def test_rollup_is_true_only_when_every_intent_sent(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
         topic = _make_topic(db_conn, name="Rollup")
@@ -2163,36 +2603,80 @@ class TestSourcesFailedSurfacing:
         assert updated.error_message == "No source attempted during initialization (2 feed(s) in backoff)"
 
 
+def _heartbeat_sender(*, ok: bool = True, error: str | None = None, fails: tuple[str, ...] = ()) -> AsyncMock:
+    """AsyncMock for app.checker.send_single_notification, one call per target.
+
+    Patched at the per-target send rather than at ``deliver_notification_intents``
+    so the intent rows reach their real terminal status: the recovery notice is
+    addressed from the ledger of alerts that actually went out, so a stub that
+    leaves every row 'pending' would test nothing.
+    """
+
+    async def _send(title: str, body: str, url: str, timeout_s: float) -> NotificationDelivery:
+        if url in fails:
+            return NotificationDelivery(url=url, ok=False, error=error or "unreachable")
+        return NotificationDelivery(url=url, ok=ok, error=None if ok else (error or "unreachable"))
+
+    return AsyncMock(side_effect=_send)
+
+
+def _titles(send: AsyncMock) -> list[str]:
+    return [call.args[0] for call in send.await_args_list]
+
+
+def _intent_rows(conn: sqlite3.Connection, topic_id: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT kind, status, url, latch_value, title FROM pending_notifications WHERE topic_id = ? ORDER BY id",
+        (topic_id,),
+    ).fetchall()
+
+
 class TestSilenceHeartbeatPipeline:
     """Heartbeat behaviour driven end-to-end through check_topic."""
 
-    async def _failing_check(self, db_conn: sqlite3.Connection, topic: Topic, send, *, threshold: int = 3):
-        settings = _make_settings(silence_heartbeat_checks=threshold)
+    async def _failing_check(
+        self,
+        db_conn: sqlite3.Connection,
+        topic: Topic,
+        send,
+        *,
+        threshold: int = 3,
+        settings: Settings | None = None,
+    ):
+        settings = settings or _make_settings(silence_heartbeat_checks=threshold)
         with (
             patch(
                 "app.checker.fetch_new_articles_for_topic",
                 new_callable=AsyncMock,
                 return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=1, feeds_failed=1),
             ),
-            patch("app.checker.deliver_notification_intents", send),
+            patch("app.checker.send_single_notification", send),
         ):
             return await check_topic(get_topic(db_conn, topic.id), settings, db_path=conn_db_path(db_conn))
 
-    async def _healthy_empty_check(self, db_conn: sqlite3.Connection, topic: Topic, send, *, threshold: int = 3):
-        settings = _make_settings(silence_heartbeat_checks=threshold)
+    async def _healthy_empty_check(
+        self,
+        db_conn: sqlite3.Connection,
+        topic: Topic,
+        send,
+        *,
+        threshold: int = 3,
+        settings: Settings | None = None,
+    ):
+        settings = settings or _make_settings(silence_heartbeat_checks=threshold)
         with (
             patch(
                 "app.checker.fetch_new_articles_for_topic",
                 new_callable=AsyncMock,
                 return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=1, feeds_failed=0),
             ),
-            patch("app.checker.deliver_notification_intents", send),
+            patch("app.checker.send_single_notification", send),
         ):
             return await check_topic(get_topic(db_conn, topic.id), settings, db_path=conn_db_path(db_conn))
 
     async def test_alert_fires_once_at_the_threshold(self, db_conn: sqlite3.Connection) -> None:
         topic = _make_topic(db_conn)
-        send = _per_url_mock(ok=True)
+        send = _heartbeat_sender()
 
         for _ in range(2):
             await self._failing_check(db_conn, topic, send)
@@ -2200,7 +2684,7 @@ class TestSilenceHeartbeatPipeline:
 
         await self._failing_check(db_conn, topic, send)
         assert send.await_count == 1
-        assert "sources failing" in send.await_args.args[0][0].title
+        assert "sources failing" in _titles(send)[0]
         assert get_topic(db_conn, topic.id).heartbeat_alerted_at is not None
 
         for _ in range(3):
@@ -2210,7 +2694,7 @@ class TestSilenceHeartbeatPipeline:
     async def test_fetch_exception_path_never_alerts_on_the_sources(self, db_conn: sqlite3.Connection) -> None:
         """A pipeline crash is recorded, but it is not evidence about the feeds (AUG-133)."""
         topic = _make_topic(db_conn)
-        send = _per_url_mock(ok=True)
+        send = _heartbeat_sender()
         settings = _make_settings(silence_heartbeat_checks=2)
         for _ in range(3):
             with (
@@ -2219,7 +2703,7 @@ class TestSilenceHeartbeatPipeline:
                     new_callable=AsyncMock,
                     side_effect=RuntimeError("boom"),
                 ),
-                patch("app.checker.deliver_notification_intents", send),
+                patch("app.checker.send_single_notification", send),
             ):
                 result = await check_topic(get_topic(db_conn, topic.id), settings, db_path=conn_db_path(db_conn))
         assert result.stage_error.startswith("pipeline_failed")
@@ -2229,7 +2713,7 @@ class TestSilenceHeartbeatPipeline:
     async def test_pipeline_crash_does_not_clear_an_announced_outage(self, db_conn: sqlite3.Connection) -> None:
         """The latch survives a check that never reached the sources."""
         topic = _make_topic(db_conn)
-        send = _per_url_mock(ok=True)
+        send = _heartbeat_sender()
         for _ in range(3):
             await self._failing_check(db_conn, topic, send)
         assert send.await_count == 1
@@ -2240,7 +2724,7 @@ class TestSilenceHeartbeatPipeline:
                 new_callable=AsyncMock,
                 side_effect=RuntimeError("boom"),
             ),
-            patch("app.checker.deliver_notification_intents", send),
+            patch("app.checker.send_single_notification", send),
         ):
             await check_topic(
                 get_topic(db_conn, topic.id),
@@ -2252,14 +2736,14 @@ class TestSilenceHeartbeatPipeline:
 
     async def test_recovery_notice_after_the_outage(self, db_conn: sqlite3.Connection) -> None:
         topic = _make_topic(db_conn)
-        send = _per_url_mock(ok=True)
+        send = _heartbeat_sender()
         for _ in range(3):
             await self._failing_check(db_conn, topic, send)
         assert send.await_count == 1
 
         await self._healthy_empty_check(db_conn, topic, send)
         assert send.await_count == 2
-        assert "recovered" in send.await_args.args[0][0].title
+        assert "recovered" in _titles(send)[1]
         assert get_topic(db_conn, topic.id).heartbeat_alerted_at is None
 
         await self._healthy_empty_check(db_conn, topic, send)
@@ -2268,7 +2752,7 @@ class TestSilenceHeartbeatPipeline:
     async def test_recovery_on_the_main_analysis_path(self, db_conn: sqlite3.Connection) -> None:
         """A check that reaches analysis also clears the outage."""
         topic = _make_topic(db_conn)
-        send = _per_url_mock(ok=True)
+        send = _heartbeat_sender()
         for _ in range(3):
             await self._failing_check(db_conn, topic, send)
         assert send.await_count == 1
@@ -2282,16 +2766,16 @@ class TestSilenceHeartbeatPipeline:
                 return_value=FetchResult(articles=[_make_article()], total_feed_entries=1),
             ),
             patch("app.checker.analyze_articles", new_callable=AsyncMock, return_value=novelty),
-            patch("app.checker.deliver_notification_intents", send),
+            patch("app.checker.send_single_notification", send),
         ):
             await check_topic(get_topic(db_conn, topic.id), settings, db_path=conn_db_path(db_conn))
 
         assert send.await_count == 2
-        assert "recovered" in send.await_args.args[0][0].title
+        assert "recovered" in _titles(send)[1]
 
     async def test_disabled_by_zero(self, db_conn: sqlite3.Connection) -> None:
         topic = _make_topic(db_conn)
-        send = _per_url_mock(ok=True)
+        send = _heartbeat_sender()
         for _ in range(4):
             await self._failing_check(db_conn, topic, send, threshold=0)
         assert send.await_count == 0
@@ -2300,7 +2784,7 @@ class TestSilenceHeartbeatPipeline:
     async def test_disabling_clears_an_outstanding_latch_silently(self, db_conn: sqlite3.Connection) -> None:
         """Turning the feature off must reset state, not park a phantom recovery."""
         topic = _make_topic(db_conn)
-        send = _per_url_mock(ok=True)
+        send = _heartbeat_sender()
         for _ in range(3):
             await self._failing_check(db_conn, topic, send)
         assert send.await_count == 1
@@ -2316,7 +2800,7 @@ class TestSilenceHeartbeatPipeline:
 
     async def test_failed_heartbeat_delivery_is_queued_and_drains(self, db_conn: sqlite3.Connection) -> None:
         topic = _make_topic(db_conn)
-        send = _per_url_mock(ok=False, error="unreachable")
+        send = _heartbeat_sender(ok=False, error="unreachable")
         for _ in range(3):
             await self._failing_check(db_conn, topic, send)
 
@@ -2325,12 +2809,15 @@ class TestSilenceHeartbeatPipeline:
         ).fetchall()
         assert len(rows) == 1
         assert "sources failing" in rows[0]["title"]
-        # The intent carries its heartbeat kind, so A5's revocation can find it.
+        # The intent carries its heartbeat kind, so the revocation can find it.
         assert rows[0]["kind"] == "heartbeat_alert"
         assert rows[0]["status"] == "pending"
-        # The latch is claimed before the send, so a dead channel never re-alerts.
+        # The latch is claimed with the intent, so a dead channel never re-alerts.
         assert get_topic(db_conn, topic.id).heartbeat_alerted_at is not None
 
+        # The failed attempt scheduled a backoff; let that window elapse.
+        db_conn.execute("UPDATE pending_notifications SET next_attempt_at = NULL WHERE topic_id = ?", (topic.id,))
+        db_conn.commit()
         with patch("app.checker.send_single_notification", side_effect=_ok_send):
             await retry_pending_notifications(db_conn, _make_settings(silence_heartbeat_checks=3))
         remaining = db_conn.execute(
@@ -2357,7 +2844,7 @@ class TestSilenceHeartbeatPipeline:
     async def test_non_ready_topic_never_heartbeats(self, db_conn: sqlite3.Connection) -> None:
         """A non-READY check must neither alert nor claim recovery."""
         topic = _make_topic(db_conn)
-        send = _per_url_mock(ok=True)
+        send = _heartbeat_sender()
         for _ in range(3):
             await self._failing_check(db_conn, topic, send)
         assert send.await_count == 1
@@ -2367,10 +2854,188 @@ class TestSilenceHeartbeatPipeline:
         update_topic(db_conn, topic)
         db_conn.commit()
 
-        with patch("app.checker.deliver_notification_intents", send):
+        with patch("app.checker.send_single_notification", send):
             await check_topic(topic, _make_settings(silence_heartbeat_checks=3), db_path=conn_db_path(db_conn))
         assert send.await_count == 1
         assert get_topic(db_conn, topic.id).heartbeat_alerted_at is not None
+
+
+class TestHeartbeatTransitionIsAtomic:
+    """AUG-019/130/131/132: the latch, its intents and its revocations are one commit."""
+
+    def _pipeline(self) -> TestSilenceHeartbeatPipeline:
+        return TestSilenceHeartbeatPipeline()
+
+    async def _outage(self, db_conn: sqlite3.Connection, topic: Topic, send, **kwargs) -> None:
+        for _ in range(3):
+            await self._pipeline()._failing_check(db_conn, topic, send, **kwargs)
+
+    async def test_zero_targets_never_consume_the_latch(self, db_conn: sqlite3.Connection) -> None:
+        """No configured Apprise target means no announcement, so nothing to latch (AUG-130)."""
+        topic = _make_topic(db_conn)
+        send = _heartbeat_sender()
+        settings = _make_settings(silence_heartbeat_checks=3, notifications=NotificationSettings(urls=[]))
+        await self._outage(db_conn, topic, send, settings=settings)
+
+        assert send.await_count == 0
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is None
+        assert _intent_rows(db_conn, topic.id) == []
+
+        # A target configured during the same outage still gets the alert.
+        await self._pipeline()._failing_check(db_conn, topic, send)
+        assert send.await_count == 1
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is not None
+
+    async def test_intent_failure_takes_the_latch_with_it(self, db_conn: sqlite3.Connection) -> None:
+        """A crash between latch and intents must leave neither (AUG-019)."""
+        topic = _make_topic(db_conn)
+        send = _heartbeat_sender()
+        with patch("app.checker.create_notification_intents", side_effect=sqlite3.OperationalError("disk I/O error")):
+            await self._outage(db_conn, topic, send)
+
+        assert send.await_count == 0
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is None
+        assert _intent_rows(db_conn, topic.id) == []
+
+        # The next check re-runs the whole transition cleanly.
+        await self._pipeline()._failing_check(db_conn, topic, send)
+        assert send.await_count == 1
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is not None
+
+    async def test_crash_before_send_leaves_a_deliverable_intent(self, db_conn: sqlite3.Connection) -> None:
+        """The send is outside the commit, so a death mid-send costs no message (AUG-019)."""
+        topic = _make_topic(db_conn)
+        send = _heartbeat_sender()
+        with patch("app.checker.deliver_notification_intents", side_effect=RuntimeError("process died")):
+            await self._outage(db_conn, topic, send)
+
+        rows = _intent_rows(db_conn, topic.id)
+        assert [(r["kind"], r["status"]) for r in rows] == [("heartbeat_alert", "pending")]
+        assert (
+            rows[0]["latch_value"]
+            == db_conn.execute("SELECT heartbeat_alerted_at FROM topics WHERE id = ?", (topic.id,)).fetchone()[0]
+        )
+
+        with patch("app.checker.send_single_notification", send):
+            await retry_pending_notifications(db_conn, _make_settings(silence_heartbeat_checks=3))
+        assert send.await_count == 1
+        assert _intent_rows(db_conn, topic.id)[0]["status"] == "sent"
+
+    async def test_a_newer_check_invalidates_a_stale_decision(self, db_conn: sqlite3.Connection) -> None:
+        """Two interleaved checks: the decision from check N cannot land after N+1 (AUG-131)."""
+        from app.crud import create_check_result
+        from app.heartbeat import evaluate_heartbeat as real_evaluate
+        from app.models import CheckResult
+
+        topic = _make_topic(db_conn)
+        send = _heartbeat_sender()
+        db_path = conn_db_path(db_conn)
+
+        def _evaluate_then_race(conn, topic_arg, threshold):
+            decision = real_evaluate(conn, topic_arg, threshold)
+            if decision is not None:
+                # A concurrent CLI check commits a newer result before we write.
+                create_check_result(
+                    db_conn,
+                    CheckResult(topic_id=topic.id, checked_at=datetime.now(UTC), stage_error=None),
+                )
+                db_conn.commit()
+            return decision
+
+        with patch("app.checker.evaluate_heartbeat", side_effect=_evaluate_then_race):
+            for _ in range(3):
+                with (
+                    patch(
+                        "app.checker.fetch_new_articles_for_topic",
+                        new_callable=AsyncMock,
+                        return_value=FetchResult(articles=[], total_feed_entries=0, feeds_total=1, feeds_failed=1),
+                    ),
+                    patch("app.checker.send_single_notification", send),
+                ):
+                    await check_topic(
+                        get_topic(db_conn, topic.id),
+                        _make_settings(silence_heartbeat_checks=3),
+                        db_path=db_path,
+                    )
+
+        assert send.await_count == 0
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is None
+        assert _intent_rows(db_conn, topic.id) == []
+
+    async def test_recovery_only_addresses_targets_that_got_the_alert(self, db_conn: sqlite3.Connection) -> None:
+        """A target that never received the outage notice is not told it ended."""
+        topic = _make_topic(db_conn)
+        settings = _make_settings(
+            silence_heartbeat_checks=3,
+            notifications=NotificationSettings(urls=["json://good.example.com", "json://bad.example.com"]),
+        )
+        send = _heartbeat_sender(fails=("json://bad.example.com",))
+        await self._outage(db_conn, topic, send, settings=settings)
+        assert send.await_count == 2
+
+        await self._pipeline()._healthy_empty_check(db_conn, topic, send, settings=settings)
+
+        recovery = [r for r in _intent_rows(db_conn, topic.id) if r["kind"] == "heartbeat_recovery"]
+        assert [r["url"] for r in recovery] == ["json://good.example.com"]
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is None
+
+    async def test_recovery_revokes_the_superseded_alert(self, db_conn: sqlite3.Connection) -> None:
+        """A queued alert must never arrive after the recovery that contradicts it (AUG-132)."""
+        topic = _make_topic(db_conn)
+        failing = _heartbeat_sender(ok=False, error="unreachable")
+        await self._outage(db_conn, topic, failing)
+        assert [r["status"] for r in _intent_rows(db_conn, topic.id)] == ["pending"]
+
+        send = _heartbeat_sender()
+        await self._pipeline()._healthy_empty_check(db_conn, topic, send)
+
+        rows = _intent_rows(db_conn, topic.id)
+        assert [(r["kind"], r["status"]) for r in rows] == [("heartbeat_alert", "revoked")]
+        # Nobody received the alert, so there is nobody to tell about the recovery —
+        # but the latch is released either way, so the next outage still announces.
+        assert send.await_count == 0
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is None
+
+        with patch("app.checker.send_single_notification", send):
+            await retry_pending_notifications(db_conn, _make_settings(silence_heartbeat_checks=3))
+        assert send.await_count == 0
+
+    async def test_disabling_revokes_queued_heartbeat_messages(self, db_conn: sqlite3.Connection) -> None:
+        """A queued alert cannot arrive after the feature was switched off (AUG-132)."""
+        topic = _make_topic(db_conn)
+        failing = _heartbeat_sender(ok=False, error="unreachable")
+        await self._outage(db_conn, topic, failing)
+        assert [r["status"] for r in _intent_rows(db_conn, topic.id)] == ["pending"]
+
+        send = _heartbeat_sender()
+        await self._pipeline()._failing_check(db_conn, topic, send, threshold=0)
+
+        assert [r["status"] for r in _intent_rows(db_conn, topic.id)] == ["revoked"]
+        assert get_topic(db_conn, topic.id).heartbeat_alerted_at is None
+        with patch("app.checker.send_single_notification", send):
+            await retry_pending_notifications(db_conn, _make_settings(silence_heartbeat_checks=3))
+        assert send.await_count == 0
+
+    async def test_corrupt_latch_clears_instead_of_wedging(self, db_conn: sqlite3.Connection) -> None:
+        """Unparseable latch text must not suppress both transitions forever (AUG-144)."""
+        topic = _make_topic(db_conn)
+        send = _heartbeat_sender()
+        await self._outage(db_conn, topic, send)
+        db_conn.execute("UPDATE topics SET heartbeat_alerted_at = 'corrupt' WHERE id = ?", (topic.id,))
+        db_conn.commit()
+
+        # Still latched: no second alert while the outage continues.
+        await self._pipeline()._failing_check(db_conn, topic, send)
+        assert send.await_count == 1
+
+        await self._pipeline()._healthy_empty_check(db_conn, topic, send)
+        assert (
+            db_conn.execute("SELECT heartbeat_alerted_at FROM topics WHERE id = ?", (topic.id,)).fetchone()[0] is None
+        )
+
+        # And the topic can announce its next outage normally.
+        await self._outage(db_conn, topic, send)
+        assert "sources failing" in _titles(send)[-1]
 
 
 class TestAnalysisFailureIsResumable:

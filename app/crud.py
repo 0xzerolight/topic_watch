@@ -16,6 +16,7 @@ from app.models import (
     FeedHealth,
     KnowledgeRevision,
     KnowledgeState,
+    NotificationKind,
     PendingNotification,
     PendingWebhook,
     Topic,
@@ -734,8 +735,9 @@ def create_knowledge_revision(conn: sqlite3.Connection, revision: KnowledgeRevis
     data = revision.to_insert_dict()
     cursor = conn.execute(
         """INSERT INTO knowledge_revisions
-               (topic_id, summary_text, token_count, source, change_note, created_at)
-           VALUES (:topic_id, :summary_text, :token_count, :source, :change_note, :created_at)""",
+               (topic_id, summary_text, token_count, source, change_note, created_at, model, basis_hash)
+           VALUES (:topic_id, :summary_text, :token_count, :source, :change_note, :created_at,
+                   :model, :basis_hash)""",
         data,
     )
     revision.id = cursor.lastrowid
@@ -749,20 +751,25 @@ def list_knowledge_revision_headers(
 ) -> list[KnowledgeRevision]:
     """List a topic's revisions newest-first WITHOUT their summary text.
 
-    The timeline renders four metadata fields per row and lazy-loads each diff,
-    so shipping ``summary_text`` would read up to ~40 KB per revision for text
-    no template shows. ``''`` is selected as a literal rather than dropping the
-    column so the shared ``from_row`` coercion still applies; the returned models
-    carry an empty ``summary_text`` and must never be written back.
+    The timeline lazy-loads each diff, so shipping ``summary_text`` would read up
+    to ~40 KB per revision for text no template shows. ``''`` is selected as a
+    literal rather than dropping the column so the shared ``from_row`` coercion
+    still applies; the returned models carry an empty ``summary_text`` and must
+    never be written back.
+
+    ``change_note`` IS selected (AUG-124). It used to be replaced with NULL for
+    the same width reason, which left a run of Update rows showing nothing but a
+    time and a token count — indistinguishable from each other, so finding one
+    development meant expanding them one at a time. It is the one-line novelty
+    summary that prompted the update, not a second body.
 
     Ordered by ``id DESC`` rather than ``created_at DESC``: two revisions written
     in the same second must still order deterministically, and ``id`` is the
-    insertion order the diff timeline depends on. The column list matches
-    ``idx_knowledge_revisions_topic`` so this is served from the index alone.
+    insertion order the diff timeline depends on.
     """
     rows = conn.execute(
         """SELECT id, topic_id, '' AS summary_text, token_count, source,
-                  NULL AS change_note, created_at
+                  change_note, created_at, model, basis_hash
            FROM knowledge_revisions
            WHERE topic_id = ?
            ORDER BY id DESC
@@ -786,9 +793,14 @@ def get_previous_knowledge_revision(
     """Get the revision immediately preceding ``revision_id`` for this topic.
 
     ``None`` when ``revision_id`` is the topic's oldest retained revision — the
-    diff view then renders the full snapshot. Pruning always removes the oldest
-    rows, so retained revisions stay contiguous and this is never a
-    non-adjacent comparison.
+    diff view then renders the full snapshot.
+
+    "Immediately preceding" is only true because retained revisions are
+    contiguous, which rests on two invariants elsewhere (AUG-146): the revision
+    append is part of the same transaction as the knowledge-state write it
+    records, so a state can never advance without its revision; and pruning only
+    ever deletes from the oldest end. Break either and this query starts
+    presenting a multi-update gap as one adjacent diff.
     """
     row = conn.execute(
         "SELECT * FROM knowledge_revisions WHERE topic_id = ? AND id < ? ORDER BY id DESC LIMIT 1",
@@ -813,6 +825,32 @@ def prune_knowledge_revisions(conn: sqlite3.Connection, topic_id: int, keep: int
                  LIMIT :keep
              )""",
         {"topic_id": topic_id, "keep": keep},
+    )
+    return cursor.rowcount
+
+
+def prune_all_knowledge_revisions(conn: sqlite3.Connection, keep: int) -> int:
+    """Apply the retention cap to every topic at once. Returns rows deleted.
+
+    Write-time pruning only ever touches the topic being written, so lowering
+    ``knowledge_revision_limit`` hid the excess rows of a quiet or finished topic
+    without ever reclaiming them — a topic that never updates again keeps its full
+    snapshots indefinitely, and the configured cap silently does not apply to it
+    (AUG-034). One indexed pass at startup makes the setting mean what it says.
+
+    ``ROW_NUMBER`` partitions by topic and ranks newest-first, so this is one scan
+    of ``idx_knowledge_revisions_topic`` rather than a correlated count per row.
+    """
+    cursor = conn.execute(
+        """DELETE FROM knowledge_revisions
+           WHERE id IN (
+               SELECT id FROM (
+                   SELECT id, ROW_NUMBER() OVER (PARTITION BY topic_id ORDER BY id DESC) AS rank
+                   FROM knowledge_revisions
+               )
+               WHERE rank > :keep
+           )""",
+        {"keep": keep},
     )
     return cursor.rowcount
 
@@ -978,21 +1016,23 @@ def list_recent_check_stage_errors(
     conn: sqlite3.Connection,
     topic_id: int,
     limit: int,
-) -> list[str | None]:
-    """Return the ``stage_error`` of a topic's newest ``limit`` checks, newest first.
+) -> list[tuple[int, str | None]]:
+    """Return ``(id, stage_error)`` for a topic's newest ``limit`` checks, newest first.
 
-    Only the one column is selected, so the Silence Heartbeat never ships the
+    Only the two columns are selected, so the Silence Heartbeat never ships the
     ``llm_response`` blobs that ``list_check_results`` carries, and ties on
-    ``checked_at`` break by ``id`` so back-to-back checks order deterministically.
+    ``checked_at`` break by ``id`` so back-to-back checks order deterministically
+    (AUG-258). The id travels with the streak because the heartbeat's latch write
+    is fenced to the exact check its decision was computed from (AUG-131).
     """
     rows = conn.execute(
-        """SELECT stage_error FROM check_results
+        """SELECT id, stage_error FROM check_results
            WHERE topic_id = ?
            ORDER BY checked_at DESC, id DESC
            LIMIT ?""",
         (topic_id, limit),
     ).fetchall()
-    return [row["stage_error"] for row in rows]
+    return [(int(row["id"]), row["stage_error"]) for row in rows]
 
 
 def sum_check_tokens(conn: sqlite3.Connection, topic_id: int) -> tuple[int, int]:
@@ -1165,6 +1205,53 @@ def apply_notification_outcome(
         (error, next_attempt_at, intent_id, claim_token),
     )
     return cursor.rowcount == 1
+
+
+# Both heartbeat message kinds: what a latch transition (or the feature being
+# switched off) supersedes.
+HEARTBEAT_INTENT_KINDS: tuple[str, ...] = (
+    NotificationKind.HEARTBEAT_ALERT.value,
+    NotificationKind.HEARTBEAT_RECOVERY.value,
+)
+
+
+def list_sent_heartbeat_alert_targets(conn: sqlite3.Connection, topic_id: int, latch_value: str | None) -> set[str]:
+    """Targets that actually received the outage alert stamped ``latch_value``.
+
+    "Sources recovered" is only meaningful to somebody who was told they were
+    failing: a target whose alert failed, was revoked, or is still queued would
+    otherwise get an unexplained all-clear for an outage it never heard about
+    (AUG-019). The latch value is the outage's identity, so an alert from an
+    earlier outage never addresses this recovery.
+    """
+    if latch_value is None:
+        return set()
+    rows = conn.execute(
+        "SELECT DISTINCT url FROM pending_notifications "
+        "WHERE topic_id = ? AND kind = ? AND latch_value = ? AND status = 'sent' AND url IS NOT NULL",
+        (topic_id, NotificationKind.HEARTBEAT_ALERT.value, latch_value),
+    ).fetchall()
+    return {row["url"] for row in rows}
+
+
+def reset_all_heartbeat_state(conn: sqlite3.Connection) -> int:
+    """Clear every latch and revoke every queued heartbeat message. NO commit.
+
+    ``silence_heartbeat_checks = 0`` is the off switch, but the per-check reset
+    only reaches a topic when that topic next runs. Disabling and re-enabling
+    inside one long interval would otherwise preserve the old latch — which then
+    either suppresses the newly enabled outage alert or fires a recovery for an
+    outage nobody was told about (AUG-260). Returns the number of latches cleared.
+    """
+    cursor = conn.execute("UPDATE topics SET heartbeat_alerted_at = NULL WHERE heartbeat_alerted_at IS NOT NULL")
+    cleared = cursor.rowcount
+    placeholders = ",".join("?" for _ in HEARTBEAT_INTENT_KINDS)
+    conn.execute(
+        "UPDATE pending_notifications SET status = 'revoked', claimed_at = NULL, claim_token = NULL "
+        f"WHERE status = 'pending' AND kind IN ({placeholders})",
+        HEARTBEAT_INTENT_KINDS,
+    )
+    return cleared
 
 
 def revoke_heartbeat_intents(conn: sqlite3.Connection, topic_id: int, kinds: tuple[str, ...]) -> int:
@@ -1539,9 +1626,15 @@ def claim_new_topic_for_init(conn: sqlite3.Connection, topic_id: int) -> bool:
 # check still holding a deleted topic could otherwise latch its replacement — an
 # alert naming the deleted topic, and a replacement whose real outage is then
 # suppressed (AUG-020/TW-AUD-007). The head-check conjunct is the same idea in time:
-# a decision computed from check N must not land once check N+1 exists.
+# a decision computed from check N must not land once check N+1 exists. It selects
+# the head with the canonical ``checked_at DESC, id DESC`` the heartbeat's own
+# streak query uses (AUG-258), not ``MAX(id)`` — a row carrying a newer id with an
+# older timestamp (a clock step, a restored row) is not the latest check, and
+# treating it as one would refuse every later transition for that topic forever.
 _HEARTBEAT_GENERATION_FENCE = " AND generation = ?"
-_HEARTBEAT_HEAD_FENCE = " AND (SELECT MAX(id) FROM check_results WHERE topic_id = topics.id) = ?"
+_HEARTBEAT_HEAD_FENCE = (
+    " AND (SELECT id FROM check_results WHERE topic_id = topics.id ORDER BY checked_at DESC, id DESC LIMIT 1) = ?"
+)
 
 
 def _heartbeat_fence(sql: str, params: list, generation: str | None, head_check_id: int | None) -> tuple[str, list]:
@@ -1577,6 +1670,23 @@ def claim_heartbeat_alert(
     sql, params = _heartbeat_fence(sql, params, generation, head_check_id)
     cursor = conn.execute(sql, params)
     return cursor.rowcount == 1
+
+
+def get_heartbeat_latch_raw(conn: sqlite3.Connection, topic_id: int) -> str | None:
+    """Return the stored latch cell verbatim: NULL is None, anything else is text.
+
+    The model hydrates ``heartbeat_alerted_at`` through the permissive optional
+    datetime coercer, which turns corrupt or forward-incompatible text into
+    ``None`` — while the latch SQL compares against the raw cell with ``IS NULL``.
+    A decision made on the hydrated value therefore claims a latch that is already
+    set and never clears the bad one, wedging the topic's heartbeat until someone
+    edits the database by hand (AUG-144). The heartbeat reads the cell itself, so
+    "set" means exactly what the UPDATE guards mean by it.
+    """
+    row = conn.execute("SELECT heartbeat_alerted_at FROM topics WHERE id = ?", (topic_id,)).fetchone()
+    if row is None or row["heartbeat_alerted_at"] is None:
+        return None
+    return str(row["heartbeat_alerted_at"])
 
 
 def clear_heartbeat_alert(

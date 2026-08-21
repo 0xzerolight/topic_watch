@@ -34,9 +34,21 @@ def test_invalid_url_returns_masked():
 
 def test_hides_host_even_though_canonical_redact_would_show_it():
     # Fold-in: _mask_url builds on log_redaction.redact_url but stays stronger for
-    # the UI by hiding the host too. The canonical helper would keep the host.
+    # the UI by hiding the host too. For an http(s) webhook the canonical helper
+    # keeps the host (AUG-248 only changed non-HTTP Apprise schemes, whose
+    # authority is itself commonly the secret — see test_log_redaction.py).
+    from app.log_redaction import redact_url
+
+    url = "https://hooks.example.com/sometopic"
+    assert "hooks.example.com" in redact_url(url)  # canonical keeps host
+    assert _mask_url(url) == "https://****"  # UI filter hides it
+
+
+def test_non_http_scheme_fingerprint_is_also_masked_by_ui_filter():
+    # AUG-248: the canonical helper no longer shows a non-HTTP scheme's host at
+    # all — _mask_url must still collapse whatever it returns to scheme://****.
     from app.log_redaction import redact_url
 
     url = "ntfy://ntfy.example.com/sometopic"
-    assert "ntfy.example.com" in redact_url(url)  # canonical keeps host
-    assert _mask_url(url) == "ntfy://****"  # UI filter hides it
+    assert "ntfy.example.com" not in redact_url(url)  # canonical now fingerprints
+    assert _mask_url(url) == "ntfy://****"  # UI filter unaffected either way

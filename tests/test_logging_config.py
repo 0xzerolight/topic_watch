@@ -6,7 +6,7 @@ import logging
 
 import pytest
 
-from app.check_context import check_id_var
+from app.check_context import check_id_var, request_id_var
 from app.logging_config import JSONFormatter, setup_logging
 
 
@@ -37,6 +37,16 @@ def set_check_id():
         yield "abcd1234"
     finally:
         check_id_var.reset(token)
+
+
+@pytest.fixture
+def set_request_id():
+    """Set request_id_var to a sentinel for the test, resetting it afterwards."""
+    token = request_id_var.set("req-9999")
+    try:
+        yield "req-9999"
+    finally:
+        request_id_var.reset(token)
 
 
 class TestSetupLoggingPlainText:
@@ -161,6 +171,34 @@ class TestSetupLoggingJSON:
         parsed = json.loads(stream.getvalue().strip())
         assert parsed["check_id"] == "-"
 
+    def test_json_output_emits_request_id_alongside_check_id(self, monkeypatch, set_check_id, set_request_id):
+        """AUG-273: a check running inside a request must show BOTH ids on the
+        same record, not just whichever check_id's fallback preference picks."""
+        monkeypatch.setenv("TOPIC_WATCH_LOG_FORMAT", "json")
+
+        stream = io.StringIO()
+        setup_logging()
+        logging.root.handlers[0].stream = stream
+
+        logging.getLogger("test.json_parent_child").info("child pipeline log line")
+
+        parsed = json.loads(stream.getvalue().strip())
+        assert parsed["check_id"] == set_check_id
+        assert parsed["request_id"] == set_request_id
+        assert parsed["check_id"] != parsed["request_id"]
+
+    def test_json_output_request_id_dash_at_default(self, monkeypatch):
+        monkeypatch.setenv("TOPIC_WATCH_LOG_FORMAT", "json")
+
+        stream = io.StringIO()
+        setup_logging()
+        logging.root.handlers[0].stream = stream
+
+        logging.getLogger("test.json_no_request_id").info("no correlation id")
+
+        parsed = json.loads(stream.getvalue().strip())
+        assert parsed["request_id"] == "-"
+
     def test_json_timestamp_is_iso_format(self, monkeypatch):
         monkeypatch.setenv("TOPIC_WATCH_LOG_FORMAT", "json")
 
@@ -268,6 +306,105 @@ class TestUvicornLoggersJSON:
 
         assert lg.handlers == [own_handler]
         assert lg.propagate is False
+
+
+class TestLiteLLMLoggerJSON:
+    """AUG-249: LiteLLM installs its own "LiteLLM" logger with a plain
+    StreamHandler at import time; in JSON mode it must be retargeted like
+    uvicorn's loggers, or its warnings render twice (once ANSI, once JSON)."""
+
+    @pytest.fixture(autouse=True)
+    def reset_litellm_logger(self):
+        lg = logging.getLogger("LiteLLM")
+        saved_handlers, saved_propagate = lg.handlers[:], lg.propagate
+        yield
+        lg.handlers = saved_handlers
+        lg.propagate = saved_propagate
+
+    def test_json_mode_retargets_litellm_logger(self, monkeypatch):
+        monkeypatch.setenv("TOPIC_WATCH_LOG_FORMAT", "json")
+        # Simulate LiteLLM having installed its own ANSI handler at import time.
+        lg = logging.getLogger("LiteLLM")
+        lg.handlers = [logging.StreamHandler()]
+        lg.propagate = True
+
+        setup_logging()
+
+        assert lg.handlers == [], "LiteLLM should have no own handlers in JSON mode"
+        assert lg.propagate is True
+
+    def test_litellm_logger_output_is_valid_json_exactly_once(self, monkeypatch):
+        monkeypatch.setenv("TOPIC_WATCH_LOG_FORMAT", "json")
+        lg = logging.getLogger("LiteLLM")
+        lg.handlers = [logging.StreamHandler()]
+        lg.propagate = True
+
+        setup_logging()
+
+        stream = io.StringIO()
+        logging.root.handlers[0].stream = stream
+
+        logging.getLogger("LiteLLM").warning("give feedback https://github.com/BerriAI/litellm/issues/new")
+
+        output = stream.getvalue().strip()
+        # Exactly one line: LiteLLM's own handler was cleared, so this reaches
+        # the root JSON handler once, not once there and once via ANSI.
+        assert len(output.splitlines()) == 1
+        parsed = json.loads(output)
+        assert parsed["logger"] == "LiteLLM"
+        assert parsed["level"] == "WARNING"
+
+    def test_plain_text_mode_leaves_litellm_logger_untouched(self, monkeypatch):
+        monkeypatch.setenv("TOPIC_WATCH_LOG_FORMAT", "text")
+        own_handler = logging.StreamHandler()
+        lg = logging.getLogger("LiteLLM")
+        lg.handlers = [own_handler]
+        lg.propagate = False
+
+        setup_logging()
+
+        assert lg.handlers == [own_handler]
+        assert lg.propagate is False
+
+
+class TestSetupLoggingRunsAtImportTime:
+    """AUG-249: Uvicorn logs "Started server process" / "Waiting for
+    application startup" through its own logger BEFORE it ever awaits the
+    ASGI lifespan — so logging must be configured as an import-time side
+    effect of app.main, not deferred to lifespan(). Run in a fresh subprocess
+    so the assertion is not entangled with this session's already-imported
+    app.main and already-configured root logger.
+    """
+
+    def test_import_configures_json_logging_without_entering_lifespan(self):
+        import subprocess
+        import sys
+        import textwrap
+
+        script = textwrap.dedent("""
+            import os
+            os.environ["TOPIC_WATCH_LOG_FORMAT"] = "json"
+            os.environ["TOPIC_WATCH_LLM__MODEL"] = "openai/gpt-4o-mini"
+            os.environ["TOPIC_WATCH_LLM__API_KEY"] = "test-key-not-real"
+            os.environ["TOPIC_WATCH_ALLOWED_HOSTS"] = "*"
+
+            import logging
+            import app.main  # noqa: F401 -- import side effect under test
+
+            root = logging.root
+            assert root.handlers, "no handler installed at import time"
+            from app.logging_config import JSONFormatter
+            assert isinstance(root.handlers[0].formatter, JSONFormatter)
+            print("OK")
+        """)
+        result = subprocess.run(  # noqa: S603 -- fixed args, no shell, absolute resolved executable
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "OK" in result.stdout
 
 
 class TestNonRootLoggerHandling:

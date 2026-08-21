@@ -20,11 +20,29 @@
                         <span title="{{ revision.created_at.strftime('%Y-%m-%d %H:%M') }}">{{ revision.created_at | timeago }}</span>
                         {% if revision.source.value == "init" %}
                         <span class="badge badge--signal"><span class="badge-dot"></span>Initial</span>
+                        {% elif revision.source.value == "unknown" %}
+                        {# Written by a version that records a kind of change this
+                           one does not know. Calling it an Update would be a
+                           plausible, false lineage (AUG-155). #}
+                        <span class="badge badge--idle"><span class="badge-dot"></span>Unknown</span>
                         {% else %}
                         <span class="badge badge--idle"><span class="badge-dot"></span>Update</span>
                         {% endif %}
+                        {# Counts recorded before revisions carried the model that
+                           produced them are in an unknown unit — the configured
+                           model is switchable and the counter has a character
+                           fallback — so they are not shown (AUG-255). #}
+                        {% if revision.model %}
                         <small class="quiet num">{{ revision.token_count }} tokens</small>
+                        {% endif %}
                     </span>
+                    {# The novelty summary that prompted this update, truncated to
+                       one line. Without it a run of Update rows is time + badge
+                       only, so finding one development meant expanding each in
+                       turn (AUG-124). The full note and diff stay lazy. #}
+                    {% if revision.change_note %}
+                    <small class="quiet rev-headline">{{ revision.change_note | truncate(90, true) }}</small>
+                    {% endif %}
                 </summary>
                 {# hx-trigger fires on the parent <details> toggle so the fetch happens
                    on first expand. `intersect` is unreliable here: a closed <details>

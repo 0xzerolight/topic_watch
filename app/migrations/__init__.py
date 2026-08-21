@@ -34,6 +34,8 @@ from app.migrations.m024_topic_heartbeat_alerted_at import up as m024_up
 from app.migrations.m025_knowledge_revisions import up as m025_up
 from app.migrations.m026_wave_a_durability import up as m026_up
 from app.migrations.m027_normalize_topic_tags import up as m027_up
+from app.migrations.m028_repair_knowledge_token_counts import up as m028_up
+from app.migrations.m029_revision_provenance import up as m029_up
 
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "baseline schema version", m001_up),
@@ -63,4 +65,6 @@ MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (25, "add knowledge_revisions table", m025_up),
     (26, "wave-A durability columns (CAS version, generation, delivery intents)", m026_up),
     (27, "canonicalize stored topic tags", m027_up),
+    (28, "repair impossible knowledge_states token counts", m028_up),
+    (29, "add model/basis_hash provenance to knowledge_revisions", m029_up),
 ]

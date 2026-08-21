@@ -5,10 +5,18 @@ import logging
 import sqlite3
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Path, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
-from app.analysis.knowledge_diff import diff_segments
+from app.analysis.knowledge import topic_basis_hash
+from app.analysis.knowledge_diff import (
+    MODE_DIFF,
+    MODE_OLDEST,
+    MODE_REINITIALIZE,
+    MODE_SNAPSHOT,
+    MODE_UNKNOWN_SOURCE,
+    diff_segments,
+)
 from app.analysis.llm import NoveltyResult
 from app.checker import build_notification_intents, deliver_notification_intents
 from app.config import Settings
@@ -40,6 +48,7 @@ from app.database import short_conn
 from app.models import (
     NOVELTY_INSTRUCTION_MAX_CHARS,
     FeedMode,
+    KnowledgeRevision,
     KnowledgeRevisionSource,
     Topic,
     TopicStatus,
@@ -271,6 +280,7 @@ async def topic_detail(
         {
             "topic": topic,
             "knowledge": knowledge,
+            "knowledge_basis_stale": _knowledge_basis_stale(topic, revisions),
             "revisions": revisions,
             "checks": checks,
             "articles": articles,
@@ -387,11 +397,45 @@ async def topic_status(
     return response
 
 
+def _knowledge_basis_stale(topic: Topic, revisions: list[KnowledgeRevision]) -> bool:
+    """True when the stored knowledge was built for a different topic scope.
+
+    Novelty is judged against the summary, and the summary answers the question
+    the topic asked when it was written. Editing the name, description, feeds or
+    novelty instruction changes that question while the baseline stays put, so
+    the topic keeps measuring against a scope the user has moved on from
+    (TW-AUD-017). Comparing the live scope with the newest revision's recorded
+    basis is enough to say so on screen; nothing is rewritten or discarded, and
+    the next knowledge write records the current basis.
+
+    Only the newest revision is consulted — older ones legitimately record older
+    scopes — and a NULL basis (every row written before migration 029) means
+    unknown, which is not a mismatch.
+    """
+    if not revisions or not revisions[0].basis_hash:
+        return False
+    return revisions[0].basis_hash != topic_basis_hash(topic)
+
+
+# SQLite binds integers as signed 64-bit; anything larger raises OverflowError at
+# bind time, which reached the generic handler as a 500 for what is only a
+# malformed URL (AUG-257).
+_SQLITE_MAX_INT = 9223372036854775807
+
+# Revisions whose place in the lineage is not an ordinary "one edit after the
+# previous one". Diffing these against the row before them renders a whole
+# replaced baseline as though the model had rewritten its understanding.
+_LINEAGE_BOUNDARIES = {
+    KnowledgeRevisionSource.INIT: MODE_REINITIALIZE,
+    KnowledgeRevisionSource.UNKNOWN: MODE_UNKNOWN_SOURCE,
+}
+
+
 @router.get("/topics/{topic_id}/knowledge-diff/{revision_id}", response_class=HTMLResponse)
 async def topic_knowledge_diff(
     request: Request,
-    topic_id: int,
-    revision_id: int,
+    topic_id: int = Path(ge=1, le=_SQLITE_MAX_INT),
+    revision_id: int = Path(ge=1, le=_SQLITE_MAX_INT),
     conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
 ):
     """Render the diff between a knowledge revision and the one before it.
@@ -405,23 +449,43 @@ async def topic_knowledge_diff(
     # any other topic's revision. It also subsumes the missing-topic 404, since
     # the FK is ON DELETE CASCADE.
     if revision is None or revision.topic_id != topic_id:
+        if request.headers.get("HX-Request"):
+            # The timeline emits a lazy URL per retained revision and fetches it
+            # only on expand, so an ordinary knowledge update at the retention cap
+            # can prune a row that is still on screen. That is normal retention,
+            # not a server fault — a 404 here fires the global error toast and
+            # offers a retry that can never succeed (AUG-318). Direct navigation
+            # still 404s below.
+            return templates.TemplateResponse(request, "_knowledge_diff_gone.html", {}, status_code=200)
         raise HTTPException(status_code=404, detail="Revision not found")
 
     previous = get_previous_knowledge_revision(conn, topic_id, revision_id)
-    # An 'init' revision starts a new lineage (first research, or Re-initialize).
-    # Diffing it against the last revision of the OLD lineage would render a
-    # wholesale delete+insert as though the model had rewritten its
-    # understanding, so treat it as having no predecessor.
-    if revision.source is KnowledgeRevisionSource.INIT:
+    boundary = _LINEAGE_BOUNDARIES.get(revision.source)
+    had_predecessor = previous is not None
+    if boundary is not None:
         previous = None
 
     previous_text = previous.summary_text if previous else ""
     # difflib is CPU-bound — up to ~0.32 s at MAX_DIFF_SEGMENTS on repetitive
     # input — and would otherwise block the event loop (CLAUDE.md).
-    segments = await asyncio.to_thread(diff_segments, previous_text, revision.summary_text)
-    inserted = sum(1 for segment in segments if segment.kind == "insert")
-    deleted = sum(1 for segment in segments if segment.kind == "delete")
-    token_delta = revision.token_count - (previous.token_count if previous else 0)
+    result = await asyncio.to_thread(diff_segments, previous_text, revision.summary_text)
+
+    mode = result.mode
+    if mode == MODE_SNAPSHOT:
+        # The module knows only that it had nothing to compare against; the reason
+        # lives here. A boundary revision with nothing behind it is simply the
+        # oldest one — say that rather than announcing a re-initialization the
+        # user cannot see the other side of.
+        mode = boundary if (boundary and had_predecessor) else MODE_OLDEST
+
+    # Counts and the token delta describe a comparison. Reporting them for a
+    # snapshot invents them — an oversized pair used to render every segment of
+    # the new revision as an addition (AUG-222).
+    inserted = deleted = token_delta = None
+    if mode == MODE_DIFF:
+        inserted = sum(1 for segment in result.segments if segment.kind == "insert")
+        deleted = sum(1 for segment in result.segments if segment.kind == "delete")
+        token_delta = _comparable_token_delta(revision, previous)
 
     return templates.TemplateResponse(
         request,
@@ -429,12 +493,30 @@ async def topic_knowledge_diff(
         {
             "revision": revision,
             "previous": previous,
-            "segments": segments,
+            "mode": mode,
+            "segments": result.segments,
             "inserted": inserted,
             "deleted": deleted,
             "token_delta": token_delta,
         },
     )
+
+
+def _comparable_token_delta(revision: KnowledgeRevision, previous: KnowledgeRevision | None) -> int | None:
+    """The signed token change, or ``None`` when the two counts are not comparable.
+
+    ``token_count`` is measured by the configured model's tokenizer, which the
+    operator can change at any time and which falls back to a character estimate
+    when unavailable. Subtracting counts produced under different models reports a
+    change of unit as knowledge growth or shrinkage, so a delta is shown only when
+    both revisions name the same model — never for the pre-provenance rows, whose
+    ``model`` is NULL (AUG-255).
+    """
+    if previous is None or not revision.model or not previous.model:
+        return None
+    if revision.model != previous.model:
+        return None
+    return revision.token_count - previous.token_count
 
 
 @router.get("/topics/{topic_id}/feed-source", response_class=HTMLResponse)
@@ -675,6 +757,15 @@ async def reinit_topic(
     if not topic.is_active:
         raise HTTPException(status_code=409, detail="Topic is paused. Enable it before re-initializing.")
 
+    # Mirrors the refusal ``initialize_new_topic`` already makes. Without it the
+    # claim below is a RESEARCHING -> RESEARCHING self-transition that always
+    # wins, so an initializer held by another process — a CLI ``init``, a second
+    # container — leaves this handler free to admit a second one. Both then spend
+    # on the same init, and whichever finishes first has its knowledge write
+    # rolled back by the other's terminal status.
+    if topic.status is TopicStatus.RESEARCHING:
+        raise HTTPException(status_code=409, detail="This topic is already being initialized.")
+
     owner = await _checking_state.start_check(topic_id)
     if owner is None:
         raise HTTPException(status_code=409, detail="This topic is busy right now. Try again when it finishes.")
@@ -686,7 +777,7 @@ async def reinit_topic(
 
     # An explicit Retry starts from a clean slate (OVH-098): reset the vestigial
     # init_attempts counter, fenced to the claim this handler just won.
-    update_topic_init_status(
+    reset = update_topic_init_status(
         conn,
         topic_id,
         status=TopicStatus.RESEARCHING,
@@ -696,6 +787,10 @@ async def reinit_topic(
         expected_status=TopicStatus.RESEARCHING,
     )
     conn.commit()
+    if not reset:
+        # The claim above committed, so this only misses when something moved the
+        # row again in between. The init still runs; only the counter reset is lost.
+        logger.warning("Retry for topic %d could not reset init_attempts: the claim moved", topic_id)
 
     db_path = getattr(request.app.state, "db_path", None)
     background_tasks.add_task(background._run_init, topic.id, settings, db_path, owner, claimed=True)

@@ -546,6 +546,15 @@ fieldset legend {
 .rev-item > details > summary { padding: var(--app-2) 0; }
 .rev-body { padding: 0 0 var(--app-3); }
 .rev-note { margin: 0 0 var(--app-2); color: var(--app-ink-quiet); }
+/* One-line change headline under a timeline row. Truncated server-side; this
+   only stops a long note from wrapping the disclosure open. */
+.rev-headline {
+  display: block;
+  margin-top: var(--app-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 .diff {
   max-height: 24rem;
@@ -560,6 +569,10 @@ fieldset legend {
   /* Summaries can contain long URLs; without this, overflow-y:auto forces a
      horizontal scrollbar inside the diff box. */
   overflow-wrap: anywhere;
+  /* Leading indentation is markdown-significant — it is what makes a bullet a
+     child of the one above — and the diff compares it, so it has to be visible
+     (AUG-254). pre-wrap keeps it while still wrapping long lines. */
+  white-space: pre-wrap;
 }
 .diff .diff-eq { color: var(--app-ink-quiet); }
 /* The +/- markers and line-through carry the meaning without color, so the diff

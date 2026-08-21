@@ -502,12 +502,19 @@ class TestCheckResultCRUD:
             create_check_result(db_conn, CheckResult(topic_id=topic.id, checked_at=stamp, stage_error=stage_error))
         db_conn.commit()
 
+        ids = [row[0] for row in db_conn.execute("SELECT id FROM check_results ORDER BY id").fetchall()]
+        first, middle, last = ids
+        # Each row travels with its id, so the heartbeat can fence its latch write
+        # to the exact check it decided from.
         assert list_recent_check_stage_errors(db_conn, topic.id, limit=10) == [
-            "sources_failed: b",
-            None,
-            "sources_failed: a",
+            (last, "sources_failed: b"),
+            (middle, None),
+            (first, "sources_failed: a"),
         ]
-        assert list_recent_check_stage_errors(db_conn, topic.id, limit=2) == ["sources_failed: b", None]
+        assert list_recent_check_stage_errors(db_conn, topic.id, limit=2) == [
+            (last, "sources_failed: b"),
+            (middle, None),
+        ]
         assert list_recent_check_stage_errors(db_conn, 9999, limit=10) == []
 
     def test_create_and_list(self, db_conn: sqlite3.Connection) -> None:

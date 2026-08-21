@@ -255,7 +255,9 @@ document.body.addEventListener("htmx:afterSwap", function (event) {
     </thead>
     <tbody>
         {% for check in checks %}
-        {% set check_importance = check.llm_response | importance_score %}
+        {# Hydrated from the model's single llm_response decode (AUG-037), not a
+           second per-row json.loads through the importance_score filter. #}
+        {% set check_importance = check.importance %}
         <tr{% if check.stage_error %} class="row-problem"{% endif %}>
             <td data-label="Time"><span title="{{ check.checked_at.strftime('%Y-%m-%d %H:%M') }}">{{ check.checked_at | timeago }}</span></td>
             <td data-label="Articles Found" class="num">{{ check.articles_found }}</td>

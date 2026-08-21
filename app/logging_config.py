@@ -23,6 +23,15 @@ class JSONFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
             "check_id": getattr(record, "check_id", "-"),
+            # The originating web request, kept separate from check_id (AUG-273):
+            # a request-triggered check logs both at once, so the two can be
+            # joined even after the check outlives the request that started it.
+            "request_id": getattr(record, "request_id", "-"),
+            # The scheduler check-all cycle a record's check_id belongs to, if
+            # any (AUG-275): every topic check and retry drain launched from
+            # the same tick shares this, so a noisy or failed cycle can be
+            # reconstructed as one unit.
+            "cycle_id": getattr(record, "cycle_id", "-"),
         }
         # Include extra fields if present
         # Standard LogRecord attributes to exclude from extras
@@ -50,6 +59,8 @@ class JSONFormatter(logging.Formatter):
             "msecs",
             "taskName",
             "check_id",
+            "request_id",
+            "cycle_id",
         }
         extras = {k: v for k, v in record.__dict__.items() if k not in standard_attrs and not k.startswith("_")}
         if extras:
@@ -81,10 +92,14 @@ def setup_logging() -> None:
         # Retarget uvicorn's loggers so their startup/error/access lines flow through
         # the root JSON handler+filter instead of uvicorn's own text formatter. This
         # makes stdout a single all-JSON stream and gives access logs a check_id field.
-        for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
-            uvicorn_logger = logging.getLogger(name)
-            uvicorn_logger.handlers = []
-            uvicorn_logger.propagate = True
+        # LiteLLM installs its own "LiteLLM" logger with a plain StreamHandler at
+        # import time and leaves propagate=True, so without retargeting it too, its
+        # warnings render twice: once through its own ANSI handler, once JSON via
+        # propagation to root (AUG-249).
+        for name in ("uvicorn", "uvicorn.error", "uvicorn.access", "LiteLLM"):
+            target_logger = logging.getLogger(name)
+            target_logger.handlers = []
+            target_logger.propagate = True
     else:
         logging.basicConfig(
             level=getattr(logging, log_level, logging.INFO),

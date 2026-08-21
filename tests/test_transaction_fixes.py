@@ -1174,6 +1174,53 @@ class TestTransitionIsAllOrNothing:
         assert db_conn.execute("SELECT COUNT(*) FROM check_results").fetchone()[0] == 0
         assert db_conn.execute("SELECT processed FROM articles WHERE id = ?", (article.id,)).fetchone()[0] == 0
 
+    async def test_a_failed_intent_insert_rolls_back_the_result_that_justified_it(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """TW-AUD-004: the delivery intents ride the CheckResult's own commit.
+
+        Committed separately they stop being the record of what this check owes:
+        a crash in between either leaves a queued alert for a check that was
+        never recorded, or a recorded check whose alert nobody will ever send.
+        """
+        topic = _ready_topic(db_conn, name="IntentAtomicity")
+        create_knowledge_state(db_conn, KnowledgeState(topic_id=topic.id, summary_text="base"))
+        article = create_article(db_conn, _make_article(id=None, topic_id=topic.id))
+        db_conn.commit()
+        settings = _pipeline_settings(
+            notifications=NotificationSettings(urls=["json://localhost"], webhook_urls=["https://hooks.example.com/x"])
+        )
+
+        with (
+            patch(
+                "app.checker.fetch_new_articles_for_topic",
+                new_callable=AsyncMock,
+                return_value=FetchResult(articles=[article], total_feed_entries=1),
+            ),
+            patch(
+                "app.checker.analyze_articles",
+                new_callable=AsyncMock,
+                return_value=NoveltyResult(has_new_info=True, summary="s", confidence=0.9, relevance=0.9, importance=1),
+            ),
+            patch("app.checker.prepare_knowledge_update", new_callable=AsyncMock, return_value=_write_result()),
+            # The last write of the transition fails, after the CheckResult and
+            # the notification intents have been written into it.
+            patch("app.checker.create_webhook_intents", side_effect=sqlite3.OperationalError("disk I/O error")),
+            patch("app.checker.deliver_notification_intents", new_callable=AsyncMock, return_value=[]),
+            pytest.raises(sqlite3.OperationalError),
+        ):
+            await check_topic(topic, settings, db_path=db_path)
+
+        assert db_conn.execute("SELECT COUNT(*) FROM check_results").fetchone()[0] == 0
+        assert db_conn.execute("SELECT COUNT(*) FROM pending_notifications").fetchone()[0] == 0
+        assert db_conn.execute("SELECT COUNT(*) FROM pending_webhooks").fetchone()[0] == 0
+        # The knowledge write and the article disposition go with them.
+        state = db_conn.execute(
+            "SELECT summary_text, version FROM knowledge_states WHERE topic_id = ?", (topic.id,)
+        ).fetchone()
+        assert state["summary_text"] == "base"
+        assert db_conn.execute("SELECT processed FROM articles WHERE id = ?", (article.id,)).fetchone()[0] == 0
+
     async def test_a_failed_article_disposition_rolls_back_the_result(
         self, db_conn: sqlite3.Connection, db_path: Path
     ) -> None:

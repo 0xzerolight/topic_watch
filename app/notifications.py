@@ -24,6 +24,20 @@ from app.url_validation import validate_outbound_url
 
 logger = logging.getLogger(__name__)
 
+# Apprise's own plugin constructors log rejected URL components — including the
+# raw offending value — at WARNING/ERROR through the "apprise" logger, and that
+# happens INSIDE ap.add()/ap.notify(), before this module gets a chance to
+# report anything through redact_url(). Even with Apprise's own CWE-312
+# masking (on by default), a scheme where the secret sits in the URL's
+# authority rather than its userinfo — ``pover://user@APPTOKEN``,
+# ``tgram://BADTOKEN/chat_id`` — still reaches that log verbatim (AUG-268).
+# Every failure mode this module cares about is already reported through its
+# own logger with redaction (see _deliver_one below), so Apprise's internal
+# diagnostics are silenced entirely rather than filtered message-by-message —
+# a filter would have to track every plugin's message shape and go stale.
+logging.getLogger("apprise").propagate = False
+logging.getLogger("apprise").addHandler(logging.NullHandler())
+
 # Payload bounds, in characters, applied when the message is built (AUG-323).
 # Apprise plugins carry per-service title/body limits and upstream's default
 # overflow policy is to hand the oversized payload to the service anyway, so the
@@ -241,14 +255,19 @@ def _deliver_one(title: str, body: str, url: str) -> NotificationDelivery:
             logger.warning("Blocked notification to %s: %s", redact_url(url), exc)
             return NotificationDelivery(url=url, ok=False, error="blocked notification target")
 
-    ap = apprise.Apprise()
-    if not ap.add(url):
-        # OVH-027: a typo'd/unsupported URL is dropped by Apprise at add() time.
-        # Surface it instead of silently succeeding on the other channels.
-        logger.warning("Skipping invalid notification URL: %s", redact_url(url))
-        return NotificationDelivery(url=url, ok=False, error="invalid notification URL")
-
     try:
+        # add() parses the URL, so it RAISES on inputs Apprise cannot make sense
+        # of — an ordinary password containing '[' reads as a broken IPv6 literal.
+        # It belongs inside the guard: the delivery state machine leans on the
+        # "Never raises" contract, and an escaping exception leaves the intent
+        # claimed with no outcome ever recorded (TW-AUD-004).
+        ap = apprise.Apprise()
+        if not ap.add(url):
+            # OVH-027: a typo'd/unsupported URL is dropped by Apprise at add() time.
+            # Surface it instead of silently succeeding on the other channels.
+            logger.warning("Skipping invalid notification URL: %s", redact_url(url))
+            return NotificationDelivery(url=url, ok=False, error="invalid notification URL")
+
         ok = bool(ap.notify(title=title, body=body))
         if ok:
             logger.info("Notification sent to %s: %s", redact_url(url), title)

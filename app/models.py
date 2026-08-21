@@ -137,13 +137,17 @@ class CorruptTimestampError(ValueError):
     """
 
 
-def _coerce_dt(value: object) -> datetime | None:
+def _coerce_dt(value: object, field: str | None = None) -> datetime | None:
     """Parse a *nullable* DB datetime cell defensively, as aware UTC.
 
     Empty/whitespace-only strings and unparseable values become ``None`` rather
     than reaching Pydantic as a raw string and raising ``ValidationError`` on
     legacy/migrated/corrupt rows — a nullable column already has "no value" as a
-    meaning it can carry, so degrading to it invents nothing.
+    meaning it can carry, so degrading to it invents nothing. Non-empty text that
+    does not parse is logged: it is stored state that reads as unset here while
+    SQL still sees it as set, which is exactly the divergence AUG-144 describes.
+    Code whose write path compares against the stored cell (the heartbeat latch)
+    must read that cell raw rather than trust this value.
 
     Whatever comes back is aware UTC (``to_utc``): rows written before the
     canonical spelling existed hold naive text, and a naive datetime raises
@@ -158,6 +162,7 @@ def _coerce_dt(value: object) -> datetime | None:
         try:
             return to_utc(datetime.fromisoformat(value))
         except (ValueError, TypeError):
+            logger.warning("Unparseable datetime in column %r; reading it as unset", field or "<unknown>")
             return None
     return None
 
@@ -171,7 +176,7 @@ def _coerce_required_dt(value: object, field: str) -> datetime:
     reports — silently, and for good once anything writes the row back. Corruption
     here is a data state to surface, not one to paper over (TW-AUD-013).
     """
-    parsed = _coerce_dt(value)
+    parsed = _coerce_dt(value, field)
     if parsed is None:
         raise CorruptTimestampError(
             f"Required timestamp column {field!r} holds {value!r}, which is not a timestamp. "
@@ -250,7 +255,7 @@ class SQLiteModel(BaseModel):
         for field in cls._required_dt_fields:
             data[field] = _coerce_required_dt(data.get(field), field)
         for field in cls._optional_dt_fields:
-            data[field] = _coerce_dt(data.get(field))
+            data[field] = _coerce_dt(data.get(field), field)
         return data
 
     @classmethod
@@ -303,10 +308,17 @@ class FeedMode(StrEnum):
 
 
 class KnowledgeRevisionSource(StrEnum):
-    """What produced a knowledge revision."""
+    """What produced a knowledge revision.
+
+    ``UNKNOWN`` is never written: it is what a stored value this version does not
+    recognise degrades to, so a row from a newer version, a restored backup or a
+    hand edit is labelled honestly instead of being passed off as an ordinary
+    update (AUG-155).
+    """
 
     INIT = "init"
     UPDATE = "update"
+    UNKNOWN = "unknown"
 
 
 # Cap for the per-topic novelty instruction (free text injected into the novelty
@@ -501,28 +513,39 @@ class KnowledgeRevision(SQLiteModel):
     source: KnowledgeRevisionSource = KnowledgeRevisionSource.UPDATE
     change_note: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    # Provenance, NULL on every row written before migration 029 and on the m025
+    # backfill. ``model`` is the configured LLM that wrote this summary and, being
+    # the same string ``count_tokens`` was called with, the identity of the unit
+    # ``token_count`` is measured in — two revisions counted under different
+    # models are not subtractable (AUG-255). ``basis_hash`` fingerprints the
+    # topic scope the summary was derived from, so a later scope edit is
+    # detectable rather than silently baked in (TW-AUD-017).
+    model: str | None = None
+    basis_hash: str | None = None
 
     @field_validator("source", mode="before")
     @classmethod
     def _coerce_source(cls, value: object) -> object:
-        """Degrade an unrecognised stored ``source`` to UPDATE instead of raising.
+        """Degrade an unrecognised stored ``source`` to UNKNOWN instead of raising.
 
         Mirrors ``Topic._clamp_importance_threshold``: a value written by a
         future version, restored from an old backup, or hand-edited in sqlite3
         must not raise ValidationError and 500 the topic detail page over a
-        badge label. The ``isinstance`` check is load-bearing for mypy, whose
-        enum plugin types ``StrEnum.__call__`` as ``(value: str)``.
+        badge label. It must not be relabelled ``update`` either — that is a
+        plausible, false lineage the diff view would then compare adjacently
+        (AUG-155). The ``isinstance`` check is load-bearing for mypy, whose enum
+        plugin types ``StrEnum.__call__`` as ``(value: str)``.
         """
         if isinstance(value, KnowledgeRevisionSource):
             return value
         if not isinstance(value, str):
-            logger.warning("Non-string knowledge revision source %r; treating as 'update'", value)
-            return KnowledgeRevisionSource.UPDATE
+            logger.warning("Non-string knowledge revision source %r; treating as 'unknown'", value)
+            return KnowledgeRevisionSource.UNKNOWN
         try:
             return KnowledgeRevisionSource(value)
         except ValueError:
-            logger.warning("Unknown knowledge revision source %r; treating as 'update'", value)
-            return KnowledgeRevisionSource.UPDATE
+            logger.warning("Unrecognised knowledge revision source %r; treating as 'unknown'", value)
+            return KnowledgeRevisionSource.UNKNOWN
 
 
 # ``check_results.stage_error`` vocabulary, written by app/checker.py. Collected
@@ -591,8 +614,9 @@ class CheckResult(SQLiteModel):
     # (``from_dashboard_row``) and the HTMX row re-render (``_topic_row_context`` ->
     # ``list_check_results`` -> ``from_row``) — honor the badge gate. Do not drop it.
     _optional_dt_fields = ("seen_at",)
-    # ``confidence`` is derived from llm_response, not a real column — never persist it (OVH-052).
-    _insert_exclude = frozenset({"confidence"})
+    # ``confidence``/``importance`` are derived from llm_response, not real
+    # columns — never persist them (OVH-052, AUG-037).
+    _insert_exclude = frozenset({"confidence", "importance"})
 
     id: int | None = None
     topic_id: int
@@ -627,6 +651,10 @@ class CheckResult(SQLiteModel):
     # confidence badge WITHOUT shipping/parsing the full llm_response blob per
     # topic (OVH-052). Never written back to the DB (excluded from inserts).
     confidence: float | None = None
+    # Non-persisted: the 1-5 importance scalar, derived from the same single blob
+    # decode as ``confidence``. ``None`` when the blob is missing, unparseable, or
+    # predates m023. The dashboard listing never reads it.
+    importance: int | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Self:
@@ -639,24 +667,41 @@ class CheckResult(SQLiteModel):
         # (detail/history) so the badge renders without a second parse. The
         # dashboard path skips the blob entirely and sets ``confidence`` via SQL
         # json_extract (OVH-052).
-        data["confidence"] = cls._confidence_from_blob(data.get("llm_response"))
+        data.pop("importance", None)
+        data["confidence"], data["importance"] = cls._scalars_from_blob(data.get("llm_response"))
         return cls(**data)
 
     @staticmethod
-    def _confidence_from_blob(llm_response: object) -> float | None:
-        """Extract the confidence scalar from an llm_response JSON blob."""
+    def _scalars_from_blob(llm_response: object) -> tuple[float | None, int | None]:
+        """Extract the confidence and importance scalars from one blob decode.
+
+        Both are rendered per row by the check-history table. Decoding the blob
+        once here and handing the template two scalars replaces the three full
+        ``json.loads`` calls a displayed row used to cost — model hydration plus
+        one template filter each (AUG-037).
+        """
         if not isinstance(llm_response, str) or not llm_response:
-            return None
+            return None, None
         try:
-            value = json.loads(llm_response).get("confidence")
-        except (json.JSONDecodeError, AttributeError):
-            return None
-        if value is None:
-            return None
+            data = json.loads(llm_response)
+        except json.JSONDecodeError:
+            return None, None
+        # json.loads() also accepts arrays, scalars, booleans and null; only a
+        # dict has keys to read (AUG-215).
+        if not isinstance(data, dict):
+            return None, None
+
+        confidence: float | None
         try:
-            return float(value)
-        except (ValueError, TypeError):
-            return None
+            confidence = float(data["confidence"])
+        except (KeyError, TypeError, ValueError):
+            confidence = None
+        importance: int | None
+        try:
+            importance = int(data["importance"])
+        except (KeyError, TypeError, ValueError):
+            importance = None
+        return confidence, importance
 
     @classmethod
     def from_dashboard_row(cls, row: sqlite3.Row, topic_id: int) -> Self:
@@ -687,7 +732,7 @@ class CheckResult(SQLiteModel):
             stage_error=row["cr_stage_error"],
             # Paired with the ``cr.seen_at AS cr_seen_at`` alias in _DASHBOARD_SELECT;
             # one without the other 500s the dashboard.
-            seen_at=_coerce_dt(row["cr_seen_at"]),
+            seen_at=_coerce_dt(row["cr_seen_at"], "seen_at"),
         )
 
     @property
