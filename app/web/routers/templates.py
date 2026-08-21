@@ -39,27 +39,50 @@ _MD_LABEL_RE = re.compile(r"^\s*\*\*[^*]+\*\*")
 _MD_LIST_RE = re.compile(r"^\s*([-*+]|\d+\.)\s+")
 
 
+# How far ahead of now a timestamp may sit and still read as "just now". Covers
+# the ordinary case — a row written moments ago, a container clock a few seconds
+# off — and nothing else.
+_FUTURE_TOLERANCE_SECONDS = 60
+
+
+def _coarse_span(seconds: int) -> str | None:
+    """``5m`` / ``3h`` / ``5d``, or None when a date reads better than a span."""
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h"
+    days = hours // 24
+    if days < 30:
+        return f"{days}d"
+    return None
+
+
 def _timeago(dt: datetime) -> str:
-    """Format a datetime as a human-readable relative time."""
+    """Format a datetime as a human-readable relative time.
+
+    A timestamp ahead of now is rendered as a future one ("in 3h", "on
+    2027-01-01") rather than collapsed into "just now". Every negative age used
+    to read as current, so a clock rollback or a bad stored value made the
+    dashboard, check history, feed health and status pages all claim freshness
+    they did not have — for as long as it took the wall clock to catch up, which
+    is precisely when the operator needs to see it (AUG-284).
+    """
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     now = datetime.now(UTC)
-    diff = now - dt
-    seconds = int(diff.total_seconds())
+    seconds = int((now - dt).total_seconds())
     if seconds < 0:
-        return "just now"
+        ahead = -seconds
+        if ahead <= _FUTURE_TOLERANCE_SECONDS:
+            return "just now"
+        span = _coarse_span(ahead)
+        return f"in {span}" if span else f"on {dt.strftime('%Y-%m-%d')}"
     if seconds < 60:
         return "just now"
-    minutes = seconds // 60
-    if minutes < 60:
-        return f"{minutes}m ago"
-    hours = minutes // 60
-    if hours < 24:
-        return f"{hours}h ago"
-    days = hours // 24
-    if days < 30:
-        return f"{days}d ago"
-    return dt.strftime("%Y-%m-%d")
+    span = _coarse_span(seconds)
+    return f"{span} ago" if span else dt.strftime("%Y-%m-%d")
 
 
 def _sanitize_error(error_message: str | None) -> Markup:

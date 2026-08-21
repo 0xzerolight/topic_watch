@@ -87,6 +87,41 @@ class TestRateLimitWindow:
         assert _check_rate_limit(ip) is True
 
 
+class TestTimeagoFuture:
+    """AUG-284 — a future timestamp reads as future, not as "just now"."""
+
+    def test_small_skew_still_reads_as_just_now(self) -> None:
+        from app.web.routers.templates import _timeago
+
+        assert _timeago(datetime.now(UTC) + timedelta(seconds=30)) == "just now"
+
+    def test_hours_ahead_reads_as_future(self) -> None:
+        from app.web.routers.templates import _timeago
+
+        assert _timeago(datetime.now(UTC) + timedelta(hours=3, seconds=1)) == "in 3h"
+
+    def test_minutes_ahead_reads_as_future(self) -> None:
+        from app.web.routers.templates import _timeago
+
+        assert _timeago(datetime.now(UTC) + timedelta(minutes=20, seconds=1)) == "in 20m"
+
+    def test_far_future_reads_as_a_date(self) -> None:
+        from app.web.routers.templates import _timeago
+
+        moment = datetime.now(UTC) + timedelta(days=400)
+        assert _timeago(moment) == f"on {moment.strftime('%Y-%m-%d')}"
+
+    def test_past_rendering_is_unchanged(self) -> None:
+        from app.web.routers.templates import _timeago
+
+        assert _timeago(datetime.now(UTC) - timedelta(seconds=5)) == "just now"
+        assert _timeago(datetime.now(UTC) - timedelta(minutes=5)) == "5m ago"
+        assert _timeago(datetime.now(UTC) - timedelta(hours=3)) == "3h ago"
+        assert _timeago(datetime.now(UTC) - timedelta(days=5)) == "5d ago"
+        old = datetime.now(UTC) - timedelta(days=45)
+        assert _timeago(old) == old.strftime("%Y-%m-%d")
+
+
 class TestLatestCheckOrdering:
     """AUG-279 — every "latest check" query uses the heartbeat's own head order."""
 
