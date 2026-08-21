@@ -107,6 +107,37 @@ async def feed_health_page(
     )
 
 
+_MAX_VALIDATION_ERROR_CHARS = 150
+
+
+async def _validate_one(url: str) -> dict:
+    """Fetch one URL and report whether it is a feed worth saving.
+
+    Reads the fetch's own outcome rather than the length of the list it returned.
+    The list is empty for a blocked URL, a timeout, a 404 and an unparseable body
+    alike, so treating "no exception" as valid told users an unreachable or
+    malformed URL was a 'Valid RSS feed with 0 entries' and let them save a source
+    that will never deliver news (AUG-175). Only a fetch the source actually
+    answered counts as valid.
+    """
+    from app.scraping.rss import fetch_feed_outcome
+    from app.scraping.source import FeedHealthOutcome
+
+    reports: list[FeedHealthOutcome] = []
+    try:
+        result = await fetch_feed_outcome(url, timeout=10.0, health_callback=reports.append)
+    except Exception as exc:  # the fetch layer is fail-safe, but never trust that here
+        message = str(exc)[:_MAX_VALIDATION_ERROR_CHARS]
+        return {"url": url, "valid": False, "message": message or type(exc).__name__}
+
+    if result.status.succeeded:
+        return {"url": url, "valid": True, "message": f"Valid RSS feed with {len(result.entries)} entries"}
+
+    # The reason lives on the health report the fetch just filed for this URL.
+    reason = next((r.error_msg for r in reports if r.error_msg), None) or "Feed could not be fetched"
+    return {"url": url, "valid": False, "message": reason[:_MAX_VALIDATION_ERROR_CHARS]}
+
+
 @router.post("/feeds/validate", response_class=HTMLResponse, dependencies=[Depends(verify_csrf)])
 async def validate_feed_url(
     request: Request,
@@ -128,7 +159,6 @@ async def validate_feed_url(
             {"results": [{"url": "", "valid": False, "message": "No URLs provided"}]},
         )
 
-    from app.scraping.rss import fetch_feed
     from app.url_validation import is_private_url
 
     results = []
@@ -136,20 +166,7 @@ async def validate_feed_url(
         if await asyncio.to_thread(is_private_url, url):
             results.append({"url": url, "valid": False, "message": "Private/local URLs are not allowed"})
             continue
-        try:
-            entries = await fetch_feed(url, timeout=10.0)
-            results.append(
-                {
-                    "url": url,
-                    "valid": True,
-                    "message": f"Valid RSS feed with {len(entries)} entries",
-                }
-            )
-        except Exception as exc:
-            error_msg = str(exc)
-            if len(error_msg) > 150:
-                error_msg = error_msg[:150] + "..."
-            results.append({"url": url, "valid": False, "message": error_msg})
+        results.append(await _validate_one(url))
 
     return templates.TemplateResponse(
         request,
