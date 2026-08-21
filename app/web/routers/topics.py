@@ -302,6 +302,38 @@ async def mark_check_seen_handler(
     return Response(status_code=204)
 
 
+@router.get("/topics/{topic_id}/checks/{check_id}/detail", response_class=HTMLResponse)
+async def check_detail(
+    request: Request,
+    topic_id: int,
+    check_id: int,
+    conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
+):
+    """Render the stored novelty findings for one check (AUG-110).
+
+    Lazy-loaded by HTMX on first expand of the Check History "New Info"
+    disclosure, mirroring ``topic_knowledge_diff``. The data is already
+    persisted and already reaches notifications; this is a read path, not a
+    new LLM call. ``reasoning`` is deliberately never rendered — it is the
+    model's raw chain-of-thought, not a finding. GET only, so no CSRF
+    (web.md).
+    """
+    check_result = get_check_result(conn, check_id)
+    # The topic_id check is not redundant: without it any topic's URL could
+    # read any other topic's findings (mirrors topic_knowledge_diff).
+    if check_result is None or check_result.topic_id != topic_id:
+        raise HTTPException(status_code=404, detail="Check result not found")
+
+    novelty: NoveltyResult | None = None
+    if check_result.llm_response:
+        try:
+            novelty = NoveltyResult.model_validate_json(check_result.llm_response)
+        except Exception:
+            logger.warning("Could not parse llm_response for check %d", check_id, exc_info=True)
+
+    return templates.TemplateResponse(request, "_check_detail.html", {"novelty": novelty})
+
+
 @router.get("/topics/{topic_id}/status", response_class=HTMLResponse)
 async def topic_status(
     request: Request,

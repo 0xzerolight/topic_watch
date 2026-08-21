@@ -1313,3 +1313,108 @@ class TestExaEnableRequiresKey:
             )
         assert response.status_code == 303
         assert app.state.settings.exa.enabled is True
+
+
+class TestTestLLMConfiguration:
+    """POST /settings/test-llm (AUG-111): probes the currently EDITED, unsaved form
+    values through the exact same live-analysis call path as production, by
+    reusing ``verify_llm_credentials`` (AUG-335) rather than a second probe shape.
+    """
+
+    async def test_settings_page_has_the_test_button(self, client: httpx.AsyncClient) -> None:
+        response = await client.get("/settings")
+        assert 'hx-post="/settings/test-llm"' in response.text
+
+    async def test_probes_the_edited_unsaved_model_not_the_saved_one(self, client: httpx.AsyncClient) -> None:
+        app.state.settings = _make_settings(llm=LLMSettings(model="openai/gpt-4o-mini", api_key="sk-saved"))
+        with patch("app.web.routers.settings.verify_llm_credentials", return_value=None) as mock_check:
+            response = await client.post(
+                "/settings/test-llm",
+                data={"llm_model": "anthropic/claude-haiku-4-5", "llm_api_key": "sk-typed", "llm_base_url": ""},
+            )
+        assert response.status_code == 200
+        mock_check.assert_called_once_with(model="anthropic/claude-haiku-4-5", api_key="sk-typed", base_url=None)
+
+    async def test_success_message(self, client: httpx.AsyncClient) -> None:
+        with patch("app.web.routers.settings.verify_llm_credentials", return_value=None):
+            response = await client.post(
+                "/settings/test-llm",
+                data={"llm_model": "openai/gpt-4o-mini", "llm_api_key": "sk-typed", "llm_base_url": ""},
+            )
+        assert response.status_code == 200
+        assert "succeeded" in response.text.lower()
+
+    async def test_failure_renders_the_key_free_message(self, client: httpx.AsyncClient) -> None:
+        from app.web.routers.settings import LLMValidationError
+
+        with patch(
+            "app.web.routers.settings.verify_llm_credentials",
+            side_effect=LLMValidationError("Authentication failed: the API key was rejected by the provider."),
+        ):
+            response = await client.post(
+                "/settings/test-llm",
+                data={"llm_model": "openai/gpt-4o-mini", "llm_api_key": "sk-typed-then-rejected", "llm_base_url": ""},
+            )
+        assert response.status_code == 200
+        assert "Authentication failed" in response.text
+        # The submitted key must never be echoed back into the page (AUG-017 class).
+        assert "sk-typed-then-rejected" not in response.text
+
+    async def test_blank_api_key_keeps_the_current_saved_key(self, client: httpx.AsyncClient) -> None:
+        """A blank key field means "test with the currently saved key" (mirrors Save)."""
+        app.state.settings = _make_settings(llm=LLMSettings(model="openai/gpt-4o-mini", api_key="sk-on-disk"))
+        with patch("app.web.routers.settings.verify_llm_credentials", return_value=None) as mock_check:
+            response = await client.post(
+                "/settings/test-llm",
+                data={"llm_model": "openai/gpt-4o-mini", "llm_api_key": "", "llm_base_url": ""},
+            )
+        assert response.status_code == 200
+        mock_check.assert_called_once_with(model="openai/gpt-4o-mini", api_key="sk-on-disk", base_url=None)
+
+    async def test_blank_model_is_refused_without_calling_the_probe(self, client: httpx.AsyncClient) -> None:
+        with patch("app.web.routers.settings.verify_llm_credentials") as mock_check:
+            response = await client.post(
+                "/settings/test-llm",
+                data={"llm_model": "", "llm_api_key": "sk-typed", "llm_base_url": ""},
+            )
+        assert response.status_code == 200
+        assert "model" in response.text.lower()
+        mock_check.assert_not_called()
+
+    async def test_env_owned_model_uses_the_environment_value(
+        self, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An env-owned control renders disabled and submits nothing — the probe
+        must use the value that will actually run, not a blank string (C5-4)."""
+        monkeypatch.setenv("TOPIC_WATCH_LLM__MODEL", "ollama/llama3.3")
+        app.state.settings = _make_settings(llm=LLMSettings(model="ollama/llama3.3", api_key=""))
+        with patch("app.web.routers.settings.verify_llm_credentials", return_value=None) as mock_check:
+            response = await client.post(
+                "/settings/test-llm",
+                # A disabled control submits nothing — the browser sends "".
+                data={"llm_model": "", "llm_api_key": "", "llm_base_url": ""},
+            )
+        assert response.status_code == 200
+        mock_check.assert_called_once_with(model="ollama/llama3.3", api_key="", base_url=None)
+
+    async def test_requires_csrf(self, db_conn: sqlite3.Connection) -> None:
+        settings = _make_settings()
+        app.state.settings = settings
+
+        def override_db():
+            yield db_conn
+
+        def override_settings():
+            return settings
+
+        app.dependency_overrides[get_db_conn] = override_db
+        app.dependency_overrides[get_settings] = override_settings
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as ac:
+                response = await ac.post(
+                    "/settings/test-llm",
+                    data={"llm_model": "openai/gpt-4o-mini", "llm_api_key": "x", "llm_base_url": ""},
+                )
+            assert response.status_code == 403
+        finally:
+            app.dependency_overrides.clear()

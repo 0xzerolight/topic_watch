@@ -80,6 +80,27 @@
                    placeholder="e.g., http://localhost:11434 for Ollama">
             <small class="help" id="base-url-hint">Optional. Set for a self-hosted provider or an OpenAI-compatible gateway.</small>
         </div>
+
+        {# AUG-111: probes the fields as currently typed, not the last-saved ones —
+           the button lives inside this <form>, so htmx includes its values (model,
+           key, base URL, csrf_token) the same way a real submit would. #}
+        <div class="field-group">
+            <button
+                type="button"
+                class="outline"
+                hx-post="/settings/test-llm"
+                hx-target="#llm-test-result"
+                hx-swap="innerHTML"
+                hx-indicator="#llm-test-spinner"
+                hx-disabled-elt="this"
+            >
+                Test LLM Configuration
+            </button>
+            <span id="llm-test-spinner" class="htmx-indicator">
+                <span class="spinner"></span> Testing...
+            </span>
+            <div id="llm-test-result" style="margin-top: 0.75rem;" role="status" aria-live="polite" aria-atomic="true"></div>
+        </div>
     </section>
 
     <section class="card">
