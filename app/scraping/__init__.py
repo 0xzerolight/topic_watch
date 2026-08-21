@@ -40,9 +40,9 @@ from app.scraping.source import (
     body_digest,
     bounded,
     collapse_duplicate_entries,
-    compute_article_hash,
     ranking_date,
     revision_marker,
+    stored_story_keys,
     story_identity,
 )
 
@@ -273,7 +273,8 @@ class _StoredArticles:
         rows = list_article_dedup_keys(conn, topic_id)
         urls_by_story: dict[str, list[str]] = {}
         for _, url, title in rows:
-            urls_by_story.setdefault(compute_article_hash(url, title), []).append(url)
+            for key in stored_story_keys(url, title):
+                urls_by_story.setdefault(key, []).append(url)
         return cls(
             identities=frozenset(content_hash for content_hash, _, _ in rows),
             stories=frozenset(urls_by_story),
@@ -529,9 +530,9 @@ def _drop_unchanged_representations(
         digest = body_digest(raw_content)
         if not digest:
             continue
-        story = compute_article_hash(url, title)
-        by_story.setdefault(story, set()).add(digest)
-        by_source.setdefault((story, source_provider), set()).add(digest)
+        for story in stored_story_keys(url, title):
+            by_story.setdefault(story, set()).add(digest)
+            by_source.setdefault((story, source_provider), set()).add(digest)
 
     unchanged: set[int] = set()
     for index, (entry, _, content, origin_provider) in contested:

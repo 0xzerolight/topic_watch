@@ -500,6 +500,33 @@ def compute_article_hash(url: str, title: str) -> str:
     return _identity_digest(canonical_url(url), title.casefold(), "")
 
 
+PUBLISHER_SUFFIX_SEPARATOR = " - "
+"""How an aggregator joins the publisher's name onto a syndicated headline."""
+
+
+def stored_story_keys(url: str, title: str) -> tuple[str, ...]:
+    """Every story key a row already in the database should answer to.
+
+    The strict key, plus a tolerant one with a trailing ``" - X"`` segment
+    removed when the title carries one. Rows written before headline stripping
+    arrived hold ``"Headline - BBC News"`` while the same feed item now parses as
+    ``"Headline"``, and the story key includes the title — so without the tolerant
+    key every AUTO topic's stored window stopped matching on upgrade and its whole
+    current set of stories was re-fetched, re-analysed and stored a second time.
+
+    Tolerance is one-directional and applies only to what is already stored, so
+    an incoming entry is still keyed on exactly the title it arrived with. A
+    headline that merely contains a dash gains a second key against its own URL,
+    which costs nothing beyond a wider match on that one URL.
+    """
+    strict = compute_article_hash(url, title)
+    head, separator, _ = title.rpartition(PUBLISHER_SUFFIX_SEPARATOR)
+    stripped = head.strip() if separator else ""
+    if not stripped:
+        return (strict,)
+    return (strict, compute_article_hash(url, stripped))
+
+
 def _representation_rank(entry: FeedEntry) -> tuple[datetime, int]:
     """Sort key deciding which of two entries for one URL is the better copy."""
     stamps = [s for s in (as_utc(entry.updated), as_utc(entry.published)) if s is not None]

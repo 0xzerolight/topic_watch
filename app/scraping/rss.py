@@ -26,6 +26,7 @@ from app.scraping.google_news import GOOGLE_NEWS_HOST
 from app.scraping.providers import NewsProvider, provider_identity
 from app.scraping.source import (
     DEADLINE_ERROR,
+    PUBLISHER_SUFFIX_SEPARATOR,
     Deadline,
     FeedFetchResult,
     FeedHealthOutcome,
@@ -282,10 +283,6 @@ def _is_wrong_media_type_only(parsed: object, bozo_exc: object) -> bool:
     return bool(isinstance(bozo_exc, feedparser.NonXMLContentType) and getattr(parsed, "version", ""))
 
 
-_PUBLISHER_SUFFIX_SEPARATOR = " - "
-"""How an aggregator joins the publisher's name onto a syndicated headline."""
-
-
 def _strip_publisher_suffix(title: str, raw_entry: dict) -> str:
     """Remove the ``" - Publisher"`` an aggregator appends to a syndicated headline.
 
@@ -298,12 +295,15 @@ def _strip_publisher_suffix(title: str, raw_entry: dict) -> str:
     Only the exact suffix the entry itself declares is removed, so a headline that
     merely contains a dash keeps it, and a headline that is nothing but the
     publisher's name is left alone rather than emptied.
+
+    Rows stored before this arrived keep the unstripped title; ``stored_story_keys``
+    is what keeps them matching.
     """
     source = raw_entry.get("source")
     publisher = source.get("title", "").strip() if isinstance(source, dict) else ""
     if not publisher:
         return title
-    suffix = f"{_PUBLISHER_SUFFIX_SEPARATOR}{publisher}"
+    suffix = f"{PUBLISHER_SUFFIX_SEPARATOR}{publisher}"
     if not title.endswith(suffix):
         return title
     return title[: -len(suffix)].strip() or title

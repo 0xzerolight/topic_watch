@@ -36,6 +36,7 @@ from app.scraping.source import (
     article_identity,
     collapse_duplicate_entries,
     normalize_published,
+    stored_story_keys,
 )
 
 # --- Sample RSS/Atom XML for mocking ---
@@ -152,6 +153,31 @@ class TestComputeArticleHash:
         h = compute_article_hash("url", "title")
         assert len(h) == 64
         assert all(c in "0123456789abcdef" for c in h)
+
+
+class TestStoredStoryKeys:
+    """AUG-180: a stored row answers to the headline it was written with AND to the stripped one."""
+
+    _URL = "https://publisher.example/story"
+
+    def test_a_bare_headline_has_one_key(self) -> None:
+        assert stored_story_keys(self._URL, "Headline") == (compute_article_hash(self._URL, "Headline"),)
+
+    def test_a_suffixed_headline_also_answers_to_the_stripped_one(self) -> None:
+        keys = stored_story_keys(self._URL, "Headline - BBC News")
+
+        assert keys == (
+            compute_article_hash(self._URL, "Headline - BBC News"),
+            compute_article_hash(self._URL, "Headline"),
+        )
+
+    def test_only_the_last_segment_is_removed(self) -> None:
+        keys = stored_story_keys(self._URL, "Headline - Subtitle - BBC News")
+
+        assert keys[1] == compute_article_hash(self._URL, "Headline - Subtitle")
+
+    def test_a_headline_that_is_only_a_suffix_is_not_emptied(self) -> None:
+        assert stored_story_keys(self._URL, " - BBC News") == (compute_article_hash(self._URL, " - BBC News"),)
 
 
 # ============================================================
@@ -2773,12 +2799,14 @@ class TestStoryDedup:
         conn.commit()
         return topic
 
-    def _store_publisher_row(self, conn: sqlite3.Connection, topic: Topic, content_hash: str) -> None:
+    def _store_publisher_row(
+        self, conn: sqlite3.Connection, topic: Topic, content_hash: str, title: str = "The Story"
+    ) -> None:
         create_article(
             conn,
             Article(
                 topic_id=topic.id,
-                title="The Story",
+                title=title,
                 url=self._PUBLISHER,
                 content_hash=content_hash,
                 raw_content="Body",
@@ -2852,6 +2880,25 @@ class TestStoryDedup:
 
         assert stored == []
         # Dropped before its content is fetched a second time.
+        extract.assert_not_called()
+
+    async def test_a_stored_row_still_matches_once_the_publisher_suffix_is_stripped(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """AUG-180: rows written before headline stripping keep the aggregator's suffix.
+
+        The story key includes the title, so on upgrade every stored story stopped
+        matching the same feed item's now-stripped headline — an AUTO topic
+        re-fetched, re-analysed and re-stored its whole current window, one LLM
+        call per story.
+        """
+        topic = self._topic(db_conn)
+        self._store_publisher_row(db_conn, topic, "pre-upgrade-key", title="The Story - BBC News")
+
+        extract = AsyncMock(return_value="Body")
+        stored = await self._run_google(topic, db_path, extract, self._resolver({self._WRAPPER: self._PUBLISHER}))
+
+        assert stored == []
         extract.assert_not_called()
 
     async def test_another_providers_copy_of_a_stored_story_is_skipped(
