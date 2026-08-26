@@ -34,6 +34,11 @@ updates:
         versions: [">=15.0.0"]
       - dependency-name: "importlib-metadata"
         versions: [">=9.0.0"]
+      # instructor 1.15.4 also caps openai<3.0.0, so the openai 3.x line is
+      # uninstallable here and broke #74 the same way. Same range-scoped shape:
+      # 2.x bumps still flow. Lift with the caps above.
+      - dependency-name: "openai"
+        versions: [">=3.0.0"]
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
