@@ -1,3 +1,11 @@
+# The mypy hook below is `language: system` and needs the project's dev
+# environment on PATH. pre-commit.ci's sandbox has no such environment, so the
+# hook aborts there with "Executable `mypy` not found" and fails the required
+# `pre-commit.ci - pr` check on every PR. Type checking is not lost: the hosted
+# CI `lint` job and `make lint` both run the same mypy invocation.
+ci:
+  skip: [mypy]
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
