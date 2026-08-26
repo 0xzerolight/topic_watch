@@ -10,6 +10,15 @@ reliable signal of change scope; historical tags are not renumbered.
 
 ## [Unreleased]
 
+### Changed
+
+- Dependencies relocked (litellm 1.98.0, apprise 1.13.0, openai 2.54.0, ruff 0.16.4, mypy 2.3.1 and 15 more). litellm 1.98.0 pulls boto3/botocore/s3transfer/jmespath in as unconditional runtime requirements, so they are now in `requirements.txt`. Supersedes the weekly group PR #74, which pinned openai 3.3.1 against instructor's `openai<3.0.0` cap and could not install
+- Dependabot no longer proposes openai 3.x. The cap comes from instructor 1.15.4, so the whole 3.x line is uninstallable here; the ignore is range-scoped like the jiter/rich/importlib-metadata ones, so 2.x bumps still flow. Lift it when instructor lifts the cap
+
+### Fixed
+
+- The required `pre-commit.ci - pr` check no longer fails on every pull request. The mypy hook is `language: system` and needs the project's dev environment on PATH; pre-commit.ci's sandbox has none, so since 5f2f5d0 it aborted with "Executable `mypy` not found" and left branch protection blocking auto-merge on all open PRs. The hook is now in the `ci.skip` list, which is pre-commit.ci's own escape hatch for system hooks. Type checking is unchanged: the hosted `lint` job, `make lint` and the local hook all still run the same `mypy app/ evals/` invocation
+
 ## [1.4.0] - 2026-08-19
 
 ### Added
