@@ -237,8 +237,6 @@ To reach it from other devices, set `TOPIC_WATCH_BIND_ADDR=0.0.0.0` in `.env` (t
 | **"Invalid host header" (HTTP 400)** | You are reaching it by hostname. Set `TOPIC_WATCH_ALLOWED_HOSTS` to that hostname in `.env` (comma-separated for several) and restart. `localhost` and IP addresses need no setting. |
 | **High memory** | Lower `max_articles_per_check` or `content_fetch_concurrency`. Increase check intervals. |
 
-If still stuck, `python -m app.cli doctor` (Docker: `docker compose exec topic-watch python -m app.cli doctor`) prints a diagnostic snapshot for a bug report, with your API key and notification URLs redacted. Issues are public: feed hosts and short path segments still show, and logs are not redacted at all. Update to the latest release first.
-
 ## Contributing
 
 Contributions of any kind are welcome.
