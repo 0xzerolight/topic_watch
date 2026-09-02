@@ -368,6 +368,7 @@ class TestScheduledCheck:
             patch("app.checker.check_topic", side_effect=fake_check_topic),
             patch("app.checker.retry_pending_notifications", new_callable=AsyncMock),
             patch("app.checker.retry_pending_webhooks", new_callable=AsyncMock),
+            patch("app.checker.retry_pending_check_intents", new_callable=AsyncMock),
             patch(
                 "app.checker.get_topics_due_for_check",
                 return_value=topics,
@@ -897,6 +898,7 @@ class TestRetryDrainDoesNotStarveDueTopics:
         with (
             patch("app.checker.retry_pending_notifications", _slow_drain),
             patch("app.checker.retry_pending_webhooks", new=AsyncMock()),
+            patch("app.checker.retry_pending_check_intents", new=AsyncMock()),
             patch("app.checker.check_topic", _fake_check),
         ):
             await asyncio.wait_for(check_all_topics(_make_settings(), db_path), timeout=5)
@@ -910,6 +912,7 @@ class TestRetryDrainDoesNotStarveDueTopics:
         with (
             patch("app.checker.retry_pending_notifications", drain),
             patch("app.checker.retry_pending_webhooks", new=AsyncMock()),
+            patch("app.checker.retry_pending_check_intents", new=AsyncMock()),
         ):
             assert await check_all_topics(_make_settings(), db_path) == []
         drain.assert_awaited_once()

@@ -10,13 +10,23 @@ import pytest
 
 from app.analysis.knowledge import KnowledgeUpdatePlan
 from app.analysis.llm import NoveltyResponse, NoveltyResult, TokenUsage
-from app.checker import check_all_topics, check_topic, retry_pending_notifications
+from app.checker import (
+    _SKIPPED_IN_FLIGHT,
+    check_all_topics,
+    check_topic,
+    retry_pending_check_intents,
+    retry_pending_notifications,
+    run_check_intent,
+)
 from app.config import LLMSettings, NotificationSettings, Settings
 from app.crud import (
     MAX_ANALYSIS_ATTEMPTS,
     apply_notification_outcome,
+    claim_check_intent,
     claim_notification_intent,
     create_article,
+    create_check_intents,
+    create_check_result,
     create_knowledge_state,
     create_pending_notification,
     create_topic,
@@ -24,11 +34,15 @@ from app.crud import (
     list_articles_for_topic,
     list_due_notification_intents,
     list_pending_notifications,
+    release_stale_check_intent_claims,
     release_stale_notification_claims,
     update_topic,
 )
+from app.database import get_connection
 from app.models import (
     Article,
+    CheckIntent,
+    CheckResult,
     FeedMode,
     KnowledgeState,
     NotificationDelivery,
@@ -3447,3 +3461,299 @@ class TestOnlyAnalyzedArticlesAreProcessed:
             await check_topic(get_topic(db_conn, topic.id), settings, db_path=db_path)
 
         assert sorted(a.id for a in mock_analyze.await_args.args[0]) == sorted(a.id for a in dropped)
+
+
+def _seed_check_intent(conn: sqlite3.Connection, topic: Topic, **overrides) -> CheckIntent:
+    defaults = {"request_id": "req-1", "topic_id": topic.id}
+    defaults.update(overrides)
+    intent = CheckIntent(**defaults)
+    create_check_intents(conn, [intent])
+    conn.commit()
+    return intent
+
+
+async def _commit_a_check_result(topic_id: int, db_path: Path) -> CheckResult:
+    """Write a real check_results row the way a completed check would."""
+    conn = get_connection(db_path)
+    try:
+        result = create_check_result(conn, CheckResult(topic_id=topic_id))
+        conn.commit()
+        return result
+    finally:
+        conn.close()
+
+
+class TestCheckIntents:
+    """AUG-286: an accepted check is durable, claimed once, and resumable."""
+
+    async def test_run_records_the_result_id_and_finishes_done(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        topic = _make_topic(db_conn, name="Intent Done")
+        intent = _seed_check_intent(db_conn, topic)
+
+        async def _fake_check(t, settings, *, db_path=None, guard=True):  # noqa: ANN001, ANN202
+            assert guard is True  # the runner no longer holds the guard itself
+            return await _commit_a_check_result(t.id, db_path)
+
+        with patch("app.checker.check_topic", side_effect=_fake_check):
+            result = await run_check_intent(intent, _make_settings(), db_path)
+
+        assert result is not None and result.id is not None
+        row = db_conn.execute("SELECT * FROM check_intents WHERE id = ?", (intent.id,)).fetchone()
+        assert row["status"] == "done"
+        assert row["check_result_id"] == result.id
+        assert row["attempts"] == 1
+        assert row["claim_token"] is None
+        assert row["claimed_at"] is None
+
+    async def test_a_newer_result_satisfies_the_intent_without_running(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """A crash between the check's commit and its apply must not re-run the check."""
+        topic = _make_topic(db_conn, name="Already Satisfied")
+        baseline = create_check_result(db_conn, CheckResult(topic_id=topic.id))
+        db_conn.commit()
+        intent = _seed_check_intent(db_conn, topic, baseline_check_id=baseline.id)
+        newer = create_check_result(db_conn, CheckResult(topic_id=topic.id))
+        db_conn.commit()
+
+        with patch("app.checker.check_topic", new_callable=AsyncMock) as mock_check:
+            assert await run_check_intent(intent, _make_settings(), db_path) is None
+
+        mock_check.assert_not_awaited()
+        row = db_conn.execute("SELECT * FROM check_intents WHERE id = ?", (intent.id,)).fetchone()
+        assert row["status"] == "done"
+        assert row["check_result_id"] == newer.id
+
+    async def test_a_deleted_topic_leaves_nothing_to_apply(
+        self, db_conn: sqlite3.Connection, db_path: Path, caplog
+    ) -> None:
+        """The FK cascade removes the row first, so an apply would only log a false 'late apply'."""
+        import logging
+
+        topic = _make_topic(db_conn, name="Vanished")
+        intent = _seed_check_intent(db_conn, topic)
+
+        with (
+            patch("app.checker.get_topic", return_value=None),
+            patch("app.checker.check_topic", new_callable=AsyncMock) as mock_check,
+            caplog.at_level(logging.WARNING, logger="app.checker"),
+        ):
+            assert await run_check_intent(intent, _make_settings(), db_path) is None
+
+        mock_check.assert_not_awaited()
+        assert not [r for r in caplog.records if "Late apply" in r.getMessage()]
+        row = db_conn.execute("SELECT * FROM check_intents WHERE id = ?", (intent.id,)).fetchone()
+        # Only the claim touched the row: no outcome was applied on top of it.
+        assert row["status"] == "running"
+        assert row["claim_token"] is not None
+        assert row["last_error"] is None
+        assert row["check_result_id"] is None
+
+    async def test_guard_contention_backs_off_and_stays_pending(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """Another check holds the per-topic guard: wait it out rather than abandon."""
+        topic = _make_topic(db_conn, name="Contended")
+        intent = _seed_check_intent(db_conn, topic)
+
+        with patch(
+            "app.checker.check_topic",
+            new_callable=AsyncMock,
+            return_value=CheckResult(topic_id=topic.id, stage_error=_SKIPPED_IN_FLIGHT),
+        ):
+            await run_check_intent(intent, _make_settings(), db_path)
+
+        row = db_conn.execute("SELECT * FROM check_intents WHERE id = ?", (intent.id,)).fetchone()
+        assert row["status"] == "pending"
+        assert row["attempts"] == 1
+        assert row["next_attempt_at"] is not None
+        assert row["last_error"] == _SKIPPED_IN_FLIGHT
+
+    async def test_a_not_ready_topic_abandons_the_intent(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
+        """Nothing to wait for: a non-READY topic will not answer a retry either."""
+        topic = _make_topic(db_conn, name="Not Ready")
+        intent = _seed_check_intent(db_conn, topic)
+
+        with patch(
+            "app.checker.check_topic",
+            new_callable=AsyncMock,
+            return_value=CheckResult(topic_id=topic.id, stage_error="skipped: topic not ready (status: error)"),
+        ):
+            await run_check_intent(intent, _make_settings(), db_path)
+
+        row = db_conn.execute("SELECT * FROM check_intents WHERE id = ?", (intent.id,)).fetchone()
+        assert row["status"] == "abandoned"
+        assert row["last_error"] == "skipped"
+        assert row["next_attempt_at"] is None
+
+    async def test_a_transition_abort_stores_only_the_prefix(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
+        """The suffix is an exception message, so only the classification is stored."""
+        topic = _make_topic(db_conn, name="Aborted")
+        intent = _seed_check_intent(db_conn, topic)
+
+        with patch(
+            "app.checker.check_topic",
+            new_callable=AsyncMock,
+            return_value=CheckResult(topic_id=topic.id, stage_error="transition_aborted: secret detail"),
+        ):
+            await run_check_intent(intent, _make_settings(), db_path)
+
+        row = db_conn.execute("SELECT last_error, status FROM check_intents WHERE id = ?", (intent.id,)).fetchone()
+        assert row["status"] == "abandoned"
+        assert row["last_error"] == "transition_aborted"
+
+    async def test_a_raising_check_backs_off_and_abandons_at_the_cap(
+        self, db_conn: sqlite3.Connection, db_path: Path, caplog
+    ) -> None:
+        """Three claims, three logged failures, then the row stops asking to be run."""
+        import logging
+
+        topic = _make_topic(db_conn, name="Always Fails")
+        intent = _seed_check_intent(db_conn, topic)
+
+        with (
+            patch("app.checker.check_topic", side_effect=RuntimeError("boom")),
+            patch("app.checker.next_attempt_at", return_value="2000-01-01T00:00:00+00:00"),
+            caplog.at_level(logging.ERROR, logger="app.checker"),
+        ):
+            for _ in range(3):
+                await retry_pending_check_intents(_make_settings(), db_path=db_path)
+
+        row = db_conn.execute("SELECT * FROM check_intents WHERE id = ?", (intent.id,)).fetchone()
+        assert row["attempts"] == 3
+        assert row["status"] == "abandoned"
+        assert row["last_error"] == "RuntimeError"
+        assert row["next_attempt_at"] is None
+        failures = [r for r in caplog.records if "failed" in r.getMessage()]
+        assert len(failures) == 3
+
+    async def test_a_timed_out_check_is_retryable_and_logged(
+        self, db_conn: sqlite3.Connection, db_path: Path, caplog
+    ) -> None:
+        """A hung manual check must still say so out loud, not only in a row nobody reads."""
+        import asyncio
+        import logging
+
+        topic = _make_topic(db_conn, name="Hangs")
+        intent = _seed_check_intent(db_conn, topic)
+
+        async def _hang(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            await asyncio.sleep(9999)
+
+        with (
+            patch("app.checker.check_topic", side_effect=_hang),
+            patch("app.checker.CHECK_TIMEOUT_SECONDS", 0.01),
+            caplog.at_level(logging.ERROR, logger="app.checker"),
+        ):
+            assert await run_check_intent(intent, _make_settings(), db_path) is None
+
+        row = db_conn.execute("SELECT * FROM check_intents WHERE id = ?", (intent.id,)).fetchone()
+        assert row["status"] == "pending"
+        assert row["last_error"] == "TimeoutError"
+        assert row["next_attempt_at"] is not None
+        assert any("timed out" in r.getMessage().lower() for r in caplog.records)
+
+    async def test_drain_rearms_a_dead_processs_claim_then_runs_it(
+        self, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """The accepted check a killed process was running is picked up by the next cycle."""
+        topic = _make_topic(db_conn, name="Orphaned")
+        intent = _seed_check_intent(db_conn, topic)
+        db_conn.execute(
+            "UPDATE check_intents SET status = 'running', claimed_at = ?, claim_token = ? WHERE id = ?",
+            ("2020-01-01T00:00:00+00:00", "gone-with-the-process", intent.id),
+        )
+        db_conn.commit()
+
+        async def _fake_check(t, settings, *, db_path=None, guard=True):  # noqa: ANN001, ANN202
+            return await _commit_a_check_result(t.id, db_path)
+
+        with patch("app.checker.check_topic", side_effect=_fake_check):
+            await retry_pending_check_intents(_make_settings(), db_path=db_path)
+
+        row = db_conn.execute("SELECT * FROM check_intents WHERE id = ?", (intent.id,)).fetchone()
+        assert row["status"] == "done"
+        assert row["check_result_id"] is not None
+
+    async def test_drain_skips_a_live_claim(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
+        """A forward clock step must not hand a running check to a second runner."""
+        from app.web.state import live_claim
+
+        topic = _make_topic(db_conn, name="Still Running")
+        intent = _seed_check_intent(db_conn, topic)
+        db_conn.execute(
+            "UPDATE check_intents SET status = 'running', claimed_at = ?, claim_token = ? WHERE id = ?",
+            ("2020-01-01T00:00:00+00:00", "live-token", intent.id),
+        )
+        db_conn.commit()
+
+        with patch("app.checker.check_topic", new_callable=AsyncMock) as mock_check, live_claim("live-token"):
+            await retry_pending_check_intents(_make_settings(), db_path=db_path)
+
+        mock_check.assert_not_awaited()
+        row = db_conn.execute("SELECT status, claim_token FROM check_intents WHERE id = ?", (intent.id,)).fetchone()
+        assert row["status"] == "running"
+        assert row["claim_token"] == "live-token"
+
+    async def test_two_concurrent_drains_run_each_intent_once(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
+        import asyncio
+
+        first = _make_topic(db_conn, name="Racer One")
+        second = _make_topic(db_conn, name="Racer Two")
+        intents = [_seed_check_intent(db_conn, first), _seed_check_intent(db_conn, second)]
+
+        runs: list[int] = []
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _slow_check(t, settings, *, db_path=None, guard=True):  # noqa: ANN001, ANN202
+            runs.append(t.id)
+            started.set()
+            await release.wait()
+            return await _commit_a_check_result(t.id, db_path)
+
+        settings = _make_settings()
+        with patch("app.checker.check_topic", side_effect=_slow_check):
+            drain1 = asyncio.create_task(retry_pending_check_intents(settings, db_path=db_path))
+            await started.wait()
+            drain2 = asyncio.create_task(retry_pending_check_intents(settings, db_path=db_path))
+            await asyncio.sleep(0)  # let drain2 observe the single-flight guard
+            release.set()
+            await asyncio.gather(drain1, drain2)
+
+        assert sorted(runs) == sorted([first.id, second.id])
+        statuses = {r["id"]: r["status"] for r in db_conn.execute("SELECT id, status FROM check_intents").fetchall()}
+        assert statuses == {i.id: "done" for i in intents}
+
+    async def test_late_apply_after_stale_release_is_a_noop(
+        self, db_conn: sqlite3.Connection, db_path: Path, caplog
+    ) -> None:
+        """A runner whose claim was re-armed mid-check cannot write over its successor."""
+        import logging
+
+        topic = _make_topic(db_conn, name="Superseded")
+        intent = _seed_check_intent(db_conn, topic)
+
+        async def _check_then_lose_the_claim(t, settings, *, db_path=None, guard=True):  # noqa: ANN001, ANN202
+            conn = get_connection(db_path)
+            try:
+                release_stale_check_intent_claims(conn, "2999-01-01T00:00:00+00:00")
+                assert claim_check_intent(conn, intent.id, "successor", "2026-01-01T00:00:00+00:00") is True
+                conn.commit()
+            finally:
+                conn.close()
+            return CheckResult(topic_id=t.id, stage_error="skipped: topic no longer exists")
+
+        with (
+            patch("app.checker.check_topic", side_effect=_check_then_lose_the_claim),
+            caplog.at_level(logging.WARNING, logger="app.checker"),
+        ):
+            await run_check_intent(intent, _make_settings(), db_path)
+
+        row = db_conn.execute("SELECT * FROM check_intents WHERE id = ?", (intent.id,)).fetchone()
+        assert row["status"] == "running"
+        assert row["claim_token"] == "successor"
+        assert row["last_error"] is None
+        assert any("Late apply" in r.getMessage() for r in caplog.records)
