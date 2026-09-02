@@ -38,11 +38,25 @@ WORKDIR /app
 # Copy the virtual environment from builder
 COPY --from=builder /opt/venv /opt/venv
 
-# Install gosu for privilege de-escalation in the entrypoint (drops from root
-# to the host-aligned PUID/PGID after fixing volume ownership).
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends gosu && \
-    rm -rf /var/lib/apt/lists/* && \
+# gosu for privilege de-escalation in the entrypoint (drops from root to the
+# host-aligned PUID/PGID after fixing volume ownership). Fetched from its GitHub
+# release and verified against a pinned per-arch SHA-256 (TW-AUD-033): the
+# Debian package was the one build input resolved outside the declared locks,
+# and apt cannot pin a single version across both published architectures.
+# To bump: change GOSU_VERSION and both sums from the release's SHA256SUMS file
+# (signed; verify with tianon's key B42F6819007F00F88E364FD4036A9C25BF357DD4).
+# License text: THIRD_PARTY_NOTICES.md (shipped below).
+ARG TARGETARCH
+ARG GOSU_VERSION=1.19
+ADD https://github.com/tianon/gosu/releases/download/${GOSU_VERSION}/gosu-${TARGETARCH} /usr/local/bin/gosu
+RUN set -eu; \
+    case "$TARGETARCH" in \
+      amd64) sum="52c8749d0142edd234e9d6bd5237dff2d81e71f43537e2f4f66f75dd4b243dd0" ;; \
+      arm64) sum="3a8ef022d82c0bc4a98bcb144e77da714c25fcfa64dccc57f6aba7ae47ff1a44" ;; \
+      *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    echo "$sum  /usr/local/bin/gosu" | sha256sum -c -; \
+    chmod 0755 /usr/local/bin/gosu; \
     gosu nobody true
 
 # Copy application code and example config
