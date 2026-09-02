@@ -879,6 +879,57 @@ class PendingNotification(SQLiteModel):
     delivered_at: str | None = None
 
 
+class CheckIntentStatus(StrEnum):
+    """Lifecycle of one accepted-check command intent.
+
+    ``pending`` -> ``running`` (claimed) -> ``done`` | ``abandoned``. ``done``
+    and ``abandoned`` rows stay as the admission ledger until the daily
+    retention tick prunes them by age, like the delivery intents.
+    """
+
+    PENDING = "pending"
+    RUNNING = "running"
+    DONE = "done"
+    ABANDONED = "abandoned"
+
+
+class CheckIntent(SQLiteModel):
+    """One durable "this check was accepted" record, written before the response.
+
+    ``POST /topics/{id}/check`` and ``POST /topics/bulk-check`` used to answer
+    "checking" the moment a Starlette background task was registered, so a crash
+    after the response lost the command outright — and a bulk request left an
+    unknowable completed prefix (AUG-286). The row is committed before the
+    response and the scheduler's check cycle resumes whatever a dead process left
+    behind.
+
+    ``request_id`` correlates the row with the request's logs and is deliberately
+    not unique (see m030). ``baseline_check_id`` is ``MAX(check_results.id)`` at
+    admission, so any newer result satisfies the intent instead of re-running a
+    check that committed but lost its apply. ``attempts`` counts CLAIMS rather
+    than completions, which is what bounds a check that takes the process down
+    with it; ``claim_token`` fences every apply exactly as it does for a delivery
+    intent (AUG-277).
+    """
+
+    _required_dt_fields = ("created_at",)
+    _insert_exclude = frozenset({"next_attempt_at", "claimed_at", "claim_token", "check_result_id", "last_error"})
+
+    id: int | None = None
+    request_id: str
+    topic_id: int
+    baseline_check_id: int | None = None
+    status: CheckIntentStatus = CheckIntentStatus.PENDING
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    attempts: int = 0
+    max_attempts: int = 3
+    next_attempt_at: str | None = None
+    claimed_at: str | None = None
+    claim_token: str | None = None
+    check_result_id: int | None = None
+    last_error: str | None = None
+
+
 class NotificationDelivery(BaseModel):
     """Per-URL outcome of a notification delivery attempt.
 
