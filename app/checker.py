@@ -394,9 +394,11 @@ async def check_topic(
     reach the pipeline through here, so a same-topic check already in flight is
     skipped (returns a CheckResult with ``stage_error='skipped: already in
     flight'`` and no LLM/notification work). Callers that already hold the guard
-    (the manual web ``/check`` path, which acquires it synchronously so it can
-    return the current row immediately) pass ``guard=False`` to avoid
-    self-blocking on the entry they already own.
+    (the JSON API, which claims it synchronously so it can answer 409 rather than
+    return a skipped result) pass ``guard=False`` to avoid self-blocking on the
+    entry they already own. The manual web ``/check`` path does not: its accepted
+    check runs as an intent, and ``run_check_intent`` lets this function take the
+    guard so a loser backs off and retries instead of being dropped (AUG-286).
 
     Args:
         topic: The topic to check. Must have an id; its status is re-read from
