@@ -3779,3 +3779,29 @@ class TestCheckIntents:
         assert row["status"] == "done"
         assert row["check_result_id"] is not None
         assert row["attempts"] == 1
+
+    async def test_an_unchanged_baseline_still_runs_the_check(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
+        """Equality is not satisfaction: every topic past its first check sits here.
+
+        ``newest == baseline`` means nothing has landed since admission, so the
+        accepted check must still run; treating it as satisfied would turn Check
+        Now into an instant no-op on every topic with history.
+        """
+        topic = _make_topic(db_conn, name="Has History")
+        baseline = create_check_result(db_conn, CheckResult(topic_id=topic.id))
+        db_conn.commit()
+        intent = _seed_check_intent(db_conn, topic, baseline_check_id=baseline.id)
+
+        async def _fake_check(t, settings, *, db_path=None, guard=True):  # noqa: ANN001, ANN202
+            return await _commit_a_check_result(t.id, db_path)
+
+        with patch("app.checker.check_topic", side_effect=_fake_check) as mock_check:
+            result = await run_check_intent(intent, _make_settings(), db_path)
+
+        mock_check.assert_awaited_once()
+        assert result is not None and result.id is not None and result.id != baseline.id
+        row = db_conn.execute("SELECT * FROM check_intents WHERE id = ?", (intent.id,)).fetchone()
+        assert row["status"] == "done"
+        assert row["check_result_id"] == result.id
+        landed = db_conn.execute("SELECT COUNT(*) AS n FROM check_results WHERE topic_id = ?", (topic.id,)).fetchone()
+        assert landed["n"] == 2
