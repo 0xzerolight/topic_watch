@@ -18,6 +18,7 @@ reliable signal of change scope; historical tags are not renumbered.
 ### Fixed
 
 - The required `pre-commit.ci - pr` check no longer fails on every pull request. The mypy hook is `language: system` and needs the project's dev environment on PATH; pre-commit.ci's sandbox has none, so since 5f2f5d0 it aborted with "Executable `mypy` not found" and left branch protection blocking auto-merge on all open PRs. The hook is now in the `ci.skip` list, which is pre-commit.ci's own escape hatch for system hooks. Type checking is unchanged: the hosted `lint` job, `make lint` and the local hook all still run the same `mypy app/ evals/` invocation
+- A webhook target that resolves to a private or reserved address is abandoned after one attempt instead of after the whole retry budget; a target the resolver could not answer for still retries. The sender now reads `url_validation`'s three-state destination verdict instead of the fail-closed bool, which could not tell a resolved private address apart from the absence of a DNS answer
 
 ## [1.4.0] - 2026-08-19
 
