@@ -8,16 +8,22 @@ ENV PYTHONDONTWRITEBYTECODE=1
 
 WORKDIR /build
 
-# Install build dependencies if needed (none currently, but future-proof)
-RUN pip install --no-cache-dir --upgrade pip
+# Build backend pinned by hash (TW-AUD-033): hatchling and its dependencies come
+# from requirements-build.txt, not from whatever PyPI serves at build time. It is
+# installed into the builder's base interpreter, not the runtime venv, so the
+# image ships no build tooling. The base image's own pip is used as-is: it is
+# part of the digest-pinned input above, so it is not upgraded here.
+COPY requirements-build.txt ./
+RUN pip install --no-cache-dir --require-hashes -r requirements-build.txt
 
-# Copy project metadata and install into a venv
 COPY pyproject.toml README.md requirements.txt ./
 COPY app/ ./app/
+RUN pip wheel --no-cache-dir --no-deps --no-build-isolation --wheel-dir /build/dist .
 
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
-RUN pip install --no-cache-dir --require-hashes -r requirements.txt && pip install --no-cache-dir --no-deps .
+RUN pip install --no-cache-dir --require-hashes -r requirements.txt \
+ && pip install --no-cache-dir --no-deps /build/dist/*.whl
 
 # === Stage 2: Runtime ===
 # Same digest pin as the builder stage (OVH-061).

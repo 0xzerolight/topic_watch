@@ -12,6 +12,8 @@ dev: ## Install project in editable mode with dev dependencies
 # pip-compile ships with pip-tools, which is deliberately NOT in the dev extras:
 # it requires pip/setuptools/wheel, so locking it would hash-pin pip itself into
 # the requirements-dev.txt that `make dev` and every CI job install.
+# `requirements-build.txt` pins the wheel build backend the Docker image uses; it
+# is installed only in the builder stage.
 lock-tools: ## Install the pinned pip-compile toolchain (use a throwaway/worktree venv)
 	pip install "pip==25.1.1" "pip-tools==7.5.3"
 
@@ -30,6 +32,7 @@ _require_pip_compile:
 lock: _require_pip_compile ## Regenerate pinned requirements lockfiles from pyproject.toml
 	pip-compile --strip-extras --generate-hashes --output-file=requirements.txt pyproject.toml
 	pip-compile --strip-extras --generate-hashes --extra=dev --output-file=requirements-dev.txt pyproject.toml
+	pip-compile --strip-extras --generate-hashes --output-file=requirements-build.txt requirements-build.in
 
 # `lock` keeps every version already pinned in the output files, so it cannot
 # pull in a bumped dependency. Use this when Dependabot's group PR fails to
@@ -38,6 +41,7 @@ lock: _require_pip_compile ## Regenerate pinned requirements lockfiles from pypr
 lock-upgrade: _require_pip_compile ## Relock at the newest versions pyproject.toml allows
 	pip-compile --upgrade --strip-extras --generate-hashes --output-file=requirements.txt pyproject.toml
 	pip-compile --upgrade --strip-extras --generate-hashes --extra=dev --output-file=requirements-dev.txt pyproject.toml
+	pip-compile --upgrade --strip-extras --generate-hashes --output-file=requirements-build.txt requirements-build.in
 
 test: ## Run tests with pytest
 	pytest --tb=short
