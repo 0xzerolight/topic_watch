@@ -8,7 +8,7 @@ import instructor
 import litellm
 import pytest
 from litellm import ModelResponse
-from litellm.types.utils import Choices, Message, Usage
+from litellm.types.utils import ChatCompletionMessageToolCall, Choices, Function, Message, Usage
 
 import app.analysis.llm as llm_module
 from app.analysis.llm import (
@@ -753,6 +753,22 @@ def _completion_for(model_instance) -> ModelResponse:
     return ModelResponse(choices=[choice], usage=Usage(prompt_tokens=11, completion_tokens=7))
 
 
+def _tool_call_completion_for(model_instance) -> ModelResponse:
+    """A litellm completion that answers in TOOLS mode: an actual tool call.
+
+    ``_completion_for`` carries the JSON in ``content``, which parses only in
+    json_mode / markdown_json_mode - instructor's TOOLS parser reads
+    ``tool_calls[0].function.arguments`` and rejects a content-only reply. A
+    handler that needs a TOOLS attempt to SUCCEED has to return this shape.
+    """
+    tool_call = ChatCompletionMessageToolCall(
+        function=Function(name=type(model_instance).__name__, arguments=json.dumps(model_instance.model_dump()))
+    )
+    message = Message(content=None, role="assistant", tool_calls=[tool_call])
+    choice = Choices(message=message, index=0, finish_reason="tool_calls")
+    return ModelResponse(choices=[choice], usage=Usage(prompt_tokens=11, completion_tokens=7))
+
+
 @contextmanager
 def _fake_acompletion(handler, *, keep_mode_hints: bool = False):
     """Patch ``litellm.acompletion`` with ``handler`` and reset the per-mode cache.
@@ -978,8 +994,12 @@ class TestStructuredOutputModeFallback:
         state = {"reject_tools": True}
 
         def handler(kwargs: dict) -> ModelResponse:
-            if "tool_choice" in kwargs and state["reject_tools"]:
-                raise _tool_choice_error()
+            if "tool_choice" in kwargs:
+                if state["reject_tools"]:
+                    raise _tool_choice_error()
+                # The re-probe must be able to SUCCEED, or the test only proves
+                # TOOLS was retried, never that regained support is picked up.
+                return _tool_call_completion_for(expected)
             return _completion_for(expected)
 
         settings = _make_settings(llm=LLMSettings(model="deepseek/deepseek-reasoner", api_key="k"))
@@ -992,10 +1012,11 @@ class TestStructuredOutputModeFallback:
             await analyze_articles([_make_article()], "Known facts.", _make_topic(), settings)
             clock["now"] += llm_module._MODE_HINT_TTL_SECONDS + 1
             state["reject_tools"] = False
-            await analyze_articles([_make_article()], "Known facts.", _make_topic(), settings)
+            result = await analyze_articles([_make_article()], "Known facts.", _make_topic(), settings)
 
         assert len(calls) == 3  # TOOLS(400) + JSON(ok), then TOOLS probed again
         assert "tool_choice" in calls[2]
+        assert result.has_new_info is True  # the re-probed TOOLS attempt is the one that answered
 
 
 # ============================================================
