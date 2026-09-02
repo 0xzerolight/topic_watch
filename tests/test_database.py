@@ -821,6 +821,45 @@ class TestMigrations:
         assert row["status"] == "pending"
         assert row["kind"] == "novelty"
 
+    def test_migration_030_creates_check_intents(self, db_conn: sqlite3.Connection) -> None:
+        """m030 lands the durable check-admission table; re-running it is a no-op."""
+        from app.migrations.m030_check_intents import up as m030_up
+
+        expected = {
+            "id",
+            "request_id",
+            "topic_id",
+            "baseline_check_id",
+            "status",
+            "created_at",
+            "attempts",
+            "max_attempts",
+            "next_attempt_at",
+            "claimed_at",
+            "claim_token",
+            "check_result_id",
+            "last_error",
+        }
+        actual = {row[1] for row in db_conn.execute("PRAGMA table_info(check_intents)").fetchall()}
+        assert expected <= actual, f"check_intents missing {expected - actual}"
+
+        indexes = {row[0] for row in db_conn.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()}
+        assert "idx_check_intents_due" in indexes
+
+        # A partially-applied migration must be safe to re-run.
+        m030_up(db_conn)
+        m030_up(db_conn)
+
+    def test_m030_registered_in_migrations_list(self) -> None:
+        """The table only exists on a real database once the registry names it."""
+        from app.migrations import MIGRATIONS
+
+        versions = [m[0] for m in MIGRATIONS]
+        assert versions == sorted(versions)
+        entry = next((m for m in MIGRATIONS if m[0] == 30), None)
+        assert entry is not None, "migration 30 is not registered"
+        assert "check_intents" in entry[1]
+
     def test_topic_novelty_instruction_column_exists(self, db_conn: sqlite3.Connection) -> None:
         """Migration m022 adds the nullable novelty_instruction column."""
         columns = {row[1] for row in db_conn.execute("PRAGMA table_info(topics)").fetchall()}

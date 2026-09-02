@@ -314,7 +314,7 @@ class TestM029Provenance:
 
         versions = [m[0] for m in MIGRATIONS]
         assert versions == sorted(versions)
-        assert versions[-2:] == [28, 29]
+        assert versions[-2:] == [29, 30]
 
     def test_columns_exist_and_default_null(self, db_conn: sqlite3.Connection) -> None:
         topic = _seed_topic(db_conn, "Provenance Schema Topic")
