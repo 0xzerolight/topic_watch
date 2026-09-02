@@ -3757,3 +3757,25 @@ class TestCheckIntents:
         assert row["claim_token"] == "successor"
         assert row["last_error"] is None
         assert any("Late apply" in r.getMessage() for r in caplog.records)
+
+    async def test_the_check_cycle_resumes_a_pending_intent(self, db_conn: sqlite3.Connection, db_path: Path) -> None:
+        """The cycle's drain call is the whole of the resume; pin that it happens.
+
+        The topic is inactive, so the cycle never lists it as due — only the
+        check-intent drain can run it, and deleting the wiring leaves the row
+        untouched.
+        """
+        topic = _make_topic(db_conn, name="Resumed By The Cycle", is_active=False)
+        intent = _seed_check_intent(db_conn, topic)
+
+        async def _fake_check(t, settings, *, db_path=None, guard=True):  # noqa: ANN001, ANN202
+            return await _commit_a_check_result(t.id, db_path)
+
+        with patch("app.checker.check_topic", side_effect=_fake_check) as mock_check:
+            assert await check_all_topics(_make_settings(), db_path=db_path) == []
+
+        mock_check.assert_awaited_once()
+        row = db_conn.execute("SELECT * FROM check_intents WHERE id = ?", (intent.id,)).fetchone()
+        assert row["status"] == "done"
+        assert row["check_result_id"] is not None
+        assert row["attempts"] == 1
