@@ -10,10 +10,10 @@ import math
 from datetime import UTC, datetime
 from pathlib import Path
 
-from app.checker import CHECK_TIMEOUT_SECONDS, check_all_topics, check_topic
+from app.checker import _RETRY_DRAIN_LIMIT, CHECK_TIMEOUT_SECONDS, check_all_topics, run_check_intent
 from app.config import Settings
-from app.crud import get_topic, get_topics_due_for_check, update_topic_init_status
-from app.models import TopicStatus
+from app.crud import get_topic, get_topics_due_for_check, list_due_check_intents, update_topic_init_status
+from app.models import CheckIntent, TopicStatus, to_db_utc
 from app.web.state import _checking_state
 
 logger = logging.getLogger(__name__)
@@ -42,12 +42,19 @@ def _check_all_deadline_seconds(due_count: int, concurrency: int) -> float:
 
 
 def _due_topic_count(settings: Settings, db_path: Path | None) -> int:
-    """How many topics this cycle has to get through, for the deadline above."""
+    """How many topics this cycle has to get through, for the deadline above.
+
+    The cycle also resumes due check intents, and each of those is a full check —
+    so the deadline counts them too. The list query, not a COUNT(*): the drain
+    itself runs at most ``_RETRY_DRAIN_LIMIT`` per cycle, and a bigger count would
+    only inflate the deadline past the work the cycle can actually do.
+    """
     try:
         from app.database import get_db
 
         with get_db(db_path) as conn:
-            return len(get_topics_due_for_check(conn, settings.check_interval_minutes))
+            due = len(get_topics_due_for_check(conn, settings.check_interval_minutes))
+            return due + len(list_due_check_intents(conn, to_db_utc(datetime.now(UTC)), _RETRY_DRAIN_LIMIT))
     except Exception:
         # The cycle itself will report the real problem; fall back to the
         # overhead-only bound rather than refusing to run.
@@ -136,45 +143,18 @@ async def _run_init(
         await _checking_state.finish_check(topic_id, held)
 
 
-async def _run_single_check(topic_id: int, settings: Settings, db_path: Path | None = None) -> None:
-    """Background task: check a single topic by ID.
+async def _run_single_check(intent: CheckIntent, settings: Settings, db_path: Path | None = None) -> None:
+    """Background task: run the check the handler already admitted (AUG-286).
 
-    Authoritatively owns the per-topic ``_checking_state`` guard for every caller
-    that enqueues it — the manual ``/check`` handler and bulk-check alike
-    (OVH-033). It acquires ``start_check`` at entry and skips (no fetch/LLM/notify)
-    when another check of the same topic is already in flight, then releases the
-    guard in ``finally``. ``check_topic`` is called with ``guard=False`` because
-    this task already holds the guard.
-
-    Bounded like the other two background tasks: the guard it holds is evictable
-    by ``clear_stale`` once the entry passes the handlers' staleness threshold, and
-    eviction admits a second checker of the same topic.
+    A thin wrapper now. ``run_check_intent`` owns the whole lifecycle — the claim,
+    the per-topic guard (via ``check_topic``), the timeout, and the outcome it
+    records on the row — so an interrupted run is resumed by the next scheduler
+    check cycle instead of being lost with this task.
     """
-    from app.database import get_db
-
-    owner = await _checking_state.start_check(topic_id)
-    if owner is None:
-        logger.info("Single check: topic %d already being checked; skipping", topic_id)
-        return
-
     try:
-        with get_db(db_path) as conn:
-            topic = get_topic(conn, topic_id)
-        if topic:
-            await asyncio.wait_for(
-                check_topic(topic, settings, db_path=db_path, guard=False),
-                timeout=CHECK_TIMEOUT_SECONDS,
-            )
-    except TimeoutError:
-        logger.error(
-            "Check timed out for topic %d after %d seconds",
-            topic_id,
-            CHECK_TIMEOUT_SECONDS,
-        )
+        await run_check_intent(intent, settings, db_path)
     except Exception:
-        logger.error("Background check failed for topic %d", topic_id, exc_info=True)
-    finally:
-        await _checking_state.finish_check(topic_id, owner)
+        logger.error("Background check failed for topic %s", intent.topic_id, exc_info=True)
 
 
 async def _run_check_all(settings: Settings, db_path: Path | None = None, owner: str | None = None) -> None:

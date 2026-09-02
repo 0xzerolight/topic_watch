@@ -3,16 +3,19 @@
 import asyncio
 import sqlite3
 from collections.abc import AsyncGenerator
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 
 from app.config import LLMSettings, NotificationSettings, Settings
-from app.crud import create_topic, get_topic
+from app.crud import create_check_intents, create_topic, get_topic
+from app.database import get_connection
 from app.main import app
-from app.models import FeedMode, Topic, TopicStatus
+from app.models import CheckIntent, CheckResult, FeedMode, Topic, TopicStatus
 from app.web.dependencies import get_db_conn, get_settings
+from app.web.state import _checking_state
 
 CSRF_TEST_TOKEN = "test-csrf-token-for-bulk-tests"
 
@@ -204,8 +207,8 @@ class TestBulkCheck:
 
         # Only the READY topic should be queued
         assert mock_check.call_count == 1
-        called_topic_id = mock_check.call_args[0][0]
-        assert called_topic_id == ready_topic.id
+        called_intent = mock_check.call_args[0][0]
+        assert called_intent.topic_id == ready_topic.id
 
     async def test_bulk_check_empty_list_does_not_crash(self, client: httpx.AsyncClient) -> None:
         """Bulk check with no topic_ids does not crash and redirects."""
@@ -249,7 +252,67 @@ class TestBulkCheck:
         assert response.status_code == 303
         # Three identical ids → exactly one queued check.
         assert mock_check.call_count == 1
-        assert mock_check.call_args[0][0] == topic.id
+        assert mock_check.call_args[0][0].topic_id == topic.id
+
+    async def test_bulk_check_admits_one_intent_per_ready_topic_in_one_commit(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """AUG-286: a crash mid-batch must leave a knowable record of what was accepted."""
+        first = _make_topic(db_conn, name="Bulk One", status=TopicStatus.READY)
+        second = _make_topic(db_conn, name="Bulk Two", status=TopicStatus.READY)
+        skipped = _make_topic(db_conn, name="Bulk Busy", status=TopicStatus.RESEARCHING)
+
+        body = f"topic_ids={first.id}&topic_ids={second.id}&topic_ids={skipped.id}"
+        with (
+            patch("app.web.routers.background._run_single_check", new_callable=AsyncMock) as mock_check,
+            patch("app.web.routers.topics.create_check_intents", side_effect=create_check_intents) as spy_create,
+        ):
+            response = await client.post(
+                "/topics/bulk-check",
+                content=body.encode(),
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                follow_redirects=False,
+            )
+
+        assert response.status_code == 303
+        # One insert call for the whole batch, so the rows land in one transaction.
+        spy_create.assert_called_once()
+        assert len(spy_create.call_args[0][1]) == 2
+
+        verify = get_connection(db_path)
+        try:
+            rows = verify.execute("SELECT request_id, topic_id, status FROM check_intents ORDER BY id").fetchall()
+        finally:
+            verify.close()
+        assert [r["topic_id"] for r in rows] == [first.id, second.id]
+        assert {r["status"] for r in rows} == {"pending"}
+        assert {r["request_id"] for r in rows} == {response.headers["X-Request-ID"]}
+        assert mock_check.call_count == 2
+
+    async def test_bulk_check_skips_a_topic_already_being_checked(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """A topic mid-check already owes this answer, so bulk admits nothing for it."""
+        busy = _make_topic(db_conn, name="Bulk Busy Guard", status=TopicStatus.READY)
+        free = _make_topic(db_conn, name="Bulk Free", status=TopicStatus.READY)
+
+        owner = await _checking_state.start_check(busy.id)
+        try:
+            body = f"topic_ids={busy.id}&topic_ids={free.id}"
+            with patch("app.web.routers.background._run_single_check", new_callable=AsyncMock) as mock_check:
+                response = await client.post(
+                    "/topics/bulk-check",
+                    content=body.encode(),
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    follow_redirects=False,
+                )
+        finally:
+            await _checking_state.finish_check(busy.id, owner)
+
+        assert response.status_code == 303
+        rows = db_conn.execute("SELECT topic_id FROM check_intents").fetchall()
+        assert [r["topic_id"] for r in rows] == [free.id]
+        assert mock_check.call_count == 1
 
     async def test_bulk_check_requires_csrf(
         self, client_no_csrf: httpx.AsyncClient, db_conn: sqlite3.Connection
@@ -268,86 +331,96 @@ class TestBulkCheck:
 
 
 class TestSingleCheckGuard:
-    """The bulk-check / manual background task is the authoritative guard owner."""
+    """The guard now lives inside ``check_topic``, below which the intent runner sits."""
 
-    async def test_run_single_check_skips_when_already_checking(self, tmp_path) -> None:
-        """A second _run_single_check on an in-flight topic skips the pipeline (OVH-033)."""
+    def _seed(self, db_path: Path, name: str) -> tuple[Topic, CheckIntent]:
         from app.database import get_db, init_db
-        from app.web.routers import background
-        from app.web.state import _checking_state
 
-        db_path = tmp_path / "bulk.db"
         init_db(db_path)
         with get_db(db_path) as seed:
-            topic = _make_topic(seed, name="Busy")
+            topic = _make_topic(seed, name=name)
+            intent = CheckIntent(request_id="req-1", topic_id=topic.id)
+            create_check_intents(seed, [intent])
+        return topic, intent
+
+    async def test_run_single_check_skips_when_already_checking(self, tmp_path) -> None:
+        """A check whose topic is already in flight backs off instead of running (OVH-033)."""
+        from app.web.routers import background
+
+        db_path = tmp_path / "bulk.db"
+        topic, intent = self._seed(db_path, "Busy")
         settings = _make_settings()
 
-        _checking_state._topics.clear()
-        _checking_state._start_times.clear()
+        # Slot already taken (e.g. the manual /check is mid-flight). The guard is
+        # inside check_topic now, so patch the layer below it.
+        assert await _checking_state.start_check(topic.id) is not None
         try:
-            # Slot already taken (e.g. the manual /check is mid-flight).
-            assert await _checking_state.start_check(topic.id) is not None
-            with patch("app.web.routers.background.check_topic", new_callable=AsyncMock) as mock_check:
-                await background._run_single_check(topic.id, settings, db_path)
+            with patch(
+                "app.checker._check_topic_guarded",
+                new_callable=AsyncMock,
+                return_value=CheckResult(topic_id=topic.id),
+            ) as mock_check:
+                await background._run_single_check(intent, settings, db_path)
             mock_check.assert_not_awaited()
         finally:
             _checking_state._topics.clear()
             _checking_state._start_times.clear()
 
+        conn = get_connection(db_path)
+        try:
+            row = conn.execute("SELECT * FROM check_intents WHERE id = ?", (intent.id,)).fetchone()
+        finally:
+            conn.close()
+        assert row["status"] == "pending"
+        assert row["attempts"] == 1
+        assert row["last_error"] == "skipped: already in flight"
+
     async def test_run_single_check_acquires_and_releases(self, tmp_path) -> None:
-        """_run_single_check claims the guard, runs with guard=False, then releases (OVH-033)."""
-        from app.database import get_db, init_db
+        """The runner delegates the guard to check_topic and leaves no slot held."""
         from app.web.routers import background
-        from app.web.state import _checking_state
 
         db_path = tmp_path / "bulk2.db"
-        init_db(db_path)
-        with get_db(db_path) as seed:
-            topic = _make_topic(seed, name="Free")
+        topic, intent = self._seed(db_path, "Free")
         settings = _make_settings()
 
-        _checking_state._topics.clear()
-        _checking_state._start_times.clear()
-        try:
-            with patch("app.web.routers.background.check_topic", new_callable=AsyncMock) as mock_check:
-                await background._run_single_check(topic.id, settings, db_path)
-            # check_topic invoked with guard=False (task owns the guard).
-            assert mock_check.await_count == 1
-            assert mock_check.await_args.kwargs.get("guard") is False
-            # Guard released after completion.
-            assert await _checking_state.is_checking(topic.id) is False
-        finally:
-            _checking_state._topics.clear()
-            _checking_state._start_times.clear()
+        with patch(
+            "app.checker.check_topic", new_callable=AsyncMock, return_value=CheckResult(topic_id=topic.id)
+        ) as mock_check:
+            await background._run_single_check(intent, settings, db_path)
+
+        assert mock_check.await_count == 1
+        assert mock_check.await_args.kwargs.get("guard") is True
+        assert await _checking_state.is_checking(topic.id) is False
 
     async def test_concurrent_run_single_check_only_one_runs(self, tmp_path) -> None:
-        """Two concurrent _run_single_check of the same topic: only one runs the pipeline."""
-        from app.database import get_db, init_db
+        """Two intents for one topic: the guard lets exactly one through and the other waits."""
+        from app.database import get_db
         from app.web.routers import background
-        from app.web.state import _checking_state
 
         db_path = tmp_path / "bulk3.db"
-        init_db(db_path)
+        topic, first = self._seed(db_path, "Racer")
+        second = CheckIntent(request_id="req-2", topic_id=topic.id)
         with get_db(db_path) as seed:
-            topic = _make_topic(seed, name="Racer")
+            create_check_intents(seed, [second])
         settings = _make_settings()
 
-        runs = 0
-
-        async def _slow_check(t, settings, **kwargs):
-            nonlocal runs
-            runs += 1
+        async def _slow_check(t, settings, db_path):
             await asyncio.sleep(0.05)
+            return CheckResult(topic_id=topic.id)
 
-        _checking_state._topics.clear()
-        _checking_state._start_times.clear()
+        with patch("app.checker._check_topic_guarded", side_effect=_slow_check) as mock_check:
+            await asyncio.gather(
+                background._run_single_check(first, settings, db_path),
+                background._run_single_check(second, settings, db_path),
+            )
+        assert mock_check.await_count == 1
+
+        conn = get_connection(db_path)
         try:
-            with patch("app.web.routers.background.check_topic", side_effect=_slow_check):
-                await asyncio.gather(
-                    background._run_single_check(topic.id, settings, db_path),
-                    background._run_single_check(topic.id, settings, db_path),
-                )
-            assert runs == 1
+            rows = {r["id"]: r for r in conn.execute("SELECT * FROM check_intents").fetchall()}
         finally:
-            _checking_state._topics.clear()
-            _checking_state._start_times.clear()
+            conn.close()
+        loser = [r for r in rows.values() if r["status"] == "pending"]
+        assert len(loser) == 1
+        assert loser[0]["attempts"] == 1
+        assert loser[0]["last_error"] == "skipped: already in flight"

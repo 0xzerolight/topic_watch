@@ -9,6 +9,7 @@ import sqlite3
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -24,6 +25,7 @@ from app.crud import (
     get_topic_by_name,
     list_article_headers_for_topic,
 )
+from app.database import get_connection
 from app.main import REQUEST_ID_PATTERN, app
 from app.models import (
     Article,
@@ -2230,7 +2232,69 @@ class TestCheckNow:
         assert response.status_code == 200
         # Pipeline must be deferred to the background task, never run inline.
         mock_bg.assert_called_once()
-        assert mock_bg.call_args[0][0] == topic.id
+        assert mock_bg.call_args[0][0].topic_id == topic.id
+
+    async def test_check_now_admits_a_durable_intent_before_responding(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """AUG-286: the accepted check is on disk, committed, before the page answers."""
+        topic = _make_topic(db_conn)
+        baseline = create_check_result(db_conn, CheckResult(topic_id=topic.id))
+        db_conn.commit()
+
+        with patch("app.web.routers.background._run_single_check", new_callable=AsyncMock) as mock_bg:
+            response = await client.post(f"/topics/{topic.id}/check", headers={"HX-Request": "true"})
+
+        assert response.status_code == 200
+        # Read through a second connection: an uncommitted insert would not be here.
+        verify = get_connection(db_path)
+        try:
+            rows = verify.execute(
+                "SELECT id, request_id, topic_id, status, baseline_check_id FROM check_intents"
+            ).fetchall()
+        finally:
+            verify.close()
+
+        assert len(rows) == 1
+        assert rows[0]["request_id"] == response.headers["X-Request-ID"]
+        assert rows[0]["topic_id"] == topic.id
+        assert rows[0]["status"] == "pending"
+        assert rows[0]["baseline_check_id"] == baseline.id
+        # The task is handed the row that already exists, not a topic id.
+        assert mock_bg.call_args[0][0].id == rows[0]["id"]
+
+    async def test_check_now_while_checking_admits_nothing(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """The in-flight check already owes this answer; a second intent would only lose the guard."""
+        topic = _make_topic(db_conn)
+        from app.web.state import _checking_state
+
+        owner = await _checking_state.start_check(topic.id)
+        try:
+            with patch("app.web.routers.background._run_single_check", new_callable=AsyncMock) as mock_bg:
+                response = await client.post(f"/topics/{topic.id}/check", headers={"HX-Request": "true"})
+        finally:
+            await _checking_state.finish_check(topic.id, owner)
+
+        assert response.status_code == 200
+        mock_bg.assert_not_called()
+        assert db_conn.execute("SELECT COUNT(*) FROM check_intents").fetchone()[0] == 0
+
+    async def test_check_now_on_a_topic_that_is_not_ready_admits_nothing(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection
+    ) -> None:
+        """check_topic would only answer 'skipped: topic not ready', so nothing is admitted."""
+        topic = _make_topic(db_conn, name="Errored", status=TopicStatus.ERROR)
+
+        with patch("app.web.routers.background._run_single_check", new_callable=AsyncMock) as mock_bg:
+            response = await client.post(f"/topics/{topic.id}/check", headers={"HX-Request": "true"})
+
+        assert response.status_code == 200
+        mock_bg.assert_not_called()
+        assert db_conn.execute("SELECT COUNT(*) FROM check_intents").fetchone()[0] == 0
+        # The plain row, not a checking row that would poll toward a check nobody queued.
+        assert "since_check_id=" not in response.text
 
     async def test_check_htmx_returns_row_partial(self, client: httpx.AsyncClient, db_conn: sqlite3.Connection) -> None:
         """OVH-005: HTMX /check returns the topic-row partial."""

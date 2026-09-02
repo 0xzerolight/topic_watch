@@ -11,9 +11,9 @@ import pytest
 from app.analysis.knowledge import KnowledgeUpdatePlan
 from app.analysis.llm import TokenUsage
 from app.config import LLMSettings, NotificationSettings, Settings
-from app.crud import create_topic, delete_topic, get_topic
+from app.crud import create_check_intents, create_topic, delete_topic, get_topic
 from app.database import get_connection, init_db
-from app.models import Article, Topic, TopicStatus
+from app.models import Article, CheckIntent, Topic, TopicStatus
 from app.scraping import FetchResult
 from app.web.routers.background import _run_check_all, _run_init
 
@@ -284,6 +284,17 @@ class TestRunSingleCheckTimeout:
 
         assert CHECK_TIMEOUT_SECONDS < 600
 
+    def _seed_intent(self, db_path: Path) -> tuple[int, CheckIntent]:
+        conn = get_connection(db_path)
+        try:
+            topic = _make_topic(conn, status=TopicStatus.READY)
+            intent = CheckIntent(request_id="req-1", topic_id=topic.id)
+            create_check_intents(conn, [intent])
+            conn.commit()
+            return topic.id, intent
+        finally:
+            conn.close()
+
     async def test_hanging_check_is_cancelled_and_releases_the_guard(self, db_path: Path, caplog) -> None:
         import logging
 
@@ -291,13 +302,7 @@ class TestRunSingleCheckTimeout:
         from app.web.state import _checking_state
 
         settings = _make_settings()
-
-        conn = get_connection(db_path)
-        try:
-            topic = _make_topic(conn, status=TopicStatus.READY)
-            topic_id = topic.id
-        finally:
-            conn.close()
+        topic_id, intent = self._seed_intent(db_path)
 
         async def _hang(*args, **kwargs):
             await asyncio.sleep(9999)
@@ -305,12 +310,12 @@ class TestRunSingleCheckTimeout:
         _checking_state._topics.clear()
         try:
             with (
-                patch("app.web.routers.background.CHECK_TIMEOUT_SECONDS", 0.05),
-                patch("app.web.routers.background.check_topic", side_effect=_hang),
-                caplog.at_level(logging.ERROR, logger="app.web.routers.background"),
+                patch("app.checker.CHECK_TIMEOUT_SECONDS", 0.05),
+                patch("app.checker.check_topic", side_effect=_hang),
+                caplog.at_level(logging.ERROR, logger="app.checker"),
             ):
                 # Outer bound so an unbounded task fails the test instead of hanging it.
-                await asyncio.wait_for(_run_single_check(topic_id, settings, db_path), timeout=5)
+                await asyncio.wait_for(_run_single_check(intent, settings, db_path), timeout=5)
         finally:
             _checking_state._topics.clear()
 
@@ -318,24 +323,19 @@ class TestRunSingleCheckTimeout:
         assert await _checking_state.is_checking(topic_id) is False
 
     async def test_normal_completion_runs_the_check(self, db_path: Path) -> None:
+        from app.models import CheckResult
         from app.web.routers.background import _run_single_check
         from app.web.state import _checking_state
 
         settings = _make_settings()
-
-        conn = get_connection(db_path)
-        try:
-            topic = _make_topic(conn, status=TopicStatus.READY)
-            topic_id = topic.id
-        finally:
-            conn.close()
+        topic_id, intent = self._seed_intent(db_path)
 
         _checking_state._topics.clear()
         try:
             with patch(
-                "app.web.routers.background.check_topic", new_callable=AsyncMock, return_value=None
+                "app.checker.check_topic", new_callable=AsyncMock, return_value=CheckResult(topic_id=topic_id)
             ) as mock_check:
-                await _run_single_check(topic_id, settings, db_path)
+                await _run_single_check(intent, settings, db_path)
         finally:
             _checking_state._topics.clear()
 

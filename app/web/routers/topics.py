@@ -24,6 +24,7 @@ from app.crud import (
     claim_topic_for_init,
     count_articles_for_topic,
     count_check_results,
+    create_check_intents,
     create_notification_intents,
     create_topic,
     create_webhook_intents,
@@ -39,6 +40,7 @@ from app.crud import (
     list_check_results,
     list_knowledge_revision_headers,
     mark_check_seen,
+    max_check_result_id,
     sum_check_tokens,
     update_topic,
     update_topic_config,
@@ -47,6 +49,7 @@ from app.crud import (
 from app.database import short_conn
 from app.models import (
     NOVELTY_INSTRUCTION_MAX_CHARS,
+    CheckIntent,
     FeedMode,
     KnowledgeRevision,
     KnowledgeRevisionSource,
@@ -683,13 +686,30 @@ async def check_topic_handler(
         # still polling toward the in-flight check's completion.
         return _topic_row_response(request, conn, topic, topic_id, checking=True, baseline_check_id=baseline_check_id)
 
-    # Defer the pipeline to a background task with its own connection. The task
-    # is the authoritative owner of the per-topic guard: it acquires
-    # ``start_check`` at entry (so two near-simultaneous submissions still
-    # de-dupe even though both passed the read above) and releases it when done
-    # (OVH-033/OVH-096).
+    if topic.status is not TopicStatus.READY:
+        # check_topic would only answer 'skipped: topic not ready'; nothing to admit.
+        return _topic_row_response(request, conn, topic, topic_id, checking=False, baseline_check_id=baseline_check_id)
+
+    # Record the accepted command BEFORE answering (AUG-286): a crash after the
+    # response used to lose it with nothing on disk to say it was ever asked for.
+    # The background task claims this row; a row a dead process leaves behind is
+    # resumed by the next scheduler check cycle.
+    intent = CheckIntent(
+        request_id=request.state.request_id,
+        topic_id=topic_id,
+        # MAX(id), not the poll's checked_at-ordered baseline above: a future-stamped
+        # row would otherwise mark the intent satisfied before it ever ran.
+        baseline_check_id=max_check_result_id(conn, topic_id),
+    )
+    create_check_intents(conn, [intent])
+    conn.commit()
+
+    # Defer the pipeline to a background task with its own connection. The
+    # per-topic guard is taken by ``check_topic`` inside the intent runner, so two
+    # near-simultaneous submissions still de-dupe even though both passed the read
+    # above — the loser's intent backs off and retries (OVH-033/OVH-096).
     db_path = getattr(request.app.state, "db_path", None)
-    background_tasks.add_task(background._run_single_check, topic_id, settings, db_path)
+    background_tasks.add_task(background._run_single_check, intent, settings, db_path)
 
     return _topic_row_response(request, conn, topic, topic_id, checking=True, baseline_check_id=baseline_check_id)
 
@@ -970,16 +990,22 @@ async def bulk_check_handler(
     conn: sqlite3.Connection = Depends(get_db_conn, scope="function"),
     settings: Settings = Depends(get_settings),
 ):
-    """Trigger checks for multiple topics."""
+    """Trigger checks for multiple topics.
+
+    Every accepted topic gets one durable intent row, all of them committed in a
+    single transaction before the redirect (AUG-286): a crash partway through the
+    batch used to leave an unknowable completed prefix.
+    """
     form = await request.form()
     topic_ids = form.getlist("topic_ids")
     db_path = getattr(request.app.state, "db_path", None)
     # Dedup so a duplicated checkbox id (crafted form or double-submit) cannot
     # queue the same topic's check twice in one request (OVH-166). Preserve the
-    # first-seen order; the per-topic guard in _run_single_check would skip a
-    # same-process duplicate anyway, but dropping it here avoids the redundant
-    # sequential background task entirely.
+    # first-seen order; the per-topic guard inside ``check_topic`` would make a
+    # same-process duplicate back off anyway, but dropping it here avoids the
+    # redundant intent and background task entirely.
     queued: set[int] = set()
+    intents: list[CheckIntent] = []
     for tid in topic_ids:
         try:
             topic_id = int(str(tid))
@@ -990,11 +1016,28 @@ async def bulk_check_handler(
             continue
         try:
             topic = get_topic(conn, topic_id)
-            if topic and topic.id is not None and topic.status == TopicStatus.READY:
-                background_tasks.add_task(background._run_single_check, topic.id, settings, db_path)
-                queued.add(topic_id)
+            if topic is None or topic.id is None or topic.status != TopicStatus.READY:
+                continue
+            if await _checking_state.is_checking(topic.id):
+                # That check already owes this answer; a second intent would only
+                # lose the guard and retry for nothing.
+                continue
+            intents.append(
+                CheckIntent(
+                    request_id=request.state.request_id,
+                    topic_id=topic.id,
+                    baseline_check_id=max_check_result_id(conn, topic.id),
+                )
+            )
+            queued.add(topic_id)
         except Exception as exc:
             logger.warning("Failed to queue check for topic %s: %s", tid, exc)
+
+    if intents:
+        create_check_intents(conn, intents)
+        conn.commit()
+        for intent in intents:
+            background_tasks.add_task(background._run_single_check, intent, settings, db_path)
     return RedirectResponse(url="/", status_code=303)
 
 
