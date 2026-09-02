@@ -10,6 +10,10 @@ reliable signal of change scope; historical tags are not renumbered.
 
 ## [Unreleased]
 
+### Added
+
+- Check Now and bulk checks are recorded before the page responds; a check a crash or restart interrupted runs on the next scheduler cycle instead of being lost
+
 ### Changed
 
 - Dependencies relocked (litellm 1.98.0, apprise 1.13.0, openai 2.54.0, ruff 0.16.4, mypy 2.3.1 and 15 more). litellm 1.98.0 pulls boto3/botocore/s3transfer/jmespath in as unconditional runtime requirements, so they are now in `requirements.txt`. Supersedes the weekly group PR #74, which pinned openai 3.3.1 against instructor's `openai<3.0.0` cap and could not install
