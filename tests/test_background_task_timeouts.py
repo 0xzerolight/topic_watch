@@ -304,23 +304,33 @@ class TestRunSingleCheckTimeout:
         settings = _make_settings()
         topic_id, intent = self._seed_intent(db_path)
 
+        # Patched BELOW the guard so the real check_topic takes it: the guard
+        # moved out of _run_single_check into check_topic (AUG-286), so mocking
+        # check_topic itself would leave nothing holding it and the release
+        # assertion below could not fail.
+        held: list[bool] = []
+
         async def _hang(*args, **kwargs):
+            held.append(await _checking_state.is_checking(topic_id))
             await asyncio.sleep(9999)
 
         _checking_state._topics.clear()
         try:
             with (
                 patch("app.checker.CHECK_TIMEOUT_SECONDS", 0.05),
-                patch("app.checker.check_topic", side_effect=_hang),
+                patch("app.checker._check_topic_guarded", side_effect=_hang),
                 caplog.at_level(logging.ERROR, logger="app.checker"),
             ):
                 # Outer bound so an unbounded task fails the test instead of hanging it.
                 await asyncio.wait_for(_run_single_check(intent, settings, db_path), timeout=5)
+            # Read before the cleanup clear below, which answers False either way.
+            still_held = await _checking_state.is_checking(topic_id)
         finally:
             _checking_state._topics.clear()
 
         assert any("timed out" in record.message.lower() for record in caplog.records)
-        assert await _checking_state.is_checking(topic_id) is False
+        assert held == [True]  # the guard was really held while the check ran
+        assert still_held is False  # and released when the timeout cancelled it
 
     async def test_normal_completion_runs_the_check(self, db_path: Path) -> None:
         from app.models import CheckResult
