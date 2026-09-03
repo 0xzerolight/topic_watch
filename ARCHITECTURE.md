@@ -93,10 +93,10 @@ All application code lives under `app/`.
 
 | Module | Responsibility |
 |--------|---------------|
-| `models.py` | Pydantic models: `Topic`, `Article`, `KnowledgeState`, `KnowledgeRevision`, `CheckResult`, `FeedHealth`, `DashboardStats`, `PendingNotification`, `PendingWebhook`. Enums: `TopicStatus` (new/researching/ready/error), `FeedMode` (auto/manual/exa), `KnowledgeRevisionSource` (init/update). Each model has `from_row()` and `to_insert_dict()` for SQLite interop; datetime cells are coerced defensively. |
+| `models.py` | Pydantic models: `Topic`, `Article`, `KnowledgeState`, `KnowledgeRevision`, `CheckResult`, `FeedHealth`, `DashboardStats`, `PendingNotification`, `PendingWebhook`, `CheckIntent`. Enums: `TopicStatus` (new/researching/ready/error), `FeedMode` (auto/manual/exa), `KnowledgeRevisionSource` (init/update). Each model has `from_row()` and `to_insert_dict()` for SQLite interop; datetime cells are coerced defensively. |
 | `crud.py` | All SQL (parameterized), grouped by model: CRUD, feed-health upserts, notification + webhook retry queues, check-intent admission/claim/apply/release, dashboard aggregation, article retention cleanup, stuck-topic recovery. |
 | `database.py` | SQLite connection factory (WAL mode, foreign keys, busy timeout). Schema init (`init_db`). `backup_database()` uses the sqlite3 backup API (not a file copy — safe under WAL) and runs `PRAGMA integrity_check`, discarding and raising `BackupVerificationError` on a bad backup. Migration runner (`run_migrations`) backs up the DB first, validates `schema_version` is an exact contiguous prefix of the registry (else `SchemaLedgerError`), then applies each pending migration's `up()` plus its ledger row inside one `BEGIN IMMEDIATE` per version. |
-| `migrations/` | 29 sequential migrations (`m001`–`m029`) registered in `__init__.py` as `(version, description, up_function)` tuples. Tracked in `schema_version`. Append-only. |
+| `migrations/` | 30 sequential migrations (`m001`–`m030`) registered in `__init__.py` as `(version, description, up_function)` tuples. Tracked in `schema_version`. Append-only. |
 | `interval.py` | Human-readable interval parsing/formatting (`m`/`h`/`d`/`w`/`M`, combined syntax like `"1w 3d 2h"`). Enforces min/max interval bounds. |
 | `opml.py` | OPML import/export. Parses feeds from RSS readers (FreshRSS, Miniflux, TT-RSS), validates feed URLs, and exports topics as OPML. |
 
