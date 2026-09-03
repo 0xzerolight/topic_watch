@@ -12,6 +12,8 @@ from datetime import UTC, datetime, timedelta
 
 from app.models import (
     Article,
+    CheckIntent,
+    CheckIntentStatus,
     CheckResult,
     DashboardStats,
     FeedHealth,
@@ -1390,10 +1392,12 @@ def abandon_expired_notifications(conn: sqlite3.Connection) -> list[PendingNotif
 
 
 def delete_old_delivery_intents(conn: sqlite3.Connection, days: int) -> int:
-    """Prune terminal delivery intents older than ``days``. Returns rows removed.
+    """Prune terminal delivery and check intents older than ``days``. Returns rows removed.
 
     Only terminal rows are eligible: anything still 'pending' or 'sending' owes a
-    delivery no matter how old it is.
+    delivery no matter how old it is, and a 'pending' or 'running' check intent
+    still owes a run (AUG-286). The accepted-check ledger ages out on the same
+    daily tick as the delivery ledger, so it needs no job and no window of its own.
     """
     cutoff = to_db_utc(datetime.now(UTC) - timedelta(days=days))
     removed = conn.execute(
@@ -1402,6 +1406,10 @@ def delete_old_delivery_intents(conn: sqlite3.Connection, days: int) -> int:
     ).rowcount
     removed += conn.execute(
         "DELETE FROM pending_webhooks WHERE status IN ('sent', 'abandoned', 'revoked') AND created_at < ?",
+        (cutoff,),
+    ).rowcount
+    removed += conn.execute(
+        "DELETE FROM check_intents WHERE status IN ('done', 'abandoned') AND created_at < ?",
         (cutoff,),
     ).rowcount
     return removed
@@ -1565,6 +1573,121 @@ def abandon_expired_webhooks(conn: sqlite3.Connection) -> list[PendingWebhook]:
         "UPDATE pending_webhooks SET status = 'abandoned' WHERE status = 'pending' AND retry_count >= max_retries"
     )
     return abandoned
+
+
+# --- Check intents ---
+#
+# A check intent is one durable row per accepted manual check, written BEFORE the
+# handler answers (AUG-286). The lifecycle is 'pending' -> 'running' -> 'done' |
+# 'abandoned', and the two invariants stated at the delivery intents above hold
+# here unchanged:
+#
+# 1. Eligibility lives INSIDE the claim predicate, never in the list query alone.
+#    A drainer working from a snapshot taken before another drainer exhausted a
+#    row must lose the claim, not physically run past ``max_attempts``.
+# 2. Every apply is fenced by the immutable ``claim_token`` the winning claim
+#    stamped, so a worker whose claim was released as stale — including one
+#    released because the wall clock jumped — cannot mutate the row its successor
+#    now owns.
+
+_CHECK_INTENT_INSERT = """INSERT INTO check_intents
+    (request_id, topic_id, baseline_check_id, status, created_at, attempts, max_attempts)
+    VALUES (:request_id, :topic_id, :baseline_check_id, :status, :created_at, :attempts, :max_attempts)"""
+
+# Eligibility lives inside the claim, never in the list alone (invariant 1).
+_CHECK_INTENT_DUE = (
+    "status = 'pending' AND attempts < max_attempts AND (next_attempt_at IS NULL OR next_attempt_at <= ?)"
+)
+
+
+def create_check_intents(conn: sqlite3.Connection, intents: list[CheckIntent]) -> list[int]:
+    """Insert command intents and return their ids. NO commit — rides the caller's transaction."""
+    ids: list[int] = []
+    for intent in intents:
+        cursor = conn.execute(_CHECK_INTENT_INSERT, intent.to_insert_dict())
+        intent.id = cursor.lastrowid
+        ids.append(int(cursor.lastrowid or 0))
+    return ids
+
+
+def list_due_check_intents(conn: sqlite3.Connection, now_iso: str, limit: int) -> list[CheckIntent]:
+    """Intents eligible to run now, oldest first, bounded by ``limit``."""
+    rows = conn.execute(
+        f"SELECT * FROM check_intents WHERE {_CHECK_INTENT_DUE} ORDER BY created_at ASC, id ASC LIMIT ?",  # noqa: S608 - constant predicate
+        (now_iso, limit),
+    ).fetchall()
+    return [CheckIntent.from_row(row) for row in rows]
+
+
+def claim_check_intent(conn: sqlite3.Connection, intent_id: int, claim_token: str, now_iso: str) -> bool:
+    """Atomically take ownership of one intent; True only for the winner.
+
+    The claim counts the attempt: a check that takes the process down before any
+    outcome is applied is still bounded by ``max_attempts``. SET and WHERE both
+    read the pre-update row, so the predicate's ``attempts`` is the old value.
+    """
+    cursor = conn.execute(
+        "UPDATE check_intents SET status = 'running', attempts = attempts + 1, claimed_at = ?, claim_token = ? "
+        f"WHERE id = ? AND {_CHECK_INTENT_DUE}",  # noqa: S608 - constant predicate
+        (now_iso, claim_token, intent_id, now_iso),
+    )
+    return cursor.rowcount == 1
+
+
+def apply_check_intent_outcome(
+    conn: sqlite3.Connection,
+    intent_id: int,
+    claim_token: str,
+    *,
+    status: CheckIntentStatus,
+    check_result_id: int | None = None,
+    error: str | None = None,
+    next_attempt_at: str | None = None,
+) -> bool:
+    """Record what the claimed run did. Fenced by the claim token (invariant 2).
+
+    ``status`` is DONE, ABANDONED, or PENDING (retry later). A PENDING apply on a
+    row whose attempts have reached the cap lands as 'abandoned' — the cap is
+    decided here, in one statement, never from a caller's stale row.
+    """
+    if status is CheckIntentStatus.RUNNING:
+        raise ValueError("an outcome cannot be 'running'")
+    cursor = conn.execute(
+        """UPDATE check_intents SET
+            status = CASE WHEN :status = 'pending' AND attempts >= max_attempts THEN 'abandoned' ELSE :status END,
+            check_result_id = :check_result_id,
+            last_error = :error,
+            next_attempt_at = CASE WHEN :status = 'pending' AND attempts < max_attempts THEN :next_attempt_at ELSE NULL END,
+            claimed_at = NULL, claim_token = NULL
+        WHERE id = :id AND claim_token = :claim_token AND status = 'running'""",
+        {
+            "status": status.value,
+            "check_result_id": check_result_id,
+            "error": error,
+            "next_attempt_at": next_attempt_at,
+            "id": intent_id,
+            "claim_token": claim_token,
+        },
+    )
+    return cursor.rowcount == 1
+
+
+def release_stale_check_intent_claims(conn: sqlite3.Connection, cutoff: str, live_tokens: Sequence[str] = ()) -> int:
+    """Re-arm claims older than ``cutoff`` (wall clock) that no live runner holds.
+
+    A row already at its attempt cap is abandoned here rather than re-armed:
+    re-arming it would leave a 'pending' row the due predicate never lists.
+    """
+    exclusion, params = _live_claim_exclusion(live_tokens)
+    cursor = conn.execute(
+        "UPDATE check_intents SET "
+        "status = CASE WHEN attempts >= max_attempts THEN 'abandoned' ELSE 'pending' END, "
+        "last_error = CASE WHEN attempts >= max_attempts THEN 'claim expired' ELSE last_error END, "
+        "claimed_at = NULL, claim_token = NULL "
+        f"WHERE status = 'running' AND claimed_at IS NOT NULL AND claimed_at <= ?{exclusion}",  # noqa: S608 - placeholders only
+        [cutoff, *params],
+    )
+    return cursor.rowcount
 
 
 # --- FeedHealth CRUD ---

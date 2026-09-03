@@ -11,21 +11,25 @@ import pytest
 
 from app.config import LLMSettings, Settings
 from app.crud import (
+    apply_check_intent_outcome,
     apply_notification_outcome,
     apply_webhook_outcome,
+    claim_check_intent,
     claim_new_topic_for_init,
     claim_notification_intent,
     claim_topic_for_init,
     claim_webhook_intent,
+    create_check_intents,
     create_pending_notification,
     create_pending_webhook,
     create_topic,
     get_new_topics,
     get_topic,
+    release_stale_check_intent_claims,
     release_stale_notification_claims,
     release_stale_webhook_claims,
 )
-from app.models import PendingNotification, Topic, TopicStatus
+from app.models import CheckIntent, CheckIntentStatus, PendingNotification, Topic, TopicStatus
 from app.web.state import CheckingState, _checking_state
 
 
@@ -1005,3 +1009,183 @@ def test_late_webhook_apply_with_a_stale_token_is_a_noop(db_conn: sqlite3.Connec
 
     row = db_conn.execute("SELECT retry_count FROM pending_webhooks WHERE id = ?", (webhook_id,)).fetchone()
     assert row is not None and row["retry_count"] == 0
+
+
+# --- Check intents: the same claim/apply/release contract over accepted checks (AUG-286) ---
+
+
+def _make_check_intent(conn: sqlite3.Connection, topic: Topic, **overrides) -> CheckIntent:
+    defaults = {"request_id": "req-1", "topic_id": topic.id}
+    defaults.update(overrides)
+    intent = CheckIntent(**defaults)
+    create_check_intents(conn, [intent])
+    conn.commit()
+    return intent
+
+
+def test_check_intent_claim_succeeds_once_then_fails(db_conn: sqlite3.Connection) -> None:
+    """Only the first claim wins, and the claim itself counts the attempt."""
+    topic = _make_topic(db_conn)
+    intent = _make_check_intent(db_conn, topic)
+
+    assert claim_check_intent(db_conn, intent.id, "tok", "2025-01-01T00:00:00+00:00") is True
+    db_conn.commit()
+    row = db_conn.execute("SELECT attempts, status FROM check_intents WHERE id = ?", (intent.id,)).fetchone()
+    assert row["attempts"] == 1
+    assert row["status"] == "running"
+
+    # A second claimant loses even though its own snapshot said the row was free.
+    assert claim_check_intent(db_conn, intent.id, "tok2", "2025-01-01T00:00:01+00:00") is False
+
+
+def test_release_stale_check_intent_claim_rearms_row(db_conn: sqlite3.Connection) -> None:
+    """A claim older than the cutoff is released so the row can be re-claimed."""
+    topic = _make_topic(db_conn)
+    intent = _make_check_intent(db_conn, topic)
+    assert claim_check_intent(db_conn, intent.id, "tok", "2020-01-01T00:00:00+00:00") is True
+    db_conn.commit()
+
+    # Cutoff before the claim time: nothing released.
+    assert release_stale_check_intent_claims(db_conn, "2019-01-01T00:00:00+00:00") == 0
+    assert release_stale_check_intent_claims(db_conn, "2020-06-01T00:00:00+00:00") == 1
+    db_conn.commit()
+    assert claim_check_intent(db_conn, intent.id, "tok2", "2025-01-01T00:00:00+00:00") is True
+
+
+def test_a_live_runners_check_claim_survives_a_forward_clock_step(db_conn: sqlite3.Connection) -> None:
+    """AUG-277: a wall-clock jump must not re-arm a claim whose check is running.
+
+    Re-arming it lets a second drainer run the same check again, spending the
+    provider budget twice and racing the first check's commit.
+    """
+    from app.web.state import live_claim, live_claim_tokens
+
+    topic = _make_topic(db_conn)
+    intent = _make_check_intent(db_conn, topic)
+    assert claim_check_intent(db_conn, intent.id, "live-token", "2020-01-01T00:00:00+00:00") is True
+    db_conn.commit()
+
+    with live_claim("live-token"):
+        released = release_stale_check_intent_claims(db_conn, "2999-01-01T00:00:00+00:00", live_claim_tokens())
+        db_conn.commit()
+        assert released == 0
+        assert claim_check_intent(db_conn, intent.id, "other", "2999-01-01T00:00:00+00:00") is False
+
+    assert release_stale_check_intent_claims(db_conn, "2999-01-01T00:00:00+00:00", live_claim_tokens()) == 1
+
+
+def test_a_dead_processs_check_claim_is_still_recovered(db_conn: sqlite3.Connection) -> None:
+    """The wall-clock rule stays the recovery path for claims nobody holds."""
+    from app.web.state import live_claim, live_claim_tokens
+
+    topic = _make_topic(db_conn)
+    mine = _make_check_intent(db_conn, topic, request_id="mine")
+    theirs = _make_check_intent(db_conn, topic, request_id="theirs")
+    assert claim_check_intent(db_conn, mine.id, "live-token", "2020-01-01T00:00:00+00:00") is True
+    assert claim_check_intent(db_conn, theirs.id, "gone-with-the-process", "2020-01-01T00:00:00+00:00") is True
+    db_conn.commit()
+
+    with live_claim("live-token"):
+        released = release_stale_check_intent_claims(db_conn, "2999-01-01T00:00:00+00:00", live_claim_tokens())
+    assert released == 1
+    db_conn.commit()
+    row = db_conn.execute("SELECT status FROM check_intents WHERE id = ?", (theirs.id,)).fetchone()
+    assert row["status"] == "pending"
+
+
+def test_a_stale_release_at_the_cap_abandons_instead_of_rearming(db_conn: sqlite3.Connection) -> None:
+    """A row re-armed at its cap would sit 'pending' forever, undue to every claim."""
+    topic = _make_topic(db_conn)
+    intent = _make_check_intent(db_conn, topic, attempts=3, max_attempts=3)
+    db_conn.execute(
+        "UPDATE check_intents SET status = 'running', claimed_at = ?, claim_token = ? WHERE id = ?",
+        ("2020-01-01T00:00:00+00:00", "dead", intent.id),
+    )
+    db_conn.commit()
+
+    assert release_stale_check_intent_claims(db_conn, "2999-01-01T00:00:00+00:00") == 1
+    db_conn.commit()
+
+    row = db_conn.execute("SELECT status, last_error FROM check_intents WHERE id = ?", (intent.id,)).fetchone()
+    assert row["status"] == "abandoned"
+    assert row["last_error"] == "claim expired"
+
+
+def test_apply_with_a_stale_token_is_a_noop(db_conn: sqlite3.Connection) -> None:
+    """A runner whose claim was released and re-taken cannot mutate the new owner's row."""
+    first_owner, second_owner = "owner-a", "owner-b"
+    topic = _make_topic(db_conn)
+    intent = _make_check_intent(db_conn, topic)
+
+    assert claim_check_intent(db_conn, intent.id, first_owner, "2020-01-01T00:00:00+00:00") is True
+    db_conn.commit()
+    release_stale_check_intent_claims(db_conn, "2020-06-01T00:00:00+00:00")
+    db_conn.commit()
+    assert claim_check_intent(db_conn, intent.id, second_owner, "2026-01-01T00:00:00+00:00") is True
+    db_conn.commit()
+
+    assert (
+        apply_check_intent_outcome(db_conn, intent.id, first_owner, status=CheckIntentStatus.DONE, check_result_id=9)
+        is False
+    )
+    assert (
+        apply_check_intent_outcome(db_conn, intent.id, first_owner, status=CheckIntentStatus.ABANDONED, error="late")
+        is False
+    )
+    db_conn.commit()
+
+    row = db_conn.execute(
+        "SELECT status, claim_token, check_result_id FROM check_intents WHERE id = ?", (intent.id,)
+    ).fetchone()
+    assert row["status"] == "running"
+    assert row["claim_token"] == second_owner
+    assert row["check_result_id"] is None
+
+
+def test_claim_rejects_an_exhausted_intent(db_conn: sqlite3.Connection) -> None:
+    """A row already at max_attempts is rejected by the claim, not just by the list query."""
+    topic = _make_topic(db_conn)
+    intent = _make_check_intent(db_conn, topic, attempts=3, max_attempts=3)
+
+    assert claim_check_intent(db_conn, intent.id, "tok", "2026-01-01T00:00:00+00:00") is False
+
+
+def test_claim_rejects_an_undue_intent(db_conn: sqlite3.Connection) -> None:
+    """A backoff that has not elapsed is enforced inside the claim too."""
+    topic = _make_topic(db_conn)
+    intent = _make_check_intent(db_conn, topic)
+    db_conn.execute(
+        "UPDATE check_intents SET next_attempt_at = ? WHERE id = ?",
+        ("2999-01-01T00:00:00+00:00", intent.id),
+    )
+    db_conn.commit()
+
+    assert claim_check_intent(db_conn, intent.id, "tok", "2026-01-01T00:00:00+00:00") is False
+
+
+def test_a_pending_apply_at_the_cap_lands_abandoned(db_conn: sqlite3.Connection) -> None:
+    """The cap is decided in the apply statement, never from a caller's stale row."""
+    topic = _make_topic(db_conn)
+    intent = _make_check_intent(db_conn, topic)
+
+    for attempt in range(3):
+        assert claim_check_intent(db_conn, intent.id, f"tok-{attempt}", "2026-01-01T00:00:00+00:00") is True
+        assert (
+            apply_check_intent_outcome(
+                db_conn,
+                intent.id,
+                f"tok-{attempt}",
+                status=CheckIntentStatus.PENDING,
+                error="boom",
+                next_attempt_at="2020-01-01T00:00:00+00:00",
+            )
+            is True
+        )
+        db_conn.commit()
+
+    row = db_conn.execute(
+        "SELECT status, attempts, next_attempt_at FROM check_intents WHERE id = ?", (intent.id,)
+    ).fetchone()
+    assert row["attempts"] == 3
+    assert row["status"] == "abandoned"
+    assert row["next_attempt_at"] is None

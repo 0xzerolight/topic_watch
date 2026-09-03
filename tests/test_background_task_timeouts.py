@@ -11,9 +11,9 @@ import pytest
 from app.analysis.knowledge import KnowledgeUpdatePlan
 from app.analysis.llm import TokenUsage
 from app.config import LLMSettings, NotificationSettings, Settings
-from app.crud import create_topic, delete_topic, get_topic
+from app.crud import create_check_intents, create_topic, delete_topic, get_topic
 from app.database import get_connection, init_db
-from app.models import Article, Topic, TopicStatus
+from app.models import Article, CheckIntent, Topic, TopicStatus
 from app.scraping import FetchResult
 from app.web.routers.background import _run_check_all, _run_init
 
@@ -284,6 +284,17 @@ class TestRunSingleCheckTimeout:
 
         assert CHECK_TIMEOUT_SECONDS < 600
 
+    def _seed_intent(self, db_path: Path) -> tuple[int, CheckIntent]:
+        conn = get_connection(db_path)
+        try:
+            topic = _make_topic(conn, status=TopicStatus.READY)
+            intent = CheckIntent(request_id="req-1", topic_id=topic.id)
+            create_check_intents(conn, [intent])
+            conn.commit()
+            return topic.id, intent
+        finally:
+            conn.close()
+
     async def test_hanging_check_is_cancelled_and_releases_the_guard(self, db_path: Path, caplog) -> None:
         import logging
 
@@ -291,51 +302,50 @@ class TestRunSingleCheckTimeout:
         from app.web.state import _checking_state
 
         settings = _make_settings()
+        topic_id, intent = self._seed_intent(db_path)
 
-        conn = get_connection(db_path)
-        try:
-            topic = _make_topic(conn, status=TopicStatus.READY)
-            topic_id = topic.id
-        finally:
-            conn.close()
+        # Patched BELOW the guard so the real check_topic takes it: the guard
+        # moved out of _run_single_check into check_topic (AUG-286), so mocking
+        # check_topic itself would leave nothing holding it and the release
+        # assertion below could not fail.
+        held: list[bool] = []
 
         async def _hang(*args, **kwargs):
+            held.append(await _checking_state.is_checking(topic_id))
             await asyncio.sleep(9999)
 
         _checking_state._topics.clear()
         try:
             with (
-                patch("app.web.routers.background.CHECK_TIMEOUT_SECONDS", 0.05),
-                patch("app.web.routers.background.check_topic", side_effect=_hang),
-                caplog.at_level(logging.ERROR, logger="app.web.routers.background"),
+                patch("app.checker.CHECK_TIMEOUT_SECONDS", 0.05),
+                patch("app.checker._check_topic_guarded", side_effect=_hang),
+                caplog.at_level(logging.ERROR, logger="app.checker"),
             ):
                 # Outer bound so an unbounded task fails the test instead of hanging it.
-                await asyncio.wait_for(_run_single_check(topic_id, settings, db_path), timeout=5)
+                await asyncio.wait_for(_run_single_check(intent, settings, db_path), timeout=5)
+            # Read before the cleanup clear below, which answers False either way.
+            still_held = await _checking_state.is_checking(topic_id)
         finally:
             _checking_state._topics.clear()
 
         assert any("timed out" in record.message.lower() for record in caplog.records)
-        assert await _checking_state.is_checking(topic_id) is False
+        assert held == [True]  # the guard was really held while the check ran
+        assert still_held is False  # and released when the timeout cancelled it
 
     async def test_normal_completion_runs_the_check(self, db_path: Path) -> None:
+        from app.models import CheckResult
         from app.web.routers.background import _run_single_check
         from app.web.state import _checking_state
 
         settings = _make_settings()
-
-        conn = get_connection(db_path)
-        try:
-            topic = _make_topic(conn, status=TopicStatus.READY)
-            topic_id = topic.id
-        finally:
-            conn.close()
+        topic_id, intent = self._seed_intent(db_path)
 
         _checking_state._topics.clear()
         try:
             with patch(
-                "app.web.routers.background.check_topic", new_callable=AsyncMock, return_value=None
+                "app.checker.check_topic", new_callable=AsyncMock, return_value=CheckResult(topic_id=topic_id)
             ) as mock_check:
-                await _run_single_check(topic_id, settings, db_path)
+                await _run_single_check(intent, settings, db_path)
         finally:
             _checking_state._topics.clear()
 
@@ -472,3 +482,27 @@ class TestCheckAllDeadlineScalesWithBacklog:
         from app.web.routers.background import _check_all_deadline_seconds
 
         assert _check_all_deadline_seconds(0, settings.topic_check_concurrency) == _CHECK_ALL_TIMEOUT_SECONDS
+
+    async def test_due_check_intents_count_toward_the_backlog_and_saturate(self, db_path: Path) -> None:
+        """Each resumed intent is a full check, but only _RETRY_DRAIN_LIMIT of them run per cycle."""
+        from app.checker import _RETRY_DRAIN_LIMIT
+        from app.web.routers.background import _due_topic_count
+
+        settings = _make_settings()
+        conn = get_connection(db_path)
+        try:
+            topic = _make_topic(conn, name="Due One", status=TopicStatus.READY)
+            create_check_intents(conn, [CheckIntent(request_id="req-1", topic_id=topic.id)])
+            conn.commit()
+            assert _due_topic_count(settings, db_path) == 2  # one due topic + one due intent
+
+            create_check_intents(
+                conn,
+                [CheckIntent(request_id=f"req-{i}", topic_id=topic.id) for i in range(_RETRY_DRAIN_LIMIT + 5)],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # A COUNT(*) here would inflate the deadline past the work one cycle does.
+        assert _due_topic_count(settings, db_path) == 1 + _RETRY_DRAIN_LIMIT

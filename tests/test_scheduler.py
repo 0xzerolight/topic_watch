@@ -368,6 +368,7 @@ class TestScheduledCheck:
             patch("app.checker.check_topic", side_effect=fake_check_topic),
             patch("app.checker.retry_pending_notifications", new_callable=AsyncMock),
             patch("app.checker.retry_pending_webhooks", new_callable=AsyncMock),
+            patch("app.checker.retry_pending_check_intents", new_callable=AsyncMock),
             patch(
                 "app.checker.get_topics_due_for_check",
                 return_value=topics,
@@ -731,13 +732,14 @@ class TestDeliveryLedgerRetention:
 
         from app.crud import (
             DELIVERY_INTENT_RETENTION_DAYS,
+            create_check_intents,
             create_pending_notification,
             create_topic,
             create_webhook_intents,
             delete_old_delivery_intents,
         )
         from app.database import get_connection, init_db
-        from app.models import PendingNotification, PendingWebhook, Topic, TopicStatus
+        from app.models import CheckIntent, PendingNotification, PendingWebhook, Topic, TopicStatus
 
         db_path = tmp_path / "ledger.db"
         init_db(db_path)
@@ -770,17 +772,33 @@ class TestDeliveryLedgerRetention:
                     ],
                 )
                 conn.execute("UPDATE pending_webhooks SET status = ? WHERE id = ?", (status, hook_id))
+                # And so is the accepted-check ledger (AUG-286): 'done' is its 'sent'.
+                intent_status = "done" if status == "sent" else status
+                (check_id,) = create_check_intents(
+                    conn,
+                    [
+                        CheckIntent(
+                            request_id=title.replace("sent", "done"),
+                            topic_id=topic.id,
+                            created_at=created,
+                        )
+                    ],
+                )
+                conn.execute("UPDATE check_intents SET status = ? WHERE id = ?", (intent_status, check_id))
             conn.commit()
 
             removed = delete_old_delivery_intents(conn, DELIVERY_INTENT_RETENTION_DAYS)
             conn.commit()
 
-            assert removed == 4
+            assert removed == 6
             titles = {r["title"] for r in conn.execute("SELECT title FROM pending_notifications")}
             # An undelivered intent still owes a delivery, however old it is.
             assert titles == {"old-pending", "fresh-sent"}
             hooks = {r["url"].rsplit("/", 1)[-1] for r in conn.execute("SELECT url FROM pending_webhooks")}
             assert hooks == {"old-pending", "fresh-sent"}
+            # An unfinished check still owes a run, however old it is.
+            checks = {r["request_id"] for r in conn.execute("SELECT request_id FROM check_intents")}
+            assert checks == {"old-pending", "fresh-done"}
         finally:
             conn.close()
 
@@ -880,6 +898,7 @@ class TestRetryDrainDoesNotStarveDueTopics:
         with (
             patch("app.checker.retry_pending_notifications", _slow_drain),
             patch("app.checker.retry_pending_webhooks", new=AsyncMock()),
+            patch("app.checker.retry_pending_check_intents", new=AsyncMock()),
             patch("app.checker.check_topic", _fake_check),
         ):
             await asyncio.wait_for(check_all_topics(_make_settings(), db_path), timeout=5)
@@ -893,6 +912,7 @@ class TestRetryDrainDoesNotStarveDueTopics:
         with (
             patch("app.checker.retry_pending_notifications", drain),
             patch("app.checker.retry_pending_webhooks", new=AsyncMock()),
+            patch("app.checker.retry_pending_check_intents", new=AsyncMock()),
         ):
             assert await check_all_topics(_make_settings(), db_path) == []
         drain.assert_awaited_once()

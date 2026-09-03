@@ -36,6 +36,7 @@ from app.migrations.m026_wave_a_durability import up as m026_up
 from app.migrations.m027_normalize_topic_tags import up as m027_up
 from app.migrations.m028_repair_knowledge_token_counts import up as m028_up
 from app.migrations.m029_revision_provenance import up as m029_up
+from app.migrations.m030_check_intents import up as m030_up
 
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "baseline schema version", m001_up),
@@ -67,4 +68,5 @@ MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (27, "canonicalize stored topic tags", m027_up),
     (28, "repair impossible knowledge_states token counts", m028_up),
     (29, "add model/basis_hash provenance to knowledge_revisions", m029_up),
+    (30, "add check_intents: durable admission for accepted background checks", m030_up),
 ]

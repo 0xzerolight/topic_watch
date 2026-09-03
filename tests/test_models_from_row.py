@@ -19,6 +19,8 @@ from pydantic import ValidationError
 
 from app.models import (
     Article,
+    CheckIntent,
+    CheckIntentStatus,
     CheckResult,
     CorruptTimestampError,
     FeedHealth,
@@ -460,6 +462,57 @@ class TestPendingNotificationFromRow:
         row["created_at"] = "???"
         with pytest.raises(CorruptTimestampError, match="created_at"):
             PendingNotification.from_row(row)
+
+
+class TestCheckIntentFromRow:
+    """CheckIntent.from_row / to_insert_dict defensive handling + round-trip."""
+
+    def _base_row(self) -> dict:
+        return {
+            "id": 1,
+            "request_id": "req-abc",
+            "topic_id": 7,
+            "baseline_check_id": 42,
+            "status": "pending",
+            "created_at": "2026-06-13T12:00:00+00:00",
+            "attempts": 0,
+            "max_attempts": 3,
+            "next_attempt_at": None,
+            "claimed_at": None,
+            "claim_token": None,
+            "check_result_id": None,
+            "last_error": None,
+        }
+
+    def test_valid_row_parses_identically(self) -> None:
+        intent = CheckIntent.from_row(self._base_row())
+        assert intent.request_id == "req-abc"
+        assert intent.topic_id == 7
+        assert intent.baseline_check_id == 42
+        assert intent.status is CheckIntentStatus.PENDING
+        assert intent.created_at.year == 2026
+
+    def test_malformed_created_at_raises(self) -> None:
+        row = self._base_row()
+        row["created_at"] = "???"
+        with pytest.raises(CorruptTimestampError, match="created_at"):
+            CheckIntent.from_row(row)
+
+    def test_round_trip_from_row_to_insert_dict(self) -> None:
+        """Only the admission columns are inserted; the claim/outcome ones are the runner's."""
+        intent = CheckIntent.from_row(self._base_row())
+        data = intent.to_insert_dict()
+        assert set(data) == {
+            "request_id",
+            "topic_id",
+            "baseline_check_id",
+            "status",
+            "created_at",
+            "attempts",
+            "max_attempts",
+        }
+        assert data["status"] == "pending"
+        assert data["created_at"] == "2026-06-13T12:00:00+00:00"
 
 
 class TestPendingWebhookFromRow:

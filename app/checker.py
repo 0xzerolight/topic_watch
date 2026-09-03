@@ -28,7 +28,9 @@ from app.crud import (
     HEARTBEAT_INTENT_KINDS,
     MAX_ANALYSIS_ATTEMPTS,
     abandon_expired_notifications,
+    apply_check_intent_outcome,
     apply_notification_outcome,
+    claim_check_intent,
     claim_heartbeat_alert,
     claim_notification_intent,
     claim_topic_for_init,
@@ -41,10 +43,13 @@ from app.crud import (
     get_topic,
     get_topics_due_for_check,
     list_articles_for_topic,
+    list_due_check_intents,
     list_due_notification_intents,
     list_sent_heartbeat_alert_targets,
     mark_articles_processed,
+    max_check_result_id,
     record_article_analysis_failure,
+    release_stale_check_intent_claims,
     release_stale_notification_claims,
     revoke_heartbeat_intents,
     topic_generation_matches,
@@ -55,6 +60,8 @@ from app.database import get_db, short_conn
 from app.heartbeat import HeartbeatDecision, evaluate_heartbeat
 from app.models import (
     Article,
+    CheckIntent,
+    CheckIntentStatus,
     CheckResult,
     KnowledgeRevisionSource,
     NotificationDelivery,
@@ -79,6 +86,14 @@ logger = logging.getLogger(__name__)
 # walk the queue at once. The cross-process case is covered by the atomic
 # per-row claim below. (OVH-017)
 _notification_retry_lock = asyncio.Lock()
+
+# The same single-flight rule over the accepted-check queue (AUG-286).
+_check_intent_drain_lock = asyncio.Lock()
+
+# What ``check_topic`` reports when another check of the same topic holds the
+# per-topic guard. The only ``id is None`` outcome an intent can wait out, so the
+# runner matches on it rather than re-spelling the string.
+_SKIPPED_IN_FLIGHT = "skipped: already in flight"
 
 # Claims older than this are treated as stale — a drainer crashed mid-send, or a
 # send timed out with an unknown outcome — and the intent is re-armed. Measured
@@ -379,9 +394,11 @@ async def check_topic(
     reach the pipeline through here, so a same-topic check already in flight is
     skipped (returns a CheckResult with ``stage_error='skipped: already in
     flight'`` and no LLM/notification work). Callers that already hold the guard
-    (the manual web ``/check`` path, which acquires it synchronously so it can
-    return the current row immediately) pass ``guard=False`` to avoid
-    self-blocking on the entry they already own.
+    (the JSON API, which claims it synchronously so it can answer 409 rather than
+    return a skipped result) pass ``guard=False`` to avoid self-blocking on the
+    entry they already own. The manual web ``/check`` path does not: its accepted
+    check runs as an intent, and ``run_check_intent`` lets this function take the
+    guard so a loser backs off and retries instead of being dropped (AUG-286).
 
     Args:
         topic: The topic to check. Must have an id; its status is re-read from
@@ -404,7 +421,7 @@ async def check_topic(
     owner = await _checking_state.start_check(topic_id)
     if owner is None:
         logger.info("Topic '%s' (id=%d) already being checked; skipping", topic.name, topic_id)
-        return CheckResult(topic_id=topic_id, stage_error="skipped: already in flight")
+        return CheckResult(topic_id=topic_id, stage_error=_SKIPPED_IN_FLIGHT)
     try:
         return await _check_topic_guarded(topic, settings, db_path)
     finally:
@@ -1215,6 +1232,119 @@ async def _drain_notification_intents(
     await deliver_notification_intents(pending, settings, db_path, conn)
 
 
+async def run_check_intent(intent: CheckIntent, settings: Settings, db_path: Path | None) -> CheckResult | None:
+    """Claim one accepted-check intent, run it, and record what happened.
+
+    Three short connections and no connection across the await, exactly like a
+    delivery intent (AUG-136). Returns the CheckResult the check produced, or
+    None when nothing ran (lost claim, satisfied by a newer result, abandoned).
+    """
+    if intent.id is None:
+        raise ValueError("intent must have an id")
+    intent_id: int = intent.id
+    claim_token = secrets.token_hex(8)
+    with short_conn(None, db_path) as claim_conn:
+        won = claim_check_intent(claim_conn, intent_id, claim_token, to_db_utc(datetime.now(UTC)))
+        claim_conn.commit()
+    if not won:
+        return None
+
+    def _apply(
+        conn: sqlite3.Connection,
+        status: CheckIntentStatus,
+        *,
+        check_result_id: int | None = None,
+        error: str | None = None,
+        retry: bool = False,
+    ) -> None:
+        # Pre-increment count, like the delivery twins: 60 s before the first retry.
+        due = next_attempt_at(intent.attempts) if retry else None
+        applied = apply_check_intent_outcome(
+            conn,
+            intent_id,
+            claim_token,
+            status=status,
+            check_result_id=check_result_id,
+            error=error,
+            next_attempt_at=due,
+        )
+        if not applied:
+            logger.warning("Late apply for check intent id=%d ignored: the claim is no longer ours", intent_id)
+        conn.commit()
+
+    with short_conn(None, db_path) as conn:
+        topic = get_topic(conn, intent.topic_id)
+        if topic is None:
+            return None  # ON DELETE CASCADE already removed the row; nothing to apply
+        newest = max_check_result_id(conn, intent.topic_id)
+        if newest is not None and (intent.baseline_check_id is None or newest > intent.baseline_check_id):
+            _apply(conn, CheckIntentStatus.DONE, check_result_id=newest)
+            return None
+
+    try:
+        with live_claim(claim_token):
+            result = await asyncio.wait_for(
+                check_topic(topic, settings, db_path=db_path, guard=True), timeout=CHECK_TIMEOUT_SECONDS
+            )
+    except TimeoutError:
+        logger.error(
+            "Check intent id=%d for topic %d timed out after %d seconds",
+            intent_id,
+            intent.topic_id,
+            CHECK_TIMEOUT_SECONDS,
+        )
+        with short_conn(None, db_path) as conn:
+            _apply(conn, CheckIntentStatus.PENDING, error="TimeoutError", retry=True)
+        return None
+    except Exception as exc:  # a failed check retries with backoff up to the cap
+        logger.error("Check intent id=%d for topic %d failed", intent_id, intent.topic_id, exc_info=True)
+        with short_conn(None, db_path) as conn:
+            _apply(conn, CheckIntentStatus.PENDING, error=type(exc).__name__, retry=True)
+        return None
+
+    with short_conn(None, db_path) as conn:
+        if result.id is not None:
+            _apply(conn, CheckIntentStatus.DONE, check_result_id=result.id)
+        elif result.stage_error == _SKIPPED_IN_FLIGHT:
+            # Another check holds the guard: wait it out. The next drain usually
+            # finds the intent satisfied by the result that check commits.
+            _apply(conn, CheckIntentStatus.PENDING, error=result.stage_error, retry=True)
+        else:
+            # Not ready, gone, or the transition was fenced off: nothing to wait for.
+            # Only the prefix is stored — 'transition_aborted' carries an exception message.
+            _apply(conn, CheckIntentStatus.ABANDONED, error=(result.stage_error or "skipped").split(":", 1)[0])
+    return result
+
+
+async def retry_pending_check_intents(
+    settings: Settings, *, db_path: Path | None = None, semaphore: asyncio.Semaphore | None = None
+) -> None:
+    """Resume accepted checks a dead process left behind. Non-blocking single-flight."""
+    if _check_intent_drain_lock.locked():
+        return
+    async with _check_intent_drain_lock:
+        now = datetime.now(UTC)
+        with short_conn(None, db_path) as conn:
+            released = release_stale_check_intent_claims(conn, to_db_utc(now - _CLAIM_STALE_AFTER), live_claim_tokens())
+            if released:
+                logger.warning("Re-armed or abandoned %d stale check intent claim(s)", released)
+            conn.commit()
+            pending = list_due_check_intents(conn, to_db_utc(now), _RETRY_DRAIN_LIMIT)
+        if not pending:
+            return
+        logger.info("Resuming %d accepted check(s)", len(pending))
+        gate = semaphore or asyncio.Semaphore(settings.topic_check_concurrency)
+
+        async def _one(intent: CheckIntent) -> CheckResult | None:
+            async with gate:
+                return await run_check_intent(intent, settings, db_path)
+
+        results = await asyncio.gather(*(_one(i) for i in pending), return_exceptions=True)
+        for intent, outcome in zip(pending, results, strict=True):
+            if isinstance(outcome, BaseException):
+                logger.error("Check intent id=%s failed outside its own handling", intent.id, exc_info=outcome)
+
+
 async def check_all_topics(
     settings: Settings,
     db_path: Path | None = None,
@@ -1290,15 +1420,31 @@ async def _run_check_cycle(
     db_path: Path | None,
 ) -> list[CheckResult]:
     """The check-all cycle body (caller has set cycle_id_var)."""
+    # Bound per-topic checks so a slow topic does not head-of-line-block the rest
+    # within this single tick (OVH-055). This stays inside the one whole-cycle
+    # gate (settled #9: one minute-tick job); each per-topic ``check_topic`` still
+    # funnels through its own ``_checking_state`` per-topic guard. Mirrors the
+    # ``content_fetch_concurrency`` Semaphore precedent. Each topic keeps its own
+    # short-lived connection so concurrent checks never share a handle.
+    #
+    # Declared before ``_drain_retries``, which closes over it: the drain also runs
+    # on the no-due-topics path below, where a semaphore created further down
+    # would not exist yet.
+    semaphore = asyncio.Semaphore(settings.topic_check_concurrency)
 
     async def _drain_retries() -> None:
-        """Retry failed deliveries from previous cycles.
+        """Retry failed deliveries, and resume accepted checks, from previous cycles.
 
         Each retry function manages its own short-lived connections: it snapshots
         pending rows, sends with NO connection held, and commits per item.
+
+        The check-intent drain shares this cycle's semaphore rather than minting
+        its own: a second gate of the same size would double how many checks the
+        pipeline runs at once (AUG-286).
         """
         await retry_pending_notifications(settings=settings, db_path=db_path)
         await retry_pending_webhooks(settings=settings, db_path=db_path)
+        await retry_pending_check_intents(settings, db_path=db_path, semaphore=semaphore)
 
     # Snapshot the due topics, then release the connection before the long
     # per-topic HTTP/LLM work begins.
@@ -1310,14 +1456,6 @@ async def _run_check_cycle(
         return []
 
     logger.info("Starting check cycle for %d due topics", len(due_topics))
-
-    # Bound per-topic checks so a slow topic does not head-of-line-block the rest
-    # within this single tick (OVH-055). This stays inside the one whole-cycle
-    # gate (settled #9: one minute-tick job); each per-topic ``check_topic`` still
-    # funnels through its own ``_checking_state`` per-topic guard. Mirrors the
-    # ``content_fetch_concurrency`` Semaphore precedent. Each topic keeps its own
-    # short-lived connection so concurrent checks never share a handle.
-    semaphore = asyncio.Semaphore(settings.topic_check_concurrency)
 
     async def _check_one(topic: Topic) -> CheckResult | None:
         async with semaphore:
