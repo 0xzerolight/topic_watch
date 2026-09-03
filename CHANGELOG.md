@@ -14,6 +14,7 @@ reliable signal of change scope; historical tags are not renumbered.
 
 - Dependencies relocked (litellm 1.98.0, apprise 1.13.0, openai 2.54.0, ruff 0.16.4, mypy 2.3.1 and 15 more). litellm 1.98.0 pulls boto3/botocore/s3transfer/jmespath in as unconditional runtime requirements, so they are now in `requirements.txt`. Supersedes the weekly group PR #74, which pinned openai 3.3.1 against instructor's `openai<3.0.0` cap and could not install
 - Dependabot no longer proposes openai 3.x. The cap comes from instructor 1.15.4, so the whole 3.x line is uninstallable here; the ignore is range-scoped like the jiter/rich/importlib-metadata ones, so 2.x bumps still flow. Lift it when instructor lifts the cap
+- The Docker image builds from pinned inputs only: hatchling is hash-locked in `requirements-build.txt`, gosu comes from its signed release with a per-architecture checksum, and pip is no longer upgraded at build time. `make lock` / `make lock-upgrade` maintain the new lock; Dependabot tracks it with the other requirements files
 
 ### Fixed
 

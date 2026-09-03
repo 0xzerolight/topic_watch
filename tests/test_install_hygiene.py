@@ -7,6 +7,7 @@ These guard the non-Python deliverables of Task 2.3:
   so remote deployers following SECURITY.md find it.
 """
 
+import re
 from pathlib import Path
 
 import yaml
@@ -196,3 +197,37 @@ def test_dockerfile_ships_vendored_asset_licenses() -> None:
     notices = (_ROOT / "THIRD_PARTY_NOTICES.md").read_text()
     assert "Pico CSS" in notices
     assert "MIT" in notices
+
+
+def test_dockerfile_build_inputs_are_pinned() -> None:
+    """TW-AUD-033 residue: every input the image build resolves must come from a
+    declared lock or a pinned digest — no floating pip, no isolated-build
+    hatchling from PyPI, no apt archive."""
+    dockerfile = (_ROOT / "Dockerfile").read_text()
+    assert "--upgrade pip" not in dockerfile
+    assert "apt-get" not in dockerfile
+    assert "--require-hashes -r requirements-build.txt" in dockerfile
+    assert "--no-build-isolation" in dockerfile
+    assert "sha256sum -c" in dockerfile
+    assert "ARG TARGETARCH" in dockerfile
+
+    gosu_pin = re.search(r"^ARG GOSU_VERSION=(\S+)$", dockerfile, re.MULTILINE)
+    assert gosu_pin is not None, "Dockerfile must pin ARG GOSU_VERSION"
+
+    build_lock = (_ROOT / "requirements-build.txt").read_text()
+    assert "hatchling==" in build_lock
+    assert "--hash=sha256:" in build_lock
+    assert (_ROOT / "requirements-build.in").read_text().strip() == "hatchling"
+
+    makefile = (_ROOT / "Makefile").read_text()
+    lock_target = makefile.split("\nlock:", 1)[1].split("\n\n", 1)[0]
+    upgrade_target = makefile.split("\nlock-upgrade:", 1)[1].split("\n\n", 1)[0]
+    assert "requirements-build.txt" in lock_target
+    assert "requirements-build.txt" in upgrade_target
+
+    notices = (_ROOT / "THIRD_PARTY_NOTICES.md").read_text()
+    # The heading must name the version the image ships, so a bump that updates
+    # the binary but forgets the license section fails here instead of shipping.
+    assert f"## gosu {gosu_pin.group(1)}" in notices
+    assert "Apache License" in notices
+    assert "Version 2.0" in notices
