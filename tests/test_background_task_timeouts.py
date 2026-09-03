@@ -482,3 +482,27 @@ class TestCheckAllDeadlineScalesWithBacklog:
         from app.web.routers.background import _check_all_deadline_seconds
 
         assert _check_all_deadline_seconds(0, settings.topic_check_concurrency) == _CHECK_ALL_TIMEOUT_SECONDS
+
+    async def test_due_check_intents_count_toward_the_backlog_and_saturate(self, db_path: Path) -> None:
+        """Each resumed intent is a full check, but only _RETRY_DRAIN_LIMIT of them run per cycle."""
+        from app.checker import _RETRY_DRAIN_LIMIT
+        from app.web.routers.background import _due_topic_count
+
+        settings = _make_settings()
+        conn = get_connection(db_path)
+        try:
+            topic = _make_topic(conn, name="Due One", status=TopicStatus.READY)
+            create_check_intents(conn, [CheckIntent(request_id="req-1", topic_id=topic.id)])
+            conn.commit()
+            assert _due_topic_count(settings, db_path) == 2  # one due topic + one due intent
+
+            create_check_intents(
+                conn,
+                [CheckIntent(request_id=f"req-{i}", topic_id=topic.id) for i in range(_RETRY_DRAIN_LIMIT + 5)],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # A COUNT(*) here would inflate the deadline past the work one cycle does.
+        assert _due_topic_count(settings, db_path) == 1 + _RETRY_DRAIN_LIMIT
