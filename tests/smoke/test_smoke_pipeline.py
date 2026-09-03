@@ -42,6 +42,7 @@ from app.crud import (
     list_pending_webhooks,
 )
 from app.models import CheckResult, FeedMode, NotificationDelivery, Topic, TopicStatus
+from app.url_validation import _Destination
 from tests.helpers import RssEntry, build_rss_transport, build_rss_xml, conn_db_path, stub_llm_boundary
 
 _FEED_URL = "https://example.com/feed.xml"
@@ -320,7 +321,7 @@ async def test_check_topic_queues_webhook_through_held_conn_on_500(db_conn: sqli
             new=AsyncMock(return_value=[NotificationDelivery(url="json://localhost", ok=True)]),
         ),
         # Let the real webhook POST reach the MockTransport (skip the SSRF DNS check).
-        patch("app.webhooks.is_private_url", return_value=False),
+        patch("app.webhooks._classify_url", return_value=_Destination.PUBLIC),
     ):
         result = await check_topic(topic, settings, db_path=db_path)
 

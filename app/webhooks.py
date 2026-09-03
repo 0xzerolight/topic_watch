@@ -33,7 +33,7 @@ from app.crud import (
 from app.database import short_conn
 from app.log_redaction import redact_url
 from app.models import PendingWebhook, next_attempt_at, to_db_utc
-from app.url_validation import is_private_url
+from app.url_validation import ResolverSaturatedError, _classify_url, _Destination
 from app.web.state import live_claim, live_claim_tokens
 
 logger = logging.getLogger(__name__)
@@ -137,15 +137,16 @@ async def send_webhook(url: str, payload: dict, timeout: float = _WEBHOOK_TIMEOU
     long enough for the ten-minute stale-claim window to expire and permit a
     duplicate send. The granular httpx phase timeouts are kept underneath it.
 
-    SSRF note: is_private_url performs blocking DNS resolution, so it is
+    SSRF note: _classify_url performs blocking DNS resolution, so it is
     offloaded to a worker thread to avoid stalling the event loop. A
     DNS-rebinding TOCTOU window between this check and the POST is a
     pre-existing, architectural limitation shared by all outbound fetches.
 
     A non-http(s) scheme and a URL that will not parse are terminal — neither
-    becomes valid on the next attempt. The SSRF gate's verdict is not: it fails
-    closed on resolution failure, so "private/reserved" is also what an
-    unresolvable host looks like, and that one recovers (see below).
+    becomes valid on the next attempt. So is a host that RESOLVED to a private
+    or reserved address: that verdict does not change on a retry. A host the
+    resolver could not answer for at all is the one blocked outcome that stays
+    retryable, because it is the absence of a verdict rather than one.
     """
     try:
         async with asyncio.timeout(timeout):
@@ -161,12 +162,12 @@ async def send_webhook(url: str, payload: dict, timeout: float = _WEBHOOK_TIMEOU
 async def _send_webhook_within_deadline(url: str, payload: dict, timeout: float) -> WebhookOutcome:
     """Validate and POST one webhook. Caller owns the total deadline."""
     # Validate the URL BEFORE the POST. A malformed URL (e.g. an unbracketed or
-    # otherwise broken IPv6 literal) makes urlparse / is_private_url raise
+    # otherwise broken IPv6 literal) makes urlparse / _classify_url raise
     # ValueError, which would violate the documented "Never raises" contract, so
     # any validation error counts as blocked (OVH-131).
     try:
-        # Scheme allowlist BEFORE the POST (OVH-141). is_private_url() returns
-        # False for schemes with no netloc (file://, gopher://, ftp://), so
+        # Scheme allowlist BEFORE the POST (OVH-141). _classify_url() reports
+        # PUBLIC for schemes with no netloc (file://, gopher://, ftp://), so
         # without this explicit check the first hop would rely solely on httpx
         # raising UnsupportedProtocol — a weaker backstop than the per-hop
         # redirect checks.
@@ -174,21 +175,32 @@ async def _send_webhook_within_deadline(url: str, payload: dict, timeout: float)
             logger.warning("Blocked webhook to non-http(s) URL: %s", redact_url(url))
             return WebhookOutcome(ok=False, retryable=False, error="non-http(s) URL")
 
-        if await asyncio.to_thread(is_private_url, url):
-            # Retryable: is_private_url fails closed, so this same verdict covers a
-            # host DNS could not answer for — a resolver restart, a container that
-            # started before its DNS, a lookup that hit the resolve timeout. Making
-            # it terminal destroyed the alert on the first attempt with no retry
-            # budget spent. The send is still blocked; only the finality is gone.
-            logger.warning("Blocked webhook to private/reserved or unresolvable URL: %s", redact_url(url))
-            return WebhookOutcome(ok=False, error="private/reserved or unresolvable URL")
+        try:
+            destination = await asyncio.to_thread(_classify_url, url)
+        except ResolverSaturatedError:
+            # No lookup ran, so nothing is known about the host: blocked, and
+            # retryable for the same reason an unresolvable one is.
+            destination = _Destination.UNRESOLVABLE
+
+        if destination is _Destination.PRIVATE:
+            # Terminal: the host RESOLVED to a private/reserved address. That
+            # verdict does not change on a retry, so spending the budget on it
+            # only delays the abandonment the ledger will record anyway.
+            logger.warning("Blocked webhook to private/reserved URL: %s", redact_url(url))
+            return WebhookOutcome(ok=False, retryable=False, error="private/reserved URL")
+        if destination is not _Destination.PUBLIC:
+            # Retryable: a host DNS could not answer for — a resolver restart, a
+            # container that started before its DNS, a lookup that hit the
+            # resolve timeout. The send is still blocked; only the finality is gone.
+            logger.warning("Blocked webhook to unresolvable URL: %s", redact_url(url))
+            return WebhookOutcome(ok=False, error="unresolvable URL")
     except Exception:
         logger.warning("Blocked webhook to malformed URL: %s", redact_url(url), exc_info=True)
         return WebhookOutcome(ok=False, retryable=False, error="malformed URL")
 
     try:
         # follow_redirects=False (httpx default, made explicit) so a 3xx to a
-        # private address can't bypass the is_private_url check above. The
+        # private address can't bypass the _classify_url check above. The
         # per-phase timeouts stay under the caller's total deadline; connect gets
         # a tighter share so a black-holed host fails fast rather than spending
         # the whole budget before a single byte moves.

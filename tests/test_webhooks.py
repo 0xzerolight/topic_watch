@@ -19,6 +19,7 @@ from app.crud import (
     release_stale_webhook_claims,
 )
 from app.models import Topic, TopicStatus, to_db_utc
+from app.url_validation import ResolverSaturatedError, _Destination
 from app.webhooks import (
     WebhookOutcome,
     _build_webhook_payload,
@@ -388,18 +389,39 @@ class TestWebhookOutcomeClassification:
             assert outcome.ok is False, url
             assert outcome.retryable is False, url
 
-    async def test_a_blocked_host_is_retried_not_abandoned(self) -> None:
-        """The SSRF gate fails closed on resolution failure, so its verdict is not final.
+    async def test_a_resolved_private_target_is_terminal(self) -> None:
+        """A destination that RESOLVED to a private address will not become public on
+        a retry, so the intent must not spend its retry budget on it (FINAL residue E,
+        the half of A4fix defect 2 that waited for B2fix's three-state verdict)."""
+        for url in ("http://127.0.0.1:8080/hook", "http://169.254.169.254/metadata", "http://localhost:9200/hook"):
+            with patch("app.webhooks.httpx.AsyncClient") as mock_cls:
+                outcome = await send_webhook(url, {})
+            assert outcome.ok is False, url
+            assert outcome.retryable is False, url
+            mock_cls.assert_not_called()
 
-        The same "blocked" answer covers a genuinely private address and a host
-        the resolver could not answer for at all — a resolver restart, a
-        container that started before its DNS, a lookup that hit the resolve
-        timeout. Spending the retry budget on it is the honest reading; only
-        url_validation can tell the two apart.
-        """
-        outcome = await send_webhook("http://127.0.0.1:8080/hook", {})
+    async def test_an_unresolvable_host_is_retried_not_abandoned(self) -> None:
+        """The absence of a DNS answer is not a verdict about the host: a resolver
+        restart or a container started before its DNS must not destroy the alert."""
+        with (
+            patch("app.webhooks._classify_url", return_value=_Destination.UNRESOLVABLE),
+            patch("app.webhooks.httpx.AsyncClient") as mock_cls,
+        ):
+            outcome = await send_webhook("https://hooks.example.test/x", {})
         assert outcome.ok is False
         assert outcome.retryable is True
+        mock_cls.assert_not_called()
+
+    async def test_a_saturated_resolver_is_retried_not_abandoned(self) -> None:
+        """No lookup ran at all, so nothing is known: retryable, and still blocked."""
+        with (
+            patch("app.webhooks._classify_url", side_effect=ResolverSaturatedError("no slot")),
+            patch("app.webhooks.httpx.AsyncClient") as mock_cls,
+        ):
+            outcome = await send_webhook("https://hooks.example.test/x", {})
+        assert outcome.ok is False
+        assert outcome.retryable is True
+        mock_cls.assert_not_called()
 
 
 class TestWebhookIntents:
@@ -582,6 +604,21 @@ class TestWebhookRetryQueue:
 
         with patch("app.webhooks.send_webhook", return_value=_fail(status=422, retryable=False, error="HTTP 422")):
             await _deliver(db_conn, topic.id, settings)
+
+        row = db_conn.execute("SELECT status, retry_count, next_attempt_at FROM pending_webhooks").fetchone()
+        assert row["status"] == "abandoned"
+        assert row["retry_count"] == 1
+        assert row["next_attempt_at"] is None
+        assert list_pending_webhooks(db_conn) == []
+
+    async def test_a_private_target_is_abandoned_after_one_attempt(self, db_conn: sqlite3.Connection) -> None:
+        """A target that resolves private stays private; do not burn the retry budget on it."""
+        topic = _make_topic(db_conn)
+        settings = _make_settings(notifications=NotificationSettings(urls=[], webhook_urls=["http://127.0.0.1:9/hook"]))
+
+        with patch("app.webhooks.httpx.AsyncClient") as mock_cls:
+            await _deliver(db_conn, topic.id, settings)
+        mock_cls.assert_not_called()
 
         row = db_conn.execute("SELECT status, retry_count, next_attempt_at FROM pending_webhooks").fetchone()
         assert row["status"] == "abandoned"
