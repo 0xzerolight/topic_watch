@@ -314,6 +314,49 @@ class TestBulkCheck:
         assert [r["topic_id"] for r in rows] == [free.id]
         assert mock_check.call_count == 1
 
+    async def test_a_topic_deleted_mid_batch_costs_only_its_own_intent(
+        self, client: httpx.AsyncClient, db_conn: sqlite3.Connection, db_path: Path
+    ) -> None:
+        """A topic that vanishes after its read must not take the batch down with it.
+
+        The batch INSERT hits the topic FK, so nothing at all is admitted; the
+        healthy topics then lose their intent, their background task and the
+        response to a 500. They are admitted without the loser instead.
+        """
+        survivor = _make_topic(db_conn, name="Bulk Survivor", status=TopicStatus.READY)
+        doomed = _make_topic(db_conn, name="Bulk Doomed", status=TopicStatus.READY)
+
+        def _vanish_then_insert(conn: sqlite3.Connection, batch: list[CheckIntent]) -> list[int]:
+            if len(batch) > 1:  # the batched attempt, before any row is written
+                side = get_connection(db_path)
+                try:
+                    side.execute("DELETE FROM topics WHERE id = ?", (doomed.id,))
+                    side.commit()
+                finally:
+                    side.close()
+            return create_check_intents(conn, batch)
+
+        body = f"topic_ids={survivor.id}&topic_ids={doomed.id}"
+        with (
+            patch("app.web.routers.background._run_single_check", new_callable=AsyncMock) as mock_check,
+            patch("app.web.routers.topics.create_check_intents", side_effect=_vanish_then_insert),
+        ):
+            response = await client.post(
+                "/topics/bulk-check",
+                content=body.encode(),
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                follow_redirects=False,
+            )
+
+        assert response.status_code == 303
+        verify = get_connection(db_path)
+        try:
+            rows = verify.execute("SELECT topic_id, status FROM check_intents").fetchall()
+        finally:
+            verify.close()
+        assert [(r["topic_id"], r["status"]) for r in rows] == [(survivor.id, "pending")]
+        assert [call[0][0].topic_id for call in mock_check.call_args_list] == [survivor.id]
+
     async def test_bulk_check_requires_csrf(
         self, client_no_csrf: httpx.AsyncClient, db_conn: sqlite3.Connection
     ) -> None:

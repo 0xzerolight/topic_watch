@@ -1034,8 +1034,25 @@ async def bulk_check_handler(
             logger.warning("Failed to queue check for topic %s: %s", tid, exc)
 
     if intents:
-        create_check_intents(conn, intents)
-        conn.commit()
+        try:
+            create_check_intents(conn, intents)
+            conn.commit()
+        except Exception as exc:
+            # A topic deleted between its read above and this insert fails the
+            # whole batch on the topic FK, so nobody is admitted. Re-admit one at
+            # a time and drop only the row that cannot land.
+            conn.rollback()
+            logger.warning("Bulk check batch admission failed (%s); admitting the survivors one at a time", exc)
+            admitted: list[CheckIntent] = []
+            for intent in intents:
+                try:
+                    create_check_intents(conn, [intent])
+                    conn.commit()
+                    admitted.append(intent)
+                except Exception as inner:
+                    conn.rollback()
+                    logger.warning("Failed to admit check for topic %s: %s", intent.topic_id, inner)
+            intents = admitted
         for intent in intents:
             background_tasks.add_task(background._run_single_check, intent, settings, db_path)
     return RedirectResponse(url="/", status_code=303)
