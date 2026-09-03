@@ -43,8 +43,9 @@ COPY --from=builder /opt/venv /opt/venv
 # release and verified against a pinned per-arch SHA-256 (TW-AUD-033): the
 # Debian package was the one build input resolved outside the declared locks,
 # and apt cannot pin a single version across both published architectures.
-# To bump: change GOSU_VERSION and both sums from the release's SHA256SUMS file
-# (signed; verify with tianon's key B42F6819007F00F88E364FD4036A9C25BF357DD4).
+# To bump: change GOSU_VERSION, both sums from the release's SHA256SUMS file
+# (signed; verify with tianon's key B42F6819007F00F88E364FD4036A9C25BF357DD4),
+# and the "## gosu <version>" heading in THIRD_PARTY_NOTICES.md.
 # License text: THIRD_PARTY_NOTICES.md (shipped below).
 ARG TARGETARCH
 ARG GOSU_VERSION=1.19

@@ -7,6 +7,7 @@ These guard the non-Python deliverables of Task 2.3:
   so remote deployers following SECURITY.md find it.
 """
 
+import re
 from pathlib import Path
 
 import yaml
@@ -210,6 +211,9 @@ def test_dockerfile_build_inputs_are_pinned() -> None:
     assert "sha256sum -c" in dockerfile
     assert "ARG TARGETARCH" in dockerfile
 
+    gosu_pin = re.search(r"^ARG GOSU_VERSION=(\S+)$", dockerfile, re.MULTILINE)
+    assert gosu_pin is not None, "Dockerfile must pin ARG GOSU_VERSION"
+
     build_lock = (_ROOT / "requirements-build.txt").read_text()
     assert "hatchling==" in build_lock
     assert "--hash=sha256:" in build_lock
@@ -222,6 +226,8 @@ def test_dockerfile_build_inputs_are_pinned() -> None:
     assert "requirements-build.txt" in upgrade_target
 
     notices = (_ROOT / "THIRD_PARTY_NOTICES.md").read_text()
-    assert "## gosu" in notices
+    # The heading must name the version the image ships, so a bump that updates
+    # the binary but forgets the license section fails here instead of shipping.
+    assert f"## gosu {gosu_pin.group(1)}" in notices
     assert "Apache License" in notices
     assert "Version 2.0" in notices
