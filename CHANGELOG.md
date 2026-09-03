@@ -12,7 +12,7 @@ reliable signal of change scope; historical tags are not renumbered.
 
 ### Added
 
-- Check Now and bulk checks are recorded before the page responds; a check a crash or restart interrupted runs on the next scheduler cycle instead of being lost
+- Check Now and bulk checks are recorded before the page responds; a check a crash or restart interrupted runs on the next scheduler cycle (after the 10-minute claim lease when the crash hit mid-check) instead of being lost
 
 ### Changed
 
