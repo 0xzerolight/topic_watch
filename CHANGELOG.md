@@ -10,6 +10,8 @@ reliable signal of change scope; historical tags are not renumbered.
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-09-08
+
 ### Added
 
 - Check Now and bulk checks are recorded before the page responds; a check a crash or restart interrupted runs on the next scheduler cycle (after the 10-minute claim lease when the crash hit mid-check) instead of being lost
