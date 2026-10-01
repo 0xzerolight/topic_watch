@@ -39,6 +39,12 @@ updates:
       # 2.x bumps still flow. Lift with the caps above.
       - dependency-name: "openai"
         versions: [">=3.0.0"]
+      # apprise 2.0 is a breaking rewrite (notify() returns AppriseResult,
+      # parallel delivery, per-service timeouts); its v1 branch still gets
+      # security fixes. As a pip major it would also hold the weekly group back
+      # from auto-merge (#86). Lift when migrating to 2.x in a minor release.
+      - dependency-name: "apprise"
+        versions: [">=2.0.0"]
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
