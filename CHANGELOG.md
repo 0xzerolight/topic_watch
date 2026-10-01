@@ -10,6 +10,14 @@ reliable signal of change scope; historical tags are not renumbered.
 
 ## [Unreleased]
 
+### Security
+
+- Dependencies relocked for upstream advisories: urllib3 2.8.0 (GHSA-8988-9cw3-xx77, GHSA-vxq7-64xx-v4gw, GHSA-gh4c-6fx4-qh6g) and oauthlib 4.0.0 (GHSA-xpv3-w29h-x7cv, GHSA-hj66-6f7g-4r5v) in both locks, virtualenv 21.14.2 in the dev lock. Feed fetching runs on httpx, so urllib3 is reached only through Apprise's notification sends and botocore; both oauthlib advisories sit in its server-side endpoints, which nothing here runs. Dependabot's own security update cannot edit a hash-locked file, so these land by a targeted relock. The blocking `pip-audit` job had failed every open PR (#85, #86) on oauthlib
+
+### Changed
+
+- The Docker image builds on the current `python:3.13-slim` digest (#85) and hatchling 1.32.4. Dependabot no longer proposes apprise 2.x: 2.0 rewrites delivery and its return type, so the migration is deferred to a minor release behind a range-scoped ignore. Supersedes #86
+
 ## [1.5.0] - 2026-09-08
 
 ### Added
