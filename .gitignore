@@ -32,9 +32,14 @@ venv/
 .DS_Store
 Thumbs.db
 
-# Claude / AI tooling
+# Local-only planning / agent dirs (same convention as the anki_miner desktop repo)
 .claude/
+/AGENTS.md
 .claude-runner/
+.codex
+sdd/
+.agents
+/.worktrees/
 
 # Build / lint caches
 .mypy_cache/
