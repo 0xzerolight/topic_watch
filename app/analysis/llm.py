@@ -1018,6 +1018,9 @@ async def analyze_articles(
     ``completion_tokens`` are populated from the raw completion's usage,
     ``analyzed_article_ids`` reports the articles the request actually carried,
     and ``key_facts`` that merely restate the knowledge summary are dropped.
+
+    Keep it non-raising on LLM failure, unlike ``generate_initial_knowledge`` and
+    ``generate_knowledge_update``: a missed update beats a false alert.
     """
     # Rebound by every prompt build; after a successful call it holds the subset
     # the winning attempt sent. ``build_messages`` is invoked fresh per attempt and

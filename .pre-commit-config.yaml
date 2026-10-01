@@ -3,6 +3,8 @@
 # hook aborts there with "Executable `mypy` not found" and fails the required
 # `pre-commit.ci - pr` check on every PR. Type checking is not lost: the hosted
 # CI `lint` job and `make lint` both run the same mypy invocation.
+# Any new `language: system` hook fails there the same way: add its id to
+# `skip` in the same commit that adds the hook.
 ci:
   skip: [mypy]
 

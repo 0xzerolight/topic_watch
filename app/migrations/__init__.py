@@ -2,6 +2,11 @@
 
 Migrations are applied in version order. Each migration is a
 (version, description, up_function) tuple.
+
+Append-only: a schema change is a new ``mNNN_description.py`` exposing
+``up(conn)``, registered at the end of ``MIGRATIONS``. Never edit, renumber or
+remove a shipped migration. A database that already ran it never runs it again,
+and ``run_migrations`` refuses a ledger that is not a prefix of this list.
 """
 
 import sqlite3

@@ -484,6 +484,9 @@ def article_identity(entry: FeedEntry) -> str:
     the knowledge state kept the superseded facts (AUG-320). With the revision in the
     key, an unchanged article still deduplicates silently and only a changed one
     reaches novelty analysis.
+
+    Stored rows keep the key they were written with, so changing this recipe
+    breaks dedup: every article already held comes back as new.
     """
     return _identity_digest(canonical_url(entry.url), entry.title.casefold(), revision_marker(entry))
 

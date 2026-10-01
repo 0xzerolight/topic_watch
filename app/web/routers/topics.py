@@ -470,7 +470,7 @@ async def topic_knowledge_diff(
 
     previous_text = previous.summary_text if previous else ""
     # difflib is CPU-bound — up to ~0.32 s at MAX_DIFF_SEGMENTS on repetitive
-    # input — and would otherwise block the event loop (CLAUDE.md).
+    # input — so it runs in a worker thread instead of blocking the event loop.
     result = await asyncio.to_thread(diff_segments, previous_text, revision.summary_text)
 
     mode = result.mode

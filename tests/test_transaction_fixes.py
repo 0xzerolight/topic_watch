@@ -114,7 +114,12 @@ def _make_article(**overrides) -> Article:
 
 @pytest.fixture
 def mem_conn():
-    """Provide an in-memory SQLite connection with the topics schema."""
+    """Provide an in-memory SQLite connection with the topics schema.
+
+    The topics table is hand-written here, not built by the migrations. A
+    migration that adds a topics column ``create_topic`` inserts must add it to
+    this table too, or every test using this fixture fails on the INSERT.
+    """
     conn = sqlite3.connect(":memory:", check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
