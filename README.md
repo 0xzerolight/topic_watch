@@ -123,12 +123,12 @@ The database is automatically backed up before any schema migration.
 
 ## Features
 
-- Novelty detection: per-topic knowledge state, not keyword matching or summarization - ignores the 10th article rehashing the same story
-- Any LLM via [LiteLLM](https://docs.litellm.ai/docs/providers) - OpenAI, Anthropic, Gemini, Groq, and more. BYOK, or run free and local with Ollama
-- Cheap: ~$0.0003/check on GPT-5.4 Nano (under $0.20/month for 5 topics checked 4×/day), or free with Ollama
-- Private and self-hosted on SQLite - no database server, no JavaScript build step. Outbound traffic: RSS feeds and the pages they link to, your LLM provider, your notifier, and your topic names to Exa if you enable it
+- Novelty detection: - ignores the 10th article rehashing the same story
+- Support for any LLM via [LiteLLM](https://docs.litellm.ai/docs/providers) - OpenAI, Anthropic, Gemini, Groq, and more. BYOK, or run free and local with Ollama
+- Private and self-hosted on SQLite. Outbound traffic: RSS feeds and the pages they link to, your LLM provider, your notifier, and your topic names to Exa if you enable it
 - Auto feeds (Bing News, falling back to Google News), manual RSS/Atom URLs, or optional [Exa](https://exa.ai) AI semantic search per topic
-- Per-topic check intervals (10 min to 6 months: `6h`, `1w 3d`, `2h 30m`) and a plain-English novelty instruction ("official announcements only, ignore rumors")
+- Per-topic check intervals (10 min to 6 months)
+- Novelty instruction ("official announcements only, ignore rumors")
 - 100+ notification services via [Apprise](https://github.com/caronc/apprise/wiki) - Discord, Slack, Telegram, email, ntfy, etc.
 
 <details>
@@ -150,7 +150,7 @@ The database is automatically backed up before any schema migration.
 <summary><strong>How It Works</strong></summary>
 
 1. Define a topic with RSS feed URLs, let it auto-generate a news-search feed (Bing News first, Google News as fallback), or point it at Exa AI semantic search.
-2. On a schedule, articles are fetched and compared against a **knowledge state** - a rolling summary of what's already known.
+2. On a schedule, new articles are fetched and compared against a **knowledge state** - a rolling summary of what's already known.
 3. An LLM decides if anything is actually new.
 4. New info -> notification with summary + sources. Nothing new -> silence.
 
@@ -177,7 +177,7 @@ Uses [LiteLLM](https://docs.litellm.ai/docs/providers). Anything LiteLLM support
 [Anthropic](https://console.anthropic.com/settings/keys) ·
 [Gemini](https://aistudio.google.com/apikey) ·
 [Groq](https://console.groq.com/keys) ·
-[DeepSeek](https://platform.deepseek.com/api_keys). Or skip keys entirely and run
+[DeepSeek](https://platform.deepseek.com/api_keys). Or run
 free + local with [Ollama](https://ollama.com/download).
 
 Ollama and OpenAI-compatible gateways (LM Studio, a LiteLLM proxy, OpenCode Go) need a
@@ -214,7 +214,7 @@ keys (e.g. `TOPIC_WATCH_LLM__API_KEY`). Full key reference:
 
 ## Security
 
-**No built-in authentication** by design (single-user tool). Because of that, the port is published on `127.0.0.1` by default - a stock install is reachable only from the machine it runs on.
+**No built-in authentication** by design (single-user tool). The port is published on `127.0.0.1` by default.
 
 <details>
 <summary><strong>Reaching it from other devices</strong></summary>
