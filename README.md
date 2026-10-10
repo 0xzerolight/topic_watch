@@ -26,13 +26,11 @@ Please leave a ⭐ star if Topic Watch is useful - it helps others find it :).
 Adding a topic - Topic Watch fetches the latest news and builds a per-topic knowledge baseline.
 </p>
 
-An LLM tracks a per-topic knowledge state and stays silent until something actually changes. Bring your own key, or run free against a local model.
-
 ## Install
 
 ### 1. Install Docker
 
-Topic Watch runs in Docker. Get it at [get.docker.com](https://get.docker.com), or install [Docker Desktop](https://www.docker.com/products/docker-desktop/) on macOS/Windows. Make sure it's running before you continue.
+Topic Watch runs in Docker. Get it at [get.docker.com](https://get.docker.com), or install [Docker Desktop](https://www.docker.com/products/docker-desktop/) on macOS/Windows.
 
 ### 2. Install Topic Watch
 
