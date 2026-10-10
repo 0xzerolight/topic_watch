@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-Self-hosted news monitor that pings you only on genuinely new info.
+Self-hosted news monitor that only notifies on genuinely new info.
 </p>
 
 <p align="center">
