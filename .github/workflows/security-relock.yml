@@ -91,6 +91,21 @@ jobs:
             gh pr create --head "$branch" --title "$title" --body-file "$RUNNER_TEMP/advisories.txt"
           fi
           gh pr merge "$branch" --auto --squash
-          # A PR opened or pushed with GITHUB_TOKEN starts no pull_request run, so dispatch CI on the
-          # branch; its check runs land on the PR head and satisfy main's required checks.
-          gh workflow run ci.yml --ref "$branch"
+          # GitHub holds the pull_request CI run on a PR opened or pushed with GITHUB_TOKEN until it is
+          # approved (conclusion action_required), and the required checks only count that run, not a
+          # dispatched one (#92). Wait for it to appear and approve it.
+          head_sha="$(git rev-parse HEAD)"
+          for _ in $(seq 30); do
+            run="$(gh run list --workflow ci.yml --event pull_request --commit "$head_sha" \
+              --json databaseId,conclusion --jq '.[0] | select(.) | "\(.databaseId) \(.conclusion)"')"
+            [ -n "$run" ] && break
+            sleep 10
+          done
+          if [ -z "$run" ]; then
+            echo "::error::no pull_request CI run appeared for $head_sha"
+            exit 1
+          fi
+          read -r run_id conclusion <<< "$run"
+          if [ "$conclusion" = "action_required" ]; then
+            gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/approve"
+          fi
