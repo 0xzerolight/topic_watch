@@ -1,0 +1,96 @@
+name: Security Relock
+
+# Dependabot's security updater cannot rewrite the hash-locked requirements files (its runs end in
+# "No files have changed!"), so a CVE in a pinned dependency stays open until someone relocks. This
+# audits the locks once a day and, when a pin is vulnerable, relocks just those packages and opens an
+# auto-merging PR. The merge still waits for main's required checks.
+
+on:
+  schedule:
+    - cron: "37 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: security-relock
+
+jobs:
+  relock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          # The locks are generated on 3.13; another version rewrites their `# via` comments.
+          python-version: "3.13"
+
+      - name: Install the relock toolchain
+        # Same pins as `make lock-tools`: pip 26 removed an internal that pip-tools 7.5.3 imports.
+        run: pip install "pip==25.1.1" "pip-tools==7.5.3" pip-audit
+
+      - name: Audit the locks
+        id: audit
+        # Mirror of ci.yml's escape hatch: an id ignored there must be ignored here too, or this
+        # run fails every day trying to upgrade past a pin that has no patched release.
+        env:
+          PIP_AUDIT_IGNORE_VULNS: ""
+        run: |
+          set -euo pipefail
+          ignore_args=()
+          for vuln_id in $PIP_AUDIT_IGNORE_VULNS; do
+            ignore_args+=(--ignore-vuln "$vuln_id")
+          done
+          # requirements.txt is a hash-identical subset of requirements-dev.txt (make verify-locks).
+          # pip-audit exits 1 when it finds anything; a real failure leaves no JSON and jq fails below.
+          pip-audit --disable-pip -r requirements-dev.txt -r requirements-build.txt \
+            -f json -o "$RUNNER_TEMP/audit.json" "${ignore_args[@]}" || true
+          vulnerable='.dependencies[] | select(.vulns | length > 0)'
+          jq -r "$vulnerable | \"\(.name)>\(.version)\"" "$RUNNER_TEMP/audit.json" > "$RUNNER_TEMP/specs.txt"
+          jq -r "$vulnerable | \"- \(.name) \(.version): \([.vulns[].id] | join(\", \"))\"" \
+            "$RUNNER_TEMP/audit.json" > "$RUNNER_TEMP/advisories.txt"
+          cat "$RUNNER_TEMP/advisories.txt"
+          if [ -s "$RUNNER_TEMP/specs.txt" ]; then
+            echo "vulnerable=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Relock the vulnerable packages
+        if: steps.audit.outputs.vulnerable == 'true'
+        run: |
+          set -euo pipefail
+          # `-P name>current`, not a bare `-P name`: a bare one leaves the pin in place whenever the
+          # other pins still allow it (aiohttp 3.14.3 stayed put behind yarl 1.24.5). The floor forces
+          # the move and lets pip-compile discard any pin that blocks it. Flags mirror `make lock`.
+          upgrade_args=()
+          while IFS= read -r spec; do
+            upgrade_args+=(-P "$spec")
+          done < "$RUNNER_TEMP/specs.txt"
+          pip-compile "${upgrade_args[@]}" --strip-extras --generate-hashes --output-file=requirements.txt pyproject.toml
+          pip-compile "${upgrade_args[@]}" --strip-extras --generate-hashes --extra=dev --output-file=requirements-dev.txt pyproject.toml
+          pip-compile "${upgrade_args[@]}" --strip-extras --generate-hashes --output-file=requirements-build.txt requirements-build.in
+          git diff --stat
+
+      - name: Open the relock PR
+        if: steps.audit.outputs.vulnerable == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          branch=security-relock
+          title="fix(deps): relock packages with known vulnerabilities"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git commit -am "$title" -m "$(cat "$RUNNER_TEMP/advisories.txt")"
+          git push --force origin "$branch"
+          if [ -z "$(gh pr list --head "$branch" --state open --json number --jq '.[].number')" ]; then
+            gh pr create --head "$branch" --title "$title" --body-file "$RUNNER_TEMP/advisories.txt"
+          fi
+          gh pr merge "$branch" --auto --squash
+          # A PR opened or pushed with GITHUB_TOKEN starts no pull_request run, so dispatch CI on the
+          # branch; its check runs land on the PR head and satisfy main's required checks.
+          gh workflow run ci.yml --ref "$branch"
