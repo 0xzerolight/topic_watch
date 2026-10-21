@@ -144,6 +144,7 @@ jobs:
         # add its GHSA/CVE/PYSEC id here with a comment explaining why, and when
         # to revisit. Empty by default — every entry here is a deliberate,
         # documented exception to the blocking gate above, not a default.
+        # Mirror every entry in security-relock.yml's audit step.
         env:
           PIP_AUDIT_IGNORE_VULNS: ""
         run: |
