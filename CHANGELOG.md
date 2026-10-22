@@ -10,6 +10,16 @@ reliable signal of change scope; historical tags are not renumbered.
 
 ## [Unreleased]
 
+## [1.5.2] - 2026-10-22
+
+### Security
+
+- Dependencies relocked for upstream advisories: aiohttp 3.14.5 (GHSA-2g87-pp6c-29x5, GHSA-5wr8-gcqf-gqf3, GHSA-494j-54xm-rwp3, GHSA-pqxq-w44r-73xw, GHSA-9xw5-w5jj-pvcg, GHSA-gx76-c99x-2c96, GHSA-6cjc-53gc-5rqm, GHSA-f9xw-jh8m-3mwq) with yarl 1.25.1 alongside it, multidict 6.9.1 (GHSA-54p9-h82j-f925) and certifi 2026.10.19 (GHSA-6q48-6c7w-9gw2) in both locks, virtualenv 21.14.12 in the dev lock (GHSA-5vjq-rrrf-7h2q, GHSA-vxj4-q4g9-crj7, GHSA-c978-59m8-c77v, GHSA-43mp-35q3-x3fq, GHSA-cw65-gx24-rc82). aiohttp arrives only as a client dependency of litellm and instructor; nothing here runs an aiohttp server, where most of its advisories sit. The certifi release drops the emSign ECC root, whose intermediates' keys were compromised, from the CA bundle feed fetching and notification sends trust. A daily Security Relock workflow now audits the locks and opens the targeted relock as an auto-merging PR (#92, #93, #94), since Dependabot's own security update still cannot edit a hash-locked file
+
+### Changed
+
+- The Docker image builds on the current `python:3.13-slim` digest (#89)
+
 ## [1.5.1] - 2026-10-01
 
 ### Security
