@@ -35,8 +35,8 @@ jobs:
 
       - name: Audit the locks
         id: audit
-        # Mirror of ci.yml's escape hatch: an id ignored there must be ignored here too, or this
-        # run fails every day trying to upgrade past a pin that has no patched release.
+        # Mirror of ci.yml's escape hatch: an id ignored there (a fix you are holding back) must be
+        # ignored here too, or this run relocks past it every day.
         env:
           PIP_AUDIT_IGNORE_VULNS: ""
         run: |
@@ -46,10 +46,13 @@ jobs:
             ignore_args+=(--ignore-vuln "$vuln_id")
           done
           # requirements.txt is a hash-identical subset of requirements-dev.txt (make verify-locks).
+          # OSV, not the default PyPI service: PyPI lacked GHSA-cx6f-vjhg-g3cc (virtualenv) for days
+          # while Dependabot alerted on it, and OSV carries the GitHub advisories Dependabot uses.
           # pip-audit exits 1 when it finds anything; a real failure leaves no JSON and jq fails below.
-          pip-audit --disable-pip -r requirements-dev.txt -r requirements-build.txt \
+          pip-audit -s osv --disable-pip -r requirements-dev.txt -r requirements-build.txt \
             -f json -o "$RUNNER_TEMP/audit.json" "${ignore_args[@]}" || true
-          vulnerable='.dependencies[] | select(.vulns | length > 0)'
+          # Only advisories with a patched release: there is nothing to relock to for the others.
+          vulnerable='.dependencies[] | select(any(.vulns[]; .fix_versions | length > 0))'
           jq -r "$vulnerable | \"\(.name)>\(.version)\"" "$RUNNER_TEMP/audit.json" > "$RUNNER_TEMP/specs.txt"
           jq -r "$vulnerable | \"- \(.name) \(.version): \([.vulns[].id] | join(\", \"))\"" \
             "$RUNNER_TEMP/audit.json" > "$RUNNER_TEMP/advisories.txt"
