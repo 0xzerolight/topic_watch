@@ -10,6 +10,12 @@ reliable signal of change scope; historical tags are not renumbered.
 
 ## [Unreleased]
 
+## [1.5.3] - 2026-11-02
+
+### Security
+
+- Dependencies relocked for upstream advisories: filelock 4.2.4 (GHSA-v4x8-3wr5-3wq8, GHSA-567q-5qvw-pf92, GHSA-9vhv-jxww-xfm5, GHSA-69hj-f68j-2879, GHSA-fq56-3cx3-fjxp, GHSA-rfpc-qcw5-3pc4, GHSA-6627-m3xw-93mp, GHSA-8mx5-7m5m-r77g, GHSA-9c4x-gm8v-wgc4, GHSA-cwqr-hh33-gh44, GHSA-j8f7-rjxc-mr56, GHSA-m462-7rxw-wvpg) and litellm 1.103.7 (GHSA-7hp6-4w63-5g45) in both locks, virtualenv 21.15.0 in the dev lock (GHSA-cx6f-vjhg-g3cc). litellm 1.103.7 requires httpx's HTTP/2 extra, so h2, hpack and hyperframe are new in both locks. filelock is loaded only when litellm's token counter downloads a Hugging Face tokenizer for a Llama 2, Llama 3, Replicate or Cohere Command-R model and huggingface_hub locks its cache with it; every filelock advisory needs another local account that can write beside the lock, or sits in lock types and Windows code that path does not use. The litellm advisory sits in its proxy server's authentication, which nothing here runs: the app uses only the client SDK. The Security Relock workflow now audits against OSV instead of PyPI's advisory service, which lacked GHSA-cx6f-vjhg-g3cc for days while Dependabot alerted on it (#95, #97, #98)
+
 ## [1.5.2] - 2026-10-22
 
 ### Security
